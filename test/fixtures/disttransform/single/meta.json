@@ -1,0 +1,23 @@
+{
+  "arrays": {
+    "expected": {
+      "dtype": "float32",
+      "shape": [
+        32,
+        32
+      ]
+    },
+    "src": {
+      "dtype": "uint8",
+      "shape": [
+        32,
+        32
+      ]
+    }
+  },
+  "params": {
+    "convention": "distance from nonzero to nearest zero",
+    "mask": "precise",
+    "metric": "L2"
+  }
+}

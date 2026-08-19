@@ -1,0 +1,22 @@
+{
+  "arrays": {
+    "surface": {
+      "dtype": "float32",
+      "shape": [
+        7,
+        7
+      ]
+    }
+  },
+  "params": {
+    "maxloc_xy": [
+      0,
+      0
+    ],
+    "maxval": 0.25,
+    "row_col_0based": [
+      0,
+      0
+    ]
+  }
+}

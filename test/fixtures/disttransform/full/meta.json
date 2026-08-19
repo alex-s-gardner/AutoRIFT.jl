@@ -1,0 +1,14 @@
+{
+  "arrays": {
+    "src": {
+      "dtype": "uint8",
+      "shape": [
+        16,
+        16
+      ]
+    }
+  },
+  "params": {
+    "degenerate": true
+  }
+}

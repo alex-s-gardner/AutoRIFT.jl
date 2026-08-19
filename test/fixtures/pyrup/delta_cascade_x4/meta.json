@@ -1,0 +1,24 @@
+{
+  "arrays": {
+    "expected": {
+      "dtype": "float32",
+      "shape": [
+        20,
+        20
+      ]
+    },
+    "src": {
+      "dtype": "float32",
+      "shape": [
+        5,
+        5
+      ]
+    }
+  },
+  "params": {
+    "factor": 4,
+    "patch": "delta",
+    "single_step": false,
+    "steps": 2
+  }
+}

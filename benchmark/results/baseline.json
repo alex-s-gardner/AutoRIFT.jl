@@ -1,0 +1,136 @@
+{
+    "environment": {
+        "julia_version": "1.12.5",
+        "cpu": "Apple M2 Max",
+        "cpu_threads": 8,
+        "nthreads": 1,
+        "os": "Darwin",
+        "arch": "aarch64",
+        "hostname": "MT-502549",
+        "git_sha": "41e583f87c22941987a222c2e397f1a2ae808746",
+        "git_branch": "master",
+        "git_dirty": true,
+        "timestamp": "1787182083"
+    },
+    "schema_version": 1,
+    "benchmarks": {
+        "points/gridpoints 4096x4096": {
+            "min_ns": 37166,
+            "median_ns": 46000,
+            "mean_ns": 190252.7087,
+            "max_ns": 95079666,
+            "allocs": 43,
+            "memory_bytes": 1312512,
+            "samples": 10000
+        },
+        "points/chip_bounds": {
+            "min_ns": 4.25,
+            "median_ns": 4.708,
+            "mean_ns": 4.8348901000000035,
+            "max_ns": 23.792,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "points/sanitize! 1024x1024": {
+            "min_ns": 639.2215568862275,
+            "median_ns": 694.6107784431138,
+            "mean_ns": 711.4101035928142,
+            "max_ns": 2956.8323353293413,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "points/pointset scattered n=100000": {
+            "min_ns": 178042,
+            "median_ns": 190041,
+            "mean_ns": 1.4968661363095238e6,
+            "max_ns": 92833125,
+            "allocs": 37,
+            "memory_bytes": 6424032,
+            "samples": 3360
+        },
+        "points/params": {
+            "min_ns": 733.0153846153846,
+            "median_ns": 804.1692307692308,
+            "mean_ns": 809.3958838461538,
+            "max_ns": 5993.907692307693,
+            "allocs": 8,
+            "memory_bytes": 304,
+            "samples": 10000
+        },
+        "points/surface_size": {
+            "min_ns": 1.833,
+            "median_ns": 2.042,
+            "mean_ns": 2.0860988,
+            "max_ns": 15.083,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "points/pointset scattered n=1000": {
+            "min_ns": 2083.3333333333335,
+            "median_ns": 2578.6666666666665,
+            "mean_ns": 5369.965244444445,
+            "max_ns": 9.485541666666666e6,
+            "allocs": 37,
+            "memory_bytes": 67040,
+            "samples": 10000
+        },
+        "points/scatter 4096x4096": {
+            "min_ns": 128.4917309812569,
+            "median_ns": 143.32965821389195,
+            "mean_ns": 289.1338266813671,
+            "max_ns": 97505.92613009922,
+            "allocs": 21,
+            "memory_bytes": 1248,
+            "samples": 10000
+        },
+        "points/nsearchable 1024x1024": {
+            "min_ns": 366.78365384615387,
+            "median_ns": 415.66346153846155,
+            "mean_ns": 415.4346706730769,
+            "max_ns": 888.6201923076923,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "points/params with methods": {
+            "min_ns": 584.4861878453039,
+            "median_ns": 642.2651933701658,
+            "mean_ns": 655.97847679558,
+            "max_ns": 10125,
+            "allocs": 10,
+            "memory_bytes": 368,
+            "samples": 10000
+        },
+        "points/gridpoints 512x512": {
+            "min_ns": 781.7769784172662,
+            "median_ns": 1173.5611510791366,
+            "mean_ns": 1465.2225755395684,
+            "max_ns": 599727.5179856115,
+            "allocs": 33,
+            "memory_bytes": 17792,
+            "samples": 10000
+        },
+        "points/search_bounds": {
+            "min_ns": 4.208,
+            "median_ns": 4.417,
+            "mean_ns": 4.571186499999998,
+            "max_ns": 23.083,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "points/scatter 1024x1024": {
+            "min_ns": 128.18449781659388,
+            "median_ns": 139.23799126637556,
+            "mean_ns": 169.47025021834062,
+            "max_ns": 1972.4792576419213,
+            "allocs": 21,
+            "memory_bytes": 1248,
+            "samples": 10000
+        }
+    },
+    "impl": "julia"
+}

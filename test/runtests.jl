@@ -19,6 +19,9 @@ include("utils.jl")
     @testset "points" begin
         include("points.jl")
     end
+    @testset "fixtures" begin
+        include("fixtures_test.jl")
+    end
 
     @testset "code quality" begin
         include("aqua.jl")

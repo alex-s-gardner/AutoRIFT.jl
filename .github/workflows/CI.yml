@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # Cancel superseded runs on a branch, but never on master: those results feed
+  # the benchmark history and the coverage trend.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  test:
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Named channels rather than version numbers, so there is nothing to bump
+        # when a new Julia lands.
+        version: ['lts', '1', 'pre']
+        os: [ubuntu-latest, macOS-latest, windows-latest]
+        exclude:
+          # One OS is enough to catch a breaking change on an unreleased Julia;
+          # three would triple the cost of the most frequently-broken job.
+          - version: 'pre'
+            os: macOS-latest
+          - version: 'pre'
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+      - uses: julia-actions/julia-processcoverage@v1
+      - uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+        continue-on-error: true
+
+  load-time:
+    # Load time is a tracked cost, not a nicety: the production driver may launch
+    # a process per image pair, in which case `using AutoRIFT` plus first-call
+    # compilation can exceed the actual correlation. Measured on every PR so a
+    # dependency that quietly pulls in a heavy transitive tree is visible at
+    # review time rather than discovered in production.
+    name: Load time
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - name: Measure
+        run: |
+          # Precompile first so the measurement is load time, not build time.
+          julia --project=. -e 'using AutoRIFT'
+          echo "### Load time" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          for i in 1 2 3; do
+            /usr/bin/time -f "  using AutoRIFT: %e s" \
+              julia --project=. -e 'using AutoRIFT' 2>&1 | tail -1 \
+              >> "$GITHUB_STEP_SUMMARY"
+          done
+          for i in 1 2 3; do
+            /usr/bin/time -f "  bare julia:     %e s" \
+              julia --project=. -e '1' 2>&1 | tail -1 >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  benchmark:
+    # Ratio-only gating, both revisions measured in the same job on the same
+    # runner. Absolute times from a hosted runner are too noisy to compare across
+    # jobs, so an absolute threshold would either fire constantly or never; a
+    # ratio between two runs on one machine is meaningful.
+    name: Benchmark
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+
+      - name: Benchmark the merge base
+        run: |
+          git checkout --detach ${{ github.event.pull_request.base.sha }}
+          julia --project=benchmark -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
+          julia --project=benchmark benchmark/run.jl --tag base
+
+      - name: Benchmark the pull request
+        run: |
+          git checkout --detach ${{ github.event.pull_request.head.sha }}
+          julia --project=benchmark -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
+          julia --project=benchmark benchmark/run.jl --tag pr
+
+      - name: Compare
+        run: |
+          {
+            echo "### Benchmark: PR vs merge base"
+            echo
+            julia --project=benchmark benchmark/compare.jl \
+              benchmark/results/history/base.json \
+              benchmark/results/history/pr.json
+          } | tee "$GITHUB_STEP_SUMMARY"

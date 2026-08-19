@@ -81,8 +81,11 @@ R = \\frac{\\sum (T - \\bar{T})(I - \\bar{I})}{\\sqrt{\\sum (T - \\bar{T})^2 \\s
 ```
 
 Invariant to an additive brightness offset in either image, which makes it the
-right default for optical imagery with varying illumination. This is the
-default for all real-valued input.
+right choice for optical imagery with varying illumination.
+
+The default, and the measure the reference implementation uses for every input
+type. (Earlier autoRIFT releases used [`NCC`](@ref) for floating-point input,
+which was a bug; v2.0.0 unified on `ZNCC`.)
 """
 struct ZNCC <: SimilarityMeasure end
 
@@ -97,12 +100,11 @@ R = \\frac{\\sum T \\cdot I}{\\sqrt{\\sum T^2 \\sum I^2}}
 ```
 
 !!! warning
-    `NCC` is **not** invariant to an additive offset, so a DC shift between the
-    two images biases the peak. The Python autoRIFT uses this measure for
-    `Float32` input and works around the non-invariance by subtracting the chip
-    minimum; [`ZNCC`](@ref) is the better-behaved choice and is the default
-    here. `NCC` is retained for comparison against the reference and for cases
-    where the mean carries signal.
+    `NCC` is **not** invariant to an additive offset, so a brightness difference
+    between the two acquisitions biases the peak. Prefer [`ZNCC`](@ref) unless
+    the mean itself carries signal you want to keep. Provided for comparison and
+    for reproducing autoRIFT releases before v2.0.0, which used this measure for
+    floating-point input.
 """
 struct NCC <: SimilarityMeasure end
 

@@ -1,0 +1,32 @@
+{
+  "arrays": {
+    "expected": {
+      "dtype": "uint8",
+      "shape": [
+        64,
+        64
+      ]
+    },
+    "kernel": {
+      "dtype": "float32",
+      "shape": [
+        9,
+        9
+      ]
+    },
+    "src": {
+      "dtype": "uint8",
+      "shape": [
+        64,
+        64
+      ]
+    }
+  },
+  "params": {
+    "border": "reflect",
+    "correlation_not_convolution": true,
+    "dtype": "uint8",
+    "kernel": "box",
+    "width": 9
+  }
+}

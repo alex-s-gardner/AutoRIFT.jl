@@ -1,0 +1,32 @@
+{
+  "arrays": {
+    "expected": {
+      "dtype": "float32",
+      "shape": [
+        64,
+        64
+      ]
+    },
+    "kernel": {
+      "dtype": "float32",
+      "shape": [
+        5,
+        5
+      ]
+    },
+    "src": {
+      "dtype": "float32",
+      "shape": [
+        64,
+        64
+      ]
+    }
+  },
+  "params": {
+    "border": "replicate",
+    "correlation_not_convolution": true,
+    "dtype": "float32",
+    "kernel": "box",
+    "width": 5
+  }
+}

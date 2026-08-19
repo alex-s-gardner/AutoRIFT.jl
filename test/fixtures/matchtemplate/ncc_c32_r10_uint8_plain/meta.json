@@ -1,0 +1,36 @@
+{
+  "arrays": {
+    "chip": {
+      "dtype": "uint8",
+      "shape": [
+        32,
+        32
+      ]
+    },
+    "expected": {
+      "dtype": "float32",
+      "shape": [
+        20,
+        20
+      ]
+    },
+    "search": {
+      "dtype": "uint8",
+      "shape": [
+        51,
+        51
+      ]
+    }
+  },
+  "params": {
+    "chip_size": 32,
+    "dtype": "uint8",
+    "search_radius": 10,
+    "similarity": "ncc",
+    "surface_shape": [
+      20,
+      20
+    ],
+    "variant": "plain"
+  }
+}

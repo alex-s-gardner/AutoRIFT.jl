@@ -116,6 +116,17 @@ end
     @test grid.radius_x[1] == 0   # same memory, not a copy
 
     @test scatter(flat) === flat
+
+    # O(1) in the number of points. `vec` shares the underlying data, so the only
+    # allocation is the eight reshaped wrappers and the struct — a fixed cost
+    # regardless of grid size. Asserted rather than merely benchmarked, because a
+    # regression to copying would be invisible in correctness terms while making
+    # the pyramid quadratic in point count.
+    small = gridpoints((256, 256), 32; chip_size = 32, search_radius = 25)
+    big = gridpoints((2048, 2048), 32; chip_size = 32, search_radius = 25)
+    scatter(small); scatter(big)   # compile before measuring
+    @test npoints(big) > 50 * npoints(small)
+    @test @allocated(scatter(big)) == @allocated(scatter(small))
 end
 
 @testset "sanitize!" begin

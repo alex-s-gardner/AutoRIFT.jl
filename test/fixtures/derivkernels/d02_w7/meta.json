@@ -1,0 +1,24 @@
+{
+  "arrays": {
+    "kx": {
+      "dtype": "float32",
+      "shape": [
+        7,
+        1
+      ]
+    },
+    "ky": {
+      "dtype": "float32",
+      "shape": [
+        7,
+        1
+      ]
+    }
+  },
+  "params": {
+    "dx": 0,
+    "dy": 2,
+    "normalize": false,
+    "width": 7
+  }
+}

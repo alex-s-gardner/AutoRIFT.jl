@@ -1,0 +1,25 @@
+# Environment for running the Python autoRIFT reference itself: whole-pipeline
+# comparison, and the timing baseline that `speedup_vs_python` is measured
+# against.
+#
+# The pins are not conservatism. The reference uses `np.bool`, `np.int`, and
+# `np.asscalar`, all removed in NumPy 1.24, so it *cannot* run on a current
+# stack. numpy<1.24 then forces an older Python, SciPy, and scikit-image.
+#
+# Only needed to regenerate benchmark/results/python.json or to re-run the
+# end-to-end scene comparison. The fixtures the test suite uses come from
+# environment-cv.yml and are committed, so neither environment is required to run
+# the tests.
+#
+#   mamba env create -f tools/python_ref/environment-legacy.yml
+#   mamba run -n autorift-legacy python tools/python_ref/bench_python.py
+name: autorift-legacy
+channels:
+  - conda-forge
+dependencies:
+  - python=3.9
+  - numpy=1.23.5
+  - opencv=4.8
+  - scipy=1.9.3
+  - scikit-image=0.19.3
+  - gdal=3.6

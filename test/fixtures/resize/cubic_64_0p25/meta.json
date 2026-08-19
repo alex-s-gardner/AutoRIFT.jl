@@ -1,0 +1,27 @@
+{
+  "arrays": {
+    "expected": {
+      "dtype": "float32",
+      "shape": [
+        16,
+        16
+      ]
+    },
+    "src": {
+      "dtype": "float32",
+      "shape": [
+        64,
+        64
+      ]
+    }
+  },
+  "params": {
+    "dst_shape": [
+      16,
+      16
+    ],
+    "interpolation": "cubic",
+    "scale": 0.25,
+    "src_size": 64
+  }
+}

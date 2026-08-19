@@ -1,0 +1,23 @@
+# Environment for generating OpenCV comparison fixtures.
+#
+# Deliberately NOT pinned to the reference's ancient stack: the cv2 primitives
+# this exercises (filter2D, resize, matchTemplate, pyrUp, distanceTransform) have
+# had stable semantics for years, so a current OpenCV is both a fair comparison
+# target and one a contributor can actually install.
+#
+# The one thing that IS version-sensitive is `filter2D`'s switch to a DFT-based
+# path once the kernel area passes a threshold, which changes rounding. Fixtures
+# bracket that at widths 11 and 13 so a change in the threshold shows up as a
+# test failure rather than as silent drift.
+#
+#   mamba env create -f tools/python_ref/environment-cv.yml
+#   mamba run -n autorift-cv python tools/python_ref/gen_fixtures.py
+name: autorift-cv
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy=2.1
+  - opencv=4.10
+  - scipy=1.14
+  - scikit-image=0.24
