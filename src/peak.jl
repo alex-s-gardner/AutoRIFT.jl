@@ -389,11 +389,12 @@ function refinement_workspace(upsampling::Integer; patch::Integer = 5)
         Matrix{Float32}(undef, n, n),
         Matrix{Float32}(undef, n, n),
         Matrix{Float32}(undef, p, p),
-        # The vertical pass at the deepest level writes (n, n/2), so half of this is never
-        # touched. Sized (n, n) anyway: the alternative is an exact-size buffer per level, and
-        # 800 kB of untouched address space at 128x upsampling is cheaper than that
-        # bookkeeping.
-        Matrix{Float32}(undef, n, n),
+        # `pyrup!`'s vertical pass writes `(2 * rows, cols)` of its *source*, so the deepest
+        # step — from `n/2` square up to `n` square — needs `(n, n/2)`. Sizing this `(n, n)`
+        # would leave half of it permanently untouched, and it is not free: one workspace is
+        # allocated per chunk per pass, so at 16 chunks the waste is real memory traffic rather
+        # than idle address space.
+        Matrix{Float32}(undef, n, max(n ÷ 2, p)),
         taps,
         up,
     )
