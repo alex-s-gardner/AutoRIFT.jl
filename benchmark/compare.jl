@@ -28,11 +28,29 @@ const NOTEWORTHY_THRESHOLD = 1.03
 # path is the case that matters: allocating once per grid point would be invisible
 # in a microbenchmark and ruinous across millions of image pairs.
 const ZEROALLOC_PATTERNS = [
-    r"^correlate/",
+    # The per-point correlation path. Allocating here would be invisible in a
+    # microbenchmark and ruinous across millions of image pairs.
+    r"^correlate/(surface|point|peak|integral|pyrup)",
     r"^points/(chip_bounds|search_bounds|surface_size|nsearchable|sanitize)",
 ]
 
+# Benchmarks allowed a small fixed allocation, with the amount that is expected.
+# Distinct from the zero-alloc set because "constant" is the property that matters
+# for these -- an allocation that grows with the work is a bug, one that does not is
+# a returned tuple. Checked as an upper bound so a regression to per-step
+# allocation still fails.
+const BOUNDED_ALLOC = Dict{Regex,Int}(
+    r"^correlate/subpixel" => 8,
+)
+
 is_zeroalloc(name) = any(p -> occursin(p, name), ZEROALLOC_PATTERNS)
+
+function _alloc_bound(name)
+    for (pat, n) in BOUNDED_ALLOC
+        occursin(pat, name) && return n
+    end
+    return nothing
+end
 
 function load(path)
     isfile(path) || error("no such benchmark result: $path")
@@ -103,9 +121,14 @@ function main()
             ""
         end
 
-        if is_zeroalloc(String(name)) && c.allocs > 0
+        nm = String(name)
+        bound = _alloc_bound(nm)
+        if is_zeroalloc(nm) && c.allocs > 0
             push!(alloc_failures, "$name ($(c.allocs) allocations)")
             flag *= " **ALLOCATES**"
+        elseif !isnothing(bound) && c.allocs > bound
+            push!(alloc_failures, "$name ($(c.allocs) allocations, bound $bound)")
+            flag *= " **OVER ALLOC BOUND**"
         elseif dalloc > 0
             flag *= " +$dalloc allocs"
         end

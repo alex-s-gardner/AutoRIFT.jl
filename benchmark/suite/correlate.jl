@@ -1,33 +1,83 @@
-# Correlation surface, peak location, and subpixel refinement — the inner loop
-# the whole package's throughput rests on. Populated at M2.
+# Correlation surface, peak location, and subpixel refinement — the inner loop the
+# whole package's throughput rests on.
 #
-# What this group must answer:
+# Names match `tools/python_ref/bench_python.py` exactly, so `compare.jl` can print
+# a per-kernel speedup against OpenCV. A mismatch silently yields no comparison
+# rather than an error, so the names are worth checking whenever either side changes.
 #
-#   * Where the direct/FFT crossover falls. Direct evaluation costs
-#     (2*radius)^2 * chip^2 multiply-accumulates; an FFT over the search window
-#     costs ~3*N*log(N) plus an integral-image pass. Theory puts the crossover
-#     near chip 32 / radius 25, but the constant depends on cache behaviour and
-#     FFTW's plan quality, so it is set by measurement here and used as a
-#     compile-time-known threshold thereafter.
+# What this group is for, beyond regression tracking:
 #
-#   * Whether a global integral image beats a per-point one. OpenCV rebuilds the
-#     integral image for every grid point, over windows that overlap ~2.5x in
-#     each direction at typical grid spacing. Computing one integral image over
-#     the whole padded image is O(N) instead of O(points * window^2). Expected to
-#     be a large win on the coarse pass; measured, not assumed.
+#   * Fixing the direct/FFT crossover. Direct evaluation costs
+#     `nshifts * chip_area` multiply-accumulates; the FFT gets every shift at once
+#     for `O(N log N)` in the search-window area. The crossover constant depends on
+#     cache behaviour and on FFTW's plan quality, so `DIRECT_THRESHOLD` is set from
+#     these numbers rather than derived from operation counts.
 #
-#   * Whether exact integer accumulation beats float for the UInt8 path. Integer
-#     accumulation is SIMD-friendly, exact, and cannot cancel — but only if the
-#     compiler vectorizes it.
+#   * Quantifying subpixel refinement. At 128x upsampling a 5x5 patch becomes
+#     640x640 — 1.6 MB materialised to locate one maximum. If that dominates,
+#     evaluating the composite interpolant directly is the M8 optimisation with the
+#     largest expected payoff, and this is the baseline that claim is measured
+#     against.
 #
-#   * The cost of subpixel refinement as a fraction of the whole. The reference
-#     cascades pyrUp up to seven times on a 5x5 patch, which at upsampling 128
-#     materializes a 640x640 surface to find one argmax. Evaluating the composite
-#     interpolant directly should be far cheaper; this group is where that claim
-#     is checked.
-#
-# Every measurement is paired with its OpenCV equivalent from
-# benchmark/results/python.json, so `speedup_vs_python` is reported per kernel
-# rather than only end-to-end.
+#   * Baselining the integral images. OpenCV rebuilds them per grid point over
+#     windows that overlap ~2.5x in each direction at typical grid spacing;
+#     computing one per pass over the whole padded image is O(N) instead. Also an
+#     M8 item, also measured rather than assumed.
+
 let g = addgroup!(SUITE, "correlate")
+
+    for (chip, radius) in CHIP_RADIUS
+        win = chip + 2radius - 1
+
+        for (dname, T) in (("uint8", UInt8), ("float32", Float32))
+            search = bench_texture((win, win); seed = chip + radius, T = T)
+            chipdata = collect(search[(radius + 1):(radius + chip),
+                                      (radius + 1):(radius + chip)])
+            ws = AutoRIFT.workspace(T, chip, radius)
+
+            g["surface zncc c$chip r$radius $dname"] =
+                @benchmarkable AutoRIFT.correlate!($ws, $search, $chipdata, $radius)
+
+            # Surface plus peak: what one grid point actually costs, and the number
+            # that multiplies out to a whole-scene time.
+            g["point zncc c$chip r$radius $dname"] = @benchmarkable begin
+                s = AutoRIFT.correlate!($ws, $search, $chipdata, $radius)
+                AutoRIFT.peak_offset(s, ($radius, $radius))
+            end
+        end
+    end
+
+    # Peak location alone, separated from surface formation. Cheap in absolute
+    # terms, but it runs once per point per pyramid level.
+    for radius in (6, 25, 50)
+        surface = bench_texture((2radius, 2radius); seed = radius)
+        g["peak r$radius"] = @benchmarkable AutoRIFT.peak_index($surface)
+    end
+
+    # Subpixel refinement, per upsampling factor. Not linear in the factor: each
+    # step quadruples the area, so the final doubling costs as much as every step
+    # before it combined.
+    let surface = bench_texture((50, 50); seed = 3)
+        for up in (16, 32, 64, 128)
+            rw = AutoRIFT.refinement_workspace(up)
+            g["subpixel x$up"] =
+                @benchmarkable AutoRIFT.subpixel_peak($rw, $surface, (25, 25), $up)
+        end
+    end
+
+    # One upsampling step at each size the cascade passes through, so the cascade's
+    # cost can be attributed to its steps.
+    for n in (5, 10, 20, 40, 80)
+        src = bench_texture((n, n); seed = n)
+        dst = Matrix{Float32}(undef, 2n, 2n)
+        g["pyrup $(n)x$(n)"] = @benchmarkable AutoRIFT.pyrup!($dst, $src)
+    end
+
+    # Integral images: the denominator's entire cost.
+    for n in (81, 113, 177)
+        src = bench_texture((n, n); seed = n)
+        S = Matrix{Float64}(undef, n + 1, n + 1)
+        g["integral $(n)x$(n)"] = @benchmarkable AutoRIFT.integral!($S, $src)
+        g["integral_sq $(n)x$(n)"] = @benchmarkable AutoRIFT.integral_sq!($S, $src)
+    end
 end

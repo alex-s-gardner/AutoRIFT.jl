@@ -22,6 +22,15 @@ include("utils.jl")
     @testset "fixtures" begin
         include("fixtures_test.jl")
     end
+    @testset "correlate" begin
+        include("correlate.jl")
+    end
+    @testset "peak" begin
+        include("peak.jl")
+    end
+    @testset "vs OpenCV" begin
+        include("opencv.jl")
+    end
 
     @testset "code quality" begin
         include("aqua.jl")

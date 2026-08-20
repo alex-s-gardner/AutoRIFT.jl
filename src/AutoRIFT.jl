@@ -71,6 +71,14 @@ include("types.jl")
 include("params.jl")
 include("points.jl")
 
+# Layer 1: template matching and peak location. These files depend on nothing else
+# in the package, so they stay extractable as a standalone package -- the Julia
+# ecosystem has no adequate NCC + subpixel-peak implementation.
+include("plans.jl")
+include("integral.jl")
+include("correlate.jl")
+include("peak.jl")
+
 export autorift, autorift!
 export SimilarityMeasure, ZNCC, NCC, Coherence
 export PreprocessMethod, Highpass, Wallis, WallisGapfill, Sobel, Laplacian,
