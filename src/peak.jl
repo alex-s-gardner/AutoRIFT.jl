@@ -119,13 +119,19 @@ end
 # Cost, and what has been tried
 # ---------------------------------------------------------------------------
 #
-# 0.56 ms at 128x upsampling against OpenCV's 247 us, so ~2.3x — down from ~6x, via the
-# two-pass form in `pyrup!` and the hoisted tap table. Refinement is still the largest
-# single cost in a fine correlation pass (82% of it before these changes), because the
-# algorithm materialises a 640x640 surface from a 5x5 patch to locate one maximum.
+# 77.7 us at 64x upsampling, down from 119 us, and 1.53x faster than before the interior/border
+# split in `pyrup!`'s vertical pass. Earlier steps were the two-pass form and the hoisted tap
+# table, together taking the gap to OpenCV from ~6x to ~2.3x. The algorithm is inherently
+# expensive — it materialises a 320x320 surface from a 5x5 patch to locate one maximum — but
+# refinement is no longer the dominant cost of a fine pass.
 #
-# Four routes to the remaining gap were measured and rejected, which is worth recording so
-# they are not retried blind:
+# Five routes were examined. **The one that worked** was reading the interior taps directly and
+# consulting the table only for the four border rows: the table was the bottleneck, since a
+# `Vector{NTuple{4,Int}}` indexed per output row yields indices the compiler cannot prove
+# contiguous, so the loop stayed scalar. See `pyrup!` for why that split is exact.
+#
+# The other four were measured and rejected, which is worth recording so they are not retried
+# blind:
 #
 #   * Cropping the cascade around the running peak at each level. The large win in
 #     principle. But the peak's deviation from its own rescaled position was measured at up
@@ -139,15 +145,24 @@ end
 #     5x5 is load-bearing.
 #
 #   * Splitting the inner loop by row parity to hoist the tap branch. Bit-identical, but
-#     1.06x — the branch predictor was already handling it.
+#     1.06x — the branch predictor was already handling it. Note this is *not* the split that
+#     eventually worked: parity removes a branch, and the cost was the indirect table read.
 #
 #   * Reordering the fused arithmetic. Faster, but it moved *further* from OpenCV rather
 #     than merely differently, which is the distinction that rules it out. The two-pass form
 #     also changes the last bit and is kept anyway; see `pyrup!` for why those two cases
 #     differ.
 #
-# What is left is vectorising the two passes, an M8 item. The cost is a fixed per-point
-# overhead rather than something that scales with scene size.
+# The cost is a fixed per-point overhead rather than something that scales with scene size, so it
+# matters most on a dense grid.
+#
+# The same interior/border split does **not** help the horizontal pass — measured at 0.29x, i.e.
+# 3.4x *slower*, bit-identical but far worse. The two passes are not symmetric: the vertical one
+# writes two adjacent rows of one column, which is contiguous, while the horizontal one would
+# write two adjacent *columns*, which are `2sh` floats apart. Handling one output column at a time
+# and paying `_pyrup_taps` once for it keeps the writes sequential, and that locality is worth more
+# than the table lookup costs. Recorded because the symmetry is inviting and the answer is
+# counter-intuitive.
 
 """
     pyrup!(dst, src, [scratch])
