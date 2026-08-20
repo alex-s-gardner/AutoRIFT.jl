@@ -186,11 +186,9 @@ function pyrup!(dst::AbstractMatrix{Float32}, src::AbstractMatrix{Float32})
     # cheaper than evaluating all 25 taps and discarding the 16 that are zero.
     #
     # The row taps depend only on the row, so computing them inside the column loop
-    # repeated the same reflection arithmetic `2sw` times over. Hoisting them into a
-    # scratch vector is worth 1.5x, and it is the only redundancy here: the tap
-    # *arithmetic* below is left exactly as it was, including the parenthesisation,
-    # because regrouping these float multiplies changes the last bit and this kernel is
-    # verified bit-identical against OpenCV.
+    # repeated the same reflection arithmetic `2sw` times over. Hoisting them is worth
+    # 1.5x, and it is the only redundancy here — the arithmetic itself must stay as
+    # written, for the reason given in the header note above.
     rows = _pyrup_row_taps(sh)
     @inbounds for j in 1:(2sw)
         jm, j0, jp, nj = _pyrup_taps(j, sw)
@@ -241,12 +239,32 @@ sits between two and takes two, in which case `centre` and `plus` are the pair a
 `minus` is unused. Indices are reflected in the upsampled space (see
 [`pyrup!`](@ref)), which is what makes the trailing edge behave as OpenCV's does.
 """
-# Row taps for an axis of length `n`, cached across calls.
+@inline function _pyrup_taps(k::Int, n::Int)
+    p = k - 1                       # 0-based upsampled position
+    if iseven(p)
+        c = p ÷ 2 + 1
+        m = reflect101_0(p - 2, 2n) ÷ 2 + 1
+        q = reflect101_0(p + 2, 2n) ÷ 2 + 1
+        return m, c, q, 3
+    else
+        c = reflect101_0(p - 1, 2n) ÷ 2 + 1
+        q = reflect101_0(p + 1, 2n) ÷ 2 + 1
+        return c, c, q, 2
+    end
+end
+
+# The tap pattern for an axis of length `n`, built once and reused.
 #
-# The cascade calls `pyrup!` at a handful of sizes, over and over, so the tap pattern is
-# recomputed for the same `n` thousands of times. A cache keyed on `n` removes that and
-# keeps `pyrup!` allocation-free. Small and bounded: one entry per distinct axis length
-# a cascade visits, which is `log2(upsampling)` of them.
+# `pyrup!` needs it for every output row, and a cascade calls `pyrup!` repeatedly at the
+# same handful of sizes, so computing it per call meant recomputing the same table.
+# Caching it is worth 1.5x — see the `pyrup!` comment for why the row taps in particular
+# were the redundancy.
+#
+# Follows the double-checked-locking shape `src/plans.jl` establishes for FFT plans, and
+# is safe for the same reason documented there: the unlocked read may miss, and a miss
+# falls through to the locked path and re-checks. Bounded in practice at one entry per
+# axis length a cascade visits, i.e. `log2(upsampling)` of them, each a few hundred
+# bytes.
 const PYRUP_ROW_TAPS = Dict{Int,Vector{NTuple{4,Int}}}()
 const PYRUP_TAPS_LOCK = ReentrantLock()
 
@@ -260,18 +278,17 @@ function _pyrup_row_taps(n::Int)
     end
 end
 
-@inline function _pyrup_taps(k::Int, n::Int)
-    p = k - 1                       # 0-based upsampled position
-    if iseven(p)
-        c = p ÷ 2 + 1
-        m = reflect101_0(p - 2, 2n) ÷ 2 + 1
-        q = reflect101_0(p + 2, 2n) ÷ 2 + 1
-        return m, c, q, 3
-    else
-        c = reflect101_0(p - 1, 2n) ÷ 2 + 1
-        q = reflect101_0(p + 1, 2n) ÷ 2 + 1
-        return c, c, q, 2
+"""
+    clear_pyrup_taps!()
+
+Drop the cached upsampling tap tables. For tests and benchmarks that need a cold cache;
+not part of normal operation. Mirrors [`AutoRIFT.clear_plans!`](@ref).
+"""
+function clear_pyrup_taps!()
+    lock(PYRUP_TAPS_LOCK) do
+        empty!(PYRUP_ROW_TAPS)
     end
+    return nothing
 end
 
 """

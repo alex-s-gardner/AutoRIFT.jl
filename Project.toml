@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["Alex S. Gardner, JPL/NASA"]
 
 [deps]
+BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
 CommonSolve = "38540f10-b2f7-11e9-35d8-d573e4eb0ff2"
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
@@ -25,6 +26,7 @@ AutoRIFTRastersExt = ["Rasters", "GeoInterface"]
 
 [compat]
 Aqua = "0.8"
+BenchmarkTools = "1.8.0"
 CommonSolve = "0.2"
 DimensionalData = "0.29, 0.30"
 FFTW = "1.8"
@@ -48,9 +50,5 @@ JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
-# Rasters and DimensionalData are deliberately absent: the core must be testable
-# without them, which is what keeps the fast-load path honest. They join this
-# list at M7, when the extensions they drive are written, and their testsets run
-# after the core ones so that the core is verified extension-free.
 [targets]
 test = ["Test", "Aqua", "JET", "JSON3"]

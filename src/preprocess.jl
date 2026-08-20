@@ -233,10 +233,21 @@ end
 # once per image rather than once per grid point, so this is not on the hot path.
 function _masked_boxmean(img::AbstractMatrix, mask::AbstractMatrix{Bool}, w::Int)
     masked = Matrix{Float32}(undef, size(img))
+    gaps = false
     @inbounds for i in eachindex(masked)
-        masked[i] = mask[i] ? Float32(img[i]) : NaN32
+        if mask[i]
+            v = Float32(img[i])
+            masked[i] = v
+            gaps |= isnan(v)
+        else
+            masked[i] = NaN32
+            gaps = true
+        end
     end
-    return windowmean(masked, w)
+    # Tracked during the copy rather than rescanned afterwards: this loop already knows
+    # whether it wrote a NaN, and `windowmean` would otherwise spend a full extra pass
+    # rediscovering it.
+    return windowmean(masked, w; hasnan = gaps)
 end
 
 # Standard deviation about the local mean, computed from squared deviations rather than
@@ -257,36 +268,47 @@ end
 function _masked_boxstd(img::AbstractMatrix, mask::AbstractMatrix{Bool},
                         mean::AbstractMatrix{Float32}, w::Int)
     dev2 = Matrix{Float32}(undef, size(img))
+    gaps = false
     @inbounds for i in eachindex(dev2)
         if mask[i] && isfinite(mean[i])
             d = Float32(img[i]) - mean[i]
-            dev2[i] = d * d
+            v = d * d
+            dev2[i] = v
+            gaps |= isnan(v)
         else
             dev2[i] = NaN32
+            gaps = true
         end
     end
-    # `windowmean` ignores NaN, so this averages over valid neighbours only.
-    msd = windowmean(dev2, w)
+    # `windowmean` ignores NaN, so this averages over valid neighbours only, and the
+    # loop above already established whether there are any.
+    msd = windowmean(dev2, w; hasnan = gaps)
     @inbounds for i in eachindex(msd)
         msd[i] = sqrt(max(msd[i], 0.0f0))
     end
     return msd
 end
 
-# Erode a validity mask by a `w`-wide window: a pixel stays valid only if every pixel
-# in its window is valid. Uses the sliding-minimum machinery, so it is O(1) per pixel
-# in the window width.
+# Erode a validity mask by a `w`-wide window: a pixel stays valid only if every pixel in
+# its window is valid. The sliding minimum over a 0/1 encoding does exactly that, and is
+# O(1) per pixel in the window width — which matters because the widths here reach 21.
+#
+# A whole-array shortcut first, because it is the common case and it is free to check: if
+# nothing is masked, eroding changes nothing. That skips three full-size temporaries and
+# two passes on every gap-free image, which is most of them.
 function _erode_mask(mask::AbstractMatrix{Bool}, w::Int)
+    all(mask) && return copy(mask)
     f = Matrix{Float32}(undef, size(mask))
     @inbounds for i in eachindex(f)
         f[i] = mask[i] ? 1.0f0 : 0.0f0
     end
+    # No NaN by construction, so the sliding minimum takes its cheap path directly.
     lo = windowmin(f, w)
-    out = BitMatrix(undef, size(mask))
+    out = Matrix{Bool}(undef, size(mask))
     @inbounds for i in eachindex(out)
         out[i] = lo[i] > 0.5f0
     end
-    return Matrix{Bool}(out)
+    return out
 end
 
 # ---------------------------------------------------------------------------

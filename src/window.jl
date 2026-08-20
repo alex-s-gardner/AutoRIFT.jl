@@ -42,8 +42,9 @@
 #
 #   max, min, range   monotone deque, separable. O(1) per pixel in the window width,
 #                     which is what makes the 48-wide dilations affordable.
-#   mean              separable running sum with a parallel count, so NaN is skipped
-#                     without a second pass. O(1) per pixel.
+#   mean              separable running sum, O(1) per pixel. A gap-free input skips the
+#                     per-pixel count entirely, since the neighbour count is then a
+#                     function of position; callers that know say so via `hasnan`.
 #   median, MAD       gather into a stack buffer and insertion-sort. O(w² log w), but
 #                     these windows are always 3 or 5 across, where a running
 #                     structure loses to a tight sort on 9 or 25 elements.
@@ -201,25 +202,33 @@ Mean over a `w`-wide sliding window, ignoring `NaN` and out-of-bounds neighbours
 A window containing only `NaN` yields `NaN`.
 
 Separable running sums, O(1) per pixel: a NaN-aware box filter, which is the one
-reduction here that no available package provides. Sums accumulate in `Float64`
-because a running sum over a large window is a long accumulation chain, and the
-count is tracked alongside so that NaN can be skipped without a second pass.
-"""
-windowmean(A::AbstractMatrix, w) = windowmean!(similar(A, Float32), A, w)
+reduction here that no available package provides. Sums accumulate in `Float64` because
+a running sum over a large window is a long accumulation chain.
 
-function windowmean!(out, A::AbstractMatrix, w)
+Pass `hasnan = false` when the caller already knows the input is gap-free. That skips
+both the detection scan and the per-pixel count array — the count is then a function of
+position alone — which is worth 1.8x. Results are bit-identical either way, since the
+sums are `Float64` on both paths: this trades memory traffic, never precision. The
+default `nothing` detects, for callers that do not know.
+
+!!! note "The choice is per-array, not per-window"
+    A single `NaN` anywhere forfeits the saving for the whole array, so a scene with a
+    no-data border costs about 2.4x one without. That is the honest cost of the split
+    and it is not hidden by the average case: reprojection routinely leaves such a
+    border. Degrading gracefully would mean detecting per column inside the recurrence,
+    which is a larger change than the win justifies for now — but it is the right shape
+    if this ever becomes hot.
+"""
+windowmean(A::AbstractMatrix, w; hasnan = nothing) =
+    windowmean!(similar(A, Float32), A, w; hasnan)
+
+function windowmean!(out, A::AbstractMatrix, w; hasnan = nothing)
     wx, wy = _window_size(w, A)
-    # With no NaN anywhere, the count of contributing neighbours is a function of
-    # position alone, so the count array is pure redundancy — and it is a third of the
-    # scratch traffic. Detecting that case costs one cheap pass and saves 1.6x. The
-    # sums are Float64 in both paths, so the results are bit-identical, not merely
-    # close: this trades memory traffic, never precision.
-    #
-    # Worth having because the case is common rather than contrived. Filtering runs on
-    # whole images, where a scene with no gaps at all is the norm; the NaN-dense inputs
-    # are the *displacement* fields further down the pipeline.
-    return any(isnan, A) ? _windowmean_masked!(out, A, wx, wy) :
-                           _windowmean_dense!(out, A, wx, wy)
+    # Detection is a full extra pass (0.3 ms on 1024²), so it is only paid when the
+    # caller cannot say. Every in-package caller can.
+    gaps = isnothing(hasnan) ? any(isnan, A) : hasnan
+    return gaps ? _windowmean_masked!(out, A, wx, wy) :
+                  _windowmean_dense!(out, A, wx, wy)
 end
 
 function _windowmean_masked!(out, A::AbstractMatrix, wx::Int, wy::Int)
@@ -383,8 +392,10 @@ windowmedian(A::AbstractMatrix, w) = _window_sorted(A, w, _median_of!)
 Median absolute deviation over a `w`-wide sliding window, ignoring `NaN`.
 
 `median(|x - median(x)|)`, the robust scale estimate the outlier filter compares
-displacements against. Two passes over the gathered values, so roughly twice the cost
-of [`windowmedian`](@ref), and subject to the same window-size caveat.
+displacements against. Two sorts of the gathered values rather than one, so roughly twice
+the cost of [`windowmedian`](@ref), and subject to the same window-size caveat.
+
+When both statistics are wanted, [`windowmedmad`](@ref) returns them from one traversal.
 """
 windowmad(A::AbstractMatrix, w) = _window_sorted(A, w, _mad_of!)
 
@@ -393,53 +404,29 @@ windowmad(A::AbstractMatrix, w) = _window_sorted(A, w, _mad_of!)
 
 Median and median absolute deviation over the same `w`-wide sliding window, in one pass.
 
-Both are needed together by the outlier filter, and computing them separately gathers
-and sorts each window twice. Fusing them is 1.67x faster and bit-identical to calling
-[`windowmedian`](@ref) and [`windowmad`](@ref) in turn — the MAD's inner sort is over
-deviations from the median it has just computed, so the work genuinely shares a prefix.
+Both are needed together by the outlier filter, and computing them separately gathers and
+sorts each window twice. Fusing them is 1.67x faster, and identical to calling
+[`windowmedian`](@ref) and [`windowmad`](@ref) in turn by construction rather than by
+coincidence: all three route through the same traversal, and the singles are this
+function's reducer with one result dropped. The MAD already computes the median on its
+way, so the fusion adds no work and needs no extra scratch.
 """
-function windowmedmad(A::AbstractMatrix, w)
-    wx, wy = _window_size(w, A)
-    nr, nc = size(A)
-    med = fill(NaN32, nr, nc)
-    mad = fill(NaN32, nr, nc)
-    lx, ly = wx ÷ 2, wy ÷ 2        # even windows are left-biased
-    rx, ry = wx - 1 - lx, wy - 1 - ly
-    buf = Vector{Float32}(undef, wx * wy)
-    dev = Vector{Float32}(undef, wx * wy)
-
-    @inbounds for j in 1:nc, i in 1:nr
-        n = 0
-        for jj in max(j - lx, 1):min(j + rx, nc)
-            for ii in max(i - ly, 1):min(i + ry, nr)
-                v = Float32(A[ii, jj])
-                isnan(v) && continue
-                n += 1
-                buf[n] = v
-            end
-        end
-        n == 0 && continue
-        _insertion_sort!(buf, n)
-        m = _sorted_median(buf, n)
-        med[i, j] = m
-        # Deviations from a sorted sequence are not themselves sorted, so this needs
-        # its own sort — but not its own gather, which is where the saving is.
-        for k in 1:n
-            dev[k] = abs(buf[k] - m)
-        end
-        _insertion_sort!(dev, n)
-        mad[i, j] = _sorted_median(dev, n)
-    end
-    return med, mad
-end
+windowmedmad(A::AbstractMatrix, w) = _window_sorted(A, w, _medmad_of!, Val(2))
 
 # Gather-then-reduce over a small stack buffer. `reduce!` receives the buffer and the
 # count of live values and may reorder them freely, which is what lets the median sort
 # in place with no allocation per window.
-function _window_sorted(A::AbstractMatrix, w, reduce!::F) where {F}
+#
+# `Val(N)` is how many values the reducer returns, and so how many output arrays are
+# produced. That is what lets a fused pair like median-and-MAD share this traversal
+# rather than copy it: the gather, the left-bias margins, and the all-missing sentinel
+# exist once. The window convention in particular is the thing this file's header warns
+# is easy to get backwards, so having one transcription of it matters more than the
+# handful of lines saved.
+function _window_sorted(A::AbstractMatrix, w, reduce!::F, ::Val{N} = Val(1)) where {F,N}
     wx, wy = _window_size(w, A)
     nr, nc = size(A)
-    out = fill(NaN32, nr, nc)
+    outs = ntuple(_ -> fill(NaN32, nr, nc), Val(N))
     lx, ly = wx ÷ 2, wy ÷ 2        # even windows are left-biased
     rx, ry = wx - 1 - lx, wy - 1 - ly
     buf = Vector{Float32}(undef, wx * wy)
@@ -455,19 +442,30 @@ function _window_sorted(A::AbstractMatrix, w, reduce!::F) where {F}
             end
         end
         n == 0 && continue         # every neighbour missing; leave NaN
-        out[i, j] = reduce!(buf, n)
+        vals = reduce!(buf, n)
+        # `N` is a compile-time constant, so this unrolls and the tuple never
+        # materialises — a one-output reducer costs exactly what it did before.
+        ntuple(k -> (outs[k][i, j] = vals[k]), Val(N))
     end
-    return out
+    return N == 1 ? only(outs) : outs
 end
 
 # Insertion sort of `buf[1:n]`, then the middle. At n <= 25 this beats calling a
 # partial-selection routine, whose setup dominates at that size.
 @inline function _median_of!(buf::Vector{Float32}, n::Int)
     _insertion_sort!(buf, n)
-    return _sorted_median(buf, n)
+    return (_sorted_median(buf, n),)
 end
 
-@inline function _mad_of!(buf::Vector{Float32}, n::Int)
+@inline _mad_of!(buf::Vector{Float32}, n::Int) = (_medmad_of!(buf, n)[2],)
+
+# Median and MAD from one sort of the gathered values.
+#
+# The fusion is free because the MAD already needs the median: it overwrites the buffer
+# with deviations from it, so returning that intermediate alongside costs nothing and
+# needs no second scratch array. `_median_of!` and `_mad_of!` are this function with one
+# of the two results dropped, which is why all three are one traversal.
+@inline function _medmad_of!(buf::Vector{Float32}, n::Int)
     _insertion_sort!(buf, n)
     m = _sorted_median(buf, n)
     @inbounds for k in 1:n
@@ -475,7 +473,7 @@ end
     end
     # The deviations are not sorted even though the values were, so sort again.
     _insertion_sort!(buf, n)
-    return _sorted_median(buf, n)
+    return (m, _sorted_median(buf, n))
 end
 
 @inline function _insertion_sort!(buf::Vector{Float32}, n::Int)
