@@ -300,6 +300,29 @@ end
     end
 end
 
+@testset "padding is only paid when needed" begin
+    # `gridpoints` insets by the chip half-extent plus the search radius, so a gridded pass
+    # never reads outside the image and padding it would be pure waste — measured at 1.2 ms
+    # and 10.6 MB per call on 1024², which is ~10% of a sparse pass. Asserted as an
+    # allocation bound rather than a timing, since that is the part that is deterministic.
+    n = 512
+    pair = ImagePair(synthetic_texture(n; seed = 1), synthetic_texture(n; seed = 2))
+    grid = gridpoints((n, n), 32; chip_size = 32, search_radius = 25)
+    out = displacement_field(grid)
+    p = params(; subpixel = :none)
+    track!(out, pair, grid, p)                     # compile
+    # Three padded copies of a 512² image would be ~3 MB; the workspaces and point shift are
+    # a small fraction of that.
+    @test @allocated(track!(out, pair, grid, p)) < 1_000_000
+
+    # A scattered point set that *does* fall outside still works, which is what the padding
+    # is there for. This point's chip is partly outside the image.
+    edge = pointset([12.0], [256.0]; chip_size = 32, search_radius = 25)
+    d = track(pair, edge, p)
+    @test d.searched[1]
+    @test !isnan(d.dx[1])
+end
+
 @testset "validation" begin
     ref, sec = shifted_pair(200, (0, 0); T = Float32)
     pair = ImagePair(ref, sec)

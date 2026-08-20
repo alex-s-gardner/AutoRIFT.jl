@@ -34,6 +34,12 @@ Per-point results of a correlation pass.
 are `NaN` in `dx`/`dy` and `false` in `searched` — distinguishing "no measurement" from a
 measurement of zero, which the reference conflates.
 
+`searched` is a `Matrix{Bool}` rather than a `BitMatrix` deliberately. `BitArray` packs 64
+elements per word, so writing one element is a read-modify-write of that word — and the
+threaded grid loop has different tasks writing different points that may share a word, which
+can lose a neighbour's write. A byte per element is not shared, so the writes are genuinely
+independent. Four times the memory for a mask that is a fraction of the output anyway.
+
 Fields share the shape of the [`PointSet`](@ref) they came from, so a gridded point set
 yields gridded output.
 """
@@ -52,7 +58,7 @@ Allocate results for `pts`, initialised to "no measurement".
 function displacement_field(pts::PointSet)
     sz = size(pts.x)
     return DisplacementField(fill(NaN32, sz), fill(NaN32, sz), fill(NaN32, sz),
-                             falses(sz))
+                             fill(false, sz))
 end
 
 Base.size(d::DisplacementField) = size(d.dx)
@@ -94,19 +100,30 @@ function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Param
         "output is $(size(out)) but the point set has $(size(pts)) points"))
 
     flat = scatter(pts)          # free: shares memory, discards only the layout
-    chipx, chipy, rx, ry, pad = _pass_geometry(flat)
+    chipx, chipy, rx, ry, pad, fits = _pass_geometry(flat, size(pair))
     # Nothing searchable: skip the padding, the planning, and the task spawning entirely.
     # The pyramid's later levels hit this, since their coarse pass zeroes most radii.
     chipx == 0 && return out
 
-    ref = _zeropad(pair.reference, pad)
-    sec = _zeropad(pair.secondary, pad)
-    # The mask pads to `false`, which is what distinguishes "outside the image" from "dark".
-    okmask = _zeropad(valid(pair), pad)
-    # Shift once into padded coordinates, including the half-pixel offset, so `chip_bounds`
-    # and `search_bounds` apply unchanged in the loop. Two Float64 vectors, against two
-    # padded image copies already allocated.
-    shifted = _shift_points(flat, pad)
+    # Padding only when a point actually needs it. `gridpoints` insets by the chip half-extent
+    # plus the search radius, so a gridded pass never does — and padding it anyway costs 1.2 ms
+    # and 10.6 MB per call, which is 2.5% of a dense coarse pass but ~10% of the sparse ones the
+    # pyramid produces. A scattered, caller-supplied point set may still need it.
+    #
+    # The half-pixel offset applies either way: it is what makes an even-sized chip's reported
+    # position refer to its true centre rather than to a position the chip is not symmetric
+    # about.
+    if fits
+        ref, sec = pair.reference, pair.secondary
+        okmask = valid(pair)
+        shifted = _shift_points(flat, (0, 0))
+    else
+        ref = _zeropad(pair.reference, pad)
+        sec = _zeropad(pair.secondary, pad)
+        # The mask pads to `false`, which is what distinguishes "outside the image" from "dark".
+        okmask = _zeropad(valid(pair), pad)
+        shifted = _shift_points(flat, pad)
+    end
 
     up = upsampling(subpixel)
     # Plans are built here, on this task, before any spawning. FFTW's planner is not
@@ -144,8 +161,9 @@ track(pair::ImagePair, pts::PointSet, p::Params; kw...) =
 # The largest chip and radius are what the workspaces are sized to; smaller points take
 # views of the corner rather than reallocating, which is why nothing size-related is a type
 # parameter in the correlation core.
-function _pass_geometry(pts::PointSet)
+function _pass_geometry(pts::PointSet, imagesize::Tuple{Int,Int})
     cx = cy = rx = ry = px = py = 0
+    fits = true
     @inbounds for i in eachindex(pts)
         issearchable(pts, i) || continue
         csx, csy = pts.chip_size_x[i], pts.chip_size_y[i]
@@ -156,13 +174,18 @@ function _pass_geometry(pts::PointSet)
         ry = max(ry, pry)
         px = max(px, csx ÷ 2 + prx + ceil(Int, abs(pts.dx_prior[i])))
         py = max(py, csy ÷ 2 + pry + ceil(Int, abs(pts.dy_prior[i])))
+        # Whether this point's window lies inside the unpadded image, which decides whether
+        # padding is needed at all. One comparison per point, against the alternative of
+        # allocating and filling three full-size copies unconditionally.
+        fits &= inbounds(pts, i, imagesize)
     end
     # The +2 is the reference's slack: it absorbs the half-pixel grid offset and any
     # rounding in the index truncations.
-    return cx, cy, rx, ry, (px + 2, py + 2)
+    return cx, cy, rx, ry, (px + 2, py + 2), fits
 end
 
-# Translate points into padded-image coordinates, plus the half-pixel offset.
+# Translate points into padded-image coordinates, plus the half-pixel offset. A zero pad is
+# the unpadded case, where only the half-pixel offset applies.
 #
 # The offset is why an even-sized chip's reported position means what it says. Such a chip
 # has no centre sample: extending `-chip/2` to `chip/2 - 1` about an integer position puts
@@ -253,8 +276,17 @@ function _track_chunk!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
     return out
 end
 
-# `any` over a view: short-circuits, allocates nothing, and says what it means.
-@inline _any_valid(mask, rows, cols) = any(view(mask, rows, cols))
+# Explicit loop rather than `any` over a view. Both short-circuit and neither allocates, but
+# the loop is 2x faster in the worst case that matters — an all-invalid window, where there is
+# no early exit to take (measured 440 ns against 888 ns on 32x32). The generic path does not
+# vectorise across a `SubArray` the way a column-major loop does, and this is the only branch
+# here that is not free.
+@inline function _any_valid(mask, rows, cols)
+    @inbounds for j in cols, i in rows
+        mask[i, j] && return true
+    end
+    return false
+end
 
 # Threaded driver: one task and one workspace per chunk, indexed by chunk rather than by
 # thread. Indexing per-thread state by `threadid()` is unsafe under task migration, and

@@ -46,6 +46,12 @@ filled from their neighbours rather than measured.
 The chip size is worth keeping rather than discarding: it says how much spatial averaging is
 behind each estimate, so a downstream consumer can tell a sharply-resolved velocity from a
 smoothed one.
+
+`interpolated` is a `BitMatrix` here, unlike `searched` on [`DisplacementField`](@ref), which
+is a `Matrix{Bool}`. The difference is deliberate and is about concurrency, not taste: this
+one is written only by the single-threaded merge, so the packed representation is safe, while
+that one is written from the threaded grid loop where a read-modify-write on a shared word
+could lose a neighbour.
 """
 struct PyramidResult
     dx::Matrix{Float32}
