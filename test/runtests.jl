@@ -40,6 +40,9 @@ include("utils.jl")
     @testset "track" begin
         include("track.jl")
     end
+    @testset "pyramid" begin
+        include("pyramid.jl")
+    end
     @testset "vs OpenCV" begin
         include("opencv.jl")
     end

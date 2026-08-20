@@ -82,11 +82,13 @@ include("peak.jl")
 
 # Layer 2: sliding-window reductions and the quality control built on them.
 include("window.jl")
+include("resample.jl")
 include("outliers.jl")
 include("preprocess.jl")
 
-# Layer 3: the grid loop, where the per-point primitives meet a whole point set.
+# Layer 3: orchestration. The grid loop, then the multi-scale pyramid built on it.
 include("track.jl")
+include("pyramid.jl")
 
 export autorift, autorift!
 export SimilarityMeasure, ZNCC, NCC, Coherence
