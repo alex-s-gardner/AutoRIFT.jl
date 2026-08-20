@@ -28,6 +28,15 @@ include("utils.jl")
     @testset "peak" begin
         include("peak.jl")
     end
+    @testset "window" begin
+        include("window.jl")
+    end
+    @testset "outliers" begin
+        include("outliers.jl")
+    end
+    @testset "preprocess" begin
+        include("preprocess.jl")
+    end
     @testset "vs OpenCV" begin
         include("opencv.jl")
     end

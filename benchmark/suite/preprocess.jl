@@ -9,4 +9,22 @@
 # not merely bookkeeping — it decides which pixels are searched at all, so its
 # cost is unavoidable and its correctness is load-bearing.
 let g = addgroup!(SUITE, "preprocess")
+    # Reported per scene size, since these scale with image area rather than with grid
+    # point count. Names match tools/python_ref/bench_python.py so compare.jl can print
+    # the speedup against cv2.
+    for n in SCENE_SIZES
+        img = bench_texture((n, n); seed = 1)
+        mask = trues(n, n)
+        for w in (5, 21)     # 5 is the default; 21 is used for Sentinel-1
+            g["highpass w$w $(n)x$(n)"] =
+                @benchmarkable AutoRIFT.highpass($img, $mask, $w)
+        end
+        g["wallis w5 $(n)x$(n)"] = @benchmarkable AutoRIFT.wallis($img, $mask, 5)
+
+        # The full path a caller actually takes: filter both images, shrink the masks,
+        # then convert to the correlation element type.
+        pair = AutoRIFT.ImagePair(img, bench_texture((n, n); seed = 2))
+        g["preprocess+quantize $(n)x$(n)"] = @benchmarkable AutoRIFT.quantize(
+            AutoRIFT.preprocess($pair, AutoRIFT.Highpass(; width = 5)), :uint8)
+    end
 end

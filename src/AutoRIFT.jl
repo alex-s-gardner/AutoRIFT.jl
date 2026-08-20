@@ -79,11 +79,17 @@ include("integral.jl")
 include("correlate.jl")
 include("peak.jl")
 
+# Layer 2: sliding-window reductions and the quality control built on them.
+include("window.jl")
+include("outliers.jl")
+include("preprocess.jl")
+
 export autorift, autorift!
 export SimilarityMeasure, ZNCC, NCC, Coherence
 export PreprocessMethod, Highpass, Wallis, WallisGapfill, Sobel, Laplacian,
        Decibel, NoPreprocess
 export SubpixelMethod, PyramidRefine, NoRefine
 export QuantizeMethod, QuantizeUInt8, NoQuantize
+export ImagePair
 
 end # module
