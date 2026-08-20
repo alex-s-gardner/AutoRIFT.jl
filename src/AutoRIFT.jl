@@ -37,15 +37,25 @@ using StableTasks: StableTasks
 Estimate the displacement of surface features between two images of the same
 scene, on a grid, to sub-pixel precision.
 
-Returns a stack of layers on the output grid: `dx` and `dy` in pixels,
-`correlation` (the peak similarity), `chip_size_x`/`chip_size_y` recording which
-chip-size level produced each estimate, and `interpolated` marking values that were
-filled from neighbours rather than measured.
+Returns layers on the output grid: the displacement, `correlation` (the peak
+similarity), `chip_size` recording which chip-size level produced each estimate,
+and `interpolated` marking values filled from neighbours rather than measured.
 
-`reference` and `secondary` may be plain matrices in pixel coordinates, or —
-with `Rasters` or `DimensionalData` loaded — dimensional arrays, in which case
-the result carries coordinates and CRS. Radar slant-range geometry needs no CRS
-and works unchanged.
+What the input is determines both the return type and the displacement convention,
+because only some inputs know which way is north:
+
+| input | returns | displacement |
+|---|---|---|
+| `Matrix` | [`AutoRIFT.MultichipResult`](@ref) | `dx`, `dy` — pixel offset, `dy` down rows |
+| `AbstractDimArray` | `DimStack` | `dx`, `dy` — as above, with coordinates |
+| `AbstractRaster` | `RasterStack` | `vx`, `vy` — feature motion, `+vy` north |
+
+The last two need `DimensionalData` or `Rasters` loaded. The raster path is the only
+one that can orient the result, so it is the only one that reports `vx`/`vy`: the
+sign flip from the correlator's secondary-to-reference offset to actual feature
+motion, and the flip from row-down to north-up, both happen there. A north-up and a
+south-up raster of one scene therefore give the same answer. Radar slant-range
+geometry has no CRS and takes the `DimStack` path unchanged.
 
 See [`AutoRIFT.params`](@ref) for the full keyword list.
 """

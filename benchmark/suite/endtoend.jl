@@ -95,4 +95,23 @@ let g = addgroup!(SUITE, "endtoend")
         g["scattered $npts pts $(n)x$(n)"] = @benchmarkable AutoRIFT.autorift(
             $ref, $sec, $pts; chip_size = 32, threaded = false)
     end
+
+    # The geospatial path against the array path on identical pixels. The extension is meant to be
+    # a coordinate wrapper, so the ratio of these two is the whole claim — a `Raster` in must not
+    # cost meaningfully more than its `parent`. Both are recorded rather than the ratio, so a
+    # regression in either is attributable.
+    let n = 1024, res = 10.0
+        a = bench_texture((n, n); seed = 1)
+        b = circshift(a, (-4, 6))
+        x = X(Projected(0.0:res:(res * (n - 1)); order = ForwardOrdered(), span = Regular(res),
+                        sampling = Intervals(Start()), crs = EPSG(3031)))
+        # y decreasing: north-up, the normal GeoTIFF layout and the one that exercises the y-flip.
+        y = Y(Projected((res * (n - 1)):(-res):0.0; order = ReverseOrdered(),
+                        span = Regular(-res), sampling = Intervals(Start()), crs = EPSG(3031)))
+        ra, rb = Raster(a, (y, x)), Raster(b, (y, x))
+        kw = (; chip_size = 32, search_radius = 25, threaded = false)
+
+        g["raster in $(n)x$(n)"] = @benchmarkable AutoRIFT.autorift($ra, $rb; $kw...)
+        g["array in $(n)x$(n)"] = @benchmarkable AutoRIFT.autorift($a, $b; $kw...)
+    end
 end

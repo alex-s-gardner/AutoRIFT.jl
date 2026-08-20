@@ -20,6 +20,12 @@
 
 using AutoRIFT
 using BenchmarkTools
+# The geospatial path is benchmarked alongside the array path, so the extensions have to be loaded
+# here. Note this is the opposite of the test suite's arrangement, which loads them last to keep
+# the core provably extension-free — here there is nothing to protect and one number to compare.
+using Rasters
+using DimensionalData
+using DimensionalData.Lookups
 using Chairmarks
 using Random
 using Statistics

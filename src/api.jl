@@ -194,6 +194,11 @@ plans across calls.
     `dx` and `dy` are the offset from `secondary` back to `reference`, which is the *negative*
     of the motion of the imaged features — a glacier flowing east gives a negative `dx`. This
     matches the reference implementation. `dy` increases downward, matching array indexing.
+
+    This is the *array* convention, and it is deliberately not what the `Raster` method returns.
+    An array has no orientation to be north-up about, so the raw offsets are the honest output
+    here; given a CRS, `autorift` instead returns map-oriented `vx`/`vy` for feature motion. The
+    flip happens once, in the extension, where the y direction is actually known.
 """
 autorift(reference::AbstractMatrix, secondary::AbstractMatrix; kwargs...) =
     autorift!(init(reference, secondary; kwargs...))
@@ -222,6 +227,27 @@ end
 # Dispatch on the point set's dimensionality: only a gridded one can run multiple chip sizes.
 _run(pair::ImagePair, grid::PointSet{2}, p::Params) = correlate_multichip(pair, grid, p)
 _run(pair::ImagePair, pts::PointSet{1}, p::Params) = track(pair, pts, p)
+
+"""
+    AutoRIFT.autorift_with_grid(reference, secondary; kwargs...) -> (result, grid)
+
+Correlate, and return the search grid alongside the result.
+
+The same computation as [`autorift`](@ref), which discards the grid. A coordinate-aware caller
+needs it: the result is indexed by grid point, and only the grid knows where those points sit in
+the image — so mapping a displacement back to a map coordinate is impossible without it.
+
+Exists so the DimensionalData and Rasters extensions share one path into the core rather than
+each rebuilding the grid and hoping it matches. Not exported: the array API has no use for it.
+"""
+function autorift_with_grid(reference::AbstractMatrix, secondary::AbstractMatrix;
+                            reference_valid = nothing, secondary_valid = nothing, kwargs...)
+    p = params(; kwargs...)
+    pair = _prepare(ImagePair(reference, secondary; reference_valid, secondary_valid), p)
+    grid = _build_grid(size(pair), p)
+    _warm_grid_plans(grid, p)
+    return _run(pair, grid, p), grid
+end
 
 # ---------------------------------------------------------------------------
 

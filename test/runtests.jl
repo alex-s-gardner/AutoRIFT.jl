@@ -40,7 +40,7 @@ include("utils.jl")
     @testset "track" begin
         include("track.jl")
     end
-    @testset "pyramid" begin
+    @testset "multichip" begin
         include("multichip.jl")
     end
     @testset "api" begin
@@ -52,5 +52,12 @@ include("utils.jl")
 
     @testset "code quality" begin
         include("aqua.jl")
+    end
+
+    # Last, and that ordering is the point: everything above ran with neither Rasters nor
+    # DimensionalData in the session, so a core file that started depending on one would fail
+    # rather than pass because a later test happened to load it.
+    @testset "extensions" begin
+        include("extensions.jl")
     end
 end

@@ -114,6 +114,13 @@ else
             @test peak_index(got) == (r + 1, r + 1)
             @test maximum(got) ≈ 1.0f0 atol = 1e-3
             @test all(isfinite, got)
+            # A generous bound, and deliberately so: this fixture set is at the edge of what
+            # Float32 can represent, and the measured worst excursion beyond [-1, 1] is 9.2e-5 —
+            # 92% of this tolerance. That is not slack to be tightened. The coefficient is formed
+            # from a Float64 numerator over a Float64 denominator and then rounded to Float32, so
+            # a value that should be exactly 1 can land a few ulp above it; at a contrast of
+            # 0.001 on a base of 0.5, "a few ulp" is this large. The peak location, asserted
+            # above, is the claim that actually matters and it is exact.
             @test all(-1.0001f0 .<= got .<= 1.0001f0)
         end
     end

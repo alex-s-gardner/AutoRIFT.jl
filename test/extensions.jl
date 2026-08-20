@@ -1,0 +1,325 @@
+# The geospatial extensions: `Raster` in, `RasterStack` out, and the sign conventions that go
+# with knowing which way is north.
+#
+# Loaded last, deliberately. Everything above this runs with neither Rasters nor DimensionalData
+# in the session, so a core file that started depending on them would fail rather than pass
+# silently because a later test had loaded them.
+
+using Rasters
+using DimensionalData
+using DimensionalData.Lookups
+using Dates
+using AutoRIFT: autorift, autorift_with_grid
+
+# A north-up projected pair with a known shift. North-up means y *decreasing*, which is what a
+# GeoTIFF normally stores and what makes the y-flip question real.
+#
+# `shift = (drow, dcol)` moves features by that many pixels in array terms, so a positive `drow`
+# moves them toward increasing row index — southward on a north-up grid.
+function projected_pair(n, shift; res = 10.0, epsg = 3031, seed = 1)
+    a = synthetic_texture(n; seed)
+    b = circshift(a, shift)
+    x = X(Projected(0.0:res:(res * (n - 1)); order = ForwardOrdered(), span = Regular(res),
+                    sampling = Intervals(Start()), crs = EPSG(epsg)))
+    y = Y(Projected((res * (n - 1)):(-res):0.0; order = ReverseOrdered(),
+                    span = Regular(-res), sampling = Intervals(Start()), crs = EPSG(epsg)))
+    return Raster(a, (y, x)), Raster(b, (y, x))
+end
+
+# Radar range-Doppler: real coordinates, no CRS, and dims that are not X/Y.
+function radar_pair(n, shift; seed = 1)
+    a = synthetic_texture(n; seed)
+    b = circshift(a, shift)
+    az = Dim{:azimuth}(Sampled(1.0:1.0:n; order = ForwardOrdered(), span = Regular(1.0),
+                               sampling = Intervals(Start())))
+    rg = Dim{:range}(Sampled(1.0:1.0:n; order = ForwardOrdered(), span = Regular(1.0),
+                             sampling = Intervals(Start())))
+    return DimArray(a, (az, rg)), DimArray(b, (az, rg))
+end
+
+med(v) = (s = sort(collect(filter(!isnan, v))); isempty(s) ? NaN : s[(length(s) + 1) ÷ 2])
+
+const EXT_KW = (; chip_size = 32, search_radius = 25, subpixel = :none)
+
+@testset "y-flip equivalence" begin
+    # The headline check of this milestone, and the reason the extension exists rather than a
+    # `parent()` call at the call site.
+    #
+    # A north-up raster stores y decreasing; a south-up one stores it increasing. `parent()` hands
+    # the core whichever order the file used, so the core sees a vertically mirrored image and
+    # returns `dy` of the opposite sign — `dx` unchanged, `dy` negated. Nothing downstream can
+    # detect that: a velocity field with `vy` inverted still looks like ice flow.
+    #
+    # So the same scene stored both ways must give the same field, and it is asserted rather than
+    # inspected.
+    # 405, not a round 400, and the reason is worth stating because it is a property of the grid
+    # rather than of this test. `gridpoints` spans `(margin+1):spacing:(n-margin)`, so the leftover
+    # at the trailing edge is whatever the step leaves — the grid is *not* generally centred in the
+    # image. Flip the storage order and the grid lands on different ground: at n = 400 the two
+    # cover 1170–3090 m and 900–2820 m, sharing no sample point at all, and no comparison between
+    # them is meaningful. At n = 405 the inset divides evenly (90 lead, 90 trail), the grid is
+    # symmetric, and the flipped grids coincide — which is what makes the fields comparable.
+    ref, sec = projected_pair(405, (4, 6))
+    north = autorift(ref, sec; EXT_KW...)
+    south = autorift(reverse(ref; dims = Y), reverse(sec; dims = Y); EXT_KW...)
+
+    # Same ground, opposite storage order.
+    @test collect(lookup(south, Y)) == reverse(collect(lookup(north, Y)))
+    @test collect(lookup(south, X)) == collect(lookup(north, X))
+
+    # And the same field. This is the assertion the milestone turns on: a sign error here would
+    # invert `vy` and still look like ice flow, so it has to be caught mechanically.
+    #
+    # The displacements are **bit-identical**, which is the strong statement and the one that
+    # matters — the y handling is exact, not merely close.
+    for layer in (:vx, :vy)
+        @test all(isequal.(parent(north[layer]), parent(reverse(south[layer]; dims = Y))))
+    end
+
+    # `correlation` agrees to 2e-6 rather than exactly, and that is float arithmetic rather than a
+    # defect. Reversing the rows reverses the order in which the integral images accumulate down a
+    # column, and floating-point addition is not associative, so the denominator's last bits
+    # differ. It cannot move a peak — the displacements above are exact — so the tolerance is the
+    # honest assertion here.
+    cn = parent(north.correlation)
+    cs = parent(reverse(south.correlation; dims = Y))
+    @test maximum(abs.(filter(!isnan, cn .- cs))) < 1e-5
+    @test count(isnan, cn) == count(isnan, cs)
+    # Not vacuous: there is real signal in these fields, and it is the same signal.
+    @test med(north.vx) == 6
+    @test med(north.vy) == -4
+    @test med(south.vx) == 6
+    @test med(south.vy) == -4
+end
+
+@testset "sign convention is map-oriented feature motion" begin
+    # Two conversions happen at this boundary and both are easy to get backwards, so each is
+    # asserted with a motion whose direction is unambiguous.
+    #
+    # `+vx` is east and `+vy` is north, and the values are *feature motion* — not the
+    # secondary-to-reference offset the core reports.
+    east = autorift(projected_pair(400, (0, 6))...; EXT_KW...)
+    @test med(east.vx) == 6            # features moved to higher x: east
+    @test med(east.vy) == 0
+
+    south = autorift(projected_pair(400, (4, 0))...; EXT_KW...)
+    @test med(south.vx) == 0
+    @test med(south.vy) == -4          # higher row index on a north-up grid: south
+
+    north = autorift(projected_pair(400, (-4, 0))...; EXT_KW...)
+    @test med(north.vy) == 4
+
+    # And the relationship to the array core is exactly the documented one: `vx = -dx`, and on a
+    # north-up raster `vy = +dy`, because the row-down and north-up flips cancel. Asserted so the
+    # extension is provably a coordinate wrapper rather than a second algorithm.
+    ref, sec = projected_pair(400, (4, 6))
+    core = autorift(parent(ref), parent(sec); EXT_KW...)
+    st = autorift(ref, sec; EXT_KW...)
+    @test all(isequal.(parent(st.vx), -core.dx))
+    @test all(isequal.(parent(st.vy), core.dy))
+    @test all(isequal.(parent(st.correlation), core.correlation))
+end
+
+@testset "output grid is geolocated" begin
+    # The output lives on the *grid*, not the image, and the grid is inset from the edges — so its
+    # coordinates have to come from the input lookups sampled at the grid's pixel positions.
+    n, res, spacing = 512, 10.0, 32
+    ref, sec = projected_pair(n, (0, 5); res)
+    st = autorift(ref, sec; EXT_KW..., grid_spacing = spacing)
+
+    _, grid = autorift_with_grid(parent(ref), parent(sec); EXT_KW..., grid_spacing = spacing)
+    @test size(st.vx) == size(grid)
+
+    xs, ys = lookup(st, X), lookup(st, Y)
+    inx, iny = lookup(ref, X), lookup(ref, Y)
+    # Every output coordinate is the input coordinate at that grid point's pixel index.
+    @test collect(xs) == [inx[round(Int, i)] for i in grid.x[1, :]]
+    @test collect(ys) == [iny[round(Int, i)] for i in grid.y[:, 1]]
+
+    # Spacing is the grid step times the input pixel size, and the axis order survives.
+    @test step(xs) == spacing * res
+    @test step(ys) == -spacing * res
+    @test order(ys) isa ReverseOrdered
+
+    # Regular, not Irregular. This matters beyond tidiness: an irregular axis has no single pixel
+    # size, so `dt` could not convert to velocity. Indexing a lookup with a vector would lose it.
+    @test span(xs) isa Regular
+    @test span(ys) isa Regular
+
+    # A single-point grid is degenerate but must not error on the step calculation.
+    tiny = autorift(projected_pair(200, (0, 0))...; chip_size = 32, search_radius = 25,
+                    grid_spacing = 200)
+    @test length(tiny.vx) >= 1
+end
+
+@testset "CRS is carried and checked" begin
+    ref, sec = projected_pair(300, (0, 4))
+    st = autorift(ref, sec; EXT_KW...)
+    @test crs(st) == EPSG(3031)
+    @test crs(st.vx) == EPSG(3031)
+
+    # Two images in different coordinate systems are not co-registered, and correlating them
+    # yields a full field of plausible nonsense — so it is refused, naming both.
+    other, _ = projected_pair(300, (0, 4); epsg = 3413)
+    err = try autorift(ref, other; EXT_KW...) catch e; e end
+    @test err isa ArgumentError
+    @test occursin("3031", sprint(showerror, err))
+    @test occursin("3413", sprint(showerror, err))
+end
+
+@testset "misaligned grids are refused" begin
+    # Equal *lookups*, not merely equal sizes. This is the likeliest caller mistake and the most
+    # damaging: correlation succeeds, every displacement is offset by the grid difference, and
+    # nothing downstream can tell.
+    ref, sec = projected_pair(300, (0, 4))
+    shifted = Raster(parent(sec), (Y(lookup(ref, Y)), X(lookup(ref, X) .+ 1000.0)))
+    @test_throws DimensionMismatch autorift(ref, shifted; EXT_KW...)
+    @test occursin("co-registered",
+                   sprint(showerror, try autorift(ref, shifted; EXT_KW...) catch e; e end))
+
+    # Different dimension names, same shape.
+    named = DimArray(parent(sec), (Dim{:azimuth}(1.0:300.0), Dim{:range}(1.0:300.0)))
+    @test_throws DimensionMismatch autorift(
+        DimArray(parent(ref), (Y(1.0:300.0), X(1.0:300.0))), named; EXT_KW...)
+end
+
+@testset "dt converts pixels to velocity" begin
+    n, res = 400, 10.0
+    ref, sec = projected_pair(n, (4, 6); res)
+
+    # Default: pixels, so the caller can convert however they like.
+    px = autorift(ref, sec; EXT_KW...)
+    @test med(px.vx) == 6
+
+    # A fixed period: metres per year, over a Julian year.
+    st = autorift(ref, sec; EXT_KW..., dt = Day(16))
+    years = 16 / 365.25
+    @test med(st.vx) ≈ 6 * res / years rtol = 1e-5
+    @test med(st.vy) ≈ -4 * res / years rtol = 1e-5
+
+    # `Date` subtraction gives a `Day`, which is how a caller most naturally arrives here.
+    @test med(autorift(ref, sec; EXT_KW..., dt = Date(2020, 7, 1) - Date(2020, 6, 15)).vx) ≈
+        med(st.vx) rtol = 1e-6
+    # A plain number is years.
+    @test med(autorift(ref, sec; EXT_KW..., dt = 1.0).vx) ≈ 6 * res rtol = 1e-5
+
+    # Calendar periods have no fixed length, so they are refused rather than silently assumed to
+    # be 365 days. The message names what to use instead.
+    err = try autorift(ref, sec; EXT_KW..., dt = Year(1)) catch e; e end
+    @test err isa ArgumentError
+    @test occursin("Day", sprint(showerror, err))
+    @test_throws ArgumentError autorift(ref, sec; EXT_KW..., dt = Month(6))
+    @test_throws ArgumentError autorift(ref, sec; EXT_KW..., dt = -1.0)
+    @test_throws ArgumentError autorift(ref, sec; EXT_KW..., dt = "16 days")
+
+    # An irregular axis has no single pixel size, so velocity would be wrong wherever the spacing
+    # differs. Refused, rather than scaled by a nominal value.
+    irr = Raster(parent(ref), (Y(lookup(ref, Y)),
+                               X(Projected(cumsum(fill(res, n)) .+ randn(n) .* 0.1;
+                                           order = ForwardOrdered(), span = Irregular(),
+                                           sampling = Intervals(Start()), crs = EPSG(3031)))))
+    irr2 = Raster(parent(sec), dims(irr))
+    @test_throws ArgumentError autorift(irr, irr2; EXT_KW..., dt = Day(16))
+    # But without `dt` the same pair works: nothing needs a pixel size.
+    @test med(autorift(irr, irr2; EXT_KW...).vx) == 6
+end
+
+@testset "layers and missingval" begin
+    ref, sec = projected_pair(300, (0, 4))
+    st = autorift(ref, sec; EXT_KW...)
+
+    @test issetequal(keys(st), (:vx, :vy, :correlation, :chip_size, :interpolated))
+    @test eltype(st.vx) === Float32
+    @test eltype(st.vy) === Float32
+    @test eltype(st.correlation) === Float32
+    @test eltype(st.chip_size) === UInt16
+    @test eltype(st.interpolated) === Bool
+
+    # Per-layer, set at construction rather than left for a caller to discover. NaN for the float
+    # layers because that is what the core writes for "not measured", which is deliberately
+    # distinct from a measured zero.
+    mv = Rasters.missingval(st)
+    @test isnan(mv.vx) && isnan(mv.vy) && isnan(mv.correlation)
+    @test mv.chip_size == 0
+    @test mv.interpolated == false
+
+    # Every layer shares the grid dims.
+    @test all(l -> dims(st[l]) == dims(st), keys(st))
+end
+
+@testset "validity masks reach the correlator" begin
+    # Masks may arrive as plain arrays or as rasters, since a caller holding rasters naturally
+    # holds its masks the same way.
+    n = 400
+    ref, sec = projected_pair(n, (0, 5))
+    m = trues(n, n)
+    m[100:250, 100:250] .= false
+
+    plain = autorift(ref, sec; EXT_KW..., reference_valid = m, secondary_valid = m)
+    wrapped = autorift(ref, sec; EXT_KW...,
+                       reference_valid = Raster(collect(m), dims(ref)),
+                       secondary_valid = Raster(collect(m), dims(ref)))
+    @test all(isequal.(parent(plain.vx), parent(wrapped.vx)))
+    # Masking removes points rather than corrupting them.
+    @test count(isnan, parent(plain.vx)) > count(isnan, parent(autorift(ref, sec; EXT_KW...).vx))
+    @test med(plain.vx) == 5
+end
+
+@testset "DimStack path: dimensional but unprojected" begin
+    # Radar range-Doppler: real coordinates, no CRS, and dims that are not X/Y. An extension that
+    # reached for `dims(A, Y)` would work on optical imagery and fail here — which is exactly the
+    # data this path exists for.
+    ref, sec = radar_pair(400, (4, 6))
+    ds = autorift(ref, sec; EXT_KW...)
+
+    @test ds isa DimStack
+    @test !(ds isa RasterStack)
+    @test map(DimensionalData.name, dims(ds)) == (:azimuth, :range)
+    @test issetequal(keys(ds), (:dx, :dy, :correlation, :chip_size, :interpolated))
+
+    # `dx`/`dy` here, not `vx`/`vy`: without a CRS there is no map orientation to flip to, so the
+    # core's raw secondary-to-reference offsets are the honest output.
+    core = autorift(parent(ref), parent(sec); EXT_KW...)
+    @test all(isequal.(parent(ds.dx), core.dx))
+    @test all(isequal.(parent(ds.dy), core.dy))
+    @test med(ds.dx) == -6
+    @test med(ds.dy) == -4
+
+    # Coordinates still come from the input lookups.
+    _, grid = autorift_with_grid(parent(ref), parent(sec); EXT_KW...)
+    @test size(ds.dx) == size(grid)
+    @test collect(lookup(ds, Dim{:range})) == [lookup(ref, Dim{:range})[round(Int, i)]
+                                               for i in grid.x[1, :]]
+
+    # A projected raster does *not* take this path, even though a Raster is an AbstractDimArray.
+    proj = autorift(projected_pair(300, (0, 4))...; EXT_KW...)
+    @test proj isa RasterStack
+    @test haskey(proj, :vx)
+end
+
+@testset "extension overhead is negligible" begin
+    # The extension must be a thin coordinate wrapper, not a second cost centre. Measured as
+    # allocations rather than time, which is the deterministic part: unwrapping is `parent()` and
+    # rewrapping touches only the grid, which is ~100x smaller than the image.
+    n = 512
+    ref, sec = projected_pair(n, (0, 5))
+    a, b = parent(ref), parent(sec)
+    autorift(ref, sec; EXT_KW...)          # compile both paths
+    autorift(a, b; EXT_KW...)
+
+    wrapped = @allocated autorift(ref, sec; EXT_KW...)
+    plain = @allocated autorift(a, b; EXT_KW...)
+    @test wrapped < 1.05 * plain
+end
+
+@testset "extension code quality" begin
+    # Aqua on each extension, per the milestone. Ambiguities are checked across the whole loaded
+    # set rather than per module, since that is where an extension would introduce one.
+    for ext in (:AutoRIFTDimensionalDataExt, :AutoRIFTRastersExt)
+        mod = Base.get_extension(AutoRIFT, ext)
+        @test mod !== nothing
+        Aqua.test_undefined_exports(mod)
+        Aqua.test_stale_deps(mod)
+    end
+    Aqua.test_ambiguities([AutoRIFT])
+end
