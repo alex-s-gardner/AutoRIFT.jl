@@ -73,10 +73,22 @@ mask when the sensor uses a fill value.
 """
 function ImagePair(reference::AbstractMatrix, secondary::AbstractMatrix;
                    reference_valid = nothing, secondary_valid = nothing)
-    rv = isnothing(reference_valid) ? map(isfinite, reference) : Matrix{Bool}(reference_valid)
-    sv = isnothing(secondary_valid) ? map(isfinite, secondary) : Matrix{Bool}(secondary_valid)
+    rv = isnothing(reference_valid) ? map(isfinite, reference) : _boolmask(reference_valid)
+    sv = isnothing(secondary_valid) ? map(isfinite, secondary) : _boolmask(secondary_valid)
     return ImagePair(reference, secondary, rv, sv)
 end
+
+# A mask as a `Matrix{Bool}`, without copying one that already is.
+#
+# `Matrix{Bool}` rather than any `AbstractMatrix{Bool}` because a `BitMatrix` packs eight
+# entries per byte, which makes a concurrent write to one element a read-modify-write of the
+# 64-bit word holding 63 of its neighbours — the same hazard that made `DisplacementField`
+# store `searched` unpacked.
+#
+# Not copying when it need not is what lets a `Cache` decide by identity whether an image it
+# holds is already prepared. A defensive copy would silently turn every reuse into a re-filter.
+_boolmask(m::Matrix{Bool}) = m
+_boolmask(m::AbstractMatrix) = Matrix{Bool}(m)
 
 Base.size(p::ImagePair) = size(p.reference)
 Base.eltype(::ImagePair{T}) where {T} = T
@@ -113,47 +125,51 @@ consistently, which lets fill values leak into the correlation as texture.
 """
 preprocess(pair::ImagePair, method::Symbol) = preprocess(pair, _preprocess(method, nokw))
 
-function preprocess(pair::ImagePair, ::NoPreprocess)
-    return ImagePair(Matrix{Float32}(pair.reference), Matrix{Float32}(pair.secondary),
-                     copy(pair.reference_valid), copy(pair.secondary_valid))
+# One image at a time is the primitive, and the pair is two calls. Every filter here is
+# per-image — nothing about filtering the reference depends on the secondary — and saying so
+# is what lets a `Cache` re-filter only the image that changed when a time series advances.
+preprocess(pair::ImagePair, m::PreprocessMethod) = ImagePair(
+    preprocess(pair.reference, pair.reference_valid, m),
+    preprocess(pair.secondary, pair.secondary_valid, m))
+
+"""
+    preprocess(img, mask, method) -> (filtered, mask)
+
+Filter a single image, returning it with its shrunken validity mask.
+
+The pair form is this applied twice. Exposed separately because a filtered image is reusable:
+in a time series each acquisition is the secondary of one pair and the reference of the next,
+so filtering per image rather than per pair halves the work.
+"""
+preprocess(img::AbstractMatrix, mask::AbstractMatrix{Bool}, ::NoPreprocess) =
+    (Matrix{Float32}(img), copy(mask))
+
+preprocess(img::AbstractMatrix, mask::AbstractMatrix{Bool}, m::Highpass) =
+    _filtered(highpass(img, mask, m.width), mask, m.width)
+
+preprocess(img::AbstractMatrix, mask::AbstractMatrix{Bool}, m::Wallis) =
+    _filtered(wallis(img, mask, m.width, m.min_std), mask, m.width)
+
+# The mask bookkeeping every windowed filter needs, written once. Doing it per filter is how
+# the reference ended up inconsistent about it.
+function _filtered(out::Matrix{Float32}, mask::AbstractMatrix{Bool}, width::Integer)
+    v = _erode_mask(mask, Int(width))
+    @inbounds for i in eachindex(out)
+        # A filter can produce a non-finite value from finite input (a zero divisor in the
+        # Wallis case), so finiteness of the output is part of validity too. The value itself
+        # becomes zero to keep downstream arithmetic finite; the mask is what records that it
+        # carries no information.
+        if !isfinite(out[i])
+            out[i] = 0.0f0
+            v[i] = false
+        end
+    end
+    return out, v
 end
 
-function preprocess(pair::ImagePair, m::Highpass)
-    w = m.width
-    return _apply_both(pair, w) do img, mask
-        highpass(img, mask, w)
-    end
-end
-
-function preprocess(pair::ImagePair, m::Wallis)
-    w = m.width
-    return _apply_both(pair, w) do img, mask
-        wallis(img, mask, w, m.min_std)
-    end
-end
-
-# Applies `f` to each image, then shrinks both masks by the filter footprint. Written
-# once because every windowed filter needs the same mask bookkeeping, and doing it per
-# filter is how the reference ended up inconsistent.
-function _apply_both(f, pair::ImagePair, w::Int)
-    r = f(pair.reference, pair.reference_valid)
-    s = f(pair.secondary, pair.secondary_valid)
-    rv = _erode_mask(pair.reference_valid, w)
-    sv = _erode_mask(pair.secondary_valid, w)
-    # A filter can also produce a non-finite value from finite input (a zero divisor in
-    # the Wallis case), so finiteness of the output is part of validity too.
-    @inbounds for i in eachindex(rv)
-        rv[i] &= isfinite(r[i])
-        sv[i] &= isfinite(s[i])
-    end
-    # Non-finite values are replaced by zero so downstream arithmetic stays finite; the
-    # mask is what records that they carry no information.
-    @inbounds for i in eachindex(r)
-        isfinite(r[i]) || (r[i] = 0.0f0)
-        isfinite(s[i]) || (s[i] = 0.0f0)
-    end
-    return ImagePair(r, s, rv, sv)
-end
+# `ImagePair` from two `(image, mask)` tuples, which is what the per-image path returns.
+ImagePair((r, rv)::Tuple{AbstractMatrix,AbstractMatrix{Bool}},
+          (s, sv)::Tuple{AbstractMatrix,AbstractMatrix{Bool}}) = ImagePair(r, s, rv, sv)
 
 """
     highpass(img, mask, width) -> Matrix{Float32}
@@ -166,10 +182,11 @@ rather than contributing zeros to it, which is where this differs from the refer
 its zero-padded convolution lets a no-data border bias the mean of every pixel near it.
 """
 function highpass(img::AbstractMatrix, mask::AbstractMatrix{Bool}, width::Integer)
-    m = _masked_boxmean(img, mask, Int(width))
-    out = Matrix{Float32}(undef, size(img))
+    # In place over the local mean: each output reads only the mean at its own index, and the
+    # mean is not wanted afterwards. Saves a full-size temporary on an image-sized array.
+    out = _masked_boxmean(img, mask, Int(width))
     @inbounds for i in eachindex(out)
-        out[i] = mask[i] && isfinite(m[i]) ? Float32(img[i]) - m[i] : NaN32
+        out[i] = mask[i] && isfinite(out[i]) ? Float32(img[i]) - out[i] : NaN32
     end
     return out
 end
@@ -232,6 +249,17 @@ end
 # work that cv2 vectorises. Closing it means cache tiling, an M8 item. Filtering runs
 # once per image rather than once per grid point, so this is not on the hot path.
 function _masked_boxmean(img::AbstractMatrix, mask::AbstractMatrix{Bool}, w::Int)
+    out = Matrix{Float32}(undef, size(img))
+    # The copy exists only to encode invalidity as NaN, which is what makes the running sum
+    # skip those pixels. With nothing masked there is nothing to encode, so read `img`
+    # directly — `windowmean!` is generic in its input. On a gap-free image, which is the
+    # common case for whole-image filtering, that removes a full-size temporary and a pass.
+    #
+    # `hasnan` is left to `windowmean!` to determine rather than asserted false: a fully valid
+    # mask says every pixel is *marked* usable, not that none of them is NaN, and claiming
+    # otherwise would silently take the dense path over an image that needs the masked one.
+    all(mask) && return windowmean!(out, img, w)
+
     masked = Matrix{Float32}(undef, size(img))
     gaps = false
     @inbounds for i in eachindex(masked)
@@ -247,7 +275,7 @@ function _masked_boxmean(img::AbstractMatrix, mask::AbstractMatrix{Bool}, w::Int
     # Tracked during the copy rather than rescanned afterwards: this loop already knows
     # whether it wrote a NaN, and `windowmean` would otherwise spend a full extra pass
     # rediscovering it.
-    return windowmean(masked, w; hasnan = gaps)
+    return windowmean!(out, masked, w; hasnan = gaps)
 end
 
 # Standard deviation about the local mean, computed from squared deviations rather than
@@ -324,24 +352,31 @@ Convert filtered images to the element type used for correlation.
 """
 quantize(pair::ImagePair, method::Symbol) = quantize(pair, _quantize(method))
 
-function quantize(pair::ImagePair, ::NoQuantize)
+# Per image, for the same reason as `preprocess`: the UInt8 scaling is computed from one
+# image's own statistics and nothing crosses between the two.
+quantize(pair::ImagePair, m::QuantizeMethod) = ImagePair(
+    quantize(pair.reference, pair.reference_valid, m),
+    quantize(pair.secondary, pair.secondary_valid, m))
+
+"""
+    quantize(img, mask, method) -> (converted, mask)
+
+Convert a single filtered image to the correlation element type, with its mask.
+
+See [`preprocess`](@ref) for why the per-image form exists.
+"""
+function quantize(img::AbstractMatrix, mask::AbstractMatrix{Bool}, ::NoQuantize)
     # Non-finite values become zero and the mask records that they are not data.
-    r = Matrix{Float32}(undef, size(pair))
-    s = Matrix{Float32}(undef, size(pair))
-    @inbounds for i in eachindex(r)
-        vr = Float32(pair.reference[i])
-        vs = Float32(pair.secondary[i])
-        r[i] = isfinite(vr) ? vr : 0.0f0
-        s[i] = isfinite(vs) ? vs : 0.0f0
+    out = Matrix{Float32}(undef, size(img))
+    @inbounds for i in eachindex(out)
+        v = Float32(img[i])
+        out[i] = isfinite(v) ? v : 0.0f0
     end
-    return ImagePair(r, s, copy(pair.reference_valid), copy(pair.secondary_valid))
+    return out, copy(mask)
 end
 
-function quantize(pair::ImagePair, ::QuantizeUInt8)
-    r = _to_uint8(pair.reference, pair.reference_valid)
-    s = _to_uint8(pair.secondary, pair.secondary_valid)
-    return ImagePair(r, s, copy(pair.reference_valid), copy(pair.secondary_valid))
-end
+quantize(img::AbstractMatrix, mask::AbstractMatrix{Bool}, ::QuantizeUInt8) =
+    (_to_uint8(img, mask), copy(mask))
 
 """
     _to_uint8(img, mask) -> Matrix{UInt8}

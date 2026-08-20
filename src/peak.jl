@@ -216,11 +216,25 @@ function pyrup!(dst::AbstractMatrix{Float32}, src::AbstractMatrix{Float32},
 
     # Vertical: 2sh x sw, writing down each column so both source and destination are
     # traversed contiguously.
+    #
+    # Split by parity rather than branching per element. Which tap pattern applies is decided
+    # by the output row's parity alone — an even upsampled position lands on a source sample and
+    # takes three taps, an odd one falls between two and takes two — so it is known from the
+    # loop index and need not be read from the table and tested. Stepping by two turns the
+    # innermost loop into straight-line arithmetic, which is what the horizontal pass below
+    # already gets by hoisting its branch out.
+    #
+    # The per-element arithmetic is untouched: the same weights applied to the same taps in the
+    # same order, only reached without a test. That distinction matters here, because an earlier
+    # attempt at this was reverted for reassociating the sum and changing results.
     @inbounds for j in 1:sw
-        for i in 1:(2sh)
-            im, i0, ip, ni = rows[i]
-            tmp[i, j] = ni == 3 ? W_C * src[i0, j] + W_S * (src[im, j] + src[ip, j]) :
-                                  W_H * (src[i0, j] + src[ip, j])
+        for i in 1:2:(2sh)              # odd index = even position: three taps
+            im, i0, ip, _ = rows[i]
+            tmp[i, j] = W_C * src[i0, j] + W_S * (src[im, j] + src[ip, j])
+        end
+        for i in 2:2:(2sh)              # even index = odd position: two taps
+            _, i0, ip, _ = rows[i]
+            tmp[i, j] = W_H * (src[i0, j] + src[ip, j])
         end
     end
 
