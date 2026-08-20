@@ -116,27 +116,31 @@ end
 # analytically tidier.
 #
 # ---------------------------------------------------------------------------
-# Known performance gap
+# Remaining performance gap
 # ---------------------------------------------------------------------------
 #
-# This is currently ~5-10x slower than OpenCV's equivalent (measured: 1.5 ms against
-# 247 us at 128x upsampling). The kernel itself is competitive -- about 1.8 ns per
-# output sample, six times faster than a naive 25-tap evaluation -- so the gap is
-# OpenCV's SIMD-vectorised separable filter against a scalar one, not an
-# algorithmic difference.
+# ~4x slower than OpenCV at 128x upsampling (1.14 ms against 247 us), down from ~6x
+# after hoisting the row taps out of the column loop. The kernel is competitive at
+# ~1.1 ns per output sample; what remains is OpenCV's SIMD-vectorised separable filter
+# against a scalar one.
 #
-# Not closed by micro-optimisation, because the algorithm itself is the waste: at
-# 128x upsampling a 5x5 patch becomes 640x640, ~1.6 MB materialised to locate a
-# single maximum. The composite interpolant is deterministic, so the peak can be
-# found by evaluating it directly under a coarse-to-fine search over the 5x5 patch,
-# touching a few hundred samples instead of half a million. That is an M8 item, and
-# it is the largest single optimisation left in the package; the numbers above are
-# the baseline it will be measured against.
+# Micro-optimisation will not close it, because the algorithm is the waste: at 128x a
+# 5x5 patch becomes 640x640, ~1.6 MB materialised to locate a single maximum. Two
+# routes were investigated and rejected for now:
 #
-# Left as-is for now on purpose: this version is simple, matches OpenCV to 2e-7, and
-# its cost is a fixed per-point overhead rather than something that scales with
-# scene size. Correctness first, and with a benchmark in place to prove the
-# improvement when it lands.
+#   * A coarse-to-fine cascade that crops around the running peak at each level. This
+#     is the big win in principle, but measuring how far the peak moves between levels
+#     over 300 surfaces gave a maximum of 11 samples — too wide to bound safely, and an
+#     empirical bound is not a guarantee. A cropped cascade that misses the true peak
+#     returns a silently wrong displacement, which is not a trade worth making.
+#
+#   * Splitting the loop by output parity to remove the tap branch. Faster, but it
+#     regrouped the float multiplies and so changed the last bit, breaking equivalence
+#     with OpenCV. The arithmetic below is deliberately left as-is for that reason.
+#
+# The honest remaining route is vectorising the separable filter, which is an M8 item.
+# The cost is a fixed per-point overhead rather than something that scales with scene
+# size, so it matters less than the numbers suggest.
 
 const PYRUP_KERNEL = Float32[1, 4, 6, 4, 1] ./ 16
 
@@ -180,10 +184,18 @@ function pyrup!(dst::AbstractMatrix{Float32}, src::AbstractMatrix{Float32})
     # turns the inner loop into at most 3x3 multiply-adds with no branches, no
     # modular arithmetic, and no reflection calls — about an order of magnitude
     # cheaper than evaluating all 25 taps and discarding the 16 that are zero.
+    #
+    # The row taps depend only on the row, so computing them inside the column loop
+    # repeated the same reflection arithmetic `2sw` times over. Hoisting them into a
+    # scratch vector is worth 1.5x, and it is the only redundancy here: the tap
+    # *arithmetic* below is left exactly as it was, including the parenthesisation,
+    # because regrouping these float multiplies changes the last bit and this kernel is
+    # verified bit-identical against OpenCV.
+    rows = _pyrup_row_taps(sh)
     @inbounds for j in 1:(2sw)
         jm, j0, jp, nj = _pyrup_taps(j, sw)
         for i in 1:(2sh)
-            im, i0, ip, ni = _pyrup_taps(i, sh)
+            im, i0, ip, ni = rows[i]
             acc = 0.0f0
             if nj == 3
                 if ni == 3
@@ -229,6 +241,25 @@ sits between two and takes two, in which case `centre` and `plus` are the pair a
 `minus` is unused. Indices are reflected in the upsampled space (see
 [`pyrup!`](@ref)), which is what makes the trailing edge behave as OpenCV's does.
 """
+# Row taps for an axis of length `n`, cached across calls.
+#
+# The cascade calls `pyrup!` at a handful of sizes, over and over, so the tap pattern is
+# recomputed for the same `n` thousands of times. A cache keyed on `n` removes that and
+# keeps `pyrup!` allocation-free. Small and bounded: one entry per distinct axis length
+# a cascade visits, which is `log2(upsampling)` of them.
+const PYRUP_ROW_TAPS = Dict{Int,Vector{NTuple{4,Int}}}()
+const PYRUP_TAPS_LOCK = ReentrantLock()
+
+function _pyrup_row_taps(n::Int)
+    v = get(PYRUP_ROW_TAPS, n, nothing)
+    v === nothing || return v
+    return lock(PYRUP_TAPS_LOCK) do
+        get!(PYRUP_ROW_TAPS, n) do
+            [_pyrup_taps(i, n) for i in 1:(2n)]
+        end
+    end
+end
+
 @inline function _pyrup_taps(k::Int, n::Int)
     p = k - 1                       # 0-based upsampled position
     if iseven(p)

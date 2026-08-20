@@ -173,10 +173,11 @@ function reject_outliers(
     scale = Float64(f.mad_scale)
     for _ in 1:n2
         _mask_to_nan!(nx, ny, keep)
-        madx = windowmad(nx, f.window)
-        mady = windowmad(ny, f.window)
-        medx = windowmedian(nx, f.window)
-        medy = windowmedian(ny, f.window)
+        # Fused: both statistics come from one gather and one pass per axis. Computing
+        # them separately gathers and sorts each window twice, and these two calls are
+        # 95% of this function's runtime.
+        medx, madx = windowmedmad(nx, f.window)
+        medy, mady = windowmedmad(ny, f.window)
         @inbounds for i in eachindex(keep)
             keep[i] || continue
             rx, ry = radius_x[i], radius_y[i]

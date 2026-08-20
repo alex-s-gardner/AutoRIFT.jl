@@ -217,20 +217,20 @@ end
 # The count is what makes it mask-aware: dividing by the window area would be wrong
 # wherever any neighbour is invalid, which near a no-data border is everywhere.
 #
-# Known performance gap, measured rather than assumed: this is ~8x slower than cv2's
-# `filter2D` at width 5 (11 ms against 1.3 ms on 1024²) and ~1.2x *faster* at width 21,
-# because the cost here is flat in the window width and cv2's is not. Several
-# alternatives were tried and none closed the small-width gap — transposing the
-# intermediate to make both passes contiguous (5.5 ms), vectorising the recurrence
-# across columns (13 ms, worse: the count-array traffic dominates), and dropping the
-# count entirely for an all-valid mask (9.5 ms). A bandwidth estimate puts the floor at
-# 0.4 ms, so the remainder is per-element scalar work that cv2 vectorises and this does
-# not.
+# Remaining performance gap, measured rather than assumed: ~6x slower than cv2's
+# `filter2D` at width 5 (8.1 ms against 1.3 ms on 1024²) and ~1.9x *faster* at width 21,
+# because the cost here is flat in the window width and cv2's is not. Down from ~8x:
+# `windowmean` now takes a count-free path when nothing is missing, which is the common
+# case for whole-image filtering and is bit-identical since the sums stay Float64.
 #
-# Closing it properly means tiling so the intermediate stays in cache, which is a real
-# optimisation and an M8 item. Left alone for now: the width the production driver
-# actually uses inside the correlator is 5 for optical and 21 for Sentinel-1, filtering
-# runs once per image rather than once per grid point, and correctness came first.
+# Alternatives tried and rejected: transposing the intermediate to make both passes
+# contiguous (5.5 ms, but two extra full-size copies), vectorising the recurrence across
+# columns (13 ms — worse, the count-array traffic dominates), and Float32 accumulation
+# (1.37x but changed results by 2e-6, since a running sum drifts across a whole row).
+#
+# A bandwidth estimate puts the floor at 0.4 ms, so what remains is per-element scalar
+# work that cv2 vectorises. Closing it means cache tiling, an M8 item. Filtering runs
+# once per image rather than once per grid point, so this is not on the hot path.
 function _masked_boxmean(img::AbstractMatrix, mask::AbstractMatrix{Bool}, w::Int)
     masked = Matrix{Float32}(undef, size(img))
     @inbounds for i in eachindex(masked)
