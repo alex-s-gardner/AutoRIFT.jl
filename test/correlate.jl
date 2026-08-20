@@ -1,6 +1,7 @@
 using AutoRIFT: workspace, correlate!, prepare_chip!, next_fft_size,
                 integral, integral_sq, boxsum, peak_index, peak, peak_offset,
-                pyrup!, reflect101, refinement_workspace, subpixel_peak
+                pyrup!, reflect101, refinement_workspace, subpixel_peak,
+                clear_workspaces!, ImagePair, gridpoints, params, track
 
 @testset "integral images" begin
     A = Float32[1 2 3; 4 5 6; 7 8 9]
@@ -211,4 +212,74 @@ end
     finally
         @eval AutoRIFT const DIRECT_THRESHOLD = $old
     end
+end
+
+@testset "workspace pool" begin
+    # Pooling exists because a threaded 1024² pass allocated 56.3 MiB against the serial path's
+    # 34.0, and GC was 21.8% of it — ~96 workspaces per run, 3 chip sizes x 2 passes x 16 chunks.
+    # The correctness requirement is that reuse changes nothing at all.
+    clear_workspaces!()
+
+    # Taken workspaces are out of the pool, so two concurrent chunks cannot share buffers. That is
+    # the same guarantee per-chunk allocation gave.
+    a = AutoRIFT.take_workspace!(Float32, 32, 25)
+    b = AutoRIFT.take_workspace!(Float32, 32, 25)
+    @test a !== b
+    AutoRIFT.give_workspace!(a)
+    # Returned, so the next take reuses it rather than allocating.
+    @test AutoRIFT.take_workspace!(Float32, 32, 25) === a
+    AutoRIFT.give_workspace!(a)
+    AutoRIFT.give_workspace!(b)
+
+    # Keyed on exact geometry, never "large enough". Reusing an oversized workspace was measured
+    # and rejected: the FFT buffer is sized from the workspace's own extents, so a chip-32 point in
+    # a chip-128 workspace runs a 192-point transform where 84 would do — 5x the arithmetic and a
+    # different rounding, 4.5e-8 from the exact answer. A pooled workspace must be the size a fresh
+    # one would be, or it is a different algorithm.
+    clear_workspaces!()
+    small = AutoRIFT.take_workspace!(Float32, 32, 25)
+    AutoRIFT.give_workspace!(small)
+    @test AutoRIFT.take_workspace!(Float32, 128, 25) !== small
+    @test size(AutoRIFT.take_workspace!(Float32, 32, 25).chip) == (32, 32)
+
+    # The element type is deliberately not part of the key: no buffer here has the image's type,
+    # which is the same reason `CorrelationWorkspace` carries no `T`.
+    clear_workspaces!()
+    w8 = AutoRIFT.take_workspace!(UInt8, 32, 25)
+    AutoRIFT.give_workspace!(w8)
+    @test AutoRIFT.take_workspace!(Float32, 32, 25) === w8
+
+    # Refinement workspaces pool on `upsampling` alone, since that and the fixed 5x5 patch
+    # determine every extent.
+    clear_workspaces!()
+    r1 = AutoRIFT.take_refinement!(64)
+    AutoRIFT.give_refinement!(r1)
+    @test AutoRIFT.take_refinement!(64) === r1
+    AutoRIFT.give_refinement!(r1)
+    @test AutoRIFT.take_refinement!(32) !== r1
+
+    clear_workspaces!()
+end
+
+@testset "pooling changes no result" begin
+    # The claim that matters: a pooled workspace must give bit-identical answers to a fresh one,
+    # on a cold pool and a warm one, serial and threaded. Buffers are not cleared on return —
+    # every one is fully written before being read — so this is what proves that safe.
+    ref, sec = shifted_pair(400, (6, -4); T = Float32)
+    pair = ImagePair(ref, sec)
+    pts = gridpoints((400, 400), 32; chip_size = 32, search_radius = 25)
+    p = params()
+
+    clear_workspaces!()
+    cold = track(pair, pts, p)          # empty pool: every workspace freshly built
+    warm = track(pair, pts, p)          # warm pool: every workspace reused
+    @test all(isequal.(cold.dx, warm.dx))
+    @test all(isequal.(cold.dy, warm.dy))
+    @test all(isequal.(cold.correlation, warm.correlation))
+
+    # And across the threading boundary, where several chunks take from the pool at once.
+    par = track(pair, pts, params(; threaded = true))
+    @test all(isequal.(cold.dx, par.dx))
+    @test all(isequal.(cold.dy, par.dy))
+    @test all(isequal.(cold.correlation, par.correlation))
 end

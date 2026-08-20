@@ -228,50 +228,58 @@ function _track_chunk!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
                        chipx::Int, chipy::Int, rx::Int, ry::Int, up::Int,
                        p::Params, idx)
     T = eltype(ref)
-    ws = workspace(T, (chipx, chipy), (rx, ry))
-    rw = up > 1 ? refinement_workspace(up) : nothing
+    ws = take_workspace!(T, (chipx, chipy), (rx, ry))
+    rw = up > 1 ? take_refinement!(up) : nothing
+    try
 
-    @inbounds for i in idx
-        issearchable(pts, i) || continue
+        @inbounds for i in idx
+            issearchable(pts, i) || continue
 
-        prx = pts.radius_x[i]
-        pry = pts.radius_y[i]
-        # `pts` is already in padded coordinates, so the documented primitives apply
-        # directly. Recomputing their arithmetic here would put the asymmetric window
-        # convention and the even-chip half-extent -- the two most delicate index
-        # conventions in the package -- in a second, untested place.
-        chip_rows, chip_cols = chip_bounds(pts, i)
-        win_rows, win_cols = search_bounds(pts, i)
+            prx = pts.radius_x[i]
+            pry = pts.radius_y[i]
+            # `pts` is already in padded coordinates, so the documented primitives apply
+            # directly. Recomputing their arithmetic here would put the asymmetric window
+            # convention and the even-chip half-extent -- the two most delicate index
+            # conventions in the package -- in a second, untested place.
+            chip_rows, chip_cols = chip_bounds(pts, i)
+            win_rows, win_cols = search_bounds(pts, i)
 
-        # Padding is sized so this holds, but a caller-supplied scattered point set can
-        # place a point anywhere, so it is checked rather than assumed.
-        checkbounds(Bool, ref, chip_rows, chip_cols) || continue
-        checkbounds(Bool, ref, win_rows, win_cols) || continue
-        # A chip with no valid pixel is padding, not imagery. Testing the chip rather than
-        # the window is deliberate: the window may legitimately overlap the edge, since the
-        # correlation only needs the chip to be real.
-        _any_valid(okmask, chip_rows, chip_cols) || continue
+            # Padding is sized so this holds, but a caller-supplied scattered point set can
+            # place a point anywhere, so it is checked rather than assumed.
+            checkbounds(Bool, ref, chip_rows, chip_cols) || continue
+            checkbounds(Bool, ref, win_rows, win_cols) || continue
+            # A chip with no valid pixel is padding, not imagery. Testing the chip rather than
+            # the window is deliberate: the window may legitimately overlap the edge, since the
+            # correlation only needs the chip to be real.
+            _any_valid(okmask, chip_rows, chip_cols) || continue
 
-        out.searched[i] = true
+            out.searched[i] = true
 
-        chip = @view sec[chip_rows, chip_cols]
-        window = @view ref[win_rows, win_cols]
-        surface = correlate!(ws, window, chip, (prx, pry); measure = p.similarity)
-        # A chip with no texture carries no information about displacement, so it is left
-        # as no measurement. The reference reports the search-window corner here, which
-        # over masked or featureless terrain is a systematic corner-pinned bias.
-        degenerate(ws) && continue
+            chip = @view sec[chip_rows, chip_cols]
+            window = @view ref[win_rows, win_cols]
+            surface = correlate!(ws, window, chip, (prx, pry); measure = p.similarity)
+            # A chip with no texture carries no information about displacement, so it is left
+            # as no measurement. The reference reports the search-window corner here, which
+            # over masked or featureless terrain is a systematic corner-pinned bias.
+            degenerate(ws) && continue
 
-        dx, dy, c = isnothing(rw) ? peak_offset(surface, (prx, pry)) :
-                                    subpixel_peak(rw, surface, (prx, pry), up)
+            dx, dy, c = isnothing(rw) ? peak_offset(surface, (prx, pry)) :
+                                        subpixel_peak(rw, surface, (prx, pry), up)
 
-        # Back to displacement about the grid point: the surface is centred on the window,
-        # which is centred on the point, and the chip was offset by the prior.
-        out.dx[i] = Float32(dx + pts.dx_prior[i])
-        out.dy[i] = Float32(dy + pts.dy_prior[i])
-        out.correlation[i] = c
+            # Back to displacement about the grid point: the surface is centred on the window,
+            # which is centred on the point, and the chip was offset by the prior.
+            out.dx[i] = Float32(dx + pts.dx_prior[i])
+            out.dy[i] = Float32(dy + pts.dy_prior[i])
+            out.correlation[i] = c
+        end
+        return out
+    finally
+        # Back to the pool even if a point threw. A leaked workspace is not a crash, but it
+        # silently turns the pool back into per-chunk allocation, which is the thing this
+        # exists to avoid — and that would be invisible.
+        give_workspace!(ws)
+        isnothing(rw) || give_refinement!(rw)
     end
-    return out
 end
 
 # Explicit loop rather than `any` over a view. Both short-circuit and neither allocates, but

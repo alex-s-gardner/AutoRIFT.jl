@@ -485,3 +485,37 @@ end
 
 subpixel_peak(rw, surface, radius::Integer, upsampling) =
     subpixel_peak(rw, surface, (Int(radius), Int(radius)), upsampling)
+
+# ---------------------------------------------------------------------------
+# Refinement workspace pool
+# ---------------------------------------------------------------------------
+#
+# The same take/give discipline as the correlation pool in `correlate.jl`, sharing its lock:
+# both are touched only at chunk boundaries, so one lock costs nothing and two would be two
+# things to reason about. See that file for why pooling is keyed on exact geometry.
+
+"""
+    AutoRIFT.take_refinement!(upsampling) -> RefinementWorkspace
+
+As [`take_workspace!`](@ref), for the sub-pixel cascade's buffers. Keyed on `upsampling` alone,
+since that and the fixed 5x5 patch determine every extent.
+"""
+function take_refinement!(up::Int)
+    rw = lock(WORKSPACE_LOCK) do
+        pool = get(REFINEMENT_POOL, up, nothing)
+        isnothing(pool) || isempty(pool) ? nothing : pop!(pool)
+    end
+    return isnothing(rw) ? refinement_workspace(up) : rw
+end
+
+"""
+    AutoRIFT.give_refinement!(rw)
+
+Return a refinement workspace to the pool.
+"""
+function give_refinement!(rw::RefinementWorkspace)
+    lock(WORKSPACE_LOCK) do
+        push!(get!(() -> RefinementWorkspace[], REFINEMENT_POOL, rw.max_upsampling), rw)
+    end
+    return nothing
+end

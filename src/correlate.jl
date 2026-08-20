@@ -149,6 +149,98 @@ function workspace(::Type{T}, chip_size, search_radius) where {T<:Real}
     )
 end
 
+# ---------------------------------------------------------------------------
+# Workspace pool
+# ---------------------------------------------------------------------------
+#
+# A chunk allocates its workspaces, uses them for its share of the grid, and drops them. That is
+# correct — never indexed by `threadid()`, so it is safe under task migration — but a run does it
+# ~96 times: 3 chip sizes x 2 passes x 16 chunks. Measured on 1024^2 threaded, that is 56.3 MiB
+# against the serial path's 34.0, and **GC accounts for 21.8% of the threaded pass** against 5.1%
+# of the serial one. The allocation *calls* are nothing (2.4 us per chunk, 0.15 ms per run); the
+# cost is collection pressure.
+#
+# So they are pooled and reused. Two things make this safe:
+#
+#   * **Keyed on exact geometry, not "large enough".** Reusing one oversized workspace across
+#     levels was tried and rejected: the FFT buffer is sized from the workspace's own extents, so
+#     a chip-32 point in a chip-128 workspace runs a 192-point transform where 84 would do —
+#     5x the arithmetic, and a different rounding, measured at 4.5e-8 from the exact answer. A
+#     pooled workspace must be the same size as a fresh one or it is not a pool, it is a
+#     different algorithm.
+#
+#   * **Taken and returned, not shared.** A workspace is out of the pool while a chunk holds it,
+#     so two concurrent chunks never touch the same buffers. That is the same guarantee
+#     per-chunk allocation gave, obtained by a lock around a small vector instead of by the
+#     allocator.
+#
+# A run visits three geometries, so the pool holds at most three entries per shape plus however
+# many a burst of concurrent chunks needs. It is not bounded, and deliberately: bounding it would
+# mean either blocking a task or falling back to allocation, and the natural bound — the number
+# of chunks in flight — is already small and set by the thread count.
+
+const WORKSPACE_LOCK = ReentrantLock()
+# Keyed by (chip, radius) so a checked-out workspace is byte-for-byte what `workspace` would have
+# built. Note the element type is *not* part of the key, and does not need to be: no buffer here
+# has the image's type — the chip is `Float32` because it is stored mean-removed, the integral
+# images are `Float64` — which is the same reason `CorrelationWorkspace` carries no `T`.
+# `Vector` rather than a single slot because several chunks run concurrently.
+const WORKSPACE_POOL = Dict{Tuple{Tuple{Int,Int},Tuple{Int,Int}},Vector{CorrelationWorkspace}}()
+
+"""
+    AutoRIFT.take_workspace!(T, chip_size, search_radius) -> CorrelationWorkspace
+
+A workspace for exactly this geometry, from the pool or newly built.
+
+Return it with [`give_workspace!`](@ref) when done. The caller has exclusive use until then, so
+concurrent chunks never share buffers — the same guarantee per-chunk allocation gave, without
+the garbage.
+"""
+function take_workspace!(::Type{T}, chip_size, search_radius) where {T<:Real}
+    csx, csy = chip_size isa Tuple ? chip_size : (chip_size, chip_size)
+    rx, ry = search_radius isa Tuple ? search_radius : (search_radius, search_radius)
+    key = ((Int(csx), Int(csy)), (Int(rx), Int(ry)))
+    ws = lock(WORKSPACE_LOCK) do
+        pool = get(WORKSPACE_POOL, key, nothing)
+        isnothing(pool) || isempty(pool) ? nothing : pop!(pool)
+    end
+    # Built outside the lock: planning and allocation are slow, and holding the lock across them
+    # would serialise exactly the burst of concurrent chunks this exists to serve.
+    return isnothing(ws) ? workspace(T, chip_size, search_radius) : ws
+end
+
+"""
+    AutoRIFT.give_workspace!(ws)
+
+Return a workspace to the pool. Its buffers are not cleared: every one is fully written before
+being read on the next use, which is what `prepare_chip!` and the integral images guarantee.
+"""
+function give_workspace!(ws::CorrelationWorkspace)
+    lock(WORKSPACE_LOCK) do
+        push!(get!(() -> CorrelationWorkspace[], WORKSPACE_POOL,
+                   (ws.max_chip, ws.max_radius)), ws)
+    end
+    return nothing
+end
+
+"""
+    AutoRIFT.clear_workspaces!()
+
+Drop every pooled workspace. For tests and benchmarks that measure allocation; not part of
+normal operation.
+"""
+function clear_workspaces!()
+    lock(WORKSPACE_LOCK) do
+        empty!(WORKSPACE_POOL)
+        empty!(REFINEMENT_POOL)
+    end
+    return nothing
+end
+
+# Declared here and filled in `peak.jl`, which is where `RefinementWorkspace` is defined. Split
+# because each pool belongs with its type, and this file is included first.
+const REFINEMENT_POOL = Dict{Int,Vector{Any}}()
+
 """
     next_fft_size(n) -> Int
 
