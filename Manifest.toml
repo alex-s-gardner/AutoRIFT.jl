@@ -2,7 +2,7 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "6d5cdaa1184a9422478c23f8af6e408054bc464f"
+project_hash = "500c70300410aabfc816ca2da1da186b5c880cd2"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -27,7 +27,7 @@ uuid = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
 version = "1.11.0"
 
 [[deps.AutoRIFT]]
-deps = ["CommonSolve", "Dates", "FFTW", "LinearAlgebra", "Scratch", "StableTasks"]
+deps = ["CommonSolve", "Dates", "FFTW", "LinearAlgebra", "PrecompileTools", "Scratch", "StableTasks"]
 path = "."
 uuid = "52cb0ed0-aa80-430c-bd04-c52888a79add"
 version = "0.1.0"
@@ -179,6 +179,12 @@ version = "1.12.1"
 
     [deps.Pkg.weakdeps]
     REPL = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
+
+[[deps.PrecompileTools]]
+deps = ["Preferences"]
+git-tree-sha1 = "edbeefc7a4889f528644251bdb5fc9ab5348bc2c"
+uuid = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
+version = "1.3.4"
 
 [[deps.Preferences]]
 deps = ["TOML"]
