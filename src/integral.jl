@@ -16,6 +16,34 @@
 # where the correlation peak is least well determined and most needs an accurate
 # denominator. OpenCV accumulates its integral images in double for the same
 # reason.
+#
+# ---------------------------------------------------------------------------
+# Why these are per-point and not global
+# ---------------------------------------------------------------------------
+#
+# Each grid point builds an integral image of its own search window, which looks like obvious
+# redundancy: neighbouring windows overlap heavily, and one table over the whole image would serve
+# every point. `boxsum` already reads four corners at an arbitrary offset, so the change is small.
+#
+# Measured on 1024x1024 with the default geometry, and it does not pay:
+#
+#     per-point, 81x81 window    7.24 us x 729 points = 5.28 ms
+#     global, 1024x1024          1.81 ms x 3 levels   = 5.42 ms
+#
+# Slightly *worse*, and the reason is the chip-size loop rather than the arithmetic. A global table
+# must be built once per level whether that level searches 729 points or none — and after the
+# finest level resolves what it can, later levels search almost nothing. On the measured scene the
+# finest level resolved all 729 points and levels 64 and 128 searched zero, so the per-point total
+# is about 1x the grid, not the 3x a global table pays regardless.
+#
+# Two plausible-sounding explanations that turned out wrong, recorded so they are not re-argued:
+# `boxsum` locality is *not* the issue (2.15 ns from a 1025x1025 table against 2.16 ns from an
+# 82x82 one — identical, since the four corner reads miss cache either way), and neither is the
+# 16 MiB the two Float64 tables would occupy. The redundancy is simply smaller than it looks.
+#
+# This would flip on a scene where the coarse levels do real work: heavily decorrelated imagery, or
+# a `chip_size` small relative to the texture scale. Worth re-measuring there rather than treating
+# it as settled for every input.
 
 """
     integral!(S, A)
