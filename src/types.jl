@@ -69,6 +69,33 @@ measure defines a numerator and a normalising denominator.
 """
 abstract type SimilarityMeasure end
 
+# ---------------------------------------------------------------------------
+# Why not SSD and SAD
+# ---------------------------------------------------------------------------
+#
+# Sum-of-squared and sum-of-absolute differences are the textbook cheap alternatives, and the DIC
+# literature uses SSD as standard. Neither is offered, for two measured reasons and one physical
+# one.
+#
+# **The normalisation they skip is 15% of the cost.** ZNCC's integral images and per-shift divide
+# cost 15% over `NCC` at chips 32 and 64 (44.4 vs 38.7 us, 75.5 vs 65.9 us). That is the entire
+# ceiling for any measure whose advantage is avoiding normalisation.
+#
+# **SAD cannot use the FFT, and that costs an order of magnitude.** SSD expands to
+# `sum(T^2) - 2*sum(T*W) + sum(W^2)`, whose cross term is the same correlation ZNCC already
+# computes — so SSD is FFT-able and would cost about what ZNCC costs. `sum(abs(T - W))` has no such
+# decomposition and must be evaluated directly at every shift: 2.56M multiply-adds per point at
+# chip 32, against the 20,000 the direct path is worth using below. Measured with a tight SIMD
+# kernel: 387 us at chip 32 and 1187 us at chip 64, so **8.7x and 15.7x slower than ZNCC**.
+#
+# **And they answer the wrong question.** Two acquisitions differ in sun angle, atmosphere, and
+# sensor gain; SSD and SAD respond to that difference directly, where ZNCC's mean-and-scale removal
+# does not. That is why the reference unified on ZNCC in v2.0.0 — earlier versions used `NCC` for
+# floating-point input, which its own comments describe as a bug.
+#
+# SSD would be a small `_correlate_surface!` method if a cross-check against a DIC package were
+# ever wanted, since the FFT machinery is already there. SAD is not worth having.
+
 """
     ZNCC()
 
