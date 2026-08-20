@@ -2,7 +2,7 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "eb0daace13c7b0da84eda7479586b6bceefb4435"
+project_hash = "58934429ed595ea222e03240629e26d146790d0c"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -27,18 +27,17 @@ uuid = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
 version = "1.11.0"
 
 [[deps.AutoRIFT]]
-deps = ["CommonSolve", "FFTW", "LinearAlgebra", "StableTasks"]
+deps = ["CommonSolve", "Dates", "FFTW", "LinearAlgebra", "StableTasks"]
 path = "."
 uuid = "52cb0ed0-aa80-430c-bd04-c52888a79add"
 version = "0.1.0"
 
     [deps.AutoRIFT.extensions]
     AutoRIFTDimensionalDataExt = "DimensionalData"
-    AutoRIFTRastersExt = ["Rasters", "GeoInterface"]
+    AutoRIFTRastersExt = ["Rasters", "DimensionalData"]
 
     [deps.AutoRIFT.weakdeps]
     DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
-    GeoInterface = "cf35fbd7-0cd7-5166-be24-54bfbe79505f"
     Rasters = "a3a2b9e3-a471-40c9-b274-f788e487c689"
 
 [[deps.Base64]]

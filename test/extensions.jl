@@ -9,15 +9,15 @@ using Rasters
 using DimensionalData
 using DimensionalData.Lookups
 using Dates
-using AutoRIFT: autorift, autorift_with_grid
+using AutoRIFT: autorift
 
 # A north-up projected pair with a known shift. North-up means y *decreasing*, which is what a
 # GeoTIFF normally stores and what makes the y-flip question real.
 #
 # `shift = (drow, dcol)` moves features by that many pixels in array terms, so a positive `drow`
 # moves them toward increasing row index — southward on a north-up grid.
-function projected_pair(n, shift; res = 10.0, epsg = 3031, seed = 1)
-    a = synthetic_texture(n; seed)
+function projected_pair(n, shift; res = 10.0, epsg = 3031)
+    a = synthetic_texture(n; seed = 1)
     b = circshift(a, shift)
     x = X(Projected(0.0:res:(res * (n - 1)); order = ForwardOrdered(), span = Regular(res),
                     sampling = Intervals(Start()), crs = EPSG(epsg)))
@@ -27,8 +27,8 @@ function projected_pair(n, shift; res = 10.0, epsg = 3031, seed = 1)
 end
 
 # Radar range-Doppler: real coordinates, no CRS, and dims that are not X/Y.
-function radar_pair(n, shift; seed = 1)
-    a = synthetic_texture(n; seed)
+function radar_pair(n, shift)
+    a = synthetic_texture(n; seed = 1)
     b = circshift(a, shift)
     az = Dim{:azimuth}(Sampled(1.0:1.0:n; order = ForwardOrdered(), span = Regular(1.0),
                                sampling = Intervals(Start())))
@@ -52,6 +52,7 @@ const EXT_KW = (; chip_size = 32, search_radius = 25, subpixel = :none)
     #
     # So the same scene stored both ways must give the same field, and it is asserted rather than
     # inspected.
+    #
     # 405, not a round 400, and the reason is worth stating because it is a property of the grid
     # rather than of this test. `gridpoints` spans `(margin+1):spacing:(n-margin)`, so the leftover
     # at the trailing edge is whatever the step leaves — the grid is *not* generally centred in the
@@ -85,6 +86,7 @@ const EXT_KW = (; chip_size = 32, search_radius = 25, subpixel = :none)
     cs = parent(reverse(south.correlation; dims = Y))
     @test maximum(abs.(filter(!isnan, cn .- cs))) < 1e-5
     @test count(isnan, cn) == count(isnan, cs)
+
     # Not vacuous: there is real signal in these fields, and it is the same signal.
     @test med(north.vx) == 6
     @test med(north.vy) == -4
@@ -127,7 +129,7 @@ end
     ref, sec = projected_pair(n, (0, 5); res)
     st = autorift(ref, sec; EXT_KW..., grid_spacing = spacing)
 
-    _, grid = autorift_with_grid(parent(ref), parent(sec); EXT_KW..., grid_spacing = spacing)
+    grid = AutoRIFT._build_grid(size(ref), AutoRIFT.params(; EXT_KW..., grid_spacing = spacing))
     @test size(st.vx) == size(grid)
 
     xs, ys = lookup(st, X), lookup(st, Y)
@@ -184,16 +186,25 @@ end
 end
 
 @testset "dt converts pixels to velocity" begin
-    n, res = 400, 10.0
+    # `dt` scales the output and nothing else, so the several spellings of it are tested on the
+    # smallest pair that still resolves anything, rather than correlating a 400² image four times
+    # to exercise four multiplications.
+    #
+    # 350 is that floor, and the reason is the outlier filter rather than the correlation: its
+    # default window is 5 grid points, so a grid narrower than that cannot judge consistency and
+    # every point is dropped. A 300² image gives a 4x4 grid and measures *zero* points; 350² gives
+    # 6x6 and measures all of them. Worth stating, because "too small" here is a property of the
+    # filter's neighbourhood, not of the image.
+    n, res = 350, 10.0
     ref, sec = projected_pair(n, (4, 6); res)
+    years = 16 / 365.25
 
     # Default: pixels, so the caller can convert however they like.
-    px = autorift(ref, sec; EXT_KW...)
-    @test med(px.vx) == 6
+    @test med(autorift(ref, sec; EXT_KW...).vx) == 6
 
-    # A fixed period: metres per year, over a Julian year.
+    # A fixed period: metres per year, over a Julian year. Both axes, since the y factor is the
+    # one that interacts with the flip.
     st = autorift(ref, sec; EXT_KW..., dt = Day(16))
-    years = 16 / 365.25
     @test med(st.vx) ≈ 6 * res / years rtol = 1e-5
     @test med(st.vy) ≈ -4 * res / years rtol = 1e-5
 
@@ -286,7 +297,7 @@ end
     @test med(ds.dy) == -4
 
     # Coordinates still come from the input lookups.
-    _, grid = autorift_with_grid(parent(ref), parent(sec); EXT_KW...)
+    grid = AutoRIFT._build_grid(size(ref), AutoRIFT.params(; EXT_KW...))
     @test size(ds.dx) == size(grid)
     @test collect(lookup(ds, Dim{:range})) == [lookup(ref, Dim{:range})[round(Int, i)]
                                                for i in grid.x[1, :]]

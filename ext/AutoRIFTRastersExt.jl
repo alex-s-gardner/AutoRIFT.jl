@@ -37,11 +37,10 @@ module AutoRIFTRastersExt
 
 import AutoRIFT
 import Rasters
-import GeoInterface as GI
 
 using Dates: Dates, Day, Millisecond, Month, Period, Year
-using DimensionalData: AbstractDimArray, dims, lookup, rebuild
-using DimensionalData.Lookups: ForwardOrdered, Lookups, ReverseOrdered, order
+using DimensionalData: dims, lookup
+using DimensionalData.Lookups: ReverseOrdered, order
 using Rasters: AbstractRaster, RasterStack, crs
 
 # Sibling extension, loaded first: Rasters depends on DimensionalData, so both of this module's
@@ -139,15 +138,16 @@ end
 # orders yield the same field. Working it as a scale factor rather than a branch around two nearly
 # identical loops keeps the reasoning in one place.
 function _to_velocity(r::AutoRIFT.MultichipResult, reference::AbstractRaster, dt)
+    # x is unconditional: map x always increases with column index, so feature motion is just the
+    # negated offset. Only y depends on how the file was written, which is the whole asymmetry.
     rowdim = first(dims(reference))
     sy = order(lookup(rowdim)) isa ReverseOrdered ? 1.0f0 : -1.0f0   # see above
-    sx = -1.0f0
 
-    isnothing(dt) && return (sx .* r.dx, sy .* r.dy)
+    isnothing(dt) && return (-r.dx, sy .* r.dy)
 
     years = _years(dt)
     px, py = _pixel_sizes(reference)
-    return (Float32.(sx .* r.dx .* (px / years)), Float32.(sy .* r.dy .* (py / years)))
+    return (Float32.(-r.dx .* (px / years)), Float32.(sy .* r.dy .* (py / years)))
 end
 
 # Ground spacing per axis, in CRS units. Refuses rather than guesses when the axis is irregular.

@@ -28,7 +28,7 @@ import AutoRIFT
 import DimensionalData as DD
 
 using DimensionalData: AbstractDimArray, DimStack, dims, lookup, rebuild
-using DimensionalData.Lookups: Lookup, Regular, span
+using DimensionalData.Lookups: Lookup, isregular
 
 """
     autorift(reference::AbstractDimArray, secondary::AbstractDimArray; kwargs...) -> DimStack
@@ -171,15 +171,14 @@ unwrap(m) = m
 
 Ground spacing along the axis `l` describes, or `nothing` if it has none.
 
-Only a `Regular` span has a single spacing. An `Irregular` or `Explicit` lookup describes an axis
-whose pixels differ in size, and no scalar can convert those displacements to ground units — so
-this reports that rather than returning a nominal value that would be silently wrong across most
-of the scene.
+Only a regularly-spaced axis has a single spacing. An `Irregular` or `Explicit` lookup describes
+an axis whose pixels differ in size, and no scalar can convert those displacements to ground
+units — so this reports that rather than returning a nominal value that would be silently wrong
+across most of the scene.
+
+The guard is what makes this total: `step` throws a `MethodError` on an irregular lookup rather
+than returning anything, so the `nothing` has to come from asking first.
 """
-function pixel_size(l::Lookup)
-    s = span(l)
-    s isa Regular || return nothing
-    return abs(DD.Lookups.val(s))
-end
+pixel_size(l::Lookup) = isregular(l) ? abs(step(l)) : nothing
 
 end # module
