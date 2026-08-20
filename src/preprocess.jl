@@ -141,8 +141,13 @@ The pair form is this applied twice. Exposed separately because a filtered image
 in a time series each acquisition is the secondary of one pair and the reference of the next,
 so filtering per image rather than per pair halves the work.
 """
+# No filter means no conversion: the image passes through with its own element type, so `Int16`
+# imagery stays 2 bytes per pixel rather than becoming 4. The correlator handles any `T<:Real`,
+# and this stage is memory-bandwidth-bound, so widening for no numerical gain would be the
+# expensive kind of harmless. A copy is still made, because the caller's array must not be
+# aliased by a pipeline that may write to it.
 preprocess(img::AbstractMatrix, mask::AbstractMatrix{Bool}, ::NoPreprocess) =
-    (Matrix{Float32}(img), copy(mask))
+    (copy(img), copy(mask))
 
 preprocess(img::AbstractMatrix, mask::AbstractMatrix{Bool}, m::Highpass) =
     _filtered(highpass(img, mask, m.width), mask, m.width)
@@ -365,12 +370,23 @@ Convert a single filtered image to the correlation element type, with its mask.
 
 See [`preprocess`](@ref) for why the per-image form exists.
 """
-function quantize(img::AbstractMatrix, mask::AbstractMatrix{Bool}, ::NoQuantize)
-    # Non-finite values become zero and the mask records that they are not data.
-    out = Matrix{Float32}(undef, size(img))
+# No quantization means the element type is the caller's, so `Int16` sensor data reaches the
+# correlator as `Int16`. The correlator is generic over `T<:Real` and converts per element where
+# it must — the chip to `Float32` because it is stored mean-removed, the sums to `Float64` — so
+# widening the whole image here would double its memory traffic and change no result.
+quantize(img::AbstractMatrix{<:Integer}, mask::AbstractMatrix{Bool}, ::NoQuantize) =
+    (copy(img), copy(mask))
+
+function quantize(img::AbstractMatrix{<:AbstractFloat}, mask::AbstractMatrix{Bool},
+                  ::NoQuantize)
+    # Only a float type can hold a non-finite value, so only this method needs to replace one.
+    # They become zero so downstream arithmetic stays finite, and the mask records that they
+    # carry no information. An integer image cannot be in that state, which is why the method
+    # above can be a plain copy rather than this loop with a test that is always false.
+    out = similar(img)
     @inbounds for i in eachindex(out)
-        v = Float32(img[i])
-        out[i] = isfinite(v) ? v : 0.0f0
+        v = img[i]
+        out[i] = isfinite(v) ? v : zero(v)
     end
     return out, copy(mask)
 end

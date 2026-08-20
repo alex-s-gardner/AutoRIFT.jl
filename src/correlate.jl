@@ -34,7 +34,7 @@
 # evaluated directly or, for large chips, obtained for all shifts at once by FFT.
 
 """
-    CorrelationWorkspace{T}
+    CorrelationWorkspace
 
 Preallocated buffers for correlating one chip against one search window.
 
@@ -44,9 +44,16 @@ pass will use; points needing less take views of the corner, which is why the
 buffers are plain `Matrix` with runtime extents rather than sized types — a size in
 the type would mean recompiling the kernel per chip size, and real runs use several.
 
+Deliberately *not* parametrized on the image element type. None of these buffers has that
+type: the chip is `Float32` because it is stored mean-removed, and the integral images are
+`Float64`. Carrying a `T` that no field uses would make `CorrelationWorkspace{UInt8}` and
+`CorrelationWorkspace{Int16}` distinct types and specialize every downstream method twice for
+identical machine code. The element type reaches the kernel through the image arguments, which
+is where it belongs.
+
 Construct with [`workspace`](@ref).
 """
-struct CorrelationWorkspace{T<:Real}
+struct CorrelationWorkspace
     # Contiguous copy of the chip, mean-removed. A copy is needed anyway: the chip
     # is a strided view into the secondary image, and both the mean removal and
     # the FFT path require contiguous Float32.
@@ -89,15 +96,22 @@ struct CorrelationWorkspace{T<:Real}
 end
 
 """
-    workspace(T, chip_size, search_radius) -> CorrelationWorkspace
+    workspace([T], chip_size, search_radius) -> CorrelationWorkspace
 
 Allocate correlation buffers for chips up to `chip_size` and search radii up to
 `search_radius`, each an `Int` or a `(x, y)` tuple.
 
 One workspace per task, never shared: the buffers are written during correlation,
-so two tasks sharing one would corrupt each other. `T` is the element type of the
-images to be correlated.
+so two tasks sharing one would corrupt each other.
+
+`T` is the element type of the images to be correlated. It is accepted for readability at the
+call site and asserted to be a `Real`, but the buffers do not depend on it — the chip is
+`Float32` because it is stored mean-removed, and the integral images are `Float64` to hold a
+sum of squares without loss. Any `T<:Real` correlates correctly, including `Int16` and other
+integer sensor types.
 """
+workspace(chip_size, search_radius) = workspace(Float32, chip_size, search_radius)
+
 function workspace(::Type{T}, chip_size, search_radius) where {T<:Real}
     csx, csy = chip_size isa Tuple ? chip_size : (chip_size, chip_size)
     rx, ry = search_radius isa Tuple ? search_radius : (search_radius, search_radius)
@@ -119,7 +133,7 @@ function workspace(::Type{T}, chip_size, search_radius) where {T<:Real}
     fx = next_fft_size(winx)
     fy = next_fft_size(winy)
 
-    return CorrelationWorkspace{T}(
+    return CorrelationWorkspace(
         Matrix{Float32}(undef, csy, csx),
         Matrix{Float32}(undef, 2ry, 2rx),
         Matrix{Float64}(undef, winy + 1, winx + 1),

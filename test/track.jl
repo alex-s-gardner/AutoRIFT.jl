@@ -205,6 +205,67 @@ end
     @test median_of(filter(!isnan, my)) ≈ 5 atol = 0.05
 end
 
+@testset "any real element type correlates" begin
+    # The correlator is generic over `T<:Real`, and that is a claim worth testing rather than
+    # asserting: signed and unsigned integers, 16- and 32-bit, and both float widths. Calibrated
+    # sensor products arrive as `Int16` at least as often as they arrive as `Float32`, and a
+    # `UInt8`-only pipeline would force a lossy rescale on them.
+    #
+    # The shift is recovered *exactly* in every type, with refinement off. Correlation responds
+    # to texture, and none of these conversions perturbs the texture: an `Int16` value is
+    # integral in `Float32` too, so the mean-removed chip is exact.
+    base_ref, base_sec = shifted_pair(400, (6, -4); T = Float64)
+    pts = gridpoints((400, 400), 32; chip_size = 32, search_radius = 25)
+    p = params(; subpixel = :none)
+
+    for T in (Int16, Int32, UInt16, Float32, Float64)
+        # Scale into each type's range, keeping negatives where the type allows them: a signed
+        # sensor product centred on zero is the case that would expose a wrong conversion.
+        scale, offset = T <: Signed ? (10_000, -5_000) :
+                        T <: Unsigned ? (10_000, 0) : (1, 0)
+        conv(A) = T <: Integer ? round.(T, A .* scale .+ offset) : T.(A)
+        pair = ImagePair(conv(base_ref), conv(base_sec))
+        @test eltype(pair) === T
+
+        d = track(pair, pts, p)
+        @test nmeasured(d) == length(d)
+        mx, my = motion(d)
+        @test all(==(6.0f0), filter(!isnan, mx))
+        @test all(==(-4.0f0), filter(!isnan, my))
+    end
+end
+
+@testset "no quantization preserves the element type" begin
+    # `quantize = :none` means the caller's type reaches the correlator. It matters because this
+    # stage is memory-bandwidth-bound: widening `Int16` to `Float32` would double the traffic
+    # over the whole image and change no result, since the correlator converts per element
+    # anyway. Asserted rather than left implicit, as it is the only thing distinguishing this
+    # path from `:uint8`.
+    ref, sec = shifted_pair(200, (0, 0); T = Float64)
+    for T in (Int16, UInt16, Float32, Float64)
+        raw = T <: Integer ? round.(T, ref .* 10_000) : T.(ref)
+        img, mask = AutoRIFT.quantize(raw, trues(size(raw)), AutoRIFT.NoQuantize())
+        @test eltype(img) === T
+        @test img == raw            # values untouched, not merely representable
+        @test img !== raw           # a copy: the caller's array must not be aliased
+    end
+
+    # Filtering is the exception, and necessarily so: subtracting a local mean from an integer
+    # image gives a fractional, signed result that the integer type cannot hold. So a filtered
+    # image is always `Float32` regardless of input type.
+    raw = round.(Int16, ref .* 10_000)
+    img, _ = AutoRIFT.preprocess(raw, trues(size(raw)), Highpass(; width = 5))
+    @test eltype(img) === Float32
+
+    # A non-finite value can only occur in a float image, and there it becomes zero with the
+    # mask recording that it is not data. An integer image cannot be in that state at all.
+    withnan = Float32.(ref)
+    withnan[5, 5] = NaN32
+    img, _ = AutoRIFT.quantize(withnan, trues(size(withnan)), AutoRIFT.NoQuantize())
+    @test img[5, 5] == 0
+    @test count(iszero, img) == 1
+end
+
 @testset "points near and beyond the edge" begin
     # A scattered point set is caller-supplied, so a point may sit anywhere. Three regimes,
     # and the distinction between them is the validity mask rather than the padding: the
