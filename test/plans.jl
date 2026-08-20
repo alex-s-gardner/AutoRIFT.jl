@@ -32,6 +32,31 @@ using Scratch: with_scratch_directory
     end
 end
 
+@testset "no plan survives precompilation" begin
+    # A regression test for a segfault, not a style preference.
+    #
+    # An FFTW plan is a handle to a C structure. Caching one in a `const Dict` means the
+    # precompile image serialises it, and on reload the handle points nowhere — executing it
+    # crashes the process inside `fftwf_execute_dft_r2c`. The precompile workload in
+    # `src/AutoRIFT.jl` plans several sizes, so without `clear_plans!()` in `__init__` the package
+    # segfaults on its first correlation.
+    #
+    # This asserts the state a freshly-loaded process must be in. It passes trivially in a session
+    # that has already correlated something, so it runs in a subprocess that has only just loaded
+    # the package — which is the only place the property is observable.
+    script = """
+        using AutoRIFT
+        n = length(AutoRIFT.RFFT_PLANS) + length(AutoRIFT.IRFFT_PLANS)
+        n == 0 || error("\$n plan(s) cached at load time; a deserialised FFTW plan segfaults")
+        # And prove it by executing one: this is the call that crashed.
+        a = [Float32((i * 7 + j * 13) % 251) / 251 for i in 1:150, j in 1:150]
+        autorift(a, circshift(a, (2, 3)); chip_size = 32, search_radius = 6, chip_size_max = 32)
+        print("ok")
+    """
+    out = read(`$(Base.julia_cmd()) --project=$(dirname(@__DIR__)) -e $script`, String)
+    @test out == "ok"
+end
+
 @testset "wisdom path is machine-specific" begin
     path = wisdom_path()
     # `nothing` is a legitimate answer — a sandbox with no writable depot — so the test accepts
