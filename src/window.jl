@@ -377,6 +377,23 @@ O(w² log w) per pixel, which is acceptable here and only here: the chip-size lo
 windows are always 3 or 5 across. A running-median structure would win asymptotically
 but lose badly at 9 or 25 elements.
 
+!!! note "Windowed histograms via integral images, and why they are not used"
+    Gupta & Sintorn (2024), *Efficient high-resolution template matching with vector quantized
+    nearest neighbour fields* (Pattern Recognition 151:110386), builds an integral image over a
+    one-hot encoding so that any rectangle's histogram is available in O(1) regardless of window
+    size — which would make this median and MAD constant-time rather than O(w² log w).
+
+    It is not worth doing, and the deciding measurement is where the time actually is. This filter
+    runs on the **output grid**, not the image: 27x27 points for a 1024² scene. Measured at 975 us
+    against a 99 ms pass, so **1.0%** of it, with the coarse pass another 1.9%. Amdahl's law caps
+    the whole win at one percent, and a histogram median is quantized where this one is exact.
+
+    The paper's larger method — vector-quantize the template into `k` codewords, then compare
+    *distributions* of codewords through coarse filters — is a different similarity measure rather
+    than a faster ZNCC, and its own results show it losing below ~0.5 scale factor. Its geometry is
+    also inverted relative to ours: it amortizes one template's codebook over a large query image,
+    where AutoRIFT has hundreds of independent chips each with its own search window.
+
 Hand-written rather than delegated. `LocalFilters.localmap` supplies exactly the right
 boundary and NaN contract, but routing a general median through it costs 119 ms on
 512² where the same traversal with a trivial reducer costs 3.6 ms — the median is
