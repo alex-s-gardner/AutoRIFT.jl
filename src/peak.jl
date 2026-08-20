@@ -172,7 +172,8 @@ pyrup!(dst::AbstractMatrix{Float32}, src::AbstractMatrix{Float32}) =
     pyrup!(dst, src, Matrix{Float32}(undef, 2 * size(src, 1), size(src, 2)))
 
 function pyrup!(dst::AbstractMatrix{Float32}, src::AbstractMatrix{Float32},
-                scratch::AbstractMatrix{Float32})
+                scratch::AbstractMatrix{Float32},
+                rows::Vector{NTuple{4,Int}} = _pyrup_row_taps(size(src, 1)))
     sh, sw = size(src)
     size(dst) == (2sh, 2sw) || throw(DimensionMismatch(
         "pyrup! destination must be $((2sh, 2sw)) for a $((sh, sw)) source, " *
@@ -209,7 +210,8 @@ function pyrup!(dst::AbstractMatrix{Float32}, src::AbstractMatrix{Float32},
     # because OpenCV is itself separable. An earlier attempt at a different reordering was
     # rejected for drifting *further* from the reference; this one does not, which is the
     # distinction that decides it.
-    rows = _pyrup_row_taps(sh)
+    length(rows) == 2sh || throw(DimensionMismatch(
+        "tap table has $(length(rows)) entries but a $(sh)-row source needs $(2sh)"))
     tmp = @view scratch[1:(2sh), 1:sw]
 
     # Vertical: 2sh x sw, writing down each column so both source and destination are
@@ -269,43 +271,18 @@ sits between two and takes two, in which case `centre` and `plus` are the pair a
     end
 end
 
-# The tap pattern for an axis of length `n`, built once and reused.
+# The tap pattern for an axis of length `n`.
 #
-# `pyrup!` needs it for every output row, and a cascade calls `pyrup!` repeatedly at the
-# same handful of sizes, so computing it per call meant recomputing the same table.
-# Caching it is worth 1.5x — see the `pyrup!` comment for why the row taps in particular
-# were the redundancy.
+# `pyrup!` needs it for every output row, so computing it inside the column loop meant
+# recomputing the same table `2 * width` times over — hoisting it is worth 1.5x.
 #
-# Follows the double-checked-locking shape `src/plans.jl` establishes for FFT plans, and
-# is safe for the same reason documented there: the unlocked read may miss, and a miss
-# falls through to the locked path and re-checks. Bounded in practice at one entry per
-# axis length a cascade visits, i.e. `log2(upsampling)` of them, each a few hundred
-# bytes.
-const PYRUP_ROW_TAPS = Dict{Int,Vector{NTuple{4,Int}}}()
-const PYRUP_TAPS_LOCK = ReentrantLock()
-
-function _pyrup_row_taps(n::Int)
-    v = get(PYRUP_ROW_TAPS, n, nothing)
-    v === nothing || return v
-    return lock(PYRUP_TAPS_LOCK) do
-        get!(PYRUP_ROW_TAPS, n) do
-            [_pyrup_taps(i, n) for i in 1:(2n)]
-        end
-    end
-end
-
-"""
-    clear_pyrup_taps!()
-
-Drop the cached upsampling tap tables. For tests and benchmarks that need a cold cache;
-not part of normal operation. Mirrors [`AutoRIFT.clear_plans!`](@ref).
-"""
-function clear_pyrup_taps!()
-    lock(PYRUP_TAPS_LOCK) do
-        empty!(PYRUP_ROW_TAPS)
-    end
-    return nothing
-end
+# Built on demand rather than cached in a process-global. It costs ~0.7 us for the largest
+# size a cascade uses and ~3 us for every size one visits, against ~560 us for the cascade
+# itself, so a global `Dict` with a lock would be machinery the cost does not justify — unlike
+# the FFT plans in `src/plans.jl`, which cost milliseconds and are genuinely process-wide.
+# `RefinementWorkspace` holds the tables it needs, since it already knows both the patch size
+# and the maximum upsampling at construction.
+_pyrup_row_taps(n::Int) = [_pyrup_taps(i, n) for i in 1:(2n)]
 
 """
     reflect101(i, n) -> Int
@@ -368,6 +345,11 @@ struct RefinementWorkspace
     # Intermediate for `pyrup!`'s two-pass form. Sized for the deepest level, so it serves
     # every shallower one and the whole cascade allocates nothing.
     scratch::Matrix{Float32}
+    # Tap tables, one per cascade level, keyed by level rather than by axis length. Built here
+    # because the workspace already knows the patch size and the maximum upsampling, which
+    # together determine exactly the set of sizes the cascade will visit — so there is nothing
+    # to discover at run time and no cache to manage.
+    taps::Vector{Vector{NTuple{4,Int}}}
     max_upsampling::Int
 end
 
@@ -383,15 +365,23 @@ function refinement_workspace(upsampling::Integer; patch::Integer = 5)
         "`upsampling` must be a power of 2, got $upsampling. The cascade doubles " *
         "at each step, and the final division is by `upsampling`, so a " *
         "non-power-of-two would scale the result wrongly rather than error."))
-    n = Int(patch) * Int(upsampling)
+    p = Int(patch)
+    up = Int(upsampling)
+    n = p * up
+    # One table per doubling: the cascade reads a `p * 2^k` sized source at level k.
+    nlevels = up == 1 ? 0 : Int(log2(up))
+    taps = [_pyrup_row_taps(p << (k - 1)) for k in 1:max(nlevels, 1)]
     return RefinementWorkspace(
         Matrix{Float32}(undef, n, n),
         Matrix{Float32}(undef, n, n),
-        Matrix{Float32}(undef, Int(patch), Int(patch)),
-        # The vertical pass of the deepest level writes (2 * n/2, n/2) = (n, n/2); sized to
-        # (n, n) so any level fits without arithmetic at the call site.
+        Matrix{Float32}(undef, p, p),
+        # The vertical pass at the deepest level writes (n, n/2), so half of this is never
+        # touched. Sized (n, n) anyway: the alternative is an exact-size buffer per level, and
+        # 800 kB of untouched address space at 128x upsampling is cheaper than that
+        # bookkeeping.
         Matrix{Float32}(undef, n, n),
-        Int(upsampling),
+        taps,
+        up,
     )
 end
 
@@ -448,18 +438,22 @@ function subpixel_peak(
     # small, but multiplied by every grid point of every image pair.
     n = p
     factor = 1
+    level = 0
     cur = @view rw.patch[1:p, 1:p]
     use_a = true
     while factor < upsampling
+        level += 1
         n *= 2
         factor *= 2
+        # `level` indexes the tap table for this step's source size.
+        tp = rw.taps[min(level, length(rw.taps))]
         if use_a
             dst = @view rw.a[1:n, 1:n]
-            pyrup!(dst, cur, rw.scratch)
+            pyrup!(dst, cur, rw.scratch, tp)
             cur = dst
         else
             dst = @view rw.b[1:n, 1:n]
-            pyrup!(dst, cur, rw.scratch)
+            pyrup!(dst, cur, rw.scratch, tp)
             cur = dst
         end
         use_a = !use_a
