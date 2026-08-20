@@ -11,7 +11,7 @@
 #   micro  ns-us   individual kernels. Measured with Chairmarks, which collects
 #                  far faster than BenchmarkTools and has better statistics at
 #                  this scale, keeping the whole suite runnable in minutes.
-#   meso   ms      one pyramid level, one correlation pass.
+#   meso   ms      one chip-size level, one correlation pass.
 #   macro  s       end-to-end scenes, batch throughput in pairs/sec, and cold
 #                  start.
 #
@@ -36,7 +36,7 @@ const SEED = 0x5EED
 Band-limited random texture, the standard benchmark input.
 
 Deliberately not white noise. Correlation cost is data-independent, but the
-*pyramid's* cost is not: the coarse pass zeroes the search radius wherever it
+multi-chip-size search's cost is not: the coarse pass zeroes the search radius wherever it
 finds no coherent motion, so a scene with realistic texture exercises a
 realistic fraction of the grid. White noise would either correlate everywhere or
 nowhere and would misreport end-to-end timings.
@@ -89,7 +89,7 @@ include("suite/correlate.jl")
 include("suite/window.jl")
 include("suite/preprocess.jl")
 include("suite/track.jl")
-include("suite/pyramid.jl")
+include("suite/multichip.jl")
 include("suite/endtoend.jl")
 include("suite/throughput.jl")
 

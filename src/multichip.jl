@@ -1,4 +1,22 @@
-# Multi-scale correlation: the pyramid.
+# Multi-chip-size correlation.
+#
+# ---------------------------------------------------------------------------
+# Not an image pyramid
+# ---------------------------------------------------------------------------
+#
+# Worth stating plainly, because the structure invites the wrong name and this file used to
+# carry it. The levels differ in **chip size**; the imagery is never downsampled. Every level
+# correlates the same full-resolution `pair` — there is no coarse-to-fine warm start from a
+# decimated image, and no image pyramid anywhere in the algorithm.
+#
+# The reference agrees: its `cv2.resize` calls (`autoRIFT.py:507-590, 812-860`) act only on the
+# *grid* arrays — `xGrid`, `yGrid`, `SearchLimitX/Y`, `Dx0`, the masks — coarsening the grid by
+# `ChipSizeUniX[i] / ChipSize0X` to match the larger chip. `I1` and `I2` are filtered and
+# quantized (`258-397`) and otherwise untouched. So this is a nested multi-chip-size grid.
+#
+# The one real pyramid in autoRIFT is the subpixel solver: `cv::pyrUp` cascaded in
+# `autoriftcoremodule.cpp:292`, which is `PyramidRefine` in `src/peak.jl`. That name is
+# correct and deliberate.
 #
 # Layer 3. This is the orchestration, and unlike everything below it, it is deliberately
 # *not* general. The loop is a knot of tuned glaciology heuristics — chip-size-indexed
@@ -35,9 +53,9 @@
 # is how a point gets excluded.
 
 """
-    PyramidResult
+    MultichipResult
 
-Displacement over the full grid, assembled from all pyramid levels.
+Displacement over the full grid, assembled from all chip-size levels.
 
 `dx`, `dy`, and `correlation` are as in [`DisplacementField`](@ref). `chip_size` records
 which level produced each point — `0` where none did — and `interpolated` marks points
@@ -53,7 +71,7 @@ one is written only by the single-threaded merge, so the packed representation i
 that one is written from the threaded grid loop where a read-modify-write on a shared word
 could lose a neighbour.
 """
-struct PyramidResult
+struct MultichipResult
     dx::Matrix{Float32}
     dy::Matrix{Float32}
     correlation::Matrix{Float32}
@@ -61,41 +79,41 @@ struct PyramidResult
     interpolated::BitMatrix
 end
 
-Base.size(r::PyramidResult) = size(r.dx)
-Base.length(r::PyramidResult) = length(r.dx)
+Base.size(r::MultichipResult) = size(r.dx)
+Base.length(r::MultichipResult) = length(r.dx)
 
 """
-    nmeasured(r::PyramidResult) -> Int
+    nmeasured(r::MultichipResult) -> Int
 
 How many grid points carry a displacement.
 """
-nmeasured(r::PyramidResult) = count(!isnan, r.dx)
+nmeasured(r::MultichipResult) = count(!isnan, r.dx)
 
 # ---------------------------------------------------------------------------
 
 """
-    correlate_pyramid(pair, grid, p) -> PyramidResult
+    correlate_multichip(pair, grid, p) -> MultichipResult
 
-Correlate `pair` over `grid` at every pyramid level, finest chip first.
+Correlate `pair` over `grid` at every chip-size level, finest chip first.
 
 `grid` must be a gridded [`PointSet`](@ref) — the coarse pass decimates it and the merge
 resamples between levels, both of which need a spatial layout. Its `chip_size_x` field is
 ignored: the level sets it.
 
-Each level runs [`pyramid_level`](@ref) and contributes only where no finer level already
+Each level runs [`chipsize_level`](@ref) and contributes only where no finer level already
 succeeded, so the smallest chip that yields a coherent estimate wins at every point.
 """
-function correlate_pyramid(pair::ImagePair, grid::PointSet{2}, p::Params)
+function correlate_multichip(pair::ImagePair, grid::PointSet{2}, p::Params)
     # `params` already guarantees at least one level: it requires `chip_size <= chip_size_min
     # <= chip_size_max` and that the bounds are power-of-two multiples of `chip_size`, so the
     # sequence always contains `chip_size_min`. Asserted rather than handled, since a caller
     # cannot reach the empty case through the public constructor.
     sizes = chip_sizes(p)
-    @assert !isempty(sizes) "no pyramid levels for chip_size $(p.chip_size_base) in " *
+    @assert !isempty(sizes) "no chip-size levels for chip_size $(p.chip_size_base) in " *
                             "[$(p.chip_size_min), $(p.chip_size_max)]"
 
     sz = size(grid)
-    result = PyramidResult(fill(NaN32, sz), fill(NaN32, sz), fill(NaN32, sz),
+    result = MultichipResult(fill(NaN32, sz), fill(NaN32, sz), fill(NaN32, sz),
                            zeros(UInt16, sz), falses(sz))
 
     for cs in sizes
@@ -103,7 +121,7 @@ function correlate_pyramid(pair::ImagePair, grid::PointSet{2}, p::Params)
         # finer ones succeed.
         wanted = result.chip_size .== 0
         any(wanted) || break                     # every point resolved
-        level = pyramid_level(pair, grid, p, cs, wanted)
+        level = chipsize_level(pair, grid, p, cs, wanted)
         isnothing(level) && continue              # level found nothing coherent
         _merge_level!(result, level.field, level.filled, cs)
     end
@@ -111,22 +129,22 @@ function correlate_pyramid(pair::ImagePair, grid::PointSet{2}, p::Params)
 end
 
 """
-    pyramid_level(pair, grid, p, chip_size, wanted) -> Union{Nothing,NamedTuple}
+    chipsize_level(pair, grid, p, chip_size, wanted) -> Union{Nothing,NamedTuple}
 
-One pyramid level: a coarse pass to find where motion is coherent, then a fine pass
+One chip-size level: a coarse pass to find where motion is coherent, then a fine pass
 restricted to that neighbourhood, then hole filling.
 
 Returns `(; field, filled)` — the displacement field, and the linear indices that were filled
 from neighbours rather than measured — or `nothing` if the level found nothing worth
 continuing.
 
-`wanted` marks the points this level should attempt — in the pyramid, those no finer level
+`wanted` marks the points this level should attempt — in the loop, those no finer level
 resolved. Returns `nothing` if the coarse pass found too little to be worth continuing,
 which is what `min_coarse_valid_fraction` decides.
 
-Separately callable so a caller can run a single scale without the pyramid.
+Separately callable so a caller can run one chip size without the loop.
 """
-function pyramid_level(pair::ImagePair, grid::PointSet{2}, p::Params,
+function chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params,
                        chip_size::Integer, wanted::AbstractMatrix{Bool})
     csx = Int(chip_size)
     csy = chip_size_y(p, csx)
@@ -193,11 +211,15 @@ function _coarse_pass(pair::ImagePair, pts::PointSet{2}, p::Params, csx::Int, cs
     nr, nc = size(pts)
     rows = stride:stride:nr
     cols = stride:stride:nc
-    # Too few coarse points to judge consistency against their neighbours: the outlier filter
-    # needs a neighbourhood, so fall back to searching everything rather than rejecting on
-    # no evidence.
-    (length(rows) < p.outlier_window || length(cols) < p.outlier_window) &&
-        return trues(nr, nc)
+    # Loosened for the decimated grid: its neighbourhoods span `stride` times more ground, so a
+    # coarse point's neighbours are genuinely further away and less like it. `relax` is where
+    # each method says what that means for it.
+    filt = relax(p.outliers)
+
+    # Too few coarse points to judge consistency against their neighbours: the filter needs a
+    # neighbourhood, so fall back to searching everything rather than rejecting on no evidence.
+    w = window(filt)
+    (length(rows) < w || length(cols) < w) && return trues(nr, nc)
 
     # The coarse point's radius must cover its whole cell, since it stands in for every fine
     # point inside it — hence the max over the cell rather than a sample of one point.
@@ -220,7 +242,7 @@ function _coarse_pass(pair::ImagePair, pts::PointSet{2}, p::Params, csx::Int, cs
     any(measured) || return nothing
 
     keep = reject_outliers(cd.dx, cd.dy, coarse.radius_x, coarse.radius_y,
-                           measured, upsampling(p.subpixel), _coarse_filter(p))
+                           measured, upsampling(p.subpixel), filt)
     @inbounds for i in eachindex(keep)
         measured[i] || (keep[i] = false)
     end
@@ -264,12 +286,6 @@ function _cell_max_radius!(out, radius, rows, cols, stride::Int)
     return out
 end
 
-# The coarse grid is decimated, so its neighbourhoods span `stride` times more ground and its
-# agreement threshold has to be looser — a coarse point's neighbours are genuinely further
-# away and less like it. The reference derives this from an overlap fraction; the effect is
-# the same and this states it directly.
-_coarse_filter(p::Params) = _pyramid_filter(p, max(p.outlier_iterations - 1, 1))
-
 # ---------------------------------------------------------------------------
 # Fine pass cleanup
 # ---------------------------------------------------------------------------
@@ -283,7 +299,7 @@ _coarse_filter(p::Params) = _pyramid_filter(p, max(p.outlier_iterations - 1, 1))
 function _reject_and_fill!(d::DisplacementField, pts::PointSet, p::Params)
     measured = map(!isnan, d.dx)
     keep = reject_outliers(d.dx, d.dy, pts.radius_x, pts.radius_y,
-                           measured, upsampling(p.subpixel), _fine_filter(p))
+                           measured, upsampling(p.subpixel), p.outliers)
     @inbounds for i in eachindex(keep)
         if !keep[i]
             d.dx[i] = NaN32
@@ -293,15 +309,6 @@ function _reject_and_fill!(d::DisplacementField, pts::PointSet, p::Params)
     end
     return _fill_holes!(d, p)
 end
-
-_fine_filter(p::Params) = _pyramid_filter(p, p.outlier_iterations)
-
-# Everything but the iteration count is shared between the two, so only that differs at the
-# call sites above.
-_pyramid_filter(p::Params, iterations::Int) =
-    outlier_filter(; window = p.outlier_window, iterations,
-                   min_agree_fraction = p.min_agree_fraction,
-                   agree_tolerance = p.agree_tolerance, mad_scale = p.mad_scale)
 
 # Fill points surrounded by enough measured neighbours with the neighbourhood median.
 #
@@ -369,10 +376,10 @@ end
 
 # Write a level's results wherever no finer level already produced one.
 #
-# The gate is what makes the pyramid work: every level sees the same grid, and the first to
+# The gate is what makes the loop work: every level sees the same grid, and the first to
 # succeed at a point owns it. Since levels run finest first, that is the smallest chip that
 # could resolve the point.
-function _merge_level!(result::PyramidResult, level::DisplacementField,
+function _merge_level!(result::MultichipResult, level::DisplacementField,
                       filled::Vector{Int}, chip_size::Integer)
     cs = UInt16(chip_size)
     # `filled` comes from the fill step itself rather than being inferred from a missing

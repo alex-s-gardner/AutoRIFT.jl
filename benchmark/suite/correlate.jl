@@ -48,7 +48,7 @@ let g = addgroup!(SUITE, "correlate")
     end
 
     # Peak location alone, separated from surface formation. Cheap in absolute
-    # terms, but it runs once per point per pyramid level.
+    # terms, but it runs once per point per chip-size level.
     for radius in (6, 25, 50)
         surface = bench_texture((2radius, 2radius); seed = radius)
         g["peak r$radius"] = @benchmarkable AutoRIFT.peak_index($surface)

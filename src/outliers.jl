@@ -1,8 +1,7 @@
 # Outlier rejection on a displacement field.
 #
-# Layer 2: depends on `window.jl` and nothing else in the package. The algorithm is a
-# PIV standard — the **normalized median test** of Westerweel & Scarano (2005) — so
-# this file is potentially useful outside AutoRIFT and is written to stay separable.
+# Layer 2: depends on `window.jl` and nothing else in the package, so this file is
+# potentially useful outside AutoRIFT and is written to stay separable.
 #
 # The problem it solves: correlation returns a displacement at every searched point,
 # including points where the peak was noise. Those false matches are not small errors,
@@ -11,92 +10,63 @@
 # neighbouring points on the same glacier move similarly — while a false match agrees
 # with nothing around it.
 #
-# Two stages, run in sequence, both from the reference:
-#
-#   1. **Agreement.** Keep a point only if enough of its neighbours have a similar
-#      displacement. Cheap, and removes isolated wild vectors.
-#
-#   2. **Normalized median.** Keep a point only if it lies within a few median
-#      absolute deviations of its neighbourhood median. Catches the subtler case of a
-#      false match that happens to sit near other false matches.
-#
-# Both are applied to displacements **normalized by the local search radius**, not to
-# raw pixels. That is what makes one set of thresholds work across a scene: a
-# 5-pixel disagreement is negligible where the search radius is 50 and decisive where
-# it is 6. Normalising also makes the thresholds dimensionless and so transferable
-# between sensors.
+# Which test asks that question is a choice, so it dispatches on an `OutlierMethod`
+# (see `types.jl`). AutoRIFT's own is `GardnerFilter`; the PIV literature's universal
+# outlier detection is a candidate for a second, and would differ enough to be worth
+# having rather than being a parameter tweak of the first.
 
 """
-    OutlierFilter
+    AutoRIFT.outlier_filter(; kwargs...) -> GardnerFilter
 
-Parameters for the normalized median test. Constructed by
-[`AutoRIFT.outlier_filter`](@ref); see that function for what each field means.
+Build a [`GardnerFilter`](@ref), AutoRIFT's default outlier method.
 
-Two instances are used per pyramid level, with different parameters for the coarse and
-fine passes — the coarse grid is decimated, so its neighbourhoods cover more ground and
-its agreement threshold has to be looser.
+A spelling that names the job rather than the author, kept because most callers want the
+default filter and not a choice between filters. Takes `GardnerFilter`'s keywords.
 """
-struct OutlierFilter
-    window::Int
-    iterations::Int
-    min_agree_fraction::Float64
-    agree_tolerance::Float64
-    mad_scale::Float64
-end
+outlier_filter(; kwargs...) = GardnerFilter(; kwargs...)
 
 """
-    AutoRIFT.outlier_filter(; window = 5, iterations = 3, min_agree_fraction = 8/25,
-                              agree_tolerance = 0.2, mad_scale = 4.0)
+    reject_outliers(dx, dy, radius_x, radius_y, valid, upsampling, method) -> BitMatrix
 
-Build an [`OutlierFilter`](@ref).
-
-# Keywords
-- `window`: neighbourhood width, in grid points. Must be odd, so the neighbourhood has
-  a centre to compare against.
-- `iterations`: how many times each stage runs. Rejection is monotone — a point once
-  rejected stays rejected — so iterating lets the removal of one outlier expose its
-  neighbours as outliers too.
-- `min_agree_fraction`: fraction of the neighbourhood that must agree for a point to
-  survive stage 1. The default `8/25` means eight of a 5x5 window's twenty-five points.
-- `agree_tolerance`: how close counts as agreement, as a fraction of the local search
-  radius.
-- `mad_scale`: how many median absolute deviations from the neighbourhood median a
-  point may lie before stage 2 rejects it.
-"""
-function outlier_filter(; window::Integer = 5, iterations::Integer = 3,
-                        min_agree_fraction::Real = 8 / 25,
-                        agree_tolerance::Real = 0.2, mad_scale::Real = 4.0)
-    isodd(window) || throw(ArgumentError(
-        "outlier filter `window` must be odd so the neighbourhood has a centre, " *
-        "got $window"))
-    window >= 3 || throw(ArgumentError(
-        "outlier filter `window` must be >= 3, got $window"))
-    iterations >= 1 || throw(ArgumentError(
-        "outlier filter `iterations` must be >= 1, got $iterations"))
-    0 <= min_agree_fraction <= 1 || throw(ArgumentError(
-        "`min_agree_fraction` must be in [0, 1], got $min_agree_fraction"))
-    agree_tolerance > 0 || throw(ArgumentError(
-        "`agree_tolerance` must be positive, got $agree_tolerance"))
-    mad_scale > 0 || throw(ArgumentError(
-        "`mad_scale` must be positive, got $mad_scale"))
-    return OutlierFilter(Int(window), Int(iterations), Float64(min_agree_fraction),
-                         Float64(agree_tolerance), Float64(mad_scale))
-end
-
-"""
-    reject_outliers(dx, dy, radius_x, radius_y, valid, upsampling, filter) -> BitMatrix
-
-Which displacements to keep: the normalized median test of Westerweel & Scarano
-(2005).
+Which displacements to keep, per `method` — an [`OutlierMethod`](@ref).
 
 `dx` and `dy` are displacement fields in pixels, `radius_x`/`radius_y` the per-point
 search radii they were found within, `valid` the points to consider at all, and
-`upsampling` the subpixel refinement factor (which sets the quantization floor — see
-below). Returns a fresh mask; the inputs are not modified.
+`upsampling` the subpixel refinement factor (which sets the quantization floor). Returns a
+fresh mask; the inputs are not modified.
+"""
+function reject_outliers(
+    dx::AbstractMatrix, dy::AbstractMatrix,
+    radius_x::AbstractMatrix, radius_y::AbstractMatrix,
+    valid::AbstractMatrix{Bool}, upsampling::Integer, method::OutlierMethod,
+)
+    axes(dx) == axes(dy) == axes(radius_x) == axes(radius_y) == axes(valid) ||
+        throw(DimensionMismatch(
+            "all inputs must share axes: got dx $(axes(dx)), dy $(axes(dy)), " *
+            "radius_x $(axes(radius_x)), radius_y $(axes(radius_y)), " *
+            "valid $(axes(valid))"))
+    return _reject(dx, dy, radius_x, radius_y, valid, upsampling, method)
+end
 
-A point is kept only if it passes both stages, and rejection is monotone across
-iterations: once a point is out it stays out, so removing one outlier can expose its
-neighbours as outliers in the next pass.
+# Nothing to reject. Still a fresh copy, so callers may mutate the result either way.
+_reject(dx, _dy, _rx, _ry, valid, _up, ::NoOutlierFilter) =
+    copyto!(BitMatrix(undef, size(dx)), valid)
+
+"""
+    _reject(..., f::GardnerFilter)
+
+Two stages, run in sequence, both from autoRIFT's `DISP_FILT`:
+
+  1. **Agreement.** Keep a point only if enough of its neighbours have a similar
+     displacement. Cheap, and removes isolated wild vectors.
+
+  2. **Median deviation.** Keep a point only if it lies within a few median absolute
+     deviations of its neighbourhood median. Catches the subtler case of a false match
+     that happens to sit near other false matches.
+
+A point is kept only if it passes both, and rejection is monotone across iterations: once
+a point is out it stays out, so removing one outlier can expose its neighbours in the next
+pass.
 
 !!! note "Why displacements are normalized by search radius"
     Both stages divide by the local search radius before comparing, but they do not
@@ -113,18 +83,15 @@ neighbours as outliers in the next pass.
     rather than of behaviour — the one place it changes the verdict is the
     quantization floor, which is an absolute subpixel step and therefore *does* scale
     against the normalized deviation.
+
+See [`GardnerFilter`](@ref) for how this differs from the normalized median test of
+Westerweel & Scarano (2005), which it resembles but is not.
 """
-function reject_outliers(
+function _reject(
     dx::AbstractMatrix, dy::AbstractMatrix,
     radius_x::AbstractMatrix, radius_y::AbstractMatrix,
-    valid::AbstractMatrix{Bool}, upsampling::Integer, f::OutlierFilter,
+    valid::AbstractMatrix{Bool}, upsampling::Integer, f::GardnerFilter,
 )
-    axes(dx) == axes(dy) == axes(radius_x) == axes(radius_y) == axes(valid) ||
-        throw(DimensionMismatch(
-            "all inputs must share axes: got dx $(axes(dx)), dy $(axes(dy)), " *
-            "radius_x $(axes(radius_x)), radius_y $(axes(radius_y)), " *
-            "valid $(axes(valid))"))
-
     # Work on normalized copies. The reference mutates its arguments and relies on
     # every caller passing a copy; copying here instead makes the function safe to
     # call directly and costs one allocation per invocation rather than per level.

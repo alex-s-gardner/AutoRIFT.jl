@@ -37,6 +37,12 @@ const SYMBOL2SUBPIXEL = Dict{Symbol,Any}(
     :none    => NoRefine,
 )
 
+# Also constructors, since `GardnerFilter` takes the five `outlier_*`/`*_scale` keywords.
+const SYMBOL2OUTLIERS = Dict{Symbol,Any}(
+    :gardner => GardnerFilter,
+    :none    => NoOutlierFilter,
+)
+
 # ---------------------------------------------------------------------------
 # Symbol resolution
 # ---------------------------------------------------------------------------
@@ -75,6 +81,56 @@ function _subpixel(x::Symbol, up)
 end
 _subpixel(x, _upsampling) = _badtype(:subpixel, x, "a Symbol or a `SubpixelMethod`")
 
+# An instance already carries its own parameters, so the loose keywords would have nothing to
+# apply to. Passing both is a contradiction rather than a merge, and saying so beats silently
+# preferring one — the alternative is a caller who sets `mad_scale` next to a `GardnerFilter`
+# and never learns it was ignored.
+function _outliers(x::OutlierMethod, kw::NamedTuple)
+    _no_stray_params(x, kw, "a $(typeof(x)) instance, which already carries its own " *
+                     "parameters")
+    return x
+end
+
+function _outliers(x::Symbol, kw::NamedTuple)
+    T = _resolve(SYMBOL2OUTLIERS, x, :outliers)
+    # A method with no parameters is checked too, since the keywords are just as ignored there
+    # and just as likely to be a mistake — but reported against what the caller actually wrote.
+    T === NoOutlierFilter && return (_no_stray_params(T(), kw, "`:$x`, which takes no " *
+                                                     "parameters"); NoOutlierFilter())
+
+    # The all-default case, which is almost every call, and it is worth its own branch:
+    # `params` runs once per image pair across tens of millions of them. `T` comes out of a
+    # `Dict{Symbol,Any}` so it is a runtime value, which makes `T(; ...)` a dynamic call, and
+    # splatting a generator whose length is not statically known costs ~700 ns and 8
+    # allocations even when it forwards nothing. Measured: 1412 ns for `params()` against 744
+    # before, entirely here. Naming the concrete type in the common branch makes it a static
+    # call at ~1 ns.
+    #
+    # `all` over a `NamedTuple` of sentinel types is decided at compile time, since `isnokw`
+    # dispatches on `NoKW` and each field's type is known — so the branch itself is free.
+    if all(isnokw, kw)
+        T === GardnerFilter && return GardnerFilter()
+        return T()
+    end
+    # Only forward what the caller actually set, so each method keeps its own defaults rather
+    # than having this file restate them. The splat is paid only when a caller overrides
+    # something, which is rare and not on any per-pair path.
+    return T(; (k => kw[k] for k in keys(kw) if !isnokw(kw[k]))...)
+end
+
+# The loose `outlier_*` keywords apply only to a method built from them. Anywhere else they are
+# silently dead, which is the failure this prevents: a caller who sets `mad_scale` beside an
+# explicit method would otherwise never learn it did nothing.
+function _no_stray_params(_method, kw::NamedTuple, what::AbstractString)
+    given = filter(k -> !isnokw(kw[k]), keys(kw))
+    isempty(given) && return nothing
+    throw(ArgumentError(
+        "`outliers` was given $what, so $(join(map(k -> "`$k`", given), ", ")) cannot " *
+        "also apply. Set them on the method instead, or drop them."))
+end
+
+_outliers(x, _kw) = _badtype(:outliers, x, "a Symbol or an `OutlierMethod`")
+
 _badtype(kw::Symbol, x, expected) =
     throw(ArgumentError("`$kw` must be $expected, got a $(typeof(x))."))
 
@@ -83,13 +139,13 @@ _badtype(kw::Symbol, x, expected) =
 # ---------------------------------------------------------------------------
 
 # Chip sizes must be multiples of 4. Two independent reasons: the chip needs an
-# even half-extent in each direction, and the pyramid halves chip size at each
+# even half-extent in each direction, and the chip size halves at each
 # level, so an odd multiple would break the finest level's grid alignment.
 function _check_chip_size(name::Symbol, cs::Integer)
     cs > 0 || throw(ArgumentError("`$name` must be positive, got $cs"))
     cs % 4 == 0 ||
         throw(ArgumentError("`$name` must be a multiple of 4, got $cs. Chip " *
-                            "sizes are halved at each pyramid level and need " *
+                            "sizes are halved at each chip-size level and need " *
                             "an even half-extent in both directions."))
     return Int(cs)
 end
@@ -129,7 +185,7 @@ Resolve and validate user keywords into a concrete [`Params`](@ref).
 
 Called once per `autorift` invocation. Every `Symbol` is mapped to a method
 object and every number range-checked here, so failures surface at the API
-boundary naming the offending keyword rather than deep inside a pyramid level.
+boundary naming the offending keyword rather than deep inside a chip-size level.
 
 Defaults match the autoRIFT reference driver, except where the reference's
 choice is a known defect — see the package documentation for the list.
@@ -144,7 +200,7 @@ choice is a known defect — see the package documentation for the list.
 
 ## Chip and grid geometry, in pixels
 - `chip_size = 32`: finest chip size. Must be a multiple of 4.
-- `chip_size_min = chip_size`, `chip_size_max = 4 * chip_size`: pyramid extent.
+- `chip_size_min = chip_size`, `chip_size_max = 4 * chip_size`: range of chip sizes tried.
   Levels are `chip_size * 2^k` within these bounds.
 - `chip_aspect = 1.0`: chip height as a multiple of width.
 - `grid_spacing = chip_size`: spacing of output grid points.
@@ -159,16 +215,24 @@ choice is a known defect — see the package documentation for the list.
 - `coarse_stride = 4`: decimation factor for the coarse pass.
 - `coarse_buffer = 8`: dilation radius applied to the coarse validity mask
   before it restricts the fine search.
-- `min_coarse_valid_fraction = 0.01`: skip a pyramid level whose coarse pass
+- `min_coarse_valid_fraction = 0.01`: skip a chip-size level whose coarse pass
   validates a smaller fraction than this.
 
 ## Outlier rejection and filling
-- `outlier_window = 5`: window for the normalized median test. Must be odd.
-- `outlier_iterations = 3`: iterations of the test.
+- `outliers = :gardner`: which implausible displacements to drop. `:gardner` is the
+  two-stage filter of Gardner et al. (2018) that autoRIFT uses; `:none` keeps everything,
+  which is useful for telling the correlator's failures from the filter's rejections. An
+  [`OutlierMethod`](@ref) instance is also accepted.
+- `outlier_window = 5`: neighbourhood width for the filter. Must be odd.
+- `outlier_iterations = 3`: iterations of the filter's first stage.
 - `min_agree_fraction = 8/25`: fraction of neighbours that must agree.
 - `agree_tolerance = 0.2`: agreement threshold, as a fraction of search radius.
 - `mad_scale = 4.0`: median-absolute-deviation multiplier.
 - `fill_window = 3`: window for median hole filling. Must be odd.
+
+The five keywords after `outliers` are [`GardnerFilter`](@ref)'s own parameters, offered at
+the top level for convenience. They cannot be combined with an `outliers` *instance*, which
+already carries its own — that is an error rather than a silent override.
 
 ## Misc
 - `threaded = false`: parallelise over grid points within one image pair. For
@@ -198,11 +262,12 @@ function params(;
     coarse_stride = 4,
     coarse_buffer = 8,
     min_coarse_valid_fraction = 0.01,
-    outlier_window = 5,
-    outlier_iterations = 3,
-    min_agree_fraction = 8 / 25,
-    agree_tolerance = 0.2,
-    mad_scale = 4.0,
+    outliers = :gardner,
+    outlier_window = nokw,
+    outlier_iterations = nokw,
+    min_agree_fraction = nokw,
+    agree_tolerance = nokw,
+    mad_scale = nokw,
     fill_window = 3,
     threaded = false,
     progress = false,
@@ -212,6 +277,11 @@ function params(;
     pre = _preprocess(preprocess, filter_width)
     quant = _quantize(quantize)
     sub = _subpixel(subpixel, upsampling)
+    # The public keywords are prefixed (`outlier_window`) where the method's own are not
+    # (`window`), because at the top level `window` alone would be ambiguous against
+    # `fill_window` and `filter_width`. Translated here, in the one file that owns keywords.
+    out = _outliers(outliers, (; window = outlier_window, iterations = outlier_iterations,
+                               min_agree_fraction, agree_tolerance, mad_scale))
 
     base = _check_chip_size(:chip_size, chip_size)
     cmin = isnokw(chip_size_min) ? base : _check_chip_size(:chip_size_min, chip_size_min)
@@ -221,11 +291,11 @@ function params(;
         "`chip_size_min` ($cmin) must be <= `chip_size_max` ($cmax)"))
     base <= cmin || throw(ArgumentError(
         "`chip_size` ($base) must be <= `chip_size_min` ($cmin). `chip_size` " *
-        "is the finest pyramid level; coarser levels are its powers-of-two " *
+        "is the finest chip-size level; coarser levels are its powers-of-two " *
         "multiples."))
     cmax % base == 0 || throw(ArgumentError(
         "`chip_size_max` ($cmax) must be a power-of-two multiple of " *
-        "`chip_size` ($base), because pyramid levels double at each step."))
+        "`chip_size` ($base), because chip-size levels double at each step."))
     ispow2(cmax ÷ base) || throw(ArgumentError(
         "`chip_size_max` ($cmax) must be a power-of-two multiple of " *
         "`chip_size` ($base), got a ratio of $(cmax ÷ base)."))
@@ -243,7 +313,7 @@ function params(;
         "`search_radius` is zero in both axes, so no pixel can be searched."))
 
     return Params(
-        sim, pre, quant, sub, booltype(threaded),
+        sim, pre, quant, sub, out, booltype(threaded),
         base, cmin, cmax, Float64(_check_positive(:chip_aspect, chip_aspect)),
         spacing,
         rx, ry, Int(min_search_radius),
@@ -251,11 +321,6 @@ function params(;
         Int(coarse_buffer),
         _check_fraction(:min_coarse_valid_fraction, min_coarse_valid_fraction),
         Float64(dx_prior), Float64(dy_prior),
-        _check_odd_window(:outlier_window, outlier_window),
-        Int(_check_positive(:outlier_iterations, outlier_iterations)),
-        _check_fraction(:min_agree_fraction, min_agree_fraction),
-        _check_fraction(:agree_tolerance, agree_tolerance),
-        Float64(_check_positive(:mad_scale, mad_scale)),
         _check_odd_window(:fill_window, fill_window),
         UInt64(rng_seed),
         Bool(progress),

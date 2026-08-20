@@ -85,7 +85,7 @@ returned displacement is the offset from secondary back to reference — see
 *not* negated here. The single flip to a physical convention happens at the output
 boundary.
 
-`subpixel` overrides the parameter set's refinement method, which the pyramid needs: its
+`subpixel` overrides the parameter set's refinement method, which the caller needs: a
 coarse pass wants integer peaks only, and paying for refinement there would be wasted.
 
 A point is skipped, leaving `NaN`, if its search radius is zero in either axis, if its
@@ -102,13 +102,13 @@ function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Param
     flat = scatter(pts)          # free: shares memory, discards only the layout
     chipx, chipy, rx, ry, pad, fits = _pass_geometry(flat, size(pair))
     # Nothing searchable: skip the padding, the planning, and the task spawning entirely.
-    # The pyramid's later levels hit this, since their coarse pass zeroes most radii.
+    # Later chip-size levels hit this, since their coarse pass zeroes most radii.
     chipx == 0 && return out
 
     # Padding only when a point actually needs it. `gridpoints` insets by the chip half-extent
     # plus the search radius, so a gridded pass never does — and padding it anyway costs 1.2 ms
     # and 10.6 MB per call, which is 2.5% of a dense coarse pass but ~10% of the sparse ones the
-    # pyramid produces. A scattered, caller-supplied point set may still need it.
+    # search produces. A scattered, caller-supplied point set may still need it.
     #
     # The half-pixel offset applies either way: it is what makes an even-sized chip's reported
     # position refer to its true centre rather than to a position the chip is not symmetric
@@ -290,7 +290,7 @@ end
 # thread. Indexing per-thread state by `threadid()` is unsafe under task migration, and
 # per-chunk is correct by construction.
 #
-# Chunks are deliberately finer than the thread count. The pyramid's sparse search zeroes
+# Chunks are deliberately finer than the thread count. The sparse search zeroes
 # most of the grid in spatially clustered patterns, and a skipped point costs a comparison
 # where a searched one costs microseconds — so an even split of the index range leaves some
 # tasks with almost nothing to do. Oversubscribing lets the scheduler even that out.

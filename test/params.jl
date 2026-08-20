@@ -58,7 +58,7 @@ end
 # Search-radius normalisation is tested in test/points.jl, alongside the
 # `PointSet` it operates on.
 
-@testset "pyramid levels" begin
+@testset "chip-size levels" begin
     # Levels are chip_size * 2^k within [min, max], ascending. Ascending order
     # is load-bearing downstream: each level only writes where no finer level
     # succeeded, so the smallest chip that works wins.

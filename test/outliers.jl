@@ -1,4 +1,4 @@
-using AutoRIFT: OutlierFilter, outlier_filter, reject_outliers
+using AutoRIFT: GardnerFilter, NoOutlierFilter, outlier_filter, reject_outliers
 
 # A coherent field with planted outliers, which is the situation the filter exists for:
 # real motion is spatially smooth, false correlation peaks are arbitrary vectors that
@@ -21,6 +21,7 @@ end
 
 @testset "construction and validation" begin
     f = outlier_filter()
+    @test f isa GardnerFilter
     @test f.window == 5
     @test f.iterations == 3
     @test f.min_agree_fraction ≈ 8 / 25
@@ -29,8 +30,90 @@ end
     @test_throws "must be >= 3" outlier_filter(; window = 1)
     @test_throws "must be >= 1" outlier_filter(; iterations = 0)
     @test_throws "in [0, 1]" outlier_filter(; min_agree_fraction = 1.5)
-    @test_throws "must be positive" outlier_filter(; agree_tolerance = 0)
+    @test_throws "in [0, 1]" outlier_filter(; agree_tolerance = 0)
+    @test_throws "in [0, 1]" outlier_filter(; agree_tolerance = 1.5)
     @test_throws "must be positive" outlier_filter(; mad_scale = -1)
+end
+
+@testset "the method is swappable" begin
+    # Which consistency test to apply is a choice, so it dispatches on an `OutlierMethod`
+    # rather than being wired in. That is what lets a second filter — Westerweel & Scarano's,
+    # say — be a new type and one method instead of an edit to the pyramid.
+    n = 20
+    dx, dy = coherent_field(n)
+    rx = fill(25, n, n)
+    ry = fill(25, n, n)
+    valid = trues(n, n)
+    dx[10, 10] = 20.0f0            # a wild vector the default filter should drop
+    dy[10, 10] = -18.0f0
+
+    kept = reject_outliers(dx, dy, rx, ry, valid, 64, GardnerFilter())
+    @test !kept[10, 10]
+
+    # `:none` keeps everything, which is how you tell the correlator's failures from the
+    # filter's rejections.
+    all_kept = reject_outliers(dx, dy, rx, ry, valid, 64, NoOutlierFilter())
+    @test all(all_kept)
+    @test all_kept !== valid        # a fresh mask; callers may mutate it
+
+    # A point never measured stays out regardless of method: `valid` is respected, not
+    # overridden.
+    part = copy(valid)
+    part[3, 3] = false
+    @test !reject_outliers(dx, dy, rx, ry, part, 64, NoOutlierFilter())[3, 3]
+
+    # `window` is the one query the scheduler makes of a method: how much neighbourhood it
+    # needs, so a grid too small to supply one can skip filtering rather than reject on no
+    # evidence. Zero means "needs none".
+    @test AutoRIFT.window(GardnerFilter(; window = 7)) == 7
+    @test AutoRIFT.window(NoOutlierFilter()) == 0
+
+    # `relax` returns a variant suited to the decimated coarse grid, and what that means is the
+    # method's own business — a method with a universal threshold may return itself.
+    @test AutoRIFT.relax(GardnerFilter(; iterations = 3)).iterations == 2
+    @test AutoRIFT.relax(GardnerFilter(; iterations = 1)).iterations == 1   # floored at one
+    @test AutoRIFT.relax(NoOutlierFilter()) === NoOutlierFilter()
+    # Everything but the iteration count survives relaxation.
+    r = AutoRIFT.relax(GardnerFilter(; window = 7, mad_scale = 2.5))
+    @test r.window == 7
+    @test r.mad_scale == 2.5
+end
+
+@testset "selected by keyword" begin
+    # The Symbol spelling, and the instance escape hatch, both reaching `Params`.
+    @test AutoRIFT.params().outliers isa GardnerFilter
+    @test AutoRIFT.params(; outliers = :none).outliers isa NoOutlierFilter
+    @test AutoRIFT.params(; outliers = GardnerFilter(; window = 7)).outliers.window == 7
+
+    # The loose keywords are the default filter's own parameters, forwarded.
+    @test AutoRIFT.params(; outlier_window = 7).outliers.window == 7
+    @test AutoRIFT.params(; mad_scale = 2.0).outliers.mad_scale == 2.0
+    # Unset keywords leave the method's defaults alone rather than restating them.
+    @test AutoRIFT.params(; outlier_window = 7).outliers.iterations == 3
+
+    @test_throws "not recognised" AutoRIFT.params(; outliers = :westerweel)
+    @test_throws "must be a Symbol or an `OutlierMethod`" AutoRIFT.params(; outliers = 5)
+
+    # Passing both a method and a loose parameter is a contradiction, not a merge: the method
+    # already carries its own, so the keyword would be silently dead. Reported against what the
+    # caller actually wrote, whether that was an instance or a Symbol.
+    @test_throws "GardnerFilter instance" AutoRIFT.params(;
+        outliers = GardnerFilter(), mad_scale = 2.0)
+    @test_throws "`:none`, which takes no parameters" AutoRIFT.params(;
+        outliers = :none, outlier_window = 7)
+
+    # `Params` carries the method as a type parameter, so it must stay concrete — the
+    # correlation kernels specialize on it, and an abstract field here would make the whole
+    # pipeline type-unstable.
+    @test isconcretetype(typeof(AutoRIFT.params()))
+    @test isconcretetype(typeof(AutoRIFT.params(; outliers = :none)))
+
+    # The all-default path must not pay for keyword forwarding. `params` runs once per image
+    # pair across tens of millions of them, and the method table is a `Dict{Symbol,Any}`, so
+    # splatting a generator into a runtime-valued constructor costs ~700 ns and 8 allocations
+    # even when it forwards nothing. Asserted as allocations, which is the deterministic part.
+    AutoRIFT.params()                       # compile
+    @test @allocated(AutoRIFT.params()) <= @allocated(AutoRIFT.params(; mad_scale = 2.0))
 end
 
 @testset "a coherent field survives" begin

@@ -36,7 +36,7 @@ is false; an all-`NaN` surface returns `(1, 1)`.
     # Traversal is column-major -- along the array's memory order -- while the
     # tie-breaking rule stays row-major. Iterating in row-major order to match the
     # rule directly would stride across memory and cost about twice as much, and
-    # this loop runs once per grid point per pyramid level.
+    # this loop runs once per grid point per chip-size level.
     #
     # The extra clause is what keeps the semantics: a strictly greater value always
     # wins, and an *equal* value wins only if it precedes the incumbent in

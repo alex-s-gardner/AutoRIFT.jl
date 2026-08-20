@@ -5,7 +5,7 @@
 #
 #   intra-pair    one pair at a time, threads split across its search points.
 #                 Simple, but carries an irreducible serial fraction (filtering,
-#                 resampling, the pyramid merge) and suffers load imbalance,
+#                 resampling, the merge) and suffers load imbalance,
 #                 because the coarse pass zeroes most of the grid in
 #                 spatially-clustered patterns and a skipped point is ~400x
 #                 cheaper than a searched one.

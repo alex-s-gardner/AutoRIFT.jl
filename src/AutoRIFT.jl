@@ -39,7 +39,7 @@ scene, on a grid, to sub-pixel precision.
 
 Returns a stack of layers on the output grid: `dx` and `dy` in pixels,
 `correlation` (the peak similarity), `chip_size_x`/`chip_size_y` recording which
-pyramid level produced each estimate, and `interpolated` marking values that were
+chip-size level produced each estimate, and `interpolated` marking values that were
 filled from neighbours rather than measured.
 
 `reference` and `secondary` may be plain matrices in pixel coordinates, or —
@@ -90,9 +90,9 @@ include("resample.jl")
 include("outliers.jl")
 include("preprocess.jl")
 
-# Layer 3: orchestration. The grid loop, then the multi-scale pyramid built on it.
+# Layer 3: orchestration. The grid loop, then the multi-chip-size search built on it.
 include("track.jl")
-include("pyramid.jl")
+include("multichip.jl")
 include("api.jl")
 
 export autorift, autorift!, reinit!
@@ -101,6 +101,7 @@ export PreprocessMethod, Highpass, Wallis, WallisGapfill, Sobel, Laplacian,
        Decibel, NoPreprocess
 export SubpixelMethod, PyramidRefine, NoRefine
 export QuantizeMethod, QuantizeUInt8, NoQuantize
+export OutlierMethod, GardnerFilter, NoOutlierFilter
 export ImagePair
 
 end # module

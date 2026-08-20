@@ -1,8 +1,8 @@
-# Resampling between pyramid levels, and the distance transform that dilates masks.
+# Resampling between chip-size levels, and the distance transform that dilates masks.
 #
 # Layer 2: depends on nothing else in the package.
 #
-# The multi-scale pyramid moves fields between grids that differ by a power of two, and it
+# The multi-chip-size search moves fields between grids that differ by a power of two, and it
 # uses a different interpolation for each purpose — averaging down, replicating masks,
 # smoothing displacements back up. Those are not interchangeable, and the reference's choice
 # in each case is deliberate:
@@ -37,7 +37,7 @@ with no valid contributor is `NaN`.
 
 Coordinates use the half-sample convention: destination sample `i` maps to source position
 `(i - 0.5) * scale + 0.5`, so the two grids cover the same extent and neither is offset by
-half a sample relative to the other. Getting this wrong shifts a whole pyramid level by a
+half a sample relative to the other. Getting this wrong shifts a whole chip-size level by a
 fraction of a grid cell, which is invisible in any single level and accumulates across them.
 """
 function resample(A::AbstractMatrix, dstsize::Tuple{Int,Int}, method)
@@ -201,7 +201,7 @@ Every position within Euclidean `radius` of a `true` in `mask`.
 Used to grow the coarse pass's validity mask before it restricts the fine search: a coarse
 estimate is evidence that the neighbourhood is worth searching, not only that one point.
 The radius is in grid cells and is a genuine Euclidean distance rather than a chessboard
-one, which matters at the radii the pyramid uses — a chessboard ball of radius 8 is 40%
+one, which matters at the radii in use — a chessboard ball of radius 8 is 40%
 larger in area than a Euclidean one.
 
 Exact, via the two-pass squared-distance transform of Felzenszwalb & Huttenlocher (2012):

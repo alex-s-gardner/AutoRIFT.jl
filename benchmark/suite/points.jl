@@ -1,7 +1,7 @@
 # Point-set construction and geometry.
 #
 # These look trivial, and per call they are, but `chip_bounds`/`search_bounds` run
-# once per search center per pyramid level — hundreds of thousands of times per
+# once per search center per chip-size level — hundreds of thousands of times per
 # image pair, tens of millions of times per batch. They must stay allocation-free
 # and inline; a regression here is a regression everywhere.
 
@@ -36,7 +36,7 @@ let g = addgroup!(SUITE, "points")
     g["search_bounds"] = @benchmarkable AutoRIFT.search_bounds($pts, 1)
     g["surface_size"] = @benchmarkable AutoRIFT.surface_size($pts, 1)
 
-    # Whole-grid sweeps, run once per pyramid level.
+    # Whole-grid sweeps, run once per chip-size level.
     g["nsearchable 1024x1024"] = @benchmarkable AutoRIFT.nsearchable($pts)
     g["sanitize! 1024x1024"] = @benchmarkable AutoRIFT.sanitize!(p, 6) setup = (
         p = AutoRIFT.gridpoints((1024, 1024), 32; chip_size = 32, search_radius = 25))

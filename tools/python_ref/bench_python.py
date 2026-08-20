@@ -173,7 +173,7 @@ def bench_preprocess(results):
 
 
 def bench_resample(results):
-    """The resampling modes the pyramid uses between levels."""
+    """The resampling modes used between chip-size levels."""
     for size in (1024,):
         src = texture((size, size), seed=2, dtype=np.float32)
         for iname, interp in (
@@ -184,7 +184,7 @@ def bench_resample(results):
         ):
             for scale in (0.5, 2.0):
                 dst = (int(size * scale), int(size * scale))
-                results[f"pyramid/resample {iname} {scale}x {size}"] = timeit(
+                results[f"multichip/resample {iname} {scale}x {size}"] = timeit(
                     lambda s=src, d=dst, i=interp: cv2.resize(s, d, interpolation=i)
                 )
 

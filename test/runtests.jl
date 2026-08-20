@@ -41,7 +41,7 @@ include("utils.jl")
         include("track.jl")
     end
     @testset "pyramid" begin
-        include("pyramid.jl")
+        include("multichip.jl")
     end
     @testset "api" begin
         include("api.jl")

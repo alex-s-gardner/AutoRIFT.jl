@@ -139,7 +139,7 @@ end
     @test shifted.y === pts.y                 # untouched fields are shared, not copied
     @test shifted.radius_x === pts.radius_x
 
-    # Indexing decimates, which is what the pyramid's coarse pass needs.
+    # Indexing decimates, which is what the chip-size loop's coarse pass needs.
     sub = pts[1:2:end, 1:2:end]
     @test size(sub) == (cld(size(pts, 1), 2), cld(size(pts, 2), 2))
     @test sub.x == pts.x[1:2:end, 1:2:end]

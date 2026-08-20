@@ -1,5 +1,5 @@
-using AutoRIFT: ImagePair, gridpoints, params, correlate_pyramid, pyramid_level,
-                PyramidResult, nmeasured, resample, resample!, Nearest, Area, Bicubic,
+using AutoRIFT: ImagePair, gridpoints, params, correlate_multichip, chipsize_level,
+                MultichipResult, nmeasured, resample, resample!, Nearest, Area, Bicubic,
                 dilate_within, windowmax
 
 # Same convention as track.jl's tests: the correlator returns secondary-to-reference, so the
@@ -89,7 +89,7 @@ end
         ref, sec = shifted_pair(512, (sx, sy); T = Float32)
         pair = ImagePair(ref, sec)
         grid = gridpoints((512, 512), 32; chip_size = 32, search_radius = 25)
-        r = correlate_pyramid(pair, grid, params(; chip_size = 32, chip_size_max = 128))
+        r = correlate_multichip(pair, grid, params(; chip_size = 32, chip_size_max = 128))
 
         @test nmeasured(r) == length(r)
         mx, my = motion(r)
@@ -111,7 +111,7 @@ end
 
     counts = Int[]
     for cmax in (32, 64, 128)
-        r = correlate_pyramid(pair, grid, params(; chip_size = 32, chip_size_max = cmax))
+        r = correlate_multichip(pair, grid, params(; chip_size = 32, chip_size_max = cmax))
         push!(counts, nmeasured(r))
         used = sort(unique(Int.(filter(>(0), vec(r.chip_size)))))
         # Every permitted level up to the maximum contributes something.
@@ -129,7 +129,7 @@ end
     n = 512
     pair = banded_pair(n, (6, -4), 200:290)
     grid = gridpoints((n, n), 32; chip_size = 32, search_radius = 25)
-    r = correlate_pyramid(pair, grid, params(; chip_size = 32, chip_size_max = 128))
+    r = correlate_multichip(pair, grid, params(; chip_size = 32, chip_size_max = 128))
 
     # Measured exactly where a level claimed the point, and unmeasured exactly where none
     # did. This is the invariant that makes `chip_size` interpretable downstream.
@@ -139,14 +139,14 @@ end
     @test !isempty(filter(cs -> cs > 32, vec(r.chip_size)))
 end
 
-@testset "pyramid_level in isolation" begin
+@testset "chipsize_level in isolation" begin
     # Callable on its own, which is what lets a caller run one scale without the pyramid.
     ref, sec = shifted_pair(512, (5, -3); T = Float32)
     pair = ImagePair(ref, sec)
     grid = gridpoints((512, 512), 32; chip_size = 32, search_radius = 25)
     p = params(; chip_size = 32)
 
-    lvl = pyramid_level(pair, grid, p, 32, trues(size(grid)))
+    lvl = chipsize_level(pair, grid, p, 32, trues(size(grid)))
     @test !isnothing(lvl)
     @test med(filter(!isnan, -lvl.field.dx)) ≈ 5 atol = 0.05
     # `filled` records what the hole fill recovered. Even on a fully-textured scene this is
@@ -161,11 +161,11 @@ end
     # from redoing work a finer one already did.
     w = falses(size(grid))
     w[1:3, 1:3] .= true
-    lvl = pyramid_level(pair, grid, p, 32, w)
+    lvl = chipsize_level(pair, grid, p, 32, w)
     @test !isnothing(lvl)
     @test count(!isnan, lvl.field.dx) <= 9
     # Nothing wanted at all is not an error, just no work.
-    @test isnothing(pyramid_level(pair, grid, p, 32, falses(size(grid))))
+    @test isnothing(chipsize_level(pair, grid, p, 32, falses(size(grid))))
 end
 
 @testset "a level that finds nothing is skipped" begin
@@ -174,7 +174,7 @@ end
     n = 384
     pair = ImagePair(synthetic_texture(n; seed = 1), synthetic_texture(n; seed = 99))
     grid = gridpoints((n, n), 32; chip_size = 32, search_radius = 25)
-    r = correlate_pyramid(pair, grid, params(; chip_size = 32, chip_size_max = 64))
+    r = correlate_multichip(pair, grid, params(; chip_size = 32, chip_size_max = 64))
     # Whatever survives must be a small minority: uncorrelated images have no coherent
     # displacement to find, and the outlier filter is what enforces that.
     @test nmeasured(r) < length(r) ÷ 2
@@ -188,9 +188,9 @@ end
     pair = banded_pair(n, (6, -4), 200:290)
     grid = gridpoints((n, n), 32; chip_size = 32, search_radius = 25)
 
-    strict = correlate_pyramid(pair, grid,
+    strict = correlate_multichip(pair, grid,
                                params(; chip_size = 32, min_coarse_valid_fraction = 0.9))
-    loose = correlate_pyramid(pair, grid,
+    loose = correlate_multichip(pair, grid,
                               params(; chip_size = 32, min_coarse_valid_fraction = 0.0))
     # A demanding threshold can reject a whole level; a permissive one cannot make the
     # answer worse where both measure.
@@ -202,7 +202,7 @@ end
     ref, sec = shifted_pair(256, (0, 0); T = Float32)
     pair = ImagePair(ref, sec)
     grid = gridpoints((256, 256), 32; chip_size = 32, search_radius = 20)
-    r = correlate_pyramid(pair, grid, params(; chip_size = 32))
+    r = correlate_multichip(pair, grid, params(; chip_size = 32))
     @test size(r) == size(grid)
     @test size(r.chip_size) == size(grid)
     @test eltype(r.chip_size) === UInt16

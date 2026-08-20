@@ -57,7 +57,7 @@ suite/points.jl       point-set construction and per-point geometry
 suite/correlate.jl    the correlation surface, peak location, subpixel refinement
 suite/window.jl       sliding-window reductions
 suite/preprocess.jl   pre-correlation filters, per Mpixel
-suite/pyramid.jl      one pyramid level, and per-step breakdown
+suite/multichip.jl    one chip-size level, and per-step breakdown
 suite/endtoend.jl     whole scenes at 256, 1024, 4096, plus cold start
 suite/throughput.jl   image pairs per second, intra-pair vs pair-level threading
 ```

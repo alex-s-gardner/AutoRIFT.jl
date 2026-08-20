@@ -158,7 +158,7 @@ end
 
 @testset "subpixel refinement" begin
     # A fractional shift is recovered to within the quantization step, and the integer-only
-    # path is what the pyramid's coarse pass uses.
+    # path is what the chip-size loop's coarse pass uses.
     ref, sec = shifted_pair(400, (4.5, -2.25); T = Float32)
     pair = ImagePair(ref, sec)
     pts = gridpoints((400, 400), 32; chip_size = 32, search_radius = 20)

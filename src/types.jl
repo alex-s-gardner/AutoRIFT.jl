@@ -138,9 +138,8 @@ abstract type SubpixelMethod end
 """
     NoRefine()
 
-Report the integer-pixel peak with no refinement. Used for the coarse pass of
-the pyramid, where only a rough displacement is needed to restrict the fine
-search.
+Report the integer-pixel peak with no refinement. Used for the coarse pass,
+where only a rough displacement is needed to restrict the fine search.
 """
 struct NoRefine <: SubpixelMethod end
 
@@ -346,6 +345,139 @@ inner loop.
 struct NoQuantize <: QuantizeMethod end
 
 # ---------------------------------------------------------------------------
+# Outlier rejection
+# ---------------------------------------------------------------------------
+
+"""
+    OutlierMethod
+
+Abstract supertype for how implausible displacements are identified and dropped.
+
+Correlation returns a displacement at every searched point, including points where the peak
+was noise. Those false matches are not small errors — they are arbitrary vectors, and one can
+dominate any downstream fit. What separates them from real motion is spatial coherence:
+neighbouring points on the same glacier move similarly, while a false match agrees with
+nothing around it. Every method here is some way of asking that question.
+
+Concrete subtypes: [`GardnerFilter`](@ref), [`NoOutlierFilter`](@ref).
+
+Selected with the `outliers` keyword, which accepts either the `Symbol` naming a method or an
+instance — the latter being the only way to override a method's own parameters.
+"""
+abstract type OutlierMethod end
+
+"""
+    GardnerFilter(; window = 5, iterations = 3, min_agree_fraction = 8/25,
+                    agree_tolerance = 0.2, mad_scale = 4.0)
+
+The two-stage filter of Gardner et al. (2018), as implemented in autoRIFT's `DISP_FILT`.
+
+Stage 1 keeps a point only if `min_agree_fraction` of its neighbourhood lies within
+`agree_tolerance` of it — cheap, and removes isolated wild vectors. Stage 2 keeps a point only
+if it lies within `mad_scale` median absolute deviations of its neighbourhood median, which
+catches the subtler case of a false match sitting near other false matches. Both run on
+displacements normalized by the local search radius, and both iterate: rejection is monotone,
+so removing one outlier can expose its neighbours.
+
+# Keywords
+- `window`: neighbourhood width in grid points. Must be odd and at least 3, so the
+  neighbourhood has a centre.
+- `iterations`: iterations of stage 1. Stage 2 runs one fewer, minimum one, per the reference.
+- `min_agree_fraction`: fraction of the *full* window area that must agree. The default `8/25`
+  is eight of a 5x5 window's twenty-five points.
+- `agree_tolerance`: how close counts as agreement, as a fraction of the local search radius.
+- `mad_scale`: how many median absolute deviations from the neighbourhood median a point may
+  lie before stage 2 rejects it.
+
+!!! note "Relation to the normalized median test"
+    This is *inspired by* the universal outlier detection of Westerweel & Scarano (2005) but is
+    not that test, and the differences change which points survive. The centre point is
+    included in both the median and the MAD, where Westerweel & Scarano exclude it — excluding
+    it is what makes their test ask whether a vector agrees with its neighbours rather than
+    with a set it partly defines. The normalization is by local search radius rather than by
+    `MAD + ε` with an absolute `ε`; the threshold is 4 rather than their universal 2; and the
+    agreement pre-pass has no counterpart there at all.
+
+    See [`AutoRIFT.reject_outliers`](@ref). Westerweel & Scarano's test proper is a candidate
+    for a future `OutlierMethod`.
+"""
+struct GardnerFilter <: OutlierMethod
+    window::Int
+    iterations::Int
+    min_agree_fraction::Float64
+    agree_tolerance::Float64
+    mad_scale::Float64
+
+    function GardnerFilter(; window::Integer = 5, iterations::Integer = 3,
+                           min_agree_fraction::Real = 8 / 25,
+                           agree_tolerance::Real = 0.2, mad_scale::Real = 4.0)
+        isodd(window) || throw(ArgumentError(
+            "outlier filter `window` must be odd so the neighbourhood has a centre, " *
+            "got $window"))
+        window >= 3 || throw(ArgumentError(
+            "outlier filter `window` must be >= 3, got $window"))
+        iterations >= 1 || throw(ArgumentError(
+            "outlier filter `iterations` must be >= 1, got $iterations"))
+        0 <= min_agree_fraction <= 1 || throw(ArgumentError(
+            "`min_agree_fraction` must be in [0, 1], got $min_agree_fraction"))
+        # A fraction of the local search radius, so a value above 1 would accept agreement
+        # looser than the entire search window — which is every point, making the stage a
+        # no-op rather than a filter.
+        0 < agree_tolerance <= 1 || throw(ArgumentError(
+            "`agree_tolerance` must be in [0, 1] and non-zero, got $agree_tolerance. It " *
+            "is a fraction of the local search radius, so 1 already accepts any " *
+            "displacement the search could have found."))
+        mad_scale > 0 || throw(ArgumentError(
+            "`mad_scale` must be positive, got $mad_scale"))
+        return new(Int(window), Int(iterations), Float64(min_agree_fraction),
+                   Float64(agree_tolerance), Float64(mad_scale))
+    end
+end
+
+"""
+    NoOutlierFilter()
+
+Keep every measured displacement.
+
+Not a sensible production choice — a single false match can dominate a downstream fit — but
+the right tool for deciding *which* stage dropped a point, since it separates the correlator's
+failures from the filter's rejections.
+"""
+struct NoOutlierFilter <: OutlierMethod end
+
+"""
+    AutoRIFT.window(method::OutlierMethod) -> Int
+
+Neighbourhood width the method needs, in grid points, or `0` if it needs none.
+
+Used to decide whether a decimated grid has enough points to judge consistency at all: a
+coarse grid narrower than the window cannot support the filter, and the caller skips it rather
+than filtering against a truncated neighbourhood.
+"""
+window(f::GardnerFilter) = f.window
+window(::NoOutlierFilter) = 0
+
+"""
+    AutoRIFT.relax(method::OutlierMethod) -> OutlierMethod
+
+A variant of `method` suited to a decimated grid.
+
+The coarse pass runs on a strided subset, so its neighbourhoods span several times more ground
+and a point's neighbours are genuinely further away and less like it. Holding them to the fine
+pass's standard would reject coherent motion. What "loosened" means is the method's own
+business, which is why this returns an instance rather than taking a scale factor — a method
+with a universal threshold may legitimately return itself.
+
+For [`GardnerFilter`](@ref) it drops one iteration; the reference derives the same effect from
+an overlap fraction.
+"""
+relax(f::GardnerFilter) = GardnerFilter(;
+    window = f.window, iterations = max(f.iterations - 1, 1),
+    min_agree_fraction = f.min_agree_fraction,
+    agree_tolerance = f.agree_tolerance, mad_scale = f.mad_scale)
+relax(m::NoOutlierFilter) = m
+
+# ---------------------------------------------------------------------------
 # Parameters
 # ---------------------------------------------------------------------------
 
@@ -360,14 +492,16 @@ nothing downstream ever re-checks or re-dispatches on a `Symbol`.
 The method choices are type parameters, not fields, so the correlation and
 filtering kernels specialize on them.
 """
-struct Params{S<:SimilarityMeasure,P<:PreprocessMethod,Q<:QuantizeMethod,R<:SubpixelMethod,T<:BoolAsType}
+struct Params{S<:SimilarityMeasure,P<:PreprocessMethod,Q<:QuantizeMethod,R<:SubpixelMethod,
+              O<:OutlierMethod,T<:BoolAsType}
     similarity::S
     preprocess::P
     quantize::Q
     subpixel::R
+    outliers::O
     threaded::T
 
-    # Chip geometry (pixels). `chip_size_base` is the finest pyramid level and
+    # Chip geometry (pixels). `chip_size_base` is the finest chip-size level and
     # the reference for grid spacing; levels are base * 2^k.
     chip_size_base::Int
     chip_size_min::Int
@@ -398,13 +532,6 @@ struct Params{S<:SimilarityMeasure,P<:PreprocessMethod,Q<:QuantizeMethod,R<:Subp
     dx_prior::Float64
     dy_prior::Float64
 
-    # Outlier rejection (the normalized median test).
-    outlier_window::Int
-    outlier_iterations::Int
-    min_agree_fraction::Float64
-    agree_tolerance::Float64
-    mad_scale::Float64
-
     # Hole filling.
     fill_window::Int
 
@@ -416,7 +543,7 @@ end
 """
     chip_sizes(p::Params) -> Vector{Int}
 
-The pyramid levels actually used, ascending. Levels are
+The chip-size levels actually used, ascending. Levels are
 `chip_size_base * 2^k` for `k = 0, 1, ...`, restricted to
 `[chip_size_min, chip_size_max]`.
 

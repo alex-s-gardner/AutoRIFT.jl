@@ -36,7 +36,7 @@ mutable struct Cache{P<:Params}
     # The pair the correlator sees: filtered and converted to the correlation element type.
     prepared::ImagePair
     grid::PointSet{2}
-    result::Union{Nothing,PyramidResult}
+    result::Union{Nothing,MultichipResult}
     # Set when the images change and cleared once a run has consumed them. `reinit!`
     # accumulates dirtiness rather than overwriting it, so two swaps before one run still
     # leave the cache correctly marked.
@@ -127,7 +127,7 @@ function reinit!(cache::Cache; reference = nothing, secondary = nothing,
 end
 
 """
-    autorift!(cache) -> PyramidResult
+    autorift!(cache) -> MultichipResult
 
 Correlate the cache's current image pair, reusing its buffers and plans.
 
@@ -157,20 +157,20 @@ than recomputing it.
 """
 function autorift!(cache::Cache)
     cache.isfresh || isnothing(cache.result) || return cache.result
-    cache.result = correlate_pyramid(cache.prepared, cache.grid, cache.params)
+    cache.result = correlate_multichip(cache.prepared, cache.grid, cache.params)
     cache.isfresh = false
     return cache.result
 end
 
 """
-    autorift(reference, secondary; kwargs...) -> PyramidResult
+    autorift(reference, secondary; kwargs...) -> MultichipResult
 
 Estimate the displacement of surface features between two images of the same scene, on a grid,
 to sub-pixel precision.
 
 Both images must be co-registered to a common grid and the same size. The result carries `dx`
 and `dy` in pixels, the peak `correlation`, the `chip_size` that produced each point, and an
-`interpolated` mask — see [`PyramidResult`](@ref). Points where no scale could produce a
+`interpolated` mask — see [`MultichipResult`](@ref). Points where no scale could produce a
 coherent estimate are `NaN`, which is deliberately distinct from a measured displacement of
 zero.
 
@@ -199,7 +199,7 @@ autorift(reference::AbstractMatrix, secondary::AbstractMatrix; kwargs...) =
     autorift!(init(reference, secondary; kwargs...))
 
 """
-    autorift(reference, secondary, grid::PointSet; kwargs...) -> PyramidResult
+    autorift(reference, secondary, grid::PointSet; kwargs...) -> MultichipResult
 
 Correlate at a caller-supplied set of search points rather than a grid synthesized from
 `grid_spacing`.
@@ -208,8 +208,8 @@ This is the production path: the eight per-pixel fields a grid generator produce
 a-priori displacement, per-point search radius and chip-size bounds — cannot be expressed as
 scalar keywords, and a [`PointSet`](@ref) is how they arrive.
 
-A gridded `PointSet{2}` runs the full multi-scale pyramid. A scattered `PointSet{1}` runs a
-single scale via [`track`](@ref), since the pyramid's coarse pass and merge are neighbourhood
+A gridded `PointSet{2}` runs the full multi-chip-size search. A scattered `PointSet{1}` runs a
+single scale via [`track`](@ref), since the chip-size loop's coarse pass and merge are neighbourhood
 operations that need a layout.
 """
 function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, grid::PointSet;
@@ -219,8 +219,8 @@ function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, grid::Po
     return _run(pair, grid, p)
 end
 
-# Dispatch on the point set's dimensionality: only a gridded one can go through the pyramid.
-_run(pair::ImagePair, grid::PointSet{2}, p::Params) = correlate_pyramid(pair, grid, p)
+# Dispatch on the point set's dimensionality: only a gridded one can run multiple chip sizes.
+_run(pair::ImagePair, grid::PointSet{2}, p::Params) = correlate_multichip(pair, grid, p)
 _run(pair::ImagePair, pts::PointSet{1}, p::Params) = track(pair, pts, p)
 
 # ---------------------------------------------------------------------------
@@ -275,7 +275,7 @@ function _build_grid(imagesize::Tuple{Int,Int}, p::Params)
                       dy_prior = p.dy_prior)
 end
 
-# Plan the transforms every pyramid level will need, on this task, before any correlation.
+# Plan the transforms every chip-size level will need, on this task, before any correlation.
 #
 # FFTW's planner is not thread-safe, so a threaded pass whose first points all miss the cache
 # would have every task contend on the planner lock — turning the most parallel part of a run

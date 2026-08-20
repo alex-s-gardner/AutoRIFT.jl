@@ -1,7 +1,7 @@
 # FFT plan cache.
 #
 # Plans are expensive to create and cheap to reuse, and the set of sizes a run
-# needs is tiny: chip size is constant within a pyramid pass and the search radius
+# needs is tiny: chip size is constant within a chip-size pass and the search radius
 # takes only a few distinct values, so a whole scene needs on the order of ten
 # plans. Caching them is the difference between planning once and planning per grid
 # point.

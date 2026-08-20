@@ -1,4 +1,4 @@
-using AutoRIFT: autorift, autorift!, reinit!, init, Cache, PyramidResult, nmeasured,
+using AutoRIFT: autorift, autorift!, reinit!, init, Cache, MultichipResult, nmeasured,
                 pointset, gridpoints, params
 
 med(v) = (s = sort(collect(v)); isempty(s) ? NaN : s[(length(s) + 1) ÷ 2])
@@ -9,7 +9,7 @@ motion(r) = (med(filter(!isnan, -r.dx)), med(filter(!isnan, -r.dy)))
     ref, sec = shifted_pair(512, (6, -4); T = Float32)
     r = autorift(ref, sec; chip_size = 32, search_radius = 25)
 
-    @test r isa PyramidResult
+    @test r isa MultichipResult
     @test nmeasured(r) == length(r)
     mx, my = motion(r)
     @test mx ≈ 6 atol = 0.05
@@ -33,7 +33,7 @@ end
     @test all(v -> isnan(v) || v == round(v), r.dx)
 
     # A bad keyword is rejected at the boundary, naming what was wrong, rather than failing
-    # somewhere inside a pyramid level.
+    # somewhere inside a chip-size level.
     @test_throws "not recognised" autorift(ref, sec; preprocess = :sharpen)
     @test_throws "multiple of 4" autorift(ref, sec; chip_size = 30)
 end
@@ -159,10 +159,10 @@ end
     # Gridded goes through the pyramid, so it carries chip sizes.
     grid = gridpoints((512, 512), 32; chip_size = 32, search_radius = 25)
     r = autorift(ref, sec, grid; chip_size = 32)
-    @test r isa PyramidResult
+    @test r isa MultichipResult
     @test med(filter(!isnan, -r.dx)) ≈ 6 atol = 0.05
 
-    # Scattered runs a single scale, since the pyramid's coarse pass and merge need a layout.
+    # Scattered runs a single scale, since the chip-size loop's coarse pass and merge need a layout.
     pts = pointset([100.0, 200.5, 300.0], [150.0, 250.0, 350.75];
                    chip_size = 32, search_radius = 25)
     d = autorift(ref, sec, pts; chip_size = 32)

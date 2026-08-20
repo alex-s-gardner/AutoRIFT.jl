@@ -1,6 +1,6 @@
 # Sliding-window reductions over a NaN-dense field.
 #
-# Eight call sites in the multi-scale pyramid, each sweeping the whole grid, with
+# Eight call sites in the multi-chip-size search, each sweeping the whole grid, with
 # windows from 3 up to 48 across. The inputs are displacement fields where NaN means
 # "no measurement", and NaN is not rare — the coarse pass deliberately invalidates
 # most of the grid — so every reduction has to ignore NaN rather than propagate it.
@@ -32,7 +32,7 @@
 #   * `LocalFilters.localmap` has exactly the right boundary and NaN semantics (it
 #     collects only in-bounds neighbours into a reusable buffer) and is competitive
 #     at width 3 — 2.9 ms against scipy's 3.8 ms on 512². But it is O(w²) per pixel:
-#     50 ms at width 12 and 665 ms at width 48, against scipy's 4.3 ms. The pyramid
+#     50 ms at width 12 and 665 ms at width 48, against scipy's 4.3 ms. The search
 #     dilates masks with windows up to 48 wide, so that is not a corner case. Routing
 #     a median through it is slower still (119 ms at width 5, against 3.6 ms for the
 #     same traversal with a trivial reducer).
@@ -62,7 +62,7 @@ Maximum over a `w`-wide sliding window, ignoring `NaN` and out-of-bounds neighbo
 
 O(1) per pixel in the window width, via the monotone-deque decomposition: separable
 into a pass along each axis, and each pass amortises to a constant number of
-comparisons per element however wide the window. This matters because the pyramid
+comparisons per element however wide the window. This matters because the search
 dilates masks with windows up to 48 across, where an O(w²) implementation is two
 orders of magnitude slower.
 """
@@ -84,7 +84,7 @@ windowmin!(out, A, w) = _window_extremum!(out, A, w, <)
 
 Maximum minus minimum over a `w`-wide sliding window, ignoring `NaN`.
 
-The morphological gradient. Used by the pyramid to measure the spread of a-priori
+The morphological gradient. Used to measure the spread of a-priori
 displacements inside a coarse cell, which determines how far the coarse search must
 reach.
 """
@@ -152,7 +152,7 @@ end
     # `left = w ÷ 2`. That is what `scipy.ndimage.generic_filter` does at its default
     # origin, so it is what the reference's filter does, and it is also what
     # `LocalFilters.localmap` does -- so the whole file agrees on one convention.
-    # Getting this backwards shifts even-window results by one pixel, and the pyramid
+    # Getting this backwards shifts even-window results by one pixel, and the search
     # uses even windows at every level above the base.
     left = w ÷ 2
     right = w - 1 - left
@@ -373,7 +373,7 @@ end
 
 Median over a `w`-wide sliding window, ignoring `NaN` and out-of-bounds neighbours.
 
-O(w² log w) per pixel, which is acceptable here and only here: the pyramid's median
+O(w² log w) per pixel, which is acceptable here and only here: the chip-size loop's median
 windows are always 3 or 5 across. A running-median structure would win asymptotically
 but lose badly at 9 or 25 elements.
 
@@ -540,7 +540,7 @@ end
 
 Normalise a window specification to `(width, height)`, clamped to the array.
 
-Clamping matches the reference, and it matters for the coarse pyramid levels: a
+Clamping matches the reference, and it matters for the coarse chip-size levels: a
 48-wide dilation applied to a grid only 20 across would otherwise index out of
 bounds.
 """

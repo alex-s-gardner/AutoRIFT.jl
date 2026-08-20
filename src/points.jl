@@ -14,7 +14,7 @@
 #   PointSet{2}  centers laid out on a grid
 #
 # Both are consumed by the same correlation kernel, which iterates `eachindex`
-# and never asks about shape. Only the multi-scale pyramid needs `N == 2`, since
+# and never asks about shape. Only the multi-chip-size search needs `N == 2`, since
 # its filtering and resampling steps are neighbourhood operations that require a
 # spatial layout; those methods dispatch on `PointSet{2}` and are unavailable for
 # scattered points, which is the correct constraint rather than a limitation.
@@ -30,7 +30,7 @@ matching shape, one entry per search center.
 
 `PointSet{1}` holds scattered centers at arbitrary coordinates; `PointSet{2}`
 holds centers on a grid. Correlation treats the two identically — each center is
-independent — while the multi-scale pyramid requires `PointSet{2}` because its
+independent — while the multi-chip-size search requires `PointSet{2}` because its
 filtering steps are neighbourhood operations.
 
 # Fields
@@ -94,7 +94,7 @@ Base.isempty(pts::PointSet) = isempty(pts.x)
 Number of points that will actually be correlated, i.e. those with a non-zero
 search radius in both axes.
 
-Typically far smaller than [`npoints`](@ref): the pyramid's coarse pass zeroes
+Typically far smaller than [`npoints`](@ref): the chip-size loop's coarse pass zeroes
 the radius wherever it found no coherent motion, and a skipped point costs
 almost nothing while a searched one costs microseconds. This ratio is what makes
 dynamic work-scheduling worthwhile.
@@ -213,7 +213,7 @@ _exactly(::Type{T}, v::Real) where {T<:AbstractFloat} = T(v)
     gridpoints(xs, ys; kwargs...) -> PointSet{2}
 
 Build a gridded [`PointSet`](@ref): centers on a regular lattice, laid out in 2-D
-so that the multi-scale pyramid can apply its neighbourhood filters.
+so that the multi-chip-size search can apply its neighbourhood filters.
 
 The first form places centers every `spacing` pixels across an image of size
 `imagesize = (nrows, ncols)`, inset far enough from the edges that a chip and its
@@ -285,7 +285,7 @@ scatter(pts::PointSet) = rebuild(pts;
 
 Decimate or crop a gridded point set, copying every field.
 
-The coarse pass of the pyramid needs a strided subset of its grid, and doing that by indexing
+The coarse pass needs a strided subset of its grid, and doing that by indexing
 eight fields at the call site both repeats the shape and makes it easy to miss one when a
 field is added. A copy rather than a view because the caller then modifies the result — the
 coarse pass overwrites the radii and the chip sizes.

@@ -168,7 +168,7 @@ end
 
 @testset "window size clamping" begin
     # A window wider than the array is clamped to its size, matching the reference.
-    # Not hypothetical: the pyramid's coarse levels apply 48-wide dilations to grids
+    # Not hypothetical: the chip-size loop's coarse levels apply 48-wide dilations to grids
     # that may be only tens of points across.
     #
     # Clamping to `n` does *not* make every output the global reduction, because the
@@ -192,7 +192,7 @@ end
 
 @testset "cost is flat in window width" begin
     # The point of the monotone deque: the extrema must not get dramatically more
-    # expensive as the window grows, because the pyramid's dilations reach width 48.
+    # expensive as the window grows, because the chip-size loop's dilations reach width 48.
     # An O(w^2) implementation would be ~250x slower at 48 than at 3; this asserts a
     # generous bound that only a genuine complexity regression would breach.
     a = rand(Float32, 256, 256)

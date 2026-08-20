@@ -8,11 +8,10 @@
 #
 # Note on naming: these levels differ in *chip size*, not in image resolution. The imagery is
 # never downsampled — the reference's `cv2.resize` calls act on the grid arrays, not on `I1`
-# and `I2` — so this is a nested multi-chip-size grid rather than an image pyramid. The
-# `pyramid` group name is retained here only until the rename lands; the Laplace subpixel
-# solver in `correlate/subpixel` is the one genuine pyramid in the algorithm.
+# and `I2` — so this is a nested multi-chip-size grid rather than an image pyramid. The Laplace
+# subpixel solver in `correlate/subpixel` is the one genuine pyramid in the algorithm.
 
-let g = addgroup!(SUITE, "pyramid")
+let g = addgroup!(SUITE, "multichip")
 
     for n in (512, 1024)
         ref = bench_texture((n, n); seed = 1)
@@ -27,13 +26,13 @@ let g = addgroup!(SUITE, "pyramid")
 
         # The whole orchestration, on already-prepared imagery — so this isolates the levels
         # from the filtering that `endtoend` includes.
-        g["correlate_pyramid c32 $(n)x$(n)"] = @benchmarkable AutoRIFT.correlate_pyramid(
+        g["correlate_multichip c32 $(n)x$(n)"] = @benchmarkable AutoRIFT.correlate_multichip(
             $prepared, $grid, $p)
 
         # One level, which is what the loop repeats. `wanted` all true asks it to attempt every
         # point, the state the first (finest) level is in.
         wanted = trues(size(grid))
-        g["level c32 $(n)x$(n)"] = @benchmarkable AutoRIFT.pyramid_level(
+        g["level c32 $(n)x$(n)"] = @benchmarkable AutoRIFT.chipsize_level(
             $prepared, $grid, $p, 32, $wanted)
 
         # The coarse pass alone: a strided subset correlated to decide where the fine pass is

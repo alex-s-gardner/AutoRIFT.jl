@@ -1,12 +1,12 @@
 # Sliding-window reductions. Populated at M3.
 #
-# Eight call sites in the pyramid, each sweeping the whole grid, so these are a
+# Eight call sites in the multi-chip-size search, each sweeping the whole grid, so these are a
 # meaningful fraction of per-level cost. The Python reference materializes a
 # (window^2 x npoints) matrix and grows its output with repeated concatenation,
 # which is quadratic; a 10-50x improvement is expected from doing neither.
 #
 # Measured per reduction (max, min, mean, median, range, MAD, agreement count)
-# and per window width. Width matters more than it looks: the pyramid dilates
+# and per window width. Width matters more than it looks: the search dilates
 # masks with windows up to 48 wide, where an O(window^2) implementation is
 # hopeless and the O(1)-per-pixel decompositions in ImageMorphology earn their
 # dependency.
@@ -18,7 +18,7 @@ let g = addgroup!(SUITE, "window")
         rng = Random.MersenneTwister(6)
         a[rand(rng, n * n) .< 0.2] .= NaN32
 
-        # Extrema at every width the pyramid uses. The point of the monotone deque is
+        # Extrema at every width the search uses. The point of the monotone deque is
         # that these stay flat as the width grows -- an O(w^2) implementation is ~150x
         # slower at width 48, which is where the mask dilations live.
         for w in (3, 5, 12, 48)
@@ -38,7 +38,7 @@ let g = addgroup!(SUITE, "window")
     end
 
     # The outlier filter, which is what the reductions exist to serve: two stages over
-    # the whole grid, iterated. Sized like a real pyramid level rather than an image.
+    # the whole grid, iterated. Sized like a real chip-size level rather than an image.
     for n in (256, 512)
         dx = bench_texture((n, n); seed = 7) .* 4.0f0
         dy = bench_texture((n, n); seed = 8) .* 4.0f0

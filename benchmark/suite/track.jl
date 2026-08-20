@@ -4,7 +4,7 @@
 # out to a scene time. Reported for the serial and threaded paths separately: the two must
 # agree bitwise (asserted in the tests), so any difference is purely scheduling.
 #
-# Also covers the sparse case, which is what the pyramid actually produces. Its coarse pass
+# Also covers the sparse case, which is what the multi-chip-size search actually produces. Its coarse pass
 # zeroes the search radius over most of the grid, and a skipped point costs a comparison
 # where a searched one costs microseconds — so throughput on a sparse grid is a different
 # measurement from throughput on a dense one, not a scaled version of it.
@@ -21,7 +21,7 @@ let g = addgroup!(SUITE, "track")
             npts = AutoRIFT.npoints(pts)
             out = AutoRIFT.displacement_field(pts)
 
-            # Integer-only, which is what the pyramid's coarse pass uses.
+            # Integer-only, which is what the chip-size loop's coarse pass uses.
             g["coarse c$cs r$r $(n)x$(n) [$npts pts]"] = @benchmarkable AutoRIFT.track!(
                 $out, $pair, $pts, $(AutoRIFT.params(; subpixel = :none)))
 
@@ -40,7 +40,7 @@ let g = addgroup!(SUITE, "track")
         end
     end
 
-    # Sparse: 20% of points searchable, as the pyramid leaves it. The cost should fall
+    # Sparse: 20% of points searchable, as the coarse pass leaves it. The cost should fall
     # roughly in proportion, and a regression here would mean skipped points are no longer
     # cheap.
     let n = 1024

@@ -243,6 +243,78 @@
       "min_ns": 304791,
       "samples": 1438
     },
+    "multichip/resample area 0.5x 1024": {
+      "allocs": 0,
+      "max_ns": 59166,
+      "mean_ns": 59166,
+      "median_ns": 59166,
+      "memory_bytes": 0,
+      "min_ns": 59166,
+      "samples": 7433
+    },
+    "multichip/resample area 2.0x 1024": {
+      "allocs": 0,
+      "max_ns": 1323042,
+      "mean_ns": 1323042,
+      "median_ns": 1323042,
+      "memory_bytes": 0,
+      "min_ns": 1323042,
+      "samples": 361
+    },
+    "multichip/resample bilinear 0.5x 1024": {
+      "allocs": 0,
+      "max_ns": 59125,
+      "mean_ns": 59125,
+      "median_ns": 59125,
+      "memory_bytes": 0,
+      "min_ns": 59125,
+      "samples": 7539
+    },
+    "multichip/resample bilinear 2.0x 1024": {
+      "allocs": 0,
+      "max_ns": 1321208,
+      "mean_ns": 1321208,
+      "median_ns": 1321208,
+      "memory_bytes": 0,
+      "min_ns": 1321208,
+      "samples": 338
+    },
+    "multichip/resample cubic 0.5x 1024": {
+      "allocs": 0,
+      "max_ns": 459000,
+      "mean_ns": 459000,
+      "median_ns": 459000,
+      "memory_bytes": 0,
+      "min_ns": 459000,
+      "samples": 951
+    },
+    "multichip/resample cubic 2.0x 1024": {
+      "allocs": 0,
+      "max_ns": 2623167,
+      "mean_ns": 2623167,
+      "median_ns": 2623167,
+      "memory_bytes": 0,
+      "min_ns": 2623167,
+      "samples": 178
+    },
+    "multichip/resample nearest 0.5x 1024": {
+      "allocs": 0,
+      "max_ns": 89833,
+      "mean_ns": 89833,
+      "median_ns": 89833,
+      "memory_bytes": 0,
+      "min_ns": 89833,
+      "samples": 5398
+    },
+    "multichip/resample nearest 2.0x 1024": {
+      "allocs": 0,
+      "max_ns": 1242042,
+      "mean_ns": 1242042,
+      "median_ns": 1242042,
+      "memory_bytes": 0,
+      "min_ns": 1242042,
+      "samples": 373
+    },
     "preprocess/highpass w21 1024x1024": {
       "allocs": 0,
       "max_ns": 13264917,
@@ -323,78 +395,6 @@
       "memory_bytes": 0,
       "min_ns": 52097458,
       "samples": 10
-    },
-    "pyramid/resample area 0.5x 1024": {
-      "allocs": 0,
-      "max_ns": 59166,
-      "mean_ns": 59166,
-      "median_ns": 59166,
-      "memory_bytes": 0,
-      "min_ns": 59166,
-      "samples": 7433
-    },
-    "pyramid/resample area 2.0x 1024": {
-      "allocs": 0,
-      "max_ns": 1323042,
-      "mean_ns": 1323042,
-      "median_ns": 1323042,
-      "memory_bytes": 0,
-      "min_ns": 1323042,
-      "samples": 361
-    },
-    "pyramid/resample bilinear 0.5x 1024": {
-      "allocs": 0,
-      "max_ns": 59125,
-      "mean_ns": 59125,
-      "median_ns": 59125,
-      "memory_bytes": 0,
-      "min_ns": 59125,
-      "samples": 7539
-    },
-    "pyramid/resample bilinear 2.0x 1024": {
-      "allocs": 0,
-      "max_ns": 1321208,
-      "mean_ns": 1321208,
-      "median_ns": 1321208,
-      "memory_bytes": 0,
-      "min_ns": 1321208,
-      "samples": 338
-    },
-    "pyramid/resample cubic 0.5x 1024": {
-      "allocs": 0,
-      "max_ns": 459000,
-      "mean_ns": 459000,
-      "median_ns": 459000,
-      "memory_bytes": 0,
-      "min_ns": 459000,
-      "samples": 951
-    },
-    "pyramid/resample cubic 2.0x 1024": {
-      "allocs": 0,
-      "max_ns": 2623167,
-      "mean_ns": 2623167,
-      "median_ns": 2623167,
-      "memory_bytes": 0,
-      "min_ns": 2623167,
-      "samples": 178
-    },
-    "pyramid/resample nearest 0.5x 1024": {
-      "allocs": 0,
-      "max_ns": 89833,
-      "mean_ns": 89833,
-      "median_ns": 89833,
-      "memory_bytes": 0,
-      "min_ns": 89833,
-      "samples": 5398
-    },
-    "pyramid/resample nearest 2.0x 1024": {
-      "allocs": 0,
-      "max_ns": 1242042,
-      "mean_ns": 1242042,
-      "median_ns": 1242042,
-      "memory_bytes": 0,
-      "min_ns": 1242042,
-      "samples": 373
     },
     "window/disttransform 2048x2048": {
       "allocs": 0,
