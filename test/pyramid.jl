@@ -146,17 +146,24 @@ end
     grid = gridpoints((512, 512), 32; chip_size = 32, search_radius = 25)
     p = params(; chip_size = 32)
 
-    d = pyramid_level(pair, grid, p, 32, trues(size(grid)))
-    @test !isnothing(d)
-    @test med(filter(!isnan, -d.dx)) ≈ 5 atol = 0.05
+    lvl = pyramid_level(pair, grid, p, 32, trues(size(grid)))
+    @test !isnothing(lvl)
+    @test med(filter(!isnan, -lvl.field.dx)) ≈ 5 atol = 0.05
+    # `filled` records what the hole fill recovered. Even on a fully-textured scene this is
+    # not always empty: the outlier filter rejects the occasional point, and the fill then
+    # recovers it from its neighbours. Every filled index must be a real point of the grid.
+    @test all(i -> 1 <= i <= length(grid), lvl.filled)
+    # A filled point has a displacement but no correlation of its own, since nothing was
+    # measured there.
+    @test all(i -> !isnan(lvl.field.dx[i]), lvl.filled)
 
     # `wanted` restricts which points are attempted, which is how the pyramid stops a level
     # from redoing work a finer one already did.
     w = falses(size(grid))
     w[1:3, 1:3] .= true
-    d = pyramid_level(pair, grid, p, 32, w)
-    @test !isnothing(d)
-    @test count(!isnan, d.dx) <= 9
+    lvl = pyramid_level(pair, grid, p, 32, w)
+    @test !isnothing(lvl)
+    @test count(!isnan, lvl.field.dx) <= 9
     # Nothing wanted at all is not an error, just no work.
     @test isnothing(pyramid_level(pair, grid, p, 32, falses(size(grid))))
 end

@@ -105,16 +105,20 @@ function correlate_pyramid(pair::ImagePair, grid::PointSet{2}, p::Params)
         any(wanted) || break                     # every point resolved
         level = pyramid_level(pair, grid, p, cs, wanted)
         isnothing(level) && continue              # level found nothing coherent
-        _merge_level!(result, level, cs)
+        _merge_level!(result, level.field, level.filled, cs)
     end
     return result
 end
 
 """
-    pyramid_level(pair, grid, p, chip_size, wanted) -> Union{Nothing,DisplacementField}
+    pyramid_level(pair, grid, p, chip_size, wanted) -> Union{Nothing,NamedTuple}
 
 One pyramid level: a coarse pass to find where motion is coherent, then a fine pass
 restricted to that neighbourhood, then hole filling.
+
+Returns `(; field, filled)` — the displacement field, and the linear indices that were filled
+from neighbours rather than measured — or `nothing` if the level found nothing worth
+continuing.
 
 `wanted` marks the points this level should attempt — in the pyramid, those no finer level
 resolved. Returns `nothing` if the coarse pass found too little to be worth continuing,
@@ -145,8 +149,8 @@ function pyramid_level(pair::ImagePair, grid::PointSet{2}, p::Params,
     nsearchable(pts) == 0 && return nothing
 
     fine = track(pair, pts, p)
-    _reject_and_fill!(fine, pts, p)
-    return fine
+    filled = _reject_and_fill!(fine, pts, p)
+    return (; field = fine, filled)
 end
 
 # Points for one level: the caller's grid with this level's chip size, and the radius zeroed
@@ -169,9 +173,10 @@ function _level_points(grid::PointSet{2}, p::Params, csx::Int, csy::Int,
             ry[i] = 0
         end
     end
-    pts = PointSet(copy(grid.x), copy(grid.y), rx, ry,
-                   copy(grid.dx_prior), copy(grid.dy_prior),
-                   fill(csx, n), fill(csy, n))
+    # Coordinates and priors are shared rather than copied: nothing below writes them, and
+    # only the radii (here and by the coarse mask) and the chip sizes are level-specific.
+    pts = rebuild(grid; radius_x = rx, radius_y = ry,
+                  chip_size_x = fill(csx, n), chip_size_y = fill(csy, n))
     sanitize!(pts, p.min_search_radius)
     return pts
 end
@@ -196,34 +201,41 @@ function _coarse_pass(pair::ImagePair, pts::PointSet{2}, p::Params, csx::Int, cs
 
     # The coarse point's radius must cover its whole cell, since it stands in for every fine
     # point inside it — hence the max over the cell rather than a sample of one point.
-    crx = windowmax(Float32.(pts.radius_x), stride)[rows, cols]
-    cry = windowmax(Float32.(pts.radius_y), stride)[rows, cols]
-    coarse = PointSet(pts.x[rows, cols], pts.y[rows, cols],
-                      round.(Int, crx), round.(Int, cry),
-                      pts.dx_prior[rows, cols], pts.dy_prior[rows, cols],
-                      fill(csx, length(rows), length(cols)),
-                      fill(csy, length(rows), length(cols)))
+    #
+    # Computed per coarse cell rather than by a full-grid sliding max that is then decimated:
+    # the latter discards fifteen sixteenths of its work at stride 4, and measured 113 us and
+    # 405 KB per level against 7.9 us here. It also stays in `Int` throughout, where the
+    # sliding form needed a Float32 round trip in each direction.
+    coarse = pts[rows, cols]
+    _cell_max_radius!(coarse.radius_x, pts.radius_x, rows, cols, stride)
+    _cell_max_radius!(coarse.radius_y, pts.radius_y, rows, cols, stride)
+    fill!(coarse.chip_size_x, csx)
+    fill!(coarse.chip_size_y, csy)
     nsearchable(coarse) == 0 && return nothing
 
     # Integer peaks only: the coarse pass decides *where* to look, and sub-pixel precision
     # would not change that answer while costing most of the pass.
     cd = track(pair, coarse, p; subpixel = NoRefine())
-    measured = .!isnan.(cd.dx)
+    measured = map(!isnan, cd.dx)
     any(measured) || return nothing
 
     keep = reject_outliers(cd.dx, cd.dy, coarse.radius_x, coarse.radius_y,
-                           Matrix{Bool}(measured), upsampling(p.subpixel),
-                           _coarse_filter(p))
+                           measured, upsampling(p.subpixel), _coarse_filter(p))
     @inbounds for i in eachindex(keep)
         measured[i] || (keep[i] = false)
     end
 
     # Was enough of the coarse grid coherent? Judged only over points that were searchable at
     # all, so a level is not penalised for the points a previous level already resolved.
-    searchable = coarse.radius_x .> 0
-    denom = count(i -> searchable[i] && measured[i], eachindex(keep))
+    denom = 0
+    numer = 0
+    @inbounds for i in eachindex(keep)
+        coarse.radius_x[i] > 0 || continue
+        measured[i] || continue
+        denom += 1
+        keep[i] && (numer += 1)
+    end
     denom == 0 && return nothing
-    numer = count(i -> searchable[i] && keep[i], eachindex(keep))
     (numer / denom) < p.min_coarse_valid_fraction && return nothing
 
     # A coherent coarse estimate is evidence about its neighbourhood, not just its own point,
@@ -234,32 +246,44 @@ function _coarse_pass(pair::ImagePair, pts::PointSet{2}, p::Params, csx::Int, cs
     return resample(grown, (nr, nc), Nearest()) .> 0.5f0
 end
 
+# Maximum radius over each coarse cell, matching the left-biased window convention the sliding
+# reductions use so the two agree at the boundaries.
+function _cell_max_radius!(out, radius, rows, cols, stride::Int)
+    nr, nc = size(radius)
+    lo = stride ÷ 2
+    hi = stride - 1 - lo
+    @inbounds for (jo, j) in enumerate(cols), (io, i) in enumerate(rows)
+        m = 0
+        for jj in max(j - lo, 1):min(j + hi, nc)
+            for ii in max(i - lo, 1):min(i + hi, nr)
+                m = max(m, radius[ii, jj])
+            end
+        end
+        out[io, jo] = m
+    end
+    return out
+end
+
 # The coarse grid is decimated, so its neighbourhoods span `stride` times more ground and its
 # agreement threshold has to be looser — a coarse point's neighbours are genuinely further
 # away and less like it. The reference derives this from an overlap fraction; the effect is
 # the same and this states it directly.
-function _coarse_filter(p::Params)
-    return outlier_filter(; window = p.outlier_window,
-                          iterations = max(p.outlier_iterations - 1, 1),
-                          min_agree_fraction = p.min_agree_fraction,
-                          agree_tolerance = p.agree_tolerance,
-                          mad_scale = p.mad_scale)
-end
+_coarse_filter(p::Params) = _pyramid_filter(p, max(p.outlier_iterations - 1, 1))
 
 # ---------------------------------------------------------------------------
 # Fine pass cleanup
 # ---------------------------------------------------------------------------
 
-# Reject inconsistent estimates, then fill small holes from their neighbours.
+# Reject inconsistent estimates, then fill small holes from their neighbours. Returns the
+# indices that were filled.
 #
 # Filling is worth doing at this stage rather than at the end: a hole filled here can be
 # resampled coherently into the next level's prior, whereas a hole left open forces that
 # level to search blind.
 function _reject_and_fill!(d::DisplacementField, pts::PointSet, p::Params)
-    measured = .!isnan.(d.dx)
+    measured = map(!isnan, d.dx)
     keep = reject_outliers(d.dx, d.dy, pts.radius_x, pts.radius_y,
-                           Matrix{Bool}(measured), upsampling(p.subpixel),
-                           _fine_filter(p))
+                           measured, upsampling(p.subpixel), _fine_filter(p))
     @inbounds for i in eachindex(keep)
         if !keep[i]
             d.dx[i] = NaN32
@@ -267,12 +291,15 @@ function _reject_and_fill!(d::DisplacementField, pts::PointSet, p::Params)
             d.correlation[i] = NaN32
         end
     end
-    _fill_holes!(d, p)
-    return d
+    return _fill_holes!(d, p)
 end
 
-_fine_filter(p::Params) =
-    outlier_filter(; window = p.outlier_window, iterations = p.outlier_iterations,
+_fine_filter(p::Params) = _pyramid_filter(p, p.outlier_iterations)
+
+# Everything but the iteration count is shared between the two, so only that differs at the
+# call sites above.
+_pyramid_filter(p::Params, iterations::Int) =
+    outlier_filter(; window = p.outlier_window, iterations,
                    min_agree_fraction = p.min_agree_fraction,
                    agree_tolerance = p.agree_tolerance, mad_scale = p.mad_scale)
 
@@ -282,33 +309,58 @@ _fine_filter(p::Params) =
 # ring makes the next ring well surrounded in turn, so a small hole closes from its edge
 # inward while a large one is left alone. A single pass with a looser threshold would instead
 # invent values in the middle of genuinely empty regions.
+#
+# Visits the holes rather than the grid. Sweeping the whole grid with `windowmedian` cost
+# 0.76 ms per pass on a 118x118 level with 9% holes — and on that level the first pass fills
+# nothing, so the entire cost was discarded. Gathering per hole is ~20x faster there and ~90x
+# where fills do happen, because the cost scales with the number of holes rather than with the
+# grid.
+#
+# Returns the indices it filled, so the caller can record which points are interpolated
+# rather than deducing it later from a missing correlation.
 function _fill_holes!(d::DisplacementField, p::Params)
     w = p.fill_window
+    lo = w ÷ 2
+    hi = w - 1 - lo
     # Two thirds of a full window: enough neighbours that the median means something, and
     # strict enough that an isolated point does not seed a fill.
     needed = 2 * w^2 ÷ 3
+    nr, nc = size(d.dx)
+    bufx = Vector{Float32}(undef, w * w)
+    bufy = Vector{Float32}(undef, w * w)
+    filled = Int[]
+
     for _ in 1:3
-        medx = windowmedian(d.dx, w)
-        medy = windowmedian(d.dy, w)
-        # Count measured neighbours by taking the mean of an indicator, which reuses the
-        # NaN-aware box mean rather than adding another sliding count.
-        ind = Matrix{Float32}(undef, size(d.dx))
-        @inbounds for i in eachindex(ind)
-            ind[i] = isnan(d.dx[i]) ? 0.0f0 : 1.0f0
+        # Two-phase: collect this pass's fills before applying any, so every point in a pass
+        # sees the same field. Filling in place would let one fill seed the next within a
+        # single pass, which is what the three-pass structure exists to control.
+        pending = Tuple{Int,Float32,Float32}[]
+        @inbounds for j in 1:nc, i in 1:nr
+            isnan(d.dx[i, j]) || continue
+            n = 0
+            for jj in max(j - lo, 1):min(j + hi, nc)
+                for ii in max(i - lo, 1):min(i + hi, nr)
+                    v = d.dx[ii, jj]
+                    isnan(v) && continue
+                    n += 1
+                    bufx[n] = v
+                    bufy[n] = d.dy[ii, jj]
+                end
+            end
+            n >= needed || continue
+            _insertion_sort!(bufx, n)
+            _insertion_sort!(bufy, n)
+            push!(pending, (LinearIndices(d.dx)[i, j],
+                            _sorted_median(bufx, n), _sorted_median(bufy, n)))
         end
-        frac = windowmean(ind, w; hasnan = false)
-        filled = false
-        @inbounds for i in eachindex(d.dx)
-            isnan(d.dx[i]) || continue
-            isnan(medx[i]) && continue
-            frac[i] * w^2 >= needed || continue
-            d.dx[i] = medx[i]
-            d.dy[i] = medy[i]
-            filled = true
+        isempty(pending) && break        # nothing left that qualifies
+        @inbounds for (idx, mx, my) in pending
+            d.dx[idx] = mx
+            d.dy[idx] = my
+            push!(filled, idx)
         end
-        filled || break          # nothing left that qualifies
     end
-    return d
+    return filled
 end
 
 # ---------------------------------------------------------------------------
@@ -320,8 +372,17 @@ end
 # The gate is what makes the pyramid work: every level sees the same grid, and the first to
 # succeed at a point owns it. Since levels run finest first, that is the smallest chip that
 # could resolve the point.
-function _merge_level!(result::PyramidResult, level::DisplacementField, chip_size::Integer)
+function _merge_level!(result::PyramidResult, level::DisplacementField,
+                      filled::Vector{Int}, chip_size::Integer)
     cs = UInt16(chip_size)
+    # `filled` comes from the fill step itself rather than being inferred from a missing
+    # correlation. The inference would work today, but only because of an invariant spanning
+    # three files that nothing asserts — that a measured point always has all three of dx, dy
+    # and correlation. Recording the fact where it is known is cheaper than maintaining that.
+    wasfilled = falses(size(result.dx))
+    @inbounds for idx in filled
+        wasfilled[idx] = true
+    end
     @inbounds for i in eachindex(result.dx)
         result.chip_size[i] == 0 || continue      # a finer level already owns this point
         isnan(level.dx[i]) && continue
@@ -329,9 +390,7 @@ function _merge_level!(result::PyramidResult, level::DisplacementField, chip_siz
         result.dy[i] = level.dy[i]
         result.correlation[i] = level.correlation[i]
         result.chip_size[i] = cs
-        # A filled point has no correlation of its own, which is how `interpolated` is
-        # distinguished from measured without carrying a second mask through the level.
-        result.interpolated[i] = isnan(level.correlation[i])
+        result.interpolated[i] = wasfilled[i]
     end
     return result
 end

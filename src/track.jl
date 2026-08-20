@@ -194,9 +194,7 @@ end
 # plus one.
 function _shift_points(pts::PointSet, pad::Tuple{Int,Int})
     px, py = pad
-    return PointSet(pts.x .+ (px + 0.5), pts.y .+ (py + 0.5),
-                    pts.radius_x, pts.radius_y, pts.dx_prior, pts.dy_prior,
-                    pts.chip_size_x, pts.chip_size_y)
+    return rebuild(pts; x = pts.x .+ (px + 0.5), y = pts.y .+ (py + 0.5))
 end
 
 function _zeropad(A::AbstractMatrix{T}, pad::Tuple{Int,Int}) where {T}

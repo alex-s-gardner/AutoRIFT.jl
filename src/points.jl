@@ -274,9 +274,43 @@ either view is visible in the other. Used to hand a gridded point set to the
 correlator, which has no use for the layout.
 """
 scatter(pts::PointSet{1}) = pts
-scatter(pts::PointSet) = PointSet(
-    vec(pts.x), vec(pts.y), vec(pts.radius_x), vec(pts.radius_y),
-    vec(pts.dx_prior), vec(pts.dy_prior), vec(pts.chip_size_x), vec(pts.chip_size_y))
+scatter(pts::PointSet) = rebuild(pts;
+    x = vec(pts.x), y = vec(pts.y),
+    radius_x = vec(pts.radius_x), radius_y = vec(pts.radius_y),
+    dx_prior = vec(pts.dx_prior), dy_prior = vec(pts.dy_prior),
+    chip_size_x = vec(pts.chip_size_x), chip_size_y = vec(pts.chip_size_y))
+
+"""
+    pts[rows, cols] -> PointSet{2}
+
+Decimate or crop a gridded point set, copying every field.
+
+The coarse pass of the pyramid needs a strided subset of its grid, and doing that by indexing
+eight fields at the call site both repeats the shape and makes it easy to miss one when a
+field is added. A copy rather than a view because the caller then modifies the result — the
+coarse pass overwrites the radii and the chip sizes.
+"""
+Base.getindex(pts::PointSet{2}, rows, cols) = PointSet(
+    pts.x[rows, cols], pts.y[rows, cols],
+    pts.radius_x[rows, cols], pts.radius_y[rows, cols],
+    pts.dx_prior[rows, cols], pts.dy_prior[rows, cols],
+    pts.chip_size_x[rows, cols], pts.chip_size_y[rows, cols])
+
+"""
+    rebuild(pts::PointSet; kwargs...) -> PointSet
+
+A copy of `pts` with the named fields replaced, sharing the rest.
+
+Used wherever a point set is derived from another by changing one or two fields — shifting the
+coordinates, overriding the chip size, zeroing a radius. Doing that by listing all eight
+positional arguments means adding a field to `PointSet` silently drops it from every such site,
+which is the failure this exists to prevent.
+"""
+rebuild(pts::PointSet; x = pts.x, y = pts.y,
+        radius_x = pts.radius_x, radius_y = pts.radius_y,
+        dx_prior = pts.dx_prior, dy_prior = pts.dy_prior,
+        chip_size_x = pts.chip_size_x, chip_size_y = pts.chip_size_y) =
+    PointSet(x, y, radius_x, radius_y, dx_prior, dy_prior, chip_size_x, chip_size_y)
 
 """
     sanitize!(pts::PointSet, min_radius) -> Int
@@ -399,3 +433,7 @@ function Base.show(io::IO, pts::PointSet{N}) where {N}
 end
 
 Base.size(pts::PointSet, d::Integer) = size(pts.x, d)
+# Needed for `end` to resolve inside `pts[rows, cols]`: without it, indexing with `end` is a
+# MethodError rather than the obvious thing.
+Base.axes(pts::PointSet) = axes(pts.x)
+Base.axes(pts::PointSet, d::Integer) = axes(pts.x, d)

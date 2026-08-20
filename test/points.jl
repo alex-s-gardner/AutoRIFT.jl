@@ -129,6 +129,26 @@ end
     @test @allocated(scatter(big)) == @allocated(scatter(small))
 end
 
+@testset "rebuild and indexing" begin
+    # Both exist so that deriving one point set from another does not mean listing eight
+    # positional fields — which is how adding a field silently drops it from a derived set.
+    pts = gridpoints((256, 256), 32; chip_size = 32, search_radius = 25)
+
+    shifted = AutoRIFT.rebuild(pts; x = pts.x .+ 10.0)
+    @test shifted.x == pts.x .+ 10.0
+    @test shifted.y === pts.y                 # untouched fields are shared, not copied
+    @test shifted.radius_x === pts.radius_x
+
+    # Indexing decimates, which is what the pyramid's coarse pass needs.
+    sub = pts[1:2:end, 1:2:end]
+    @test size(sub) == (cld(size(pts, 1), 2), cld(size(pts, 2), 2))
+    @test sub.x == pts.x[1:2:end, 1:2:end]
+    @test sub.radius_x == pts.radius_x[1:2:end, 1:2:end]
+    # A copy, not a view: the coarse pass overwrites the radii of the result.
+    sub.radius_x[1] = 999
+    @test pts.radius_x[1] != 999
+end
+
 @testset "sanitize!" begin
     # Rule 1: zero is contagious across axes. A window with no extent in one
     # direction cannot yield a displacement, so both radii are cleared.
