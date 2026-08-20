@@ -22,6 +22,9 @@ include("utils.jl")
     @testset "fixtures" begin
         include("fixtures_test.jl")
     end
+    @testset "plans" begin
+        include("plans.jl")
+    end
     @testset "correlate" begin
         include("correlate.jl")
     end

@@ -105,6 +105,19 @@ include("track.jl")
 include("multichip.jl")
 include("api.jl")
 
+# Import this machine's saved FFTW wisdom, so a fresh process does not re-measure plans it has
+# already measured. Measured cost of not doing this: 822 ms for the three sizes a default run
+# needs, against 158 ms for the correlation itself — paid on every process launch, which for a
+# driver that runs one pair per process is every pair.
+#
+# `load_wisdom!` never throws and never blocks on anything but a small file read, which is what
+# makes it safe here: an `__init__` that can fail makes the package unloadable, and one that can
+# hang makes it unloadable in practice. See `src/plans.jl`.
+function __init__()
+    load_wisdom!()
+    return nothing
+end
+
 export autorift, autorift!, reinit!
 export SimilarityMeasure, ZNCC, NCC, Coherence
 export PreprocessMethod, Highpass, Wallis, WallisGapfill, Sobel, Laplacian,
