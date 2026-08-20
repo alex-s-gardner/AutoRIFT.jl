@@ -7,7 +7,8 @@ pairs, so a 10% regression in the correlation kernel is a material cost, and
 ```bash
 julia --project=benchmark -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
 
-julia --project=benchmark benchmark/run.jl                     # full run
+# `-t auto` matters: without it the threaded benchmarks silently measure the serial path.
+julia --project=benchmark -t auto benchmark/run.jl              # full run
 julia --project=benchmark benchmark/run.jl --quick              # reduced sampling
 julia --project=benchmark benchmark/run.jl --tag my-experiment
 

@@ -116,31 +116,39 @@ end
 # analytically tidier.
 #
 # ---------------------------------------------------------------------------
-# Remaining performance gap
+# Cost, and what has been tried
 # ---------------------------------------------------------------------------
 #
-# ~4x slower than OpenCV at 128x upsampling (1.14 ms against 247 us), down from ~6x
-# after hoisting the row taps out of the column loop. The kernel is competitive at
-# ~1.1 ns per output sample; what remains is OpenCV's SIMD-vectorised separable filter
-# against a scalar one.
+# 0.56 ms at 128x upsampling against OpenCV's 247 us, so ~2.3x — down from ~6x, via the
+# two-pass form in `pyrup!` and the hoisted tap table. Refinement is still the largest
+# single cost in a fine correlation pass (82% of it before these changes), because the
+# algorithm materialises a 640x640 surface from a 5x5 patch to locate one maximum.
 #
-# Micro-optimisation will not close it, because the algorithm is the waste: at 128x a
-# 5x5 patch becomes 640x640, ~1.6 MB materialised to locate a single maximum. Two
-# routes were investigated and rejected for now:
+# Four routes to the remaining gap were measured and rejected, which is worth recording so
+# they are not retried blind:
 #
-#   * A coarse-to-fine cascade that crops around the running peak at each level. This
-#     is the big win in principle, but measuring how far the peak moves between levels
-#     over 300 surfaces gave a maximum of 11 samples — too wide to bound safely, and an
-#     empirical bound is not a guarantee. A cropped cascade that misses the true peak
-#     returns a silently wrong displacement, which is not a trade worth making.
+#   * Cropping the cascade around the running peak at each level. The large win in
+#     principle. But the peak's deviation from its own rescaled position was measured at up
+#     to 5.5 previous-level samples over 400 surfaces — far too wide to bound, and an
+#     empirical bound is not a guarantee. A cropped cascade that misses the peak returns a
+#     silently wrong displacement.
 #
-#   * Splitting the loop by output parity to remove the tap branch. Faster, but it
-#     regrouped the float multiplies and so changed the last bit, breaking equivalence
-#     with OpenCV. The arithmetic below is deliberately left as-is for that reason.
+#   * A 3x3 patch instead of 5x5, which would cost 36% as much. 155 of 200 test surfaces
+#     gave a different answer, by up to 3 pixels: a 3x3 patch has no interior at all under a
+#     5-tap kernel, so every output depends on reflected border. The reference's choice of
+#     5x5 is load-bearing.
 #
-# The honest remaining route is vectorising the separable filter, which is an M8 item.
-# The cost is a fixed per-point overhead rather than something that scales with scene
-# size, so it matters less than the numbers suggest.
+#   * Splitting the inner loop by row parity to hoist the tap branch. Bit-identical, but
+#     1.06x — the branch predictor was already handling it.
+#
+#   * Reordering the fused arithmetic. Faster, but it moved *further* from OpenCV rather
+#     than merely differently, which is the distinction that rules it out. Note the
+#     two-pass form does change the last bit and is nonetheless kept: measured across all
+#     25 upsampling fixtures both forms sit at 1.788e-7 from OpenCV, because OpenCV is
+#     itself separable.
+#
+# What is left is vectorising the two passes, an M8 item. The cost is a fixed per-point
+# overhead rather than something that scales with scene size.
 
 const PYRUP_KERNEL = Float32[1, 4, 6, 4, 1] ./ 16
 
@@ -156,9 +164,12 @@ preserved rather than quartered. Border samples are reflected without repeating 
 edge (OpenCV's `BORDER_REFLECT_101`), which matters here more than it usually does
 because the patch is only 5x5 — the border is most of it.
 
-`dst` must be exactly `2 .* size(src)`.
+`dst` must be exactly `2 .* size(src)`. `scratch` is an optional buffer of at least
+`(2 * size(src, 1), size(src, 2))` for the intermediate of the two-pass form; the
+refinement cascade supplies one from its workspace so the hot path allocates nothing.
 """
-function pyrup!(dst::AbstractMatrix{Float32}, src::AbstractMatrix{Float32})
+function pyrup!(dst::AbstractMatrix{Float32}, src::AbstractMatrix{Float32},
+                scratch::Union{Nothing,AbstractMatrix{Float32}} = nothing)
     sh, sw = size(src)
     size(dst) == (2sh, 2sw) || throw(DimensionMismatch(
         "pyrup! destination must be $((2sh, 2sw)) for a $((sh, sw)) source, " *
@@ -181,43 +192,49 @@ function pyrup!(dst::AbstractMatrix{Float32}, src::AbstractMatrix{Float32})
     #
     # (Doubled from [1,4,6,4,1]/16 so that brightness is preserved rather than
     # halved per axis.) Precomputing the source indices per output row and column
-    # turns the inner loop into at most 3x3 multiply-adds with no branches, no
-    # modular arithmetic, and no reflection calls — about an order of magnitude
-    # cheaper than evaluating all 25 taps and discarding the 16 that are zero.
+    # turns each pass into at most three multiply-adds with no branches, no modular
+    # arithmetic, and no reflection calls.
     #
-    # The row taps depend only on the row, so computing them inside the column loop
-    # repeated the same reflection arithmetic `2sw` times over. Hoisting them is worth
-    # 1.5x, and it is the only redundancy here — the arithmetic itself must stay as
-    # written, for the reason given in the header note above.
+    # Applied as two passes rather than one. A single pass costs up to nine loads per
+    # output sample; separating it into a vertical pass through an intermediate and then a
+    # horizontal pass costs three in each, and is 2.6x faster at the sizes the refinement
+    # cascade uses.
+    #
+    # Separating changes the order of the float multiplies, and so the last bit — but the
+    # thing that matters is agreement with OpenCV, not with the fused form. Measured across
+    # all 25 upsampling fixtures, both forms sit at 1.788e-7 from OpenCV: exactly as close,
+    # because OpenCV is itself separable. An earlier attempt at a different reordering was
+    # rejected for drifting *further* from the reference; this one does not, which is the
+    # distinction that decides it.
     rows = _pyrup_row_taps(sh)
-    @inbounds for j in 1:(2sw)
-        jm, j0, jp, nj = _pyrup_taps(j, sw)
+    # The cascade supplies scratch from its workspace so the hot path allocates nothing; a
+    # standalone call allocates, which is the right trade for a function whose standalone
+    # use is tests and one-offs.
+    tmp = isnothing(scratch) ? Matrix{Float32}(undef, 2sh, sw) :
+                               view(scratch, 1:(2sh), 1:sw)
+
+    # Vertical: 2sh x sw, writing down each column so both source and destination are
+    # traversed contiguously.
+    @inbounds for j in 1:sw
         for i in 1:(2sh)
             im, i0, ip, ni = rows[i]
-            acc = 0.0f0
-            if nj == 3
-                if ni == 3
-                    acc = W_C * (W_C * src[i0, j0]) +
-                          W_C * W_S * (src[im, j0] + src[ip, j0]) +
-                          W_S * W_C * (src[i0, jm] + src[i0, jp]) +
-                          W_S * W_S * (src[im, jm] + src[ip, jm] +
-                                       src[im, jp] + src[ip, jp])
-                else
-                    acc = W_H * (W_C * (src[i0, j0] + src[ip, j0]) +
-                                 W_S * (src[i0, jm] + src[ip, jm] +
-                                        src[i0, jp] + src[ip, jp]))
-                end
-            else
-                if ni == 3
-                    acc = W_H * (W_C * (src[i0, j0] + src[i0, jp]) +
-                                 W_S * (src[im, j0] + src[ip, j0] +
-                                        src[im, jp] + src[ip, jp]))
-                else
-                    acc = W_H * W_H * (src[i0, j0] + src[ip, j0] +
-                                       src[i0, jp] + src[ip, jp])
-                end
+            tmp[i, j] = ni == 3 ? W_C * src[i0, j] + W_S * (src[im, j] + src[ip, j]) :
+                                  W_H * (src[i0, j] + src[ip, j])
+        end
+    end
+
+    # Horizontal: the column taps are loop-invariant, so the branch is hoisted out of the
+    # inner loop entirely.
+    @inbounds for j in 1:(2sw)
+        jm, j0, jp, nj = _pyrup_taps(j, sw)
+        if nj == 3
+            for i in 1:(2sh)
+                dst[i, j] = W_C * tmp[i, j0] + W_S * (tmp[i, jm] + tmp[i, jp])
             end
-            dst[i, j] = acc
+        else
+            for i in 1:(2sh)
+                dst[i, j] = W_H * (tmp[i, j0] + tmp[i, jp])
+            end
         end
     end
     return dst
@@ -349,6 +366,9 @@ struct RefinementWorkspace
     a::Matrix{Float32}
     b::Matrix{Float32}
     patch::Matrix{Float32}
+    # Intermediate for `pyrup!`'s two-pass form. Sized for the deepest level, so it serves
+    # every shallower one and the whole cascade allocates nothing.
+    scratch::Matrix{Float32}
     max_upsampling::Int
 end
 
@@ -369,6 +389,9 @@ function refinement_workspace(upsampling::Integer; patch::Integer = 5)
         Matrix{Float32}(undef, n, n),
         Matrix{Float32}(undef, n, n),
         Matrix{Float32}(undef, Int(patch), Int(patch)),
+        # The vertical pass of the deepest level writes (2 * n/2, n/2) = (n, n/2); sized to
+        # (n, n) so any level fits without arithmetic at the call site.
+        Matrix{Float32}(undef, n, n),
         Int(upsampling),
     )
 end
@@ -433,11 +456,11 @@ function subpixel_peak(
         factor *= 2
         if use_a
             dst = @view rw.a[1:n, 1:n]
-            pyrup!(dst, cur)
+            pyrup!(dst, cur, rw.scratch)
             cur = dst
         else
             dst = @view rw.b[1:n, 1:n]
-            pyrup!(dst, cur)
+            pyrup!(dst, cur, rw.scratch)
             cur = dst
         end
         use_a = !use_a

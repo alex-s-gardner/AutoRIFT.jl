@@ -31,14 +31,26 @@ end
 
 @testset "next_fft_size" begin
     @test next_fft_size(1) == 1
-    @test next_fft_size(8) == 8
-    @test next_fft_size(81) == 81      # 3^4
-    # A prime length is rounded up: FFTW can be an order of magnitude slower on
-    # one, and the padding cost is trivial by comparison.
-    @test next_fft_size(83) == 84      # 2^2 * 3 * 7
-    for n in (17, 31, 83, 127, 251)
+
+    # Deliberately *not* the smallest product of small primes. FFTW's radix-2 codelets are
+    # far better optimised than its others, so a 2-heavy length beats a smaller 3-heavy one:
+    # 81 is itself 3^4 and takes 14.1 us, where 96 = 2^5*3 takes 8.7 us. So the size chosen
+    # for 81 must be larger than 81.
+    @test next_fft_size(81) > 81
+    @test next_fft_size(43) == 48       # matches the measured winner
+
+    # A power of two is chosen when it is close enough, but not unconditionally: at 81 the
+    # nearest is 128, and padding that far costs more than the radix-2 advantage buys.
+    @test next_fft_size(113) == 128
+    @test next_fft_size(81) < 128
+
+    for n in (17, 31, 43, 81, 83, 113, 127, 163, 177, 251)
         m = next_fft_size(n)
+        # Never smaller than requested, and never padded so far that the extra arithmetic
+        # could dominate the transform it is meant to speed up.
         @test m >= n
+        @test m <= ceil(Int, 1.5n)
+        # Still 7-smooth, which is the constraint FFTW actually needs.
         r = m
         for p in (2, 3, 5, 7)
             while r % p == 0

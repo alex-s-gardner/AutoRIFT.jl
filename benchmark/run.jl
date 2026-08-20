@@ -115,6 +115,11 @@ function main()
 
     nbench = length(BenchmarkTools.leaves(SUITE))
     @info "Running $nbench benchmarks" tag quick nthreads = env.nthreads
+    # A single-threaded process makes every threaded benchmark measure the serial path,
+    # silently. That is worse than not measuring it: the numbers look plausible and a real
+    # threading regression would be invisible.
+    env.nthreads == 1 && @warn "Julia is single-threaded, so threaded benchmarks measure " *
+        "the serial path. Re-run with `julia -t auto` for meaningful numbers."
     if nbench == 0
         @warn "The suite is empty. Groups are populated as their milestones land."
     end
