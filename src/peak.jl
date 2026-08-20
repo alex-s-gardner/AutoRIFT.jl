@@ -142,18 +142,15 @@ end
 #     1.06x — the branch predictor was already handling it.
 #
 #   * Reordering the fused arithmetic. Faster, but it moved *further* from OpenCV rather
-#     than merely differently, which is the distinction that rules it out. Note the
-#     two-pass form does change the last bit and is nonetheless kept: measured across all
-#     25 upsampling fixtures both forms sit at 1.788e-7 from OpenCV, because OpenCV is
-#     itself separable.
+#     than merely differently, which is the distinction that rules it out. The two-pass form
+#     also changes the last bit and is kept anyway; see `pyrup!` for why those two cases
+#     differ.
 #
 # What is left is vectorising the two passes, an M8 item. The cost is a fixed per-point
 # overhead rather than something that scales with scene size.
 
-const PYRUP_KERNEL = Float32[1, 4, 6, 4, 1] ./ 16
-
 """
-    pyrup!(dst, src)
+    pyrup!(dst, src, [scratch])
 
 One Gaussian-pyramid upsampling step: `dst` becomes `src` at twice the size in each
 dimension.
@@ -168,8 +165,14 @@ because the patch is only 5x5 — the border is most of it.
 `(2 * size(src, 1), size(src, 2))` for the intermediate of the two-pass form; the
 refinement cascade supplies one from its workspace so the hot path allocates nothing.
 """
+# Standalone form: allocates its own intermediate. The right trade for a function whose
+# standalone use is tests and one-off calls; the cascade passes scratch and allocates
+# nothing.
+pyrup!(dst::AbstractMatrix{Float32}, src::AbstractMatrix{Float32}) =
+    pyrup!(dst, src, Matrix{Float32}(undef, 2 * size(src, 1), size(src, 2)))
+
 function pyrup!(dst::AbstractMatrix{Float32}, src::AbstractMatrix{Float32},
-                scratch::Union{Nothing,AbstractMatrix{Float32}} = nothing)
+                scratch::AbstractMatrix{Float32})
     sh, sw = size(src)
     size(dst) == (2sh, 2sw) || throw(DimensionMismatch(
         "pyrup! destination must be $((2sh, 2sw)) for a $((sh, sw)) source, " *
@@ -207,11 +210,7 @@ function pyrup!(dst::AbstractMatrix{Float32}, src::AbstractMatrix{Float32},
     # rejected for drifting *further* from the reference; this one does not, which is the
     # distinction that decides it.
     rows = _pyrup_row_taps(sh)
-    # The cascade supplies scratch from its workspace so the hot path allocates nothing; a
-    # standalone call allocates, which is the right trade for a function whose standalone
-    # use is tests and one-offs.
-    tmp = isnothing(scratch) ? Matrix{Float32}(undef, 2sh, sw) :
-                               view(scratch, 1:(2sh), 1:sw)
+    tmp = @view scratch[1:(2sh), 1:sw]
 
     # Vertical: 2sh x sw, writing down each column so both source and destination are
     # traversed contiguously.

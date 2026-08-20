@@ -3,709 +3,799 @@
         "julia_version": "1.12.5",
         "cpu": "Apple M2 Max",
         "cpu_threads": 8,
-        "nthreads": 1,
+        "nthreads": 8,
         "os": "Darwin",
         "arch": "aarch64",
         "hostname": "MT-502549",
-        "git_sha": "973c1c9f695a637a77017ed38ac4ac43fe819c65",
+        "git_sha": "ec5a851f49b08a3d2dc42d09a553bcbe7adc0ec3",
         "git_branch": "master",
-        "git_dirty": true,
-        "timestamp": "1787195309"
+        "git_dirty": false,
+        "timestamp": "1787202232"
     },
     "schema_version": 1,
     "benchmarks": {
-        "preprocess/preprocess+quantize 256x256": {
-            "min_ns": 2077208,
-            "median_ns": 2.2623545e6,
-            "mean_ns": 2.484987953777336e6,
-            "max_ns": 87916916,
-            "allocs": 77,
-            "memory_bytes": 4618256,
-            "samples": 2012
-        },
         "preprocess/preprocess+quantize 4096x4096": {
-            "min_ns": 1182258333,
-            "median_ns": 1.2508776665e9,
-            "mean_ns": 1.26282248925e9,
-            "max_ns": 1367276291,
-            "allocs": 81,
-            "memory_bytes": 1178797968,
-            "samples": 4
-        },
-        "window/reject_outliers 512x512": {
-            "min_ns": 416517708,
-            "median_ns": 418724667,
-            "mean_ns": 4.1974233325e8,
-            "max_ns": 426487917,
-            "allocs": 60,
-            "memory_bytes": 16812400,
-            "samples": 12
+            "min_ns": 616687875,
+            "median_ns": 632650396,
+            "mean_ns": 6.36236557375e8,
+            "max_ns": 667836667,
+            "allocs": 45,
+            "memory_bytes": 771818608,
+            "samples": 8
         },
         "correlate/point zncc c64 r25 float32": {
-            "min_ns": 76791,
-            "median_ns": 83667,
-            "mean_ns": 84353.1198,
-            "max_ns": 217875,
+            "min_ns": 77542,
+            "median_ns": 84125,
+            "mean_ns": 87546.6609,
+            "max_ns": 9710667,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
         },
-        "correlate/subpixel x64": {
-            "min_ns": 287292,
-            "median_ns": 313916,
-            "mean_ns": 318729.5345,
-            "max_ns": 2294084,
-            "allocs": 0,
-            "memory_bytes": 0,
-            "samples": 10000
+        "track/fine c32 r25 1024x1024 [900 pts]": {
+            "min_ns": 177862667,
+            "median_ns": 1.834826665e8,
+            "mean_ns": 1.834553184642857e8,
+            "max_ns": 198010042,
+            "allocs": 74,
+            "memory_bytes": 12759792,
+            "samples": 28
         },
         "correlate/pyrup 80x80": {
-            "min_ns": 28333,
-            "median_ns": 30917,
-            "mean_ns": 31804.2171,
-            "max_ns": 83042,
-            "allocs": 0,
-            "memory_bytes": 0,
+            "min_ns": 11250,
+            "median_ns": 12208,
+            "mean_ns": 13593.5078,
+            "max_ns": 693458,
+            "allocs": 2,
+            "memory_bytes": 65568,
             "samples": 10000
         },
         "preprocess/highpass w21 4096x4096": {
-            "min_ns": 211864958,
-            "median_ns": 260686250,
-            "mean_ns": 2.6006451865e8,
-            "max_ns": 318199958,
+            "min_ns": 215027042,
+            "median_ns": 244821583,
+            "mean_ns": 2.3896720623809522e8,
+            "max_ns": 257943167,
             "allocs": 13,
             "memory_bytes": 335577392,
-            "samples": 20
+            "samples": 21
         },
         "points/pointset scattered n=1000": {
-            "min_ns": 2143.5555555555557,
-            "median_ns": 2750,
-            "mean_ns": 3608.412455555556,
-            "max_ns": 200300.88888888888,
+            "min_ns": 2226.777777777778,
+            "median_ns": 3666.6666666666665,
+            "mean_ns": 4654.721422222223,
+            "max_ns": 215583.33333333334,
             "allocs": 37,
             "memory_bytes": 67040,
             "samples": 10000
         },
+        "window/max w3 512x512": {
+            "min_ns": 3767291,
+            "median_ns": 3.9931045e6,
+            "mean_ns": 4.1207904934102143e6,
+            "max_ns": 21343000,
+            "allocs": 11,
+            "memory_bytes": 2105552,
+            "samples": 1214
+        },
+        "correlate/integral 113x113": {
+            "min_ns": 7375,
+            "median_ns": 8031.25,
+            "mean_ns": 8307.849125,
+            "max_ns": 19239.5,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "track/coarse c64 r25 1024x1024 [841 pts]": {
+            "min_ns": 73817500,
+            "median_ns": 75787354,
+            "mean_ns": 7.68490365909091e7,
+            "max_ns": 98948833,
+            "allocs": 63,
+            "memory_bytes": 12468560,
+            "samples": 66
+        },
+        "track/fine c32 r25 512x512 [196 pts]": {
+            "min_ns": 38544333,
+            "median_ns": 39558333,
+            "mean_ns": 3.984106507936508e7,
+            "max_ns": 54698416,
+            "allocs": 74,
+            "memory_bytes": 4797168,
+            "samples": 126
+        },
+        "preprocess/highpass w5 4096x4096": {
+            "min_ns": 218079292,
+            "median_ns": 245920417,
+            "mean_ns": 2.4285377980952382e8,
+            "max_ns": 259120750,
+            "allocs": 13,
+            "memory_bytes": 335577392,
+            "samples": 21
+        },
+        "correlate/surface zncc c32 r6 float32": {
+            "min_ns": 13125,
+            "median_ns": 14000,
+            "mean_ns": 14399.9195,
+            "max_ns": 87666,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "preprocess/highpass w5 256x256": {
+            "min_ns": 358875,
+            "median_ns": 409709,
+            "mean_ns": 431405.1167,
+            "max_ns": 17312541,
+            "allocs": 13,
+            "memory_bytes": 1313072,
+            "samples": 10000
+        },
+        "correlate/surface zncc c64 r50 uint8": {
+            "min_ns": 184666,
+            "median_ns": 188792,
+            "mean_ns": 198107.2182,
+            "max_ns": 381333,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "correlate/peak r25": {
+            "min_ns": 1470.8,
+            "median_ns": 1487.5,
+            "mean_ns": 1523.6212899999996,
+            "max_ns": 5629.1,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "correlate/peak r50": {
+            "min_ns": 5451.333333333333,
+            "median_ns": 5937.5,
+            "mean_ns": 6114.284966666669,
+            "max_ns": 19277.666666666668,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "window/count_agreeing w5 512x512": {
+            "min_ns": 3264833,
+            "median_ns": 3.4759585e6,
+            "mean_ns": 3.516164903656821e6,
+            "max_ns": 13410750,
+            "allocs": 3,
+            "memory_bytes": 1048656,
+            "samples": 1422
+        },
+        "correlate/point zncc c64 r50 uint8": {
+            "min_ns": 176125,
+            "median_ns": 194709,
+            "mean_ns": 199037.0352,
+            "max_ns": 414375,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "preprocess/highpass w21 1024x1024": {
+            "min_ns": 7816416,
+            "median_ns": 8.8211455e6,
+            "mean_ns": 9.506315661596958e6,
+            "max_ns": 29530708,
+            "allocs": 13,
+            "memory_bytes": 20980016,
+            "samples": 526
+        },
+        "points/scatter 1024x1024": {
+            "min_ns": 132.04079254079255,
+            "median_ns": 163.36363636363637,
+            "mean_ns": 207.85416177156176,
+            "max_ns": 12282.44055944056,
+            "allocs": 21,
+            "memory_bytes": 1248,
+            "samples": 10000
+        },
+        "track/threaded c32 r25 1024x1024": {
+            "min_ns": 24779542,
+            "median_ns": 27351542,
+            "mean_ns": 3.0117853674698796e7,
+            "max_ns": 52610958,
+            "allocs": 772,
+            "memory_bytes": 35554176,
+            "samples": 166
+        },
+        "correlate/surface zncc c32 r25 uint8": {
+            "min_ns": 45083,
+            "median_ns": 49125,
+            "mean_ns": 50592.1357,
+            "max_ns": 85083,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "window/max w48 512x512": {
+            "min_ns": 4005125,
+            "median_ns": 4196229,
+            "mean_ns": 4.354846739547038e6,
+            "max_ns": 20780417,
+            "allocs": 11,
+            "memory_bytes": 2105552,
+            "samples": 1148
+        },
+        "points/sanitize! 1024x1024": {
+            "min_ns": 639.4670658682635,
+            "median_ns": 700.3532934131737,
+            "mean_ns": 723.8298011976044,
+            "max_ns": 1430.1437125748503,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "window/mad w5 512x512": {
+            "min_ns": 90613667,
+            "median_ns": 93684292,
+            "mean_ns": 9.52237837735849e7,
+            "max_ns": 110348250,
+            "allocs": 4,
+            "memory_bytes": 1048784,
+            "samples": 53
+        },
+        "points/pointset scattered n=100000": {
+            "min_ns": 170791,
+            "median_ns": 192792,
+            "mean_ns": 289018.53,
+            "max_ns": 22683000,
+            "allocs": 37,
+            "memory_bytes": 6424032,
+            "samples": 10000
+        },
+        "correlate/point zncc c32 r25 uint8": {
+            "min_ns": 50125,
+            "median_ns": 50542,
+            "mean_ns": 52543.5461,
+            "max_ns": 85292,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "points/params": {
+            "min_ns": 738.1889763779527,
+            "median_ns": 834.9685039370079,
+            "mean_ns": 861.7147803149605,
+            "max_ns": 60758.20472440945,
+            "allocs": 8,
+            "memory_bytes": 304,
+            "samples": 10000
+        },
+        "points/scatter 4096x4096": {
+            "min_ns": 134,
+            "median_ns": 162.69085714285714,
+            "mean_ns": 207.95555714285715,
+            "max_ns": 22366.14285714286,
+            "allocs": 21,
+            "memory_bytes": 1248,
+            "samples": 10000
+        },
+        "correlate/integral 81x81": {
+            "min_ns": 3812.5,
+            "median_ns": 3906.25,
+            "mean_ns": 3934.648425,
+            "max_ns": 15140.625,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "correlate/surface zncc c32 r6 uint8": {
+            "min_ns": 13416,
+            "median_ns": 13791,
+            "mean_ns": 14042.4677,
+            "max_ns": 105917,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "points/params with methods": {
+            "min_ns": 584.0335195530727,
+            "median_ns": 675.1648044692737,
+            "mean_ns": 711.1929972067039,
+            "max_ns": 47939.01117318436,
+            "allocs": 10,
+            "memory_bytes": 368,
+            "samples": 10000
+        },
+        "correlate/pyrup 5x5": {
+            "min_ns": 92.36257928118393,
+            "median_ns": 105.48731501057082,
+            "mean_ns": 116.46549270613107,
+            "max_ns": 9635.614164904862,
+            "allocs": 1,
+            "memory_bytes": 224,
+            "samples": 10000
+        },
+        "correlate/pyrup 20x20": {
+            "min_ns": 864.0819672131148,
+            "median_ns": 909.1475409836065,
+            "mean_ns": 1070.4539737704918,
+            "max_ns": 71624.31147540984,
+            "allocs": 2,
+            "memory_bytes": 3616,
+            "samples": 10000
+        },
+        "points/gridpoints 4096x4096": {
+            "min_ns": 40792,
+            "median_ns": 46792,
+            "mean_ns": 60443.5155,
+            "max_ns": 18304417,
+            "allocs": 43,
+            "memory_bytes": 1312512,
+            "samples": 10000
+        },
+        "points/chip_bounds": {
+            "min_ns": 4.292,
+            "median_ns": 4.708,
+            "mean_ns": 4.913352500000003,
+            "max_ns": 35.125,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "preprocess/highpass w5 1024x1024": {
+            "min_ns": 7544541,
+            "median_ns": 8.7267915e6,
+            "mean_ns": 9.442635198113207e6,
+            "max_ns": 30506958,
+            "allocs": 13,
+            "memory_bytes": 20980016,
+            "samples": 530
+        },
+        "window/median w5 512x512": {
+            "min_ns": 62594625,
+            "median_ns": 6.44449585e7,
+            "mean_ns": 6.4738010743589744e7,
+            "max_ns": 73125666,
+            "allocs": 4,
+            "memory_bytes": 1048784,
+            "samples": 78
+        },
+        "correlate/surface zncc c64 r50 float32": {
+            "min_ns": 170166,
+            "median_ns": 185042,
+            "mean_ns": 191744.5207,
+            "max_ns": 4584125,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "correlate/integral 177x177": {
+            "min_ns": 22625,
+            "median_ns": 23166,
+            "mean_ns": 24210.6084,
+            "max_ns": 98416,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "points/gridpoints 512x512": {
+            "min_ns": 807.5567010309278,
+            "median_ns": 1168.381443298969,
+            "mean_ns": 1784.4801701030924,
+            "max_ns": 101270.61855670103,
+            "allocs": 33,
+            "memory_bytes": 17792,
+            "samples": 10000
+        },
+        "preprocess/wallis w5 4096x4096": {
+            "min_ns": 431120416,
+            "median_ns": 475005375,
+            "mean_ns": 4.7107421209090906e8,
+            "max_ns": 484510875,
+            "allocs": 23,
+            "memory_bytes": 604045840,
+            "samples": 11
+        },
+        "window/mean w5 512x512": {
+            "min_ns": 2134916,
+            "median_ns": 2315000,
+            "mean_ns": 2.433252315815085e6,
+            "max_ns": 23894958,
+            "allocs": 13,
+            "memory_bytes": 4200752,
+            "samples": 2055
+        },
+        "track/coarse c32 r25 512x512 [196 pts]": {
+            "min_ns": 10148125,
+            "median_ns": 10509854,
+            "mean_ns": 1.0655542204255318e7,
+            "max_ns": 30841708,
+            "allocs": 63,
+            "memory_bytes": 3567952,
+            "samples": 470
+        },
+        "track/coarse c32 r25 1024x1024 [900 pts]": {
+            "min_ns": 46922917,
+            "median_ns": 48263791,
+            "mean_ns": 4.901219295145631e7,
+            "max_ns": 67375375,
+            "allocs": 63,
+            "memory_bytes": 11530576,
+            "samples": 103
+        },
+        "window/max w12 512x512": {
+            "min_ns": 4640125,
+            "median_ns": 4889146,
+            "mean_ns": 4.972046979125248e6,
+            "max_ns": 17492750,
+            "allocs": 11,
+            "memory_bytes": 2105552,
+            "samples": 1006
+        },
+        "correlate/subpixel x32": {
+            "min_ns": 38000,
+            "median_ns": 39292,
+            "mean_ns": 40986.7118,
+            "max_ns": 1167042,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
+        "preprocess/preprocess+quantize 256x256": {
+            "min_ns": 1276959,
+            "median_ns": 1366416,
+            "mean_ns": 1.4402600795159896e6,
+            "max_ns": 19511750,
+            "allocs": 45,
+            "memory_bytes": 3019888,
+            "samples": 3471
+        },
+        "window/reject_outliers 512x512": {
+            "min_ns": 430666250,
+            "median_ns": 4.388287085e8,
+            "mean_ns": 4.4161091675e8,
+            "max_ns": 465710584,
+            "allocs": 56,
+            "memory_bytes": 16811888,
+            "samples": 12
+        },
+        "correlate/subpixel x64": {
+            "min_ns": 142875,
+            "median_ns": 144583,
+            "mean_ns": 148514.3407,
+            "max_ns": 214166,
+            "allocs": 0,
+            "memory_bytes": 0,
+            "samples": 10000
+        },
         "correlate/point zncc c128 r25 uint8": {
-            "min_ns": 213041,
-            "median_ns": 231208,
-            "mean_ns": 233605.6695,
-            "max_ns": 3275875,
+            "min_ns": 211959,
+            "median_ns": 214084,
+            "mean_ns": 220482.4616,
+            "max_ns": 7605709,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
         },
         "window/mean w12 512x512": {
-            "min_ns": 2229834,
-            "median_ns": 2496083,
-            "mean_ns": 2.8176799866444073e6,
-            "max_ns": 93006375,
+            "min_ns": 2362584,
+            "median_ns": 2578000,
+            "mean_ns": 2.7016601712587792e6,
+            "max_ns": 21691917,
             "allocs": 13,
             "memory_bytes": 4200752,
-            "samples": 1797
+            "samples": 1851
         },
         "points/nsearchable 1024x1024": {
-            "min_ns": 367.1497584541063,
-            "median_ns": 398.7536231884058,
-            "mean_ns": 409.9441777777777,
-            "max_ns": 7222.623188405797,
-            "allocs": 0,
-            "memory_bytes": 0,
-            "samples": 10000
-        },
-        "window/max w3 512x512": {
-            "min_ns": 3537125,
-            "median_ns": 3843916,
-            "mean_ns": 4.0242480547063556e6,
-            "max_ns": 94704542,
-            "allocs": 11,
-            "memory_bytes": 2105552,
-            "samples": 1243
-        },
-        "correlate/integral 113x113": {
-            "min_ns": 7323,
-            "median_ns": 8010.5,
-            "mean_ns": 8045.7856,
-            "max_ns": 25541.75,
+            "min_ns": 366.54589371980677,
+            "median_ns": 398.3526570048309,
+            "mean_ns": 418.09671449275373,
+            "max_ns": 3631.236714975845,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
         },
         "correlate/point zncc c64 r25 uint8": {
             "min_ns": 77875,
-            "median_ns": 84750,
-            "mean_ns": 85441.6279,
-            "max_ns": 216625,
+            "median_ns": 84625,
+            "mean_ns": 87917.4472,
+            "max_ns": 2053209,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
         },
         "points/search_bounds": {
-            "min_ns": 4.041,
+            "min_ns": 4.333,
             "median_ns": 4.417,
-            "mean_ns": 4.504680899999998,
-            "max_ns": 44.666,
+            "mean_ns": 4.6088970999999965,
+            "max_ns": 21.375,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
         },
         "correlate/point zncc c32 r6 uint8": {
-            "min_ns": 15666,
-            "median_ns": 17166,
-            "mean_ns": 17409.189,
-            "max_ns": 56041,
+            "min_ns": 13458,
+            "median_ns": 13584,
+            "mean_ns": 13708.7781,
+            "max_ns": 70416,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
-        },
-        "correlate/surface zncc c32 r6 float32": {
-            "min_ns": 15708,
-            "median_ns": 17250,
-            "mean_ns": 17338.9054,
-            "max_ns": 78458,
-            "allocs": 0,
-            "memory_bytes": 0,
-            "samples": 10000
-        },
-        "preprocess/highpass w5 4096x4096": {
-            "min_ns": 212649709,
-            "median_ns": 288643396,
-            "mean_ns": 260203896,
-            "max_ns": 303774750,
-            "allocs": 13,
-            "memory_bytes": 335577392,
-            "samples": 20
         },
         "correlate/surface zncc c128 r25 float32": {
-            "min_ns": 210542,
-            "median_ns": 228834,
-            "mean_ns": 248118.2949,
-            "max_ns": 11838875,
+            "min_ns": 203541,
+            "median_ns": 213792,
+            "mean_ns": 218424.856,
+            "max_ns": 1131959,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
         },
         "correlate/subpixel x128": {
-            "min_ns": 1130000,
-            "median_ns": 1233458,
-            "mean_ns": 1.2441960542423488e6,
-            "max_ns": 3760417,
+            "min_ns": 561500,
+            "median_ns": 572042,
+            "mean_ns": 583696.2233781414,
+            "max_ns": 12447500,
             "allocs": 0,
             "memory_bytes": 0,
-            "samples": 4019
+            "samples": 8555
         },
         "correlate/integral_sq 177x177": {
-            "min_ns": 21125,
-            "median_ns": 23084,
-            "mean_ns": 23122.3229,
-            "max_ns": 120042,
+            "min_ns": 22916,
+            "median_ns": 23166,
+            "mean_ns": 23738.2537,
+            "max_ns": 51083,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
         },
         "points/surface_size": {
             "min_ns": 1.833,
-            "median_ns": 2.042,
-            "mean_ns": 2.0586606999999995,
-            "max_ns": 20.416,
-            "allocs": 0,
-            "memory_bytes": 0,
-            "samples": 10000
-        },
-        "preprocess/highpass w5 256x256": {
-            "min_ns": 339250,
-            "median_ns": 373375,
-            "mean_ns": 404177.1403,
-            "max_ns": 90605500,
-            "allocs": 13,
-            "memory_bytes": 1313072,
-            "samples": 10000
-        },
-        "correlate/surface zncc c64 r50 uint8": {
-            "min_ns": 170583,
-            "median_ns": 185375,
-            "mean_ns": 186656.1212,
-            "max_ns": 288833,
+            "median_ns": 2.083,
+            "mean_ns": 2.1363362,
+            "max_ns": 22.125,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
         },
         "correlate/peak r6": {
-            "min_ns": 74.33127572016461,
-            "median_ns": 80.71810699588477,
-            "mean_ns": 80.15568683127577,
-            "max_ns": 175.24074074074073,
-            "allocs": 0,
-            "memory_bytes": 0,
-            "samples": 10000
-        },
-        "correlate/peak r25": {
-            "min_ns": 1354.2,
-            "median_ns": 1475,
-            "mean_ns": 1438.7633399999997,
-            "max_ns": 9212.5,
+            "min_ns": 80.57851239669421,
+            "median_ns": 81.91219008264463,
+            "mean_ns": 84.19915154958677,
+            "max_ns": 190.599173553719,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
         },
         "correlate/surface zncc c64 r25 uint8": {
-            "min_ns": 76208,
-            "median_ns": 83000,
-            "mean_ns": 85132.3554,
-            "max_ns": 501458,
-            "allocs": 0,
-            "memory_bytes": 0,
-            "samples": 10000
-        },
-        "correlate/peak r50": {
-            "min_ns": 5444.333333333333,
-            "median_ns": 5916.666666666667,
-            "mean_ns": 5811.736533333333,
-            "max_ns": 21687.5,
+            "min_ns": 82583,
+            "median_ns": 83167,
+            "mean_ns": 86155.2604,
+            "max_ns": 153125,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
         },
         "preprocess/preprocess+quantize 1024x1024": {
-            "min_ns": 44631500,
-            "median_ns": 45759708,
-            "mean_ns": 5.508347853763441e7,
-            "max_ns": 156068417,
-            "allocs": 81,
-            "memory_bytes": 73713552,
-            "samples": 93
+            "min_ns": 25008750,
+            "median_ns": 26517583,
+            "mean_ns": 2.8330081491525423e7,
+            "max_ns": 51244208,
+            "allocs": 45,
+            "memory_bytes": 48252016,
+            "samples": 177
         },
         "preprocess/highpass w21 256x256": {
-            "min_ns": 338750,
-            "median_ns": 373333,
-            "mean_ns": 414347.7952,
-            "max_ns": 87578667,
+            "min_ns": 360584,
+            "median_ns": 403291,
+            "mean_ns": 427093.8116,
+            "max_ns": 17928750,
             "allocs": 13,
             "memory_bytes": 1313072,
             "samples": 10000
         },
-        "window/count_agreeing w5 512x512": {
-            "min_ns": 3105333,
-            "median_ns": 3.3780205e6,
-            "mean_ns": 3.398817601902174e6,
-            "max_ns": 7005875,
-            "allocs": 3,
-            "memory_bytes": 1048656,
-            "samples": 1472
-        },
-        "correlate/point zncc c64 r50 uint8": {
-            "min_ns": 175833,
-            "median_ns": 191250,
-            "mean_ns": 193204.1551,
-            "max_ns": 584750,
+        "correlate/surface zncc c64 r25 float32": {
+            "min_ns": 75750,
+            "median_ns": 82500,
+            "mean_ns": 85271.3077,
+            "max_ns": 204084,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
         },
         "window/mad w3 512x512": {
-            "min_ns": 24322250,
-            "median_ns": 2.53047085e7,
-            "mean_ns": 2.5372115525252525e7,
-            "max_ns": 33683292,
+            "min_ns": 25508667,
+            "median_ns": 26593917,
+            "mean_ns": 2.685478878074866e7,
+            "max_ns": 35731417,
             "allocs": 4,
             "memory_bytes": 1048720,
-            "samples": 198
+            "samples": 187
         },
-        "correlate/surface zncc c64 r25 float32": {
-            "min_ns": 75250,
-            "median_ns": 82042,
-            "mean_ns": 83575.7272,
-            "max_ns": 245125,
-            "allocs": 0,
-            "memory_bytes": 0,
-            "samples": 10000
+        "track/fine c64 r25 512x512 [169 pts]": {
+            "min_ns": 39191834,
+            "median_ns": 4.05977295e7,
+            "mean_ns": 4.1052953524590164e7,
+            "max_ns": 58376667,
+            "allocs": 74,
+            "memory_bytes": 5423856,
+            "samples": 122
         },
-        "preprocess/highpass w21 1024x1024": {
-            "min_ns": 7304167,
-            "median_ns": 8103125,
-            "mean_ns": 9704562,
-            "max_ns": 95288083,
-            "allocs": 13,
-            "memory_bytes": 20980016,
-            "samples": 516
+        "track/fine c64 r25 1024x1024 [841 pts]": {
+            "min_ns": 195622709,
+            "median_ns": 200459667,
+            "mean_ns": 2.0100797172e8,
+            "max_ns": 214371125,
+            "allocs": 74,
+            "memory_bytes": 13697776,
+            "samples": 25
         },
-        "points/scatter 1024x1024": {
-            "min_ns": 126.64113785557987,
-            "median_ns": 138.58533916849015,
-            "mean_ns": 178.49957877461705,
-            "max_ns": 9705.689277899344,
-            "allocs": 21,
-            "memory_bytes": 1248,
-            "samples": 10000
-        },
-        "correlate/surface zncc c32 r25 uint8": {
-            "min_ns": 56042,
-            "median_ns": 61083,
-            "mean_ns": 61862.3528,
-            "max_ns": 180542,
-            "allocs": 0,
-            "memory_bytes": 0,
-            "samples": 10000
+        "track/sparse 20% c32 r25 1024x1024": {
+            "min_ns": 9706208,
+            "median_ns": 10254584,
+            "mean_ns": 1.0756731015053764e7,
+            "max_ns": 31664458,
+            "allocs": 63,
+            "memory_bytes": 11530576,
+            "samples": 465
         },
         "correlate/pyrup 10x10": {
-            "min_ns": 462.98477157360406,
-            "median_ns": 503.5939086294416,
-            "mean_ns": 508.2445446700508,
-            "max_ns": 1054.781725888325,
-            "allocs": 0,
-            "memory_bytes": 0,
+            "min_ns": 237.23410404624278,
+            "median_ns": 267.7023121387283,
+            "mean_ns": 294.8263465317919,
+            "max_ns": 19733.50289017341,
+            "allocs": 1,
+            "memory_bytes": 896,
             "samples": 10000
         },
         "correlate/integral_sq 113x113": {
-            "min_ns": 7573,
-            "median_ns": 8281.25,
-            "mean_ns": 8301.061875,
-            "max_ns": 26260.5,
+            "min_ns": 7986,
+            "median_ns": 8416.666666666666,
+            "mean_ns": 8523.561533333334,
+            "max_ns": 33944.333333333336,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
         },
         "correlate/point zncc c64 r50 float32": {
-            "min_ns": 175667,
-            "median_ns": 190916,
-            "mean_ns": 192535.4815,
-            "max_ns": 346625,
+            "min_ns": 190333,
+            "median_ns": 193708,
+            "mean_ns": 198044.2285,
+            "max_ns": 450541,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
-        },
-        "window/max w48 512x512": {
-            "min_ns": 3731125,
-            "median_ns": 4.0685625e6,
-            "mean_ns": 4.253658602040816e6,
-            "max_ns": 91413167,
-            "allocs": 11,
-            "memory_bytes": 2105552,
-            "samples": 1176
-        },
-        "points/sanitize! 1024x1024": {
-            "min_ns": 639.1369047619048,
-            "median_ns": 694.4464285714286,
-            "mean_ns": 703.5841303571425,
-            "max_ns": 1394.095238095238,
-            "allocs": 0,
-            "memory_bytes": 0,
-            "samples": 10000
-        },
-        "window/mad w5 512x512": {
-            "min_ns": 87365542,
-            "median_ns": 8.93570835e7,
-            "mean_ns": 8.956949407142857e7,
-            "max_ns": 95882750,
-            "allocs": 4,
-            "memory_bytes": 1048784,
-            "samples": 56
-        },
-        "points/pointset scattered n=100000": {
-            "min_ns": 166167,
-            "median_ns": 188958,
-            "mean_ns": 520956.6128595248,
-            "max_ns": 90760500,
-            "allocs": 37,
-            "memory_bytes": 6424032,
-            "samples": 9596
         },
         "correlate/subpixel x16": {
-            "min_ns": 19083,
-            "median_ns": 21041,
-            "mean_ns": 21158.0515,
-            "max_ns": 91500,
-            "allocs": 0,
-            "memory_bytes": 0,
-            "samples": 10000
-        },
-        "points/params": {
-            "min_ns": 723.8805970149253,
-            "median_ns": 813.1194029850747,
-            "mean_ns": 836.8556843283582,
-            "max_ns": 49228.23880597015,
-            "allocs": 8,
-            "memory_bytes": 304,
-            "samples": 10000
-        },
-        "correlate/point zncc c32 r25 uint8": {
-            "min_ns": 57500,
-            "median_ns": 62542,
-            "mean_ns": 63097.8738,
-            "max_ns": 208500,
+            "min_ns": 10625,
+            "median_ns": 11125,
+            "mean_ns": 11466.4531,
+            "max_ns": 31250,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
         },
         "correlate/point zncc c128 r25 float32": {
-            "min_ns": 211875,
-            "median_ns": 230167,
-            "mean_ns": 230856.227,
-            "max_ns": 375750,
+            "min_ns": 195750,
+            "median_ns": 215250,
+            "mean_ns": 218026.2769,
+            "max_ns": 573541,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
         },
         "window/reject_outliers 256x256": {
-            "min_ns": 102740875,
-            "median_ns": 104056021,
-            "mean_ns": 1.0435657029166667e8,
-            "max_ns": 113715417,
-            "allocs": 60,
-            "memory_bytes": 4204912,
-            "samples": 48
-        },
-        "points/scatter 4096x4096": {
-            "min_ns": 124.44873208379272,
-            "median_ns": 139.74641675854465,
-            "mean_ns": 179.6854643880926,
-            "max_ns": 96116.68577728776,
-            "allocs": 21,
-            "memory_bytes": 1248,
-            "samples": 10000
-        },
-        "correlate/integral 81x81": {
-            "min_ns": 3531.25,
-            "median_ns": 3849,
-            "mean_ns": 3863.5207375,
-            "max_ns": 10406.25,
-            "allocs": 0,
-            "memory_bytes": 0,
-            "samples": 10000
-        },
-        "correlate/surface zncc c32 r6 uint8": {
-            "min_ns": 15625,
-            "median_ns": 17042,
-            "mean_ns": 17198.2977,
-            "max_ns": 108875,
-            "allocs": 0,
-            "memory_bytes": 0,
-            "samples": 10000
+            "min_ns": 105346625,
+            "median_ns": 108856375,
+            "mean_ns": 1.0883315769565217e8,
+            "max_ns": 118220417,
+            "allocs": 56,
+            "memory_bytes": 4204400,
+            "samples": 46
         },
         "correlate/point zncc c32 r25 float32": {
-            "min_ns": 56875,
-            "median_ns": 61917,
-            "mean_ns": 62262.567,
-            "max_ns": 185500,
-            "allocs": 0,
-            "memory_bytes": 0,
-            "samples": 10000
-        },
-        "points/params with methods": {
-            "min_ns": 575.0441988950276,
-            "median_ns": 654.4696132596686,
-            "mean_ns": 670.8265906077347,
-            "max_ns": 53234.11602209945,
-            "allocs": 10,
-            "memory_bytes": 368,
-            "samples": 10000
-        },
-        "correlate/pyrup 5x5": {
-            "min_ns": 125.23214285714286,
-            "median_ns": 135.92745535714286,
-            "mean_ns": 137.06050892857135,
-            "max_ns": 254.8359375,
-            "allocs": 0,
-            "memory_bytes": 0,
-            "samples": 10000
-        },
-        "correlate/pyrup 20x20": {
-            "min_ns": 1770.9,
-            "median_ns": 1933.3,
-            "mean_ns": 1936.71425,
-            "max_ns": 4841.6,
+            "min_ns": 49625,
+            "median_ns": 49958,
+            "mean_ns": 50383.4028,
+            "max_ns": 93167,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
         },
         "correlate/surface zncc c32 r25 float32": {
-            "min_ns": 55500,
-            "median_ns": 60459,
-            "mean_ns": 61149.1213,
-            "max_ns": 166500,
+            "min_ns": 44458,
+            "median_ns": 49041,
+            "mean_ns": 49544.4703,
+            "max_ns": 151042,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
-        },
-        "points/gridpoints 4096x4096": {
-            "min_ns": 38250,
-            "median_ns": 43542,
-            "mean_ns": 68561.5229,
-            "max_ns": 87095959,
-            "allocs": 43,
-            "memory_bytes": 1312512,
-            "samples": 10000
-        },
-        "points/chip_bounds": {
-            "min_ns": 4.5,
-            "median_ns": 4.792,
-            "mean_ns": 4.8648573,
-            "max_ns": 24.542,
-            "allocs": 0,
-            "memory_bytes": 0,
-            "samples": 10000
-        },
-        "preprocess/highpass w5 1024x1024": {
-            "min_ns": 7196500,
-            "median_ns": 8041708,
-            "mean_ns": 9.94557263419483e6,
-            "max_ns": 99625584,
-            "allocs": 13,
-            "memory_bytes": 20980016,
-            "samples": 503
-        },
-        "window/median w5 512x512": {
-            "min_ns": 60106375,
-            "median_ns": 61656708,
-            "mean_ns": 6.176522588888889e7,
-            "max_ns": 67759292,
-            "allocs": 4,
-            "memory_bytes": 1048784,
-            "samples": 81
         },
         "correlate/point zncc c32 r6 float32": {
-            "min_ns": 15791,
-            "median_ns": 17292,
-            "mean_ns": 17351.2097,
-            "max_ns": 75250,
+            "min_ns": 13666,
+            "median_ns": 14042,
+            "mean_ns": 14093.6266,
+            "max_ns": 27500,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
         },
         "correlate/integral_sq 81x81": {
-            "min_ns": 3697.875,
-            "median_ns": 4083.375,
-            "mean_ns": 4073.6493,
-            "max_ns": 16755.25,
-            "allocs": 0,
-            "memory_bytes": 0,
-            "samples": 10000
-        },
-        "correlate/surface zncc c64 r50 float32": {
-            "min_ns": 170083,
-            "median_ns": 184917,
-            "mean_ns": 187582.1973,
-            "max_ns": 1358250,
+            "min_ns": 3744.75,
+            "median_ns": 4104.125,
+            "mean_ns": 4282.543575,
+            "max_ns": 16963.5,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
         },
         "correlate/pyrup 40x40": {
-            "min_ns": 6958.25,
-            "median_ns": 7583.25,
-            "mean_ns": 7656.20525,
-            "max_ns": 23073,
-            "allocs": 0,
-            "memory_bytes": 0,
+            "min_ns": 2856.4444444444443,
+            "median_ns": 2958.3333333333335,
+            "mean_ns": 3320.0578666666665,
+            "max_ns": 175402.77777777778,
+            "allocs": 2,
+            "memory_bytes": 14368,
             "samples": 10000
         },
         "preprocess/wallis w5 1024x1024": {
-            "min_ns": 15287375,
-            "median_ns": 1.60528335e7,
-            "mean_ns": 2.0327647849593494e7,
-            "max_ns": 107982792,
+            "min_ns": 15210042,
+            "median_ns": 1.73177915e7,
+            "mean_ns": 1.868325144029851e7,
+            "max_ns": 39434209,
             "allocs": 23,
             "memory_bytes": 37765648,
-            "samples": 246
-        },
-        "correlate/integral 177x177": {
-            "min_ns": 20916,
-            "median_ns": 22791,
-            "mean_ns": 22923.0109,
-            "max_ns": 74041,
-            "allocs": 0,
-            "memory_bytes": 0,
-            "samples": 10000
+            "samples": 268
         },
         "window/mean w3 512x512": {
-            "min_ns": 1959625,
-            "median_ns": 2.2003745e6,
-            "mean_ns": 2.4950054555888223e6,
-            "max_ns": 88218083,
+            "min_ns": 2051167,
+            "median_ns": 2265437,
+            "mean_ns": 2.383689739752145e6,
+            "max_ns": 21349750,
             "allocs": 13,
             "memory_bytes": 4200752,
-            "samples": 2004
-        },
-        "points/gridpoints 512x512": {
-            "min_ns": 743.801652892562,
-            "median_ns": 1052,
-            "mean_ns": 1221.7380611570247,
-            "max_ns": 70227.27272727272,
-            "allocs": 33,
-            "memory_bytes": 17792,
-            "samples": 10000
-        },
-        "preprocess/wallis w5 4096x4096": {
-            "min_ns": 406633417,
-            "median_ns": 505882541,
-            "mean_ns": 4.991454696363636e8,
-            "max_ns": 527846917,
-            "allocs": 23,
-            "memory_bytes": 604045840,
-            "samples": 11
-        },
-        "window/mean w5 512x512": {
-            "min_ns": 2033542,
-            "median_ns": 2252583,
-            "mean_ns": 2.5091880150526846e6,
-            "max_ns": 89198125,
-            "allocs": 13,
-            "memory_bytes": 4200752,
-            "samples": 1993
+            "samples": 2098
         },
         "window/max w5 512x512": {
-            "min_ns": 3936334,
-            "median_ns": 4302354,
-            "mean_ns": 4.4969122904676255e6,
-            "max_ns": 94395750,
+            "min_ns": 4193500,
+            "median_ns": 4445250,
+            "mean_ns": 4.566387058447489e6,
+            "max_ns": 22452042,
             "allocs": 11,
             "memory_bytes": 2105552,
-            "samples": 1112
+            "samples": 1095
+        },
+        "track/coarse c64 r25 512x512 [169 pts]": {
+            "min_ns": 14733541,
+            "median_ns": 1.52995415e7,
+            "mean_ns": 1.5452617148148147e7,
+            "max_ns": 33478291,
+            "allocs": 63,
+            "memory_bytes": 4194640,
+            "samples": 324
         },
         "correlate/surface zncc c128 r25 uint8": {
-            "min_ns": 211542,
-            "median_ns": 229709,
-            "mean_ns": 231606.2305,
-            "max_ns": 514875,
+            "min_ns": 194500,
+            "median_ns": 214541,
+            "mean_ns": 220615.8586,
+            "max_ns": 417542,
             "allocs": 0,
             "memory_bytes": 0,
             "samples": 10000
-        },
-        "window/max w12 512x512": {
-            "min_ns": 4365417,
-            "median_ns": 4729834,
-            "mean_ns": 4.850936903976722e6,
-            "max_ns": 91495791,
-            "allocs": 11,
-            "memory_bytes": 2105552,
-            "samples": 1031
         },
         "preprocess/wallis w5 256x256": {
-            "min_ns": 674709,
-            "median_ns": 744750,
-            "mean_ns": 825391.3400495459,
-            "max_ns": 89994334,
+            "min_ns": 714666,
+            "median_ns": 792583,
+            "mean_ns": 841110.5865724381,
+            "max_ns": 19178000,
             "allocs": 23,
             "memory_bytes": 2363920,
-            "samples": 6055
-        },
-        "correlate/subpixel x32": {
-            "min_ns": 73459,
-            "median_ns": 81208,
-            "mean_ns": 83067.9722,
-            "max_ns": 1769167,
-            "allocs": 0,
-            "memory_bytes": 0,
-            "samples": 10000
+            "samples": 5943
         },
         "window/median w3 512x512": {
-            "min_ns": 16390375,
-            "median_ns": 17287792,
-            "mean_ns": 1.730944464013841e7,
-            "max_ns": 22593250,
+            "min_ns": 17219291,
+            "median_ns": 17837917,
+            "mean_ns": 1.7926767802867383e7,
+            "max_ns": 23304667,
             "allocs": 4,
             "memory_bytes": 1048720,
-            "samples": 289
+            "samples": 279
         }
     },
     "impl": "julia"
