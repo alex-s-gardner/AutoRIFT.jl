@@ -4,16 +4,10 @@ version = "0.1.0"
 authors = ["Alex S. Gardner, JPL/NASA"]
 
 [deps]
-BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
 CommonSolve = "38540f10-b2f7-11e9-35d8-d573e4eb0ff2"
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
-OffsetArrays = "6fe1bfb0-de20-5000-8ca7-80f57d26f881"
-PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
-Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
-Scratch = "6c6a2e73-6563-6170-7368-637461726353"
 StableTasks = "91464d47-22a1-43fe-8b7f-2d57ee82463f"
-Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 
 [weakdeps]
 DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
@@ -26,7 +20,6 @@ AutoRIFTRastersExt = ["Rasters", "GeoInterface"]
 
 [compat]
 Aqua = "0.8"
-BenchmarkTools = "1.8.0"
 CommonSolve = "0.2"
 DimensionalData = "0.29, 0.30"
 FFTW = "1.8"
@@ -34,11 +27,8 @@ GeoInterface = "1"
 JET = "0.9, 0.10"
 JSON3 = "1"
 LinearAlgebra = "1"
-OffsetArrays = "1"
-PrecompileTools = "1"
 Random = "1"
 Rasters = "0.14, 0.15"
-Scratch = "1"
 StableTasks = "0.1"
 Statistics = "1"
 Test = "1"
@@ -48,7 +38,9 @@ julia = "1.10"
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
 JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test", "Aqua", "JET", "JSON3"]
+test = ["Test", "Aqua", "JET", "JSON3", "Random", "Statistics"]

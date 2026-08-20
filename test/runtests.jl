@@ -43,6 +43,9 @@ include("utils.jl")
     @testset "pyramid" begin
         include("pyramid.jl")
     end
+    @testset "api" begin
+        include("api.jl")
+    end
     @testset "vs OpenCV" begin
         include("opencv.jl")
     end

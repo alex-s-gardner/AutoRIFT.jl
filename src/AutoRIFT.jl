@@ -22,10 +22,14 @@ extensions, so the core stays cheap to load.
 """
 module AutoRIFT
 
+# `init` extends CommonSolve's, a zero-dependency package that exists to own the lifecycle
+# names so packages agreeing on them do not each define their own. Costs nothing in load time,
+# and a caller who knows the SciML idiom already knows half this API. `reinit!` is not
+# CommonSolve's (it belongs to SciMLBase, which would be a heavy dependency for one name), so
+# it is ours and is exported.
+using CommonSolve: CommonSolve, init
 using LinearAlgebra: LinearAlgebra
-using Random: Random
 using StableTasks: StableTasks
-using Statistics: Statistics
 
 """
     autorift(reference, secondary; kwargs...)
@@ -89,8 +93,9 @@ include("preprocess.jl")
 # Layer 3: orchestration. The grid loop, then the multi-scale pyramid built on it.
 include("track.jl")
 include("pyramid.jl")
+include("api.jl")
 
-export autorift, autorift!
+export autorift, autorift!, reinit!
 export SimilarityMeasure, ZNCC, NCC, Coherence
 export PreprocessMethod, Highpass, Wallis, WallisGapfill, Sobel, Laplacian,
        Decibel, NoPreprocess
