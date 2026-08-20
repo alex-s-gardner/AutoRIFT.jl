@@ -32,6 +32,7 @@ Four things are needed that its docstring does not mention, all found by tracing
 so the minimum of several runs is reported, matching how the Julia suite measures.
 """
 
+import gc
 import time
 
 import cv2
@@ -81,9 +82,39 @@ def run(n, chip=32, radius=25, spacing=32):
 # hiding: a 512 scene at spacing 32 gives a 14x14 grid, whose coarse pass decimates to 3x3 — too
 # small for the 5-point outlier filter, so every point is rejected. The reference and this port
 # agree on that, which is itself a useful check. The 1024 case is the one to compare.
+def rss_growth(n=512, npairs=30):
+    """RSS growth per pair, which is where the two implementations differ most.
+
+    Reported as *current* RSS after an explicit `gc.collect()`, not peak: the question is whether
+    memory accumulates, and a peak figure cannot distinguish accumulation from allocator slack.
+    Julia's equivalent measurement tracks `Base.gc_live_bytes` for the same reason, and its live
+    heap is flat across thirty pairs.
+
+    Requires psutil; skipped with a note if absent rather than failing the run.
+    """
+    try:
+        import psutil
+    except ImportError:
+        print("rss growth: skipped (psutil not installed)")
+        return
+    proc = psutil.Process()
+    cur = lambda: proc.memory_info().rss / 2**20
+    run(n)
+    gc.collect()
+    first = cur()
+    for _ in range(npairs - 1):
+        run(n)
+    gc.collect()
+    last = cur()
+    print(f"rss growth over {npairs} pairs at {n}x{n}: "
+          f"{first:.1f} -> {last:.1f} MiB = {(last-first)/(npairs-1):+.1f} MiB/pair")
+
+
 for n in (512, 1024):
     best = None; shape = ok = mdx = mdy = None
     for rep in range(3):
         ms, shape, ok, mdx, mdy = run(n)
         best = ms if best is None else min(best, ms)
     print(f"n={n}: {best:9.1f} ms (min of 3)  grid {shape}  measured {ok}  dx={mdx:.2f} dy={mdy:.2f}")
+
+rss_growth()

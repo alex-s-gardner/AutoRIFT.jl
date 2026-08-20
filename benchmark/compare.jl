@@ -100,12 +100,36 @@ function main()
     regressions = String[]
     alloc_failures = String[]
     improvements = String[]
+    memory_regressions = String[]
 
     println("| benchmark | baseline | candidate | ratio | allocs |")
     println("|---|---:|---:|---:|---:|")
 
     for name in names
         b, c = bb[name], cb[name]
+
+        # Memory measurements carry their figure in `memory_bytes` and have zero timings, so a
+        # time ratio would be 0/0. They are compared on memory instead — and they are the one
+        # group where memory is the *point* rather than a secondary observation.
+        if startswith(String(name), "memory/")
+            mratio = b.memory_bytes == 0 ? NaN : c.memory_bytes / b.memory_bytes
+            mflag = if !isnan(mratio) && mratio >= REGRESSION_THRESHOLD
+                push!(memory_regressions,
+                      "$name ($(round(mratio, digits = 2))x, " *
+                      "$(round(c.memory_bytes/2^20, digits=1)) MiB)")
+                " **MORE MEMORY**"
+            elseif !isnan(mratio) && mratio <= 1 / NOTEWORTHY_THRESHOLD
+                " less"
+            else
+                ""
+            end
+            @printf("| %s | %.1f MiB | %.1f MiB | %s |%s |\n", name,
+                    b.memory_bytes / 2^20, c.memory_bytes / 2^20,
+                    isnan(mratio) ? "—" : @sprintf("%.2fx", mratio),
+                    isempty(mflag) ? " " : mflag)
+            continue
+        end
+
         ratio = c.min_ns / b.min_ns
         dalloc = c.allocs - b.allocs
 
@@ -136,6 +160,11 @@ function main()
         @printf("| %s | %s | %s | %.2fx |%s |\n", name,
                 prettytime(b.min_ns), prettytime(c.min_ns), ratio,
                 isempty(flag) ? " " : flag)
+    end
+
+    if !isempty(memory_regressions)
+        println("\nMORE MEMORY beyond $(REGRESSION_THRESHOLD)x:")
+        foreach(m -> println("  - ", m), memory_regressions)
     end
 
     isempty(only_cand) || println("\nNew benchmarks (no baseline): ",

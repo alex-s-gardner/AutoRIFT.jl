@@ -12,6 +12,10 @@ using JSON3
 using Printf
 
 include(joinpath(@__DIR__, "benchmarks.jl"))
+# Memory is measured in subprocesses rather than by BenchmarkTools, so it lives outside `SUITE`
+# and is merged into the results below. See `memory.jl` for why peak RSS cannot be sampled
+# in-process.
+include(joinpath(@__DIR__, "memory.jl"))
 
 function parse_args(args)
     tag, quick = nothing, false
@@ -128,6 +132,16 @@ function main()
     results = run(SUITE; verbose = true)
 
     flat = flatten(results)
+
+    # Memory, unless `--quick`: each measurement is a fresh subprocess, so the group costs a
+    # couple of minutes and is not worth paying for a smoke run.
+    if quick
+        @info "Skipping memory measurements (--quick); they spawn a process per configuration"
+    else
+        @info "Measuring peak memory in subprocesses"
+        merge!(flat, run_memory())
+    end
+
     payload = Dict(
         # Bumped whenever the recorded fields change, so `compare.jl` can refuse
         # to compare results whose schemas differ rather than silently
