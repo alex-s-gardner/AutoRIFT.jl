@@ -80,6 +80,12 @@ struct CorrelationWorkspace{T<:Real}
     # error rather than a silent out-of-bounds read.
     max_chip::Tuple{Int,Int}
     max_radius::Tuple{Int,Int}
+
+    # Set by `correlate!` to record whether the last chip carried any signal. A
+    # single-element array rather than a mutable struct so the workspace stays immutable
+    # and cheap to pass around. Callers read it via `degenerate(ws)` instead of scanning
+    # the returned surface, which would be a second pass over it per grid point.
+    was_degenerate::Vector{Bool}
 end
 
 """
@@ -125,6 +131,7 @@ function workspace(::Type{T}, chip_size, search_radius) where {T<:Real}
         Matrix{ComplexF32}(undef, fy ÷ 2 + 1, fx),
         (csx, csy),
         (rx, ry),
+        [false],
     )
 end
 
@@ -217,8 +224,10 @@ its centre — see [`AutoRIFT.peak_offset`](@ref) for converting an index to a
 displacement. `search` must be `(chip + 2 * radius - 1)` in each dimension, the
 asymmetric extent that makes the surface an even size.
 
-Returns a surface of zeros if the chip is constant; `AutoRIFT.prepare_chip!`
-explains why that is the right answer rather than a peak at the origin.
+Returns a surface of zeros if the chip is constant, and sets
+[`AutoRIFT.degenerate`](@ref) so the caller can tell that from a genuine zero
+correlation; `AutoRIFT.prepare_chip!` explains why zeros are the right answer rather than
+a peak at the origin.
 
 Allocation-free. The result aliases the workspace, so it must be consumed or
 copied before the next call on the same workspace.
@@ -244,6 +253,7 @@ function correlate!(
 
     surface = @view ws.surface[1:nr, 1:nc]
     cnorm, ok = prepare_chip!(ws, chip)
+    @inbounds ws.was_degenerate[1] = !ok
     if !ok
         fill!(surface, 0.0f0)
         return surface
@@ -255,6 +265,17 @@ end
 
 correlate!(ws, search, chip, radius::Integer; kw...) =
     correlate!(ws, search, chip, (Int(radius), Int(radius)); kw...)
+
+"""
+    degenerate(ws::CorrelationWorkspace) -> Bool
+
+Whether the last [`correlate!`](@ref) on `ws` was given a chip with no signal.
+
+A constant chip has zero variance, so the correlation coefficient is undefined at every
+shift and the surface is filled with zeros. Those zeros are not a measurement of zero
+displacement, and this is how a caller tells the two apart without scanning the surface.
+"""
+@inline degenerate(ws::CorrelationWorkspace) = @inbounds ws.was_degenerate[1]
 
 # Dispatch on the measure so each formula compiles to its own kernel with no
 # runtime branch in the inner loop.

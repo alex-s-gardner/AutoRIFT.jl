@@ -37,6 +37,9 @@ include("utils.jl")
     @testset "preprocess" begin
         include("preprocess.jl")
     end
+    @testset "track" begin
+        include("track.jl")
+    end
     @testset "vs OpenCV" begin
         include("opencv.jl")
     end

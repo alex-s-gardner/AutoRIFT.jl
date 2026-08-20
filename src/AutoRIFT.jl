@@ -24,6 +24,7 @@ module AutoRIFT
 
 using LinearAlgebra: LinearAlgebra
 using Random: Random
+using StableTasks: StableTasks
 using Statistics: Statistics
 
 """
@@ -83,6 +84,9 @@ include("peak.jl")
 include("window.jl")
 include("outliers.jl")
 include("preprocess.jl")
+
+# Layer 3: the grid loop, where the per-point primitives meet a whole point set.
+include("track.jl")
 
 export autorift, autorift!
 export SimilarityMeasure, ZNCC, NCC, Coherence
