@@ -32,6 +32,36 @@
 #
 # What remains is one multiply-accumulate over the chip per shift, which is either
 # evaluated directly or, for large chips, obtained for all shifts at once by FFT.
+#
+# ---------------------------------------------------------------------------
+# What OpenCV's matchTemplate does differently, and why none of it transfers
+# ---------------------------------------------------------------------------
+#
+# `modules/imgproc/src/templmatch.cpp` is both the correctness reference and the speed target, so
+# its tricks are worth knowing. Four were examined; none applies here, and the reasons are
+# structural rather than incidental.
+#
+#   * **The template DFT is hoisted out of the loop.** OpenCV scans *one* template over one image,
+#     so it transforms the template once and reuses the spectrum for every tile. Here every grid
+#     point cuts its own chip *and* its own search window — nothing is constant across points — so
+#     both transforms are genuinely per point. This is the biggest apparent win and it is simply
+#     not available.
+#
+#   * **The image is tiled, each tile transformed separately**, because DFT throughput degrades on
+#     large arrays (`blockScale = 4.5`, `minBlockSize = 256`). Our transforms are already 84, 128,
+#     and 192 points square for chips 32, 64, and 128 — all below the size at which OpenCV would
+#     start tiling. There is nothing to tile.
+#
+#   * **A hysteresis clamp on the near-zero denominator**: when `|num|` falls within 12.5% of the
+#     threshold, OpenCV returns ±1 rather than dividing. Measured across all 72 correlation
+#     fixtures, the worst excursion outside [-1, 1] here is 9.0e-5 — 0.009%, three orders of
+#     magnitude inside that band — so the branch would never fire, and adding it would cost a test
+#     per surface element to change nothing.
+#
+#   * **`max(sumsq - sum^2/n, 0)` to stop a negative variance**, and returning the whole surface as
+#     1 for a zero-variance template. Both of these we already do — see the clamp in
+#     `_correlate_surface!` and `degenerate`. Arrived at independently, which is reassuring rather
+#     than surprising: it is the only sane way to handle the cancellation.
 
 """
     CorrelationWorkspace
