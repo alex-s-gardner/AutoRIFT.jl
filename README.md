@@ -1,6 +1,6 @@
 # AutoRIFT.jl
 
-[![Build Status](https://github.com/alex-s-gardner/AutoRIFT.jl/actions/workflows/CI.yml/badge.svg?branch=master)](https://github.com/alex-s-gardner/AutoRIFT.jl/actions/workflows/CI.yml?query=branch%3Amaster)
+[![Build Status](https://github.com/alex-s-gardner/AutoRIFT.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/alex-s-gardner/AutoRIFT.jl/actions/workflows/CI.yml?query=branch%3Amain)
 
 Dense feature tracking by normalized cross-correlation: a pure-Julia
 reimplementation of NASA JPL's [autoRIFT](https://github.com/nasa-jpl/autoRIFT),

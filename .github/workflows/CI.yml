@@ -2,16 +2,16 @@ name: CI
 
 on:
   push:
-    branches: [master, main]
+    branches: [main]
     tags: ['*']
   pull_request:
   workflow_dispatch:
 
 concurrency:
-  # Cancel superseded runs on a branch, but never on master: those results feed
+  # Cancel superseded runs on a branch, but never on main: those results feed
   # the benchmark history and the coverage trend.
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   test:
