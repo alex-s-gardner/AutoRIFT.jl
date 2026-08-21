@@ -44,6 +44,19 @@ const nokw = NoKW()
 # non-`Bool`s, which causes widespread invalidations. Not worth it for two
 # singletons.
 
+"""
+    AutoRIFT.ImageElement
+
+The element types the correlator accepts: `Real` for optical and amplitude imagery, `Complex` for
+single-look-complex radar under [`Coherence`](@ref).
+
+`Union{Real,Complex}` rather than `Number`, which is what the type walls first said. `Number` admits
+types no path here handles — `Rational` reaches `quantize` and dies as a bare `MethodError` five
+layers down, with no mention of the actual constraint. Naming the real bound once makes the
+signatures state what the pipeline supports instead of merely more than it supports.
+"""
+const ImageElement = Union{Real,Complex}
+
 abstract type BoolAsType end
 struct True <: BoolAsType end
 struct False <: BoolAsType end

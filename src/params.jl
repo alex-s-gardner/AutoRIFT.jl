@@ -87,10 +87,15 @@ _quantize(x) = _badtype(:quantize, x, "a Symbol or a `QuantizeMethod`")
 _preprocess(x::PreprocessMethod, _width) = x
 function _preprocess(x::Symbol, width)
     T = _resolve(SYMBOL2PREPROCESS, x, :preprocess)
-    # Methods with no window ignore `filter_width` entirely; the rest take it. `Deramp` takes an
-    # `axis` instead, so it joins the no-window group — a caller wanting a single axis passes the
-    # instance, `preprocess = Deramp(; axis = :x)`.
-    return T <: Union{NoPreprocess,Decibel,Deramp} ? T() :
+    # Methods with no window ignore `filter_width` entirely; the rest take it. Asked via
+    # `filter_width` rather than by restating the list of windowless methods here: the trait already
+    # encodes it, and a second copy meant adding `Deramp` in two places — where forgetting the second
+    # would have made `preprocess = :deramp` call `Deramp(; width = ...)` and throw a `MethodError`
+    # from a keyword combination rather than a clear error.
+    #
+    # `T()` is constructed first because the trait is a property of the instance. Every method here
+    # has a zero-argument constructor, which is what makes that safe.
+    return filter_width(T()) == 0 ? T() :
            isnokw(width) ? T() : T(; width)
 end
 _preprocess(x, _width) = _badtype(:preprocess, x, "a Symbol or a `PreprocessMethod`")

@@ -81,6 +81,18 @@ type: the chip is `Float32` because it is stored mean-removed, and the integral 
 identical machine code. The element type reaches the kernel through the image arguments, which
 is where it belongs.
 
+That decision survived the addition of complex support, and the deciding reason is the *pool*:
+`WORKSPACE_POOL` is keyed on geometry alone, and a type parameter would make the key
+`(T, chip, radius)` — so a `(:coherence, :zncc)` run would need two pool entries per geometry where
+one serves. The complex buffers are therefore parallel fields rather than a parameter.
+
+The honest cost, since three separate comments below each justify one buffer and none of them add
+up: on a real-only run the complex fields are **roughly 55-60% of every workspace** and are never
+touched. They are pooled, so this is steady-state footprint rather than per-pair peak — measured
+per-pair peak RSS did not move — but a future measure needing its own scratch is the point at which
+lazily-allocated nested scratch (a `Union{Nothing,ComplexScratch}`, geometry still the only pool key)
+becomes the right shape rather than a seventh field.
+
 Construct with [`workspace`](@ref).
 """
 struct CorrelationWorkspace
@@ -136,24 +148,31 @@ struct CorrelationWorkspace
     fspec_a::Matrix{ComplexF32}
     fspec_b::Matrix{ComplexF32}
 
-    # Complex FFT scratch, for `Coherence`. Four full-size complex buffers rather than the real
-    # path's two-real-plus-two-half-spectrum: a complex transform has no conjugate symmetry to
-    # exploit, so the spectra are full size.
+    # Complex FFT scratch, for `Coherence`. Full-size rather than the real path's half-spectrum: a
+    # complex transform has no conjugate symmetry to exploit.
     #
-    # Four and not two, and this was checked rather than assumed. A c2c transform *can* be planned
-    # in place, so the spectra look redundant — but an FFTW plan encodes its buffer aliasing, and
-    # executing a plan built for distinct arrays with `input === output` does not error, it returns
-    # wrong numbers: measured 4.6 *relative* error. Reusing the buffers would mean planning a second,
-    # in-place variant of each direction, which trades 113 KiB of workspace for two more cached plans
-    # and a subtler invariant. Not worth it.
+    # **Three**, and the count was settled by measurement in both directions.
     #
-    # These are the largest buffers in the workspace — 4 x fy x fx x 8 bytes, about 226 KiB at
-    # chip 32 with radius 25. Justified by what they buy: the direct numerator they replace was
-    # measured at 47x the ZNCC path at chip 32 and 183x at chip 128.
+    # Not two. A c2c transform *can* be planned in place, so the spectrum looks redundant — but an
+    # FFTW plan encodes its buffer aliasing, and executing a plan built for distinct arrays with
+    # `input === output` does not error, it returns wrong numbers: measured 4.6 *relative* error.
+    # Planning genuine in-place variants does work and is bit-identical, but measured 1.3-5%
+    # *slower* — FFTW's in-place c2c plans are slower here even in isolation — for two extra cached
+    # plans and a subtler invariant.
+    #
+    # Not four either, which is where this started. The second spectrum buffer was redundant: once
+    # the search window's transform has been read out of `cbuf_a`, that buffer is dead and can
+    # receive the chip's spectrum. It is still a *distinct* array from `cbuf_b`, so the plan's
+    # aliasing invariant is untouched — that is precisely what separates this from transforming in
+    # place. Freed 9-10% of every complex workspace (55 KiB at chip 32, 288 KiB at chip 128),
+    # bit-identical and runtime-neutral.
+    #
+    # Still the largest buffers here — 3 x fy x fx x 8 bytes, ~170 KiB at chip 32 with radius 25 —
+    # and justified by what they buy: the direct numerator they replace measured 47x the ZNCC path
+    # at chip 32 and 183x at chip 128.
     cbuf_a::Matrix{ComplexF32}
     cbuf_b::Matrix{ComplexF32}
     cspec_a::Matrix{ComplexF32}
-    cspec_b::Matrix{ComplexF32}
 
     # Maximum extents this workspace was built for, so a mismatched call is an
     # error rather than a silent out-of-bounds read.
@@ -185,7 +204,7 @@ workspace's separate complex chip buffer.
 """
 workspace(chip_size, search_radius) = workspace(Float32, chip_size, search_radius)
 
-function workspace(::Type{T}, chip_size, search_radius) where {T<:Number}
+function workspace(::Type{T}, chip_size, search_radius) where {T<:ImageElement}
     csx, csy = chip_size isa Tuple ? chip_size : (chip_size, chip_size)
     rx, ry = search_radius isa Tuple ? search_radius : (search_radius, search_radius)
 
@@ -219,7 +238,6 @@ function workspace(::Type{T}, chip_size, search_radius) where {T<:Number}
         Matrix{Float32}(undef, fy, fx),
         Matrix{ComplexF32}(undef, fy ÷ 2 + 1, fx),
         Matrix{ComplexF32}(undef, fy ÷ 2 + 1, fx),
-        Matrix{ComplexF32}(undef, fy, fx),
         Matrix{ComplexF32}(undef, fy, fx),
         Matrix{ComplexF32}(undef, fy, fx),
         Matrix{ComplexF32}(undef, fy, fx),
@@ -276,7 +294,7 @@ Return it with [`give_workspace!`](@ref) when done. The caller has exclusive use
 concurrent chunks never share buffers — the same guarantee per-chunk allocation gave, without
 the garbage.
 """
-function take_workspace!(::Type{T}, chip_size, search_radius) where {T<:Number}
+function take_workspace!(::Type{T}, chip_size, search_radius) where {T<:ImageElement}
     csx, csy = chip_size isa Tuple ? chip_size : (chip_size, chip_size)
     rx, ry = search_radius isa Tuple ? search_radius : (search_radius, search_radius)
     key = ((Int(csx), Int(csy)), (Int(rx), Int(ry)))
@@ -422,10 +440,21 @@ end
 
 # The complex chip, into the workspace's own complex buffer.
 #
-# Structurally the real version with a complex accumulator, and deliberately a separate method
-# rather than a generic one: the real path is the hot path for every optical pair and must not
-# acquire a `Complex` union or an extra branch. The two are short enough that one transcription
-# each is cheaper than an abstraction over both.
+# Structurally the real version with a complex accumulator, and a separate method for a narrower
+# reason than the one first written here.
+#
+# The original justification — that a generic method "must not acquire a `Complex` union or an extra
+# branch" in the real hot path — is **wrong**, and measurement is what settled it: a single method
+# widening through a two-line `_w(::Real)`/`_w(::Complex)` helper is bit-identical *and*
+# timing-identical on both `Float32` and `UInt8` chips (27.8 vs 27.9 us, 29.1 vs 29.0 us on 200²).
+# No union ever reaches the real path, because Julia specializes on the concrete element type at
+# each call site. Type *parameterisation* was the available tool; a `Union` was never the choice.
+#
+# What does justify two methods is the *destination*: this one writes `ws.cchip` and the real one
+# `ws.chip`, which are different fields rather than different types. Unifying would mean dispatching
+# the buffer as well as the accumulator, at which point two 20-line bodies read more clearly than
+# one with two traits. That is a legibility judgement, and it is worth stating as one rather than
+# dressing it as a performance requirement.
 #
 # The mean is complex — subtracting it removes the *constant* phasor as well as the DC amplitude,
 # which is what makes coherence invariant to a global phase offset between the two acquisitions.
@@ -838,9 +867,14 @@ function _cnumerators_fft!(out, ws::CorrelationWorkspace, search, cd, nr, nc, ch
 
     plan = cfft_plan(fy, fx)
     cfft_execute!(plan, a, ws.cspec_a)
-    cfft_execute!(plan, b, ws.cspec_b)
+    # The chip's spectrum lands in `a`, not a fourth buffer: `a` is dead the moment its own
+    # transform has been read out, and it is still a *distinct* array from `b`, so the plan's
+    # aliasing invariant holds. That is the difference between this and transforming in place —
+    # see the workspace comment. Saves 9-10% of the workspace at every chip size, bit-identical
+    # and runtime-neutral (three transforms and one elementwise pass either way).
+    cfft_execute!(plan, b, a)
     @inbounds for k in eachindex(ws.cspec_a)
-        ws.cspec_a[k] *= ws.cspec_b[k]
+        ws.cspec_a[k] *= a[k]
     end
     iplan = icfft_plan(fy, fx)
     # Unnormalised in both directions, so the 1/n is applied on the read below rather than in a

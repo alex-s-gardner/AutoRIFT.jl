@@ -38,14 +38,14 @@ arise from sensor gaps, cloud masks, and the no-data border left by reprojection
 they must not be allowed to contribute to a correlation — a chip full of fill values
 correlates beautifully with any other chip full of fill values.
 """
-struct ImagePair{T<:Number,A<:AbstractMatrix{T},M<:AbstractMatrix{Bool}}
+struct ImagePair{T<:ImageElement,A<:AbstractMatrix{T},M<:AbstractMatrix{Bool}}
     reference::A
     secondary::A
     reference_valid::M
     secondary_valid::M
 
     function ImagePair(reference::A, secondary::A, reference_valid::M,
-                       secondary_valid::M) where {T<:Number,A<:AbstractMatrix{T},
+                       secondary_valid::M) where {T<:ImageElement,A<:AbstractMatrix{T},
                                                   M<:AbstractMatrix{Bool}}
         size(reference) == size(secondary) || throw(DimensionMismatch(
             "reference is $(size(reference)) but secondary is $(size(secondary)); " *
