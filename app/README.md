@@ -1,6 +1,6 @@
 # A standalone AutoRIFT binary
 
-A trimmed, statically-compiled `autorift` executable: **25.8 MiB peak RSS against 424.2 MiB** for
+A trimmed, statically-compiled `autorift` executable: **27.2 MiB peak RSS against 424.2 MiB** for
 the equivalent Julia process, 0.06 s to run a 512² pair, and no Julia installation needed at run time.
 
 This exists for one reason. 97% of an ordinary AutoRIFT process's 408 MiB memory floor is the Julia
@@ -15,7 +15,7 @@ Not in CI, not a dependency of the package, and not part of `Pkg.test()`. JuliaC
 
 | | trimmed binary | `julia -t1`, same work |
 |---|---:|---:|
-| peak RSS, 512² pair | **25.8 MiB** | 424.2 MiB |
+| peak RSS, 512² pair | **27.2 MiB** | 424.2 MiB |
 | peak RSS, 2048² pair | **117.8 MiB** | 542.7 MiB |
 | wall clock, 512², warm wisdom | **0.06 s** | 1.20 s |
 | binary | 3.2 MiB | — |

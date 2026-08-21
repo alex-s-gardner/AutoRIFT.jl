@@ -59,7 +59,7 @@ skips the correlation.
 **97% of the floor is the runtime.** AutoRIFT itself is ~7 MiB. There is no optimization inside
 this package that reaches the other 397; `--compile=min` recovers 18 MiB, which is not the right
 order of magnitude. That is what makes a trimmed binary the only real lever — see
-[`app/`](../app/README.md), which runs the same correlation at **25.8 MiB peak against 424.2 MiB**.
+[`app/`](../app/README.md), which runs the same correlation at **27.2 MiB peak against 424.2 MiB**.
 
 ## Per-pair peak
 
@@ -145,5 +145,5 @@ that does scale, and it is deferred rather than dismissed.
 - **Reuse a `Cache` across pairs** via `init`/`reinit!`/`autorift!`. The live heap is flat, so this
   is bounded regardless of batch length.
 - **No process recycling needed** — the measurement above is what establishes that.
-- **Small instances: use the trimmed binary.** 25.8 MiB against 424.2 MiB is the difference between
+- **Small instances: use the trimmed binary.** 27.2 MiB against 424.2 MiB is the difference between
   3.1% and 43% of a `t3.micro`.
