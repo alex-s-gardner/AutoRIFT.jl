@@ -278,7 +278,9 @@ choice is a known defect — see the package documentation for the list.
   [`RotationSearch`](@ref). `nothing` or `false` disables it, which is the default because it
   multiplies correlation cost by the number of angles. `true` uses ±3°, following
   `nansencenter/sea_ice_drift`; a tuple names the angles. Only useful where the ice rotates —
-  see [`RotationSearch`](@ref) for the measurement.
+  see [`RotationSearch`](@ref) for the measurement. To centre a narrow angle window on a scene
+  that is already rotated, build the method with `about`: `RotationSearch(; about =
+  scene_rotation(guess))`. See [`scene_rotation`](@ref).
 - `outliers = :gardner`: which implausible displacements to drop. `:gardner` is the
   two-stage filter of Gardner et al. (2018) that autoRIFT uses; `:none` keeps everything,
   which is useful for telling the correlator's failures from the filter's rejections. An
