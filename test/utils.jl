@@ -197,6 +197,13 @@ A test helper for the rotation search, and bilinear rather than nearest-neighbou
 `AutoRIFT._rotate_chip` is bilinear, so a nearest-neighbour scene would make every measurement of the
 search a measurement of the *mismatch* between two resamplers. Same sign convention and same
 half-pixel centre as `_rotate_chip`, for the same reason.
+
+**Deliberately not a call to `_rotate_chip`, which it near-duplicates.** The test this exists for
+asserts that counter-rotating a chip with `_rotate_chip` recovers correlation against an
+independently rotated scene. Generating the scene with the same function would let a broken rotator
+cancel against itself and the assertion pass regardless — the duplication is what keeps the two
+sides independent. (It would also need a full-image `CorrelationWorkspace` and its FFT buffers,
+which is beside the point.)
 """
 function rotate_bilinear(img::AbstractMatrix, deg::Real)
     nr, nc = size(img)
@@ -257,6 +264,39 @@ function shifted_pair(sz::Tuple{Int,Int}, shift::Tuple{Real,Real};
 end
 
 shifted_pair(n::Integer, shift; kw...) = shifted_pair((Int(n), Int(n)), shift; kw...)
+
+"""
+    chip_and_window(img, centre, chip_size, radius; shift = (0, 0), window_from = img)
+        -> (chip, window)
+
+A chip and its search window, cut about `centre = (row, col)` in the layout `correlate!` requires.
+
+The window extent is the delicate part, and it was written out by hand at seven call sites before
+this helper existed — in three spellings of the same arithmetic (`+ h + r - 2` and `+ h - 2 + r`
+differ textually but not numerically, so grep did not connect them). `correlate!`'s window is
+**deliberately asymmetric**: it reaches `radius` one way and `radius - 1` the other, so the surface
+is an even `2 * radius` and zero displacement lands on a sample rather than between two. Get the
+`-2` wrong and the correlator throws a `DimensionMismatch` that reads as a test bug rather than a
+convention error.
+
+`shift` offsets the *chip* only, which is how a known displacement is set up: the window stays put
+and the chip is cut from `shift` pixels away, so the peak must land at `shift`.
+
+`window_from` cuts the window from a different image than the chip — the reference/secondary split
+that a real pair has.
+"""
+function chip_and_window(img::AbstractMatrix, centre::Tuple{Integer,Integer},
+                         chip_size::Integer, radius::Integer;
+                         shift::Tuple{Integer,Integer} = (0, 0),
+                         window_from::AbstractMatrix = img)
+    cy, cx = centre
+    sy, sx = shift
+    h = chip_size ÷ 2
+    chip = img[(cy - h + sy):(cy + h - 1 + sy), (cx - h + sx):(cx + h - 1 + sx)]
+    window = window_from[(cy - h - radius):(cy + h + radius - 2),
+                         (cx - h - radius):(cx + h + radius - 2)]
+    return chip, window
+end
 
 # Sample `a` at (i - dy, j - dx) so the result is `a` translated by (+dx, +dy).
 function _shift_bilinear(a::Matrix{Float64}, shift::Tuple{Real,Real})

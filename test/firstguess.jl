@@ -133,28 +133,64 @@ end
     # stops the correlator and the tests from disagreeing about the sign.
     @test angles(RotationSearch(; about = 8.0)) == (-11.0, -8.0, -5.0)
     @test angles(RotationSearch((-1, 0, 1); about = -4.5)) == (3.5, 4.5, 5.5)
-    # Both spellings of the default: no `about` is exactly `about = 0`, and identically so, since
-    # the zero case skips the broadcast entirely.
+    # Both spellings of the default agree, because subtracting zero is the identity — *not* because
+    # a zero case is branched around. There is no `about == 0` fast path: one was written and
+    # measured slower than the unconditional subtraction, which `angles`'s docstring records.
     @test angles(RotationSearch()) === angles(RotationSearch(; about = 0.0))
 
-    # A non-finite centre is refused rather than searching around zero. `scene_rotation` returns
-    # `NaN` when it cannot fit, and passing that through would look like it had worked.
+    # Every angle *tried* must be finite, and the angles tried are `angles .- about` — so both
+    # halves are checked. Enforcing it only on `about` was the first version, and it let a NaN
+    # angle through to produce an all-NaN chip that vanished into the degenerate path, reported as
+    # a textureless chip rather than as bad input.
     @test_throws ArgumentError RotationSearch(; about = NaN)
     @test_throws ArgumentError RotationSearch((-3, 0, 3); about = Inf)
+    @test_throws ArgumentError RotationSearch((NaN, 0.0, 3.0))
+    @test_throws ArgumentError RotationSearch((-Inf, 0.0, 3.0))
+
+    # An unfittable field cannot be passed through by accident: `scene_rotation` returns `nothing`,
+    # so this fails at the line that made the mistake — `about::Real` rejects it — rather than
+    # becoming a NaN that survives arithmetic and surfaces somewhere else.
+    @test_throws TypeError RotationSearch(; about = scene_rotation([1.0], [2.0], [0.0], [0.0]))
 end
 
-# Displacements for a field where the ice has rotated by `motion` degrees about `centre`, plus a
-# rigid translation `shift`. Returns `(dx, dy)` in the package's reference-minus-secondary sense.
+# Displacements for a field where the ice has rotated by `motion` degrees, plus a rigid translation
+# `shift`. Returns `(dx, dy)` in the package's reference-minus-secondary sense.
 #
 # One helper rather than the same eight lines in three testsets, because the *sign* is the thing
 # under test and three hand-written copies is three chances to write it differently.
-function rotated_field(xs, ys, motion; centre = (250.0, 250.0), shift = (0.0, 0.0))
+#
+# The rotation centre is fixed rather than a keyword. It was one, and no assertion could observe it:
+# `scene_rotation` removes the centroid, so the fit is centre-invariant by construction — measured
+# identical to 1e-14 for pivots at (50, 50), (250, 250) and (-9999, 7). A knob no test can distinguish
+# reads as load-bearing at the one call site that sets it. The invariance is pinned directly below
+# instead, which is the honest way to state it.
+function rotated_field(xs, ys, motion; shift = (0.0, 0.0))
     s, c = sincos(deg2rad(motion))
-    xc, yc = centre
+    xc = yc = 250.0
     # Where each feature ends up in the secondary: carried by the motion, then translated.
     sx = @. xc + c * (xs - xc) - s * (ys - yc) + shift[1]
     sy = @. yc + s * (xs - xc) + c * (ys - yc) + shift[2]
     return xs .- sx, ys .- sy
+end
+
+# A rotation about `centre` rather than `rotated_field`'s fixed pivot, for the invariance test only.
+function rotated_field_about(xs, ys, motion, centre)
+    s, c = sincos(deg2rad(motion))
+    xc, yc = centre
+    sx = @. xc + c * (xs - xc) - s * (ys - yc)
+    sy = @. yc + s * (xs - xc) + c * (ys - yc)
+    return xs .- sx, ys .- sy
+end
+
+@testset "scene_rotation does not depend on where the rotation was centred" begin
+    # The property that lets `rotated_field` hardcode its pivot, and the reason a single scene angle
+    # is meaningful at all: the centroid step removes translation, and a rotation about a different
+    # centre differs from one about this centre by exactly a translation.
+    xs = [0.0, 100.0, 100.0, 0.0]
+    ys = [0.0, 0.0, 100.0, 100.0]
+    fits = [AutoRIFT.scene_rotation(xs, ys, rotated_field_about(xs, ys, 6.0, ctr)...)
+            for ctr in ((50.0, 50.0), (250.0, 250.0), (-9999.0, 7.0))]
+    @test all(f -> isapprox(f, -6.0; atol = 1e-9), fits)
 end
 
 @testset "scene_rotation fits a known rotation" begin
@@ -174,12 +210,16 @@ end
 end
 
 @testset "scene_rotation degenerate cases" begin
+    # `nothing`, not `NaN`: a scalar NaN survives arithmetic and surfaces somewhere unrelated, where
+    # `nothing` fails at first use. See the docstring.
+    #
     # Nothing to fit: a rotation needs two points, since one gives only a translation.
-    @test isnan(AutoRIFT.scene_rotation(Float64[], Float64[], Float64[], Float64[]))
-    @test isnan(AutoRIFT.scene_rotation([1.0], [2.0], [0.5], [0.5]))
+    @test AutoRIFT.scene_rotation(Float64[], Float64[], Float64[], Float64[]) === nothing
+    @test AutoRIFT.scene_rotation([1.0], [2.0], [0.5], [0.5]) === nothing
     # Coincident points: both Procrustes sums vanish, and `atan(0, 0)` would report a confident 0.
-    @test isnan(AutoRIFT.scene_rotation(fill(3.0, 5), fill(4.0, 5), zeros(5), zeros(5)))
-    # A pure translation is zero rotation, not some small nonzero fit.
+    @test AutoRIFT.scene_rotation(fill(3.0, 5), fill(4.0, 5), zeros(5), zeros(5)) === nothing
+    # A pure translation *is* fittable and is exactly zero rotation, not a small nonzero fit — so it
+    # belongs here as the boundary against the coincident case above, which is not fittable at all.
     @test AutoRIFT.scene_rotation([0.0, 10.0, 5.0], [0.0, 3.0, 9.0],
                                   fill(7.0, 3), fill(-2.0, 3)) == 0.0
     @test_throws DimensionMismatch AutoRIFT.scene_rotation([1.0, 2.0], [1.0], [0.0], [0.0])
@@ -190,7 +230,7 @@ end
     # sparse displacements, so no unpacking should be needed at the call site.
     xs = [0.0, 100.0, 100.0, 0.0]
     ys = [0.0, 0.0, 100.0, 100.0]
-    dx, dy = rotated_field(xs, ys, 6.0; centre = (50.0, 50.0))
+    dx, dy = rotated_field(xs, ys, 6.0)
     pts = AutoRIFT.pointset(xs, ys; dx_prior = dx, dy_prior = dy)
     @test AutoRIFT.scene_rotation(pts) ≈ -6.0 atol = 1e-9
 
@@ -221,34 +261,31 @@ end
     ci = cj = 257
     R = 4
 
-    # Peak correlation of the centre chip rotated by `ang`, at chip size `cs`.
+    # Peak correlation of the centre chip rotated by `ang`, at chip size `cs`. Chip from the rotated
+    # secondary, window from the unrotated reference — which is the arrangement under test.
     function rotated_peak(cs, ang)
-        h = cs ÷ 2
-        chip = b[(ci - h):(ci + h - 1), (cj - h):(cj + h - 1)]
-        # The window is `cs + 2R - 1` on a side: `correlate!` extends `R` one way and `R - 1` the
-        # other, so the surface is an even `2R` and zero displacement lands on a sample.
-        win = a[(ci - h - R):(ci + h - 2 + R), (cj - h - R):(cj + h - 2 + R)]
+        chip, win = chip_and_window(b, (ci, cj), cs, R; window_from = a)
         ws = AutoRIFT.workspace(Float32, (cs, cs), (R, R))
         return maximum(AutoRIFT.correlate!(
             ws, win, AutoRIFT._rotate_chip(ws, chip, ang), (R, R); measure = ZNCC()))
     end
 
-    for cs in (64, 128)
-        back = rotated_peak(cs, -motion)
-        @test back > rotated_peak(cs, 0.0)      # counter-rotation beats not rotating at all
-        @test back > rotated_peak(cs, motion)   # and rotating the wrong way is worse than either
+    # Whether counter-rotation beats not rotating is *chip-size dependent*, so the expectation is
+    # data rather than a special case below the loop. At chip 32 it loses: those corners travel only
+    # ~2 px at 8 degrees, and resampling plus corner padding cost more than that. Pinned in both
+    # directions because it is the "gain grows with chip size" effect seen from each end — a change
+    # that flipped the 32 case would mean the rotation had stopped being nearly free at small chips.
+    for (cs, beats_unrotated) in ((32, false), (64, true), (128, true))
+        back, unrotated, wrong = rotated_peak(cs, -motion), rotated_peak(cs, 0.0),
+                                 rotated_peak(cs, motion)
+        @test (back > unrotated) == beats_unrotated
+        # Counter-rotation always beats rotating the wrong way, at every size.
+        @test back > wrong
     end
 
     # `about` must produce exactly that winning angle from the scene rotation — `scene_rotation`
     # returns `-motion`, and the chip needs `+motion`, with no negation at the call site.
     @test only(angles(RotationSearch((0.0,); about = -motion))) == motion
-
-    # At chip 32 counter-rotation *loses* to not rotating, because a 32-px chip's corners travel
-    # only ~2 px at 8 degrees while resampling and corner padding cost more than that. Pinned
-    # because it is the same "gain grows with chip size" effect from the other end, and a change
-    # that made this one pass would mean the rotation had stopped being nearly free at small chips.
-    @test rotated_peak(32, -motion) < rotated_peak(32, 0.0)
-    @test rotated_peak(32, -motion) > rotated_peak(32, motion)   # still beats the wrong direction
 end
 
 @testset "rotation search is exactly the unrotated path when off" begin
