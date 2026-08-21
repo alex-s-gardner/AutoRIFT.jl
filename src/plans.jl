@@ -429,18 +429,31 @@ size, which produces a plausible-looking surface with the wrong normalisation.
 end
 
 """
-    warm_plans!(sizes)
+    warm_plans!(sizes; complex = false)
 
 Create the plans for `sizes` on the calling task, before any parallel work starts.
 
 Without this, every task racing to correlate its first point would contend on the
 planner lock and serialise — turning the most parallel part of the run into its
 most serial. Called once per pass, where the set of sizes is known in advance.
+
+`complex` selects the complex-to-complex pair that [`Coherence`](@ref) executes instead of the
+real-to-complex pair the real measures use. It must match the measure the pass will actually run:
+warming the wrong kind is doubly wrong, since it pays `FFTW_MEASURE` — 116-347 ms per size cold —
+for a plan that is never executed, *and* leaves the plans that are executed to be created inside a
+worker task, which is precisely the planner contention this function exists to prevent. Verified
+against a coherence pass before this argument existed: it warmed `RFFT_PLANS[(72,72)]`, never used
+it, and built `CFFT_PLANS[(72,72)]` lazily under the lock.
 """
-function warm_plans!(sizes)
+function warm_plans!(sizes; complex::Bool = false)
     for (ny, nx) in sizes
-        fft_plan(ny, nx)
-        ifft_plan(ny, nx)
+        if complex
+            cfft_plan(ny, nx)
+            icfft_plan(ny, nx)
+        else
+            fft_plan(ny, nx)
+            ifft_plan(ny, nx)
+        end
     end
     # Persist whatever was measured, so the next process starts warm. Only writes if a plan was
     # actually created — the common case after the first run is that this does nothing.

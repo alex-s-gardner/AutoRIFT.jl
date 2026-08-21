@@ -266,6 +266,34 @@ end
     @test_throws ArgumentError params(; similarity = ())
 end
 
+@testset "a coherence pass warms the plans it actually uses" begin
+    # `warm_plans!` exists to create plans on the calling task, before any worker races for the
+    # planner lock. Warming the wrong *kind* is doubly wrong: it pays FFTW_MEASURE (116-347 ms per
+    # size cold) for a plan never executed, and leaves the plans that ARE executed to be built
+    # inside a task under the lock — exactly the contention it exists to prevent.
+    #
+    # This regression-tests a real defect: before `warm_plans!` took a `complex` argument, a
+    # coherence run warmed `RFFT_PLANS[(72,72)]`, never touched it, and built its c2c plans lazily.
+    z1 = speckle(384; seed = 0xABCD)
+    z2 = circshift(z1, (5, -3))
+    AutoRIFT.clear_plans!()
+    autorift(z1, z2; similarity = :coherence, preprocess = :deramp, quantize = :none,
+             chip_size = 32, search_radius = 20, chip_size_max = 32)
+    # The complex plans are the ones a coherence surface executes.
+    @test !isempty(AutoRIFT.CFFT_PLANS)
+    @test !isempty(AutoRIFT.ICFFT_PLANS)
+    # And no real plan was measured for a pass that cannot use one.
+    @test isempty(AutoRIFT.RFFT_PLANS)
+    @test isempty(AutoRIFT.IRFFT_PLANS)
+
+    # The mirror case: a real pass must not warm complex plans.
+    AutoRIFT.clear_plans!()
+    autorift(abs.(z1), abs.(z2); quantize = :none, chip_size = 32, search_radius = 20,
+             chip_size_max = 32)
+    @test !isempty(AutoRIFT.RFFT_PLANS)
+    @test isempty(AutoRIFT.CFFT_PLANS)
+end
+
 @testset "end-to-end: complex pair through autorift" begin
     # The whole pipeline on synthetic SLC, which is what the milestone is for.
     n, shift = 384, (5, -3)

@@ -142,7 +142,7 @@ function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Param
     # thread-safe, so leaving this to the workers would have every one of them contend on
     # the planner lock at its first point — turning the most parallel part of the run into
     # its most serial.
-    _warm_pass_plans(chipx, chipy, rx, ry)
+    _warm_pass_plans(chipx, chipy, rx, ry, measure)
 
     istrue(p.threaded) ? _track_threaded!(out, ref, sec, okmask, shifted, chipx, chipy,
                                           rx, ry, up, p, measure) :
@@ -221,13 +221,23 @@ end
 
 # Which transform sizes this pass will use, so they can be planned up front. Only the
 # maximum extent is needed: every point either uses it or takes the direct path.
-function _warm_pass_plans(chipx::Int, chipy::Int, rx::Int, ry::Int)
+#
+# The measure decides *which kind* of transform to warm — `Coherence` executes complex-to-complex
+# plans and the real measures real-to-complex ones, so warming without knowing the measure warms
+# the wrong pair half the time.
+function _warm_pass_plans(chipx::Int, chipy::Int, rx::Int, ry::Int,
+                          measure::SimilarityMeasure)
     (chipx == 0 || rx == 0) && return nothing
     fy = next_fft_size(chipy + 2ry - 1)
     fx = next_fft_size(chipx + 2rx - 1)
-    warm_plans!(((fy, fx),))
+    warm_plans!(((fy, fx),); complex = _wants_complex_plans(measure))
     return nothing
 end
+
+# Which transform kind a measure executes. A trait rather than an `isa` at the call site, so a
+# future measure declares its own answer instead of being added to a branch here.
+_wants_complex_plans(::SimilarityMeasure) = false
+_wants_complex_plans(::Coherence) = true
 
 # ---------------------------------------------------------------------------
 # The loop

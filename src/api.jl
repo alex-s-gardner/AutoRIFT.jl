@@ -348,11 +348,21 @@ function _warm_grid_plans(grid::PointSet{2}, p::Params)
     rx = maximum(grid.radius_x)
     ry = maximum(grid.radius_y)
     (rx == 0 || ry == 0) && return nothing
+    # Per level, because the measure can differ per level: a `(:coherence, :zncc)` run needs the
+    # complex plan pair at the finest chip and the real pair above it. Warming one kind for the whole
+    # grid would leave half the levels to plan inside a worker task, under the planner lock.
     sizes = Tuple{Int,Int}[]
-    for cs in chip_sizes(p)
+    csizes = chip_sizes(p)
+    for k in eachindex(csizes)
+        cs = csizes[k]
         csy = chip_size_y(p, cs)
-        push!(sizes, (next_fft_size(csy + 2ry - 1), next_fft_size(cs + 2rx - 1)))
+        sz = (next_fft_size(csy + 2ry - 1), next_fft_size(cs + 2rx - 1))
+        if _wants_complex_plans(measure_at(p, k))
+            warm_plans!((sz,); complex = true)
+        else
+            push!(sizes, sz)
+        end
     end
-    warm_plans!(sizes)
+    isempty(sizes) || warm_plans!(sizes)
     return nothing
 end
