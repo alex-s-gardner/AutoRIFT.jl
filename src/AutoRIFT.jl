@@ -101,6 +101,7 @@ include("outliers.jl")
 include("preprocess.jl")
 
 # Layer 3: orchestration. The grid loop, then the multi-chip-size search built on it.
+include("firstguess.jl")
 include("track.jl")
 include("multichip.jl")
 include("api.jl")
@@ -142,6 +143,7 @@ export SubpixelMethod, PyramidRefine, NoRefine
 export QuantizeMethod, QuantizeUInt8, NoQuantize
 export OutlierMethod, GardnerFilter, NoOutlierFilter
 export ImagePair
+export FirstGuess, ORBGuess, first_guess
 
 # ---------------------------------------------------------------------------
 # Precompilation

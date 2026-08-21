@@ -58,6 +58,12 @@ include("utils.jl")
     @testset "complex" begin
         include("complex.jl")
     end
+    # The sparse first-guess stage. Its filter needs no detector, so it belongs in the core suite;
+    # `first_guess` itself needs ImageFeatures and is tested with the extensions below. The
+    # "names the dependency" case in here depends on running *before* that load.
+    @testset "first guess" begin
+        include("firstguess.jl")
+    end
 
     @testset "code quality" begin
         include("aqua.jl")

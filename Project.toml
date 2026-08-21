@@ -15,10 +15,13 @@ StableTasks = "91464d47-22a1-43fe-8b7f-2d57ee82463f"
 
 [weakdeps]
 DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
+ImageCore = "a09fc81d-aa75-5fe9-8630-4744c3626534"
+ImageFeatures = "92ff4b2b-8094-53d3-b29d-97f740f06cef"
 Rasters = "a3a2b9e3-a471-40c9-b274-f788e487c689"
 
 [extensions]
 AutoRIFTDimensionalDataExt = "DimensionalData"
+AutoRIFTImageFeaturesExt = ["ImageFeatures", "ImageCore"]
 AutoRIFTRastersExt = ["Rasters", "DimensionalData"]
 
 [compat]
@@ -28,6 +31,8 @@ Dates = "1"
 DimensionalData = "0.29, 0.30"
 FFTW = "1.8"
 FFTW_jll = "3.3.12"
+ImageCore = "0.10"
+ImageFeatures = "0.5"
 JET = "0.9, 0.10"
 JSON3 = "1"
 LinearAlgebra = "1"
@@ -43,6 +48,8 @@ julia = "1.10"
 [extras]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
 DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
+ImageCore = "a09fc81d-aa75-5fe9-8630-4744c3626534"
+ImageFeatures = "92ff4b2b-8094-53d3-b29d-97f740f06cef"
 JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
@@ -51,4 +58,5 @@ Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test", "Aqua", "JET", "JSON3", "Random", "Statistics", "Rasters", "DimensionalData"]
+test = ["Test", "Aqua", "JET", "JSON3", "Random", "Statistics", "Rasters", "DimensionalData",
+        "ImageFeatures", "ImageCore"]

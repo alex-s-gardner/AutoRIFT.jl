@@ -323,10 +323,86 @@ end
     @test wrapped < 1.05 * plain
 end
 
+# ---------------------------------------------------------------------------
+# The sparse first-guess stage (ImageFeatures extension)
+# ---------------------------------------------------------------------------
+
+using ImageFeatures
+using AutoRIFT: first_guess, ORBGuess
+
+# SAR-like amplitude: fully-developed speckle is a circular Gaussian field, and its magnitude is
+# what an amplitude product carries. Smoothed so neighbouring samples correlate, or a shifted copy
+# has no structure to match.
+function _speckle_amp(n::Int; seed = 1)
+    rng = Random.MersenneTwister(seed)
+    z = complex.(randn(rng, Float32, n, n), randn(rng, Float32, n, n))
+    for _ in 1:2
+        z = (z .+ circshift(z, (1, 0)) .+ circshift(z, (0, 1)) .+ circshift(z, (1, 1))) ./ 4
+    end
+    return abs.(z)
+end
+
+@testset "first_guess recovers a large displacement" begin
+    # The case the stage exists for: a shift far outside any affordable dense search radius.
+    n, shift = 512, (37, -23)
+    a = _speckle_amp(n)
+    b = circshift(a, shift)
+
+    g = first_guess(a, b, ORBGuess(; num_keypoints = 3000))
+    @test g isa AutoRIFT.PointSet
+    @test length(g.x) > 100
+
+    # The sign convention is the one thing here that must not be wrong: `dx`/`dy` are the offset
+    # from *secondary* back to reference, matching `track!`. `circshift(a, (37, -23))` makes the
+    # secondary equal to the reference moved by (+37, -23), so reference-minus-secondary is
+    # (-37, +23) — dy = -37, dx = +23. Getting this backwards would centre every search window on
+    # the far side of the true peak, which is worse than having no prior at all.
+    @test med(g.dx_prior) ≈ 23 atol = 1
+    @test med(g.dy_prior) ≈ -37 atol = 1
+end
+
+@testset "the guess is what makes a small search radius work" begin
+    # The payoff, as a measurement rather than an assertion of intent. A 43-px displacement is
+    # invisible to a dense search until the radius reaches it — and a radius that large is both
+    # slow and prone to spurious peaks.
+    n, shift = 512, (37, -23)
+    a = _speckle_amp(n)
+    b = circshift(a, shift)
+    kw = (; chip_size = 32, chip_size_max = 32, quantize = :none)
+
+    # Without a guess, radius 6 finds nothing at all.
+    blind = autorift(a, b; search_radius = 6, kw...)
+    @test nmeasured(blind) == 0
+
+    # With one, radius 6 measures every point — the prior did the reaching.
+    g = first_guess(a, b, ORBGuess(; num_keypoints = 3000))
+    guided = autorift(a, b, g; quantize = :none)
+    @test nmeasured(guided) == length(guided.dx)
+    @test med(filter(!isnan, guided.dx)) ≈ 23 atol = 0.5
+    @test med(filter(!isnan, guided.dy)) ≈ -37 atol = 0.5
+    # And it finds far more of them than a wide blind search does: measured 2093 against 144 at
+    # radius 50, because a wide radius forces a coarse grid to stay affordable.
+    wide = autorift(a, b; search_radius = 50, kw...)
+    @test nmeasured(guided) > 5 * nmeasured(wide)
+end
+
+@testset "first_guess rejects what it cannot use" begin
+    n = 256
+    a = _speckle_amp(n)
+    # Mismatched shapes.
+    @test_throws DimensionMismatch first_guess(a, _speckle_amp(n + 8), ORBGuess())
+    # A featureless image has nothing to scale and nothing to detect.
+    @test_throws ArgumentError first_guess(fill(1.0f0, n, n), fill(1.0f0, n, n), ORBGuess())
+    # Two unrelated fields: matches exist but none is spatially consistent, so the filter empties
+    # and `min_matches` reports it rather than returning a prior built from noise.
+    @test_throws ArgumentError first_guess(a, _speckle_amp(n; seed = 99),
+                                           ORBGuess(; num_keypoints = 500))
+end
+
 @testset "extension code quality" begin
     # Aqua on each extension, per the milestone. Ambiguities are checked across the whole loaded
     # set rather than per module, since that is where an extension would introduce one.
-    for ext in (:AutoRIFTDimensionalDataExt, :AutoRIFTRastersExt)
+    for ext in (:AutoRIFTDimensionalDataExt, :AutoRIFTRastersExt, :AutoRIFTImageFeaturesExt)
         mod = Base.get_extension(AutoRIFT, ext)
         @test mod !== nothing
         Aqua.test_undefined_exports(mod)
