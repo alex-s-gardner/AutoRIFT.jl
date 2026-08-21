@@ -187,6 +187,35 @@ end
 
 synthetic_texture(n::Integer; kw...) = synthetic_texture((Int(n), Int(n)); kw...)
 
+"""
+    rotate_bilinear(img, deg) -> Matrix{Float32}
+
+`img` rotated `deg` degrees about its own centre, by bilinear resampling, with out-of-image samples
+zero.
+
+A test helper for the rotation search, and bilinear rather than nearest-neighbour deliberately:
+`AutoRIFT._rotate_chip` is bilinear, so a nearest-neighbour scene would make every measurement of the
+search a measurement of the *mismatch* between two resamplers. Same sign convention and same
+half-pixel centre as `_rotate_chip`, for the same reason.
+"""
+function rotate_bilinear(img::AbstractMatrix, deg::Real)
+    nr, nc = size(img)
+    yc, xc = (nr + 1) / 2, (nc + 1) / 2
+    s, c = sincos(deg2rad(Float64(deg)))
+    out = zeros(Float32, nr, nc)
+    @inbounds for j in 1:nc, i in 1:nr
+        dy, dx = i - yc, j - xc
+        sy = yc + c * dy + s * dx
+        sx = xc - s * dy + c * dx
+        i0, j0 = floor(Int, sy), floor(Int, sx)
+        (i0 < 1 || j0 < 1 || i0 + 1 > nr || j0 + 1 > nc) && continue
+        fy, fx = sy - i0, sx - j0
+        out[i, j] = (1 - fy) * ((1 - fx) * img[i0, j0] + fx * img[i0, j0 + 1]) +
+                    fy * ((1 - fx) * img[i0 + 1, j0] + fx * img[i0 + 1, j0 + 1])
+    end
+    return out
+end
+
 function _box3(a::Matrix{Float64})
     out = similar(a)
     nr, nc = size(a)

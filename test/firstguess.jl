@@ -126,6 +126,131 @@ using AutoRIFT: RotationSearch, NoRotationSearch, angles, params
     @test_throws ArgumentError params(; rotation = "yes")
 end
 
+@testset "RotationSearch `about` shifts the window it searches" begin
+    # `angles(m)` returns the rotations applied to the *chip*, which is `m.angles .- m.about`: the
+    # chip comes from the secondary and must be turned back to the reference's orientation. Same
+    # `angle - alpha0` as `sea_ice_drift`'s `rotate_and_match`. Resolving it in `angles` is what
+    # stops the correlator and the tests from disagreeing about the sign.
+    @test angles(RotationSearch(; about = 8.0)) == (-11.0, -8.0, -5.0)
+    @test angles(RotationSearch((-1, 0, 1); about = -4.5)) == (3.5, 4.5, 5.5)
+    # Both spellings of the default: no `about` is exactly `about = 0`, and identically so, since
+    # the zero case skips the broadcast entirely.
+    @test angles(RotationSearch()) === angles(RotationSearch(; about = 0.0))
+
+    # A non-finite centre is refused rather than searching around zero. `scene_rotation` returns
+    # `NaN` when it cannot fit, and passing that through would look like it had worked.
+    @test_throws ArgumentError RotationSearch(; about = NaN)
+    @test_throws ArgumentError RotationSearch((-3, 0, 3); about = Inf)
+end
+
+# Displacements for a field where the ice has rotated by `motion` degrees about `centre`, plus a
+# rigid translation `shift`. Returns `(dx, dy)` in the package's reference-minus-secondary sense.
+#
+# One helper rather than the same eight lines in three testsets, because the *sign* is the thing
+# under test and three hand-written copies is three chances to write it differently.
+function rotated_field(xs, ys, motion; centre = (250.0, 250.0), shift = (0.0, 0.0))
+    s, c = sincos(deg2rad(motion))
+    xc, yc = centre
+    # Where each feature ends up in the secondary: carried by the motion, then translated.
+    sx = @. xc + c * (xs - xc) - s * (ys - yc) + shift[1]
+    sy = @. yc + s * (xs - xc) + c * (ys - yc) + shift[2]
+    return xs .- sx, ys .- sy
+end
+
+@testset "scene_rotation fits a known rotation" begin
+    # `scene_rotation` reports the rotation carrying **secondary onto reference**, which is the
+    # negative of the ice's own motion — the same relationship `dx`/`dy` have to velocity. Pinning
+    # that here rather than in a comment: getting it backwards would centre the angle search on
+    # exactly the wrong side and be twice as wrong as not centring at all.
+    rng = Random.MersenneTwister(11)
+    n = 400
+    xs = rand(rng, n) .* 500
+    ys = rand(rng, n) .* 500
+    for motion in (-12.0, -3.0, 0.0, 3.0, 8.5, 25.0), shift in ((0.0, 0.0), (37.0, -64.0))
+        dx, dy = rotated_field(xs, ys, motion; shift)
+        # A translation must be removed by the centroid step, not absorbed into the angle.
+        @test AutoRIFT.scene_rotation(xs, ys, dx, dy) ≈ -motion atol = 1e-9
+    end
+end
+
+@testset "scene_rotation degenerate cases" begin
+    # Nothing to fit: a rotation needs two points, since one gives only a translation.
+    @test isnan(AutoRIFT.scene_rotation(Float64[], Float64[], Float64[], Float64[]))
+    @test isnan(AutoRIFT.scene_rotation([1.0], [2.0], [0.5], [0.5]))
+    # Coincident points: both Procrustes sums vanish, and `atan(0, 0)` would report a confident 0.
+    @test isnan(AutoRIFT.scene_rotation(fill(3.0, 5), fill(4.0, 5), zeros(5), zeros(5)))
+    # A pure translation is zero rotation, not some small nonzero fit.
+    @test AutoRIFT.scene_rotation([0.0, 10.0, 5.0], [0.0, 3.0, 9.0],
+                                  fill(7.0, 3), fill(-2.0, 3)) == 0.0
+    @test_throws DimensionMismatch AutoRIFT.scene_rotation([1.0, 2.0], [1.0], [0.0], [0.0])
+end
+
+@testset "scene_rotation reads a PointSet directly" begin
+    # The form a caller actually uses: `first_guess` returns a `PointSet` whose priors are the
+    # sparse displacements, so no unpacking should be needed at the call site.
+    xs = [0.0, 100.0, 100.0, 0.0]
+    ys = [0.0, 0.0, 100.0, 100.0]
+    dx, dy = rotated_field(xs, ys, 6.0; centre = (50.0, 50.0))
+    pts = AutoRIFT.pointset(xs, ys; dx_prior = dx, dy_prior = dy)
+    @test AutoRIFT.scene_rotation(pts) ≈ -6.0 atol = 1e-9
+
+    # And the composition that is the whole point of the feature: the fitted rotation, fed to
+    # `about`, produces a chip rotation that undoes the scene's — so `about` and the motion agree
+    # in magnitude and the searched angle brackets it.
+    m = RotationSearch((0.0,); about = AutoRIFT.scene_rotation(pts))
+    @test only(angles(m)) ≈ 6.0 atol = 1e-9
+end
+
+@testset "counter-rotating the chip is what recovers correlation" begin
+    # The measurement that fixes the sign, and it is not a detail: rotating the chip the *same* way
+    # as the scene makes things worse, not better. A chip cut from the rotated secondary is
+    # correlated against an unrotated reference window, so it must be turned back.
+    #
+    # Isolated from displacement deliberately — one chip at the centre of rotation, where the
+    # displacement is zero, so the only thing varying is the chip's rotation. Measured peaks, from
+    # which `RotationSearch`'s docstring table is taken:
+    #
+    #     chip     no rotation    +8 deg     -8 deg
+    #       32          0.723      0.345      0.597
+    #       64          0.328      0.132      0.641
+    #      128          0.142      0.025      0.670
+    n = 512
+    a = synthetic_texture(n)
+    motion = 8.0
+    b = rotate_bilinear(a, motion)
+    ci = cj = 257
+    R = 4
+
+    # Peak correlation of the centre chip rotated by `ang`, at chip size `cs`.
+    function rotated_peak(cs, ang)
+        h = cs ÷ 2
+        chip = b[(ci - h):(ci + h - 1), (cj - h):(cj + h - 1)]
+        # The window is `cs + 2R - 1` on a side: `correlate!` extends `R` one way and `R - 1` the
+        # other, so the surface is an even `2R` and zero displacement lands on a sample.
+        win = a[(ci - h - R):(ci + h - 2 + R), (cj - h - R):(cj + h - 2 + R)]
+        ws = AutoRIFT.workspace(Float32, (cs, cs), (R, R))
+        return maximum(AutoRIFT.correlate!(
+            ws, win, AutoRIFT._rotate_chip(ws, chip, ang), (R, R); measure = ZNCC()))
+    end
+
+    for cs in (64, 128)
+        back = rotated_peak(cs, -motion)
+        @test back > rotated_peak(cs, 0.0)      # counter-rotation beats not rotating at all
+        @test back > rotated_peak(cs, motion)   # and rotating the wrong way is worse than either
+    end
+
+    # `about` must produce exactly that winning angle from the scene rotation — `scene_rotation`
+    # returns `-motion`, and the chip needs `+motion`, with no negation at the call site.
+    @test only(angles(RotationSearch((0.0,); about = -motion))) == motion
+
+    # At chip 32 counter-rotation *loses* to not rotating, because a 32-px chip's corners travel
+    # only ~2 px at 8 degrees while resampling and corner padding cost more than that. Pinned
+    # because it is the same "gain grows with chip size" effect from the other end, and a change
+    # that made this one pass would mean the rotation had stopped being nearly free at small chips.
+    @test rotated_peak(32, -motion) < rotated_peak(32, 0.0)
+    @test rotated_peak(32, -motion) > rotated_peak(32, motion)   # still beats the wrong direction
+end
+
 @testset "rotation search is exactly the unrotated path when off" begin
     # The load-bearing property: enabling the *feature* must cost nothing for callers who leave it
     # off. `NoRotationSearch` dispatches to a method that is the original `correlate!` call, so the
@@ -153,17 +278,7 @@ end
     # amount depends on chip size and rotation angle.
     n = 256
     a = synthetic_texture(n)
-    # Rotate about the centre by 3 degrees, by nearest-neighbour resampling — enough to decorrelate
-    # a 32-px chip without needing an image-transform dependency in the test suite.
-    yc = xc = (n + 1) / 2
-    s3, c3 = sincos(deg2rad(3.0))
-    b = zeros(Float32, n, n)
-    for j in 1:n, i in 1:n
-        dy, dx = i - yc, j - xc
-        si = round(Int, yc + c3 * dy + s3 * dx)
-        sj = round(Int, xc - s3 * dy + c3 * dx)
-        (1 <= si <= n && 1 <= sj <= n) && (b[i, j] = a[si, sj])
-    end
+    b = rotate_bilinear(a, 3.0)
 
     kw = (; chip_size = 32, chip_size_max = 32, search_radius = 8, quantize = :none,
           outliers = :none)

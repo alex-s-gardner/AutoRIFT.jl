@@ -423,7 +423,7 @@ end
 Deramp(; axis = :both) = Deramp(axis)
 
 """
-    RotationSearch(angles = (-3.0, 0.0, 3.0))
+    RotationSearch(angles = (-3.0, 0.0, 3.0); about = 0.0)
     NoRotationSearch()
 
 Whether the dense stage tries several chip rotations and keeps the best.
@@ -472,6 +472,45 @@ computed *from* the vector field afterwards rather than corrected for during mat
 
 The best-fitting angle is available per point, which makes it a measurement rather than only a
 correction — `sea_ice_drift` returns it as `best_a`.
+
+# `about`: centring the search on a scene-level rotation
+
+`about` is the **scene's** rotation, in the same sense [`scene_rotation`](@ref) reports it, and the
+chip rotations actually tried are `angles .- about`. This is `rotate_and_match`'s `alpha0`, which
+appears in its template call as exactly `angle - alpha0`.
+
+The subtraction is not a convention to be chosen: the chip comes from the *secondary* and is
+correlated against an *unrotated* reference window, so it has to be turned **back** to the
+reference's orientation. Measured on speckle rotated 8°, peak correlation of a chip rotated by each
+candidate — the counter-rotation is the only one that recovers anything, and by more the larger the
+chip:
+
+| chip | no rotation | +8° | −8° |
+|---:|---:|---:|---:|
+| 32 | 0.723 | 0.345 | 0.597 |
+| 64 | 0.328 | 0.132 | **0.641** |
+| 128 | 0.142 | 0.025 | **0.670** |
+
+At chip 128 that is 0.14 → 0.67, a **4.7x** recovery. At chip 32 counter-rotation still loses to no
+rotation at all, because a 32-px chip's corners travel only ~2 px at 8° while resampling and corner
+padding cost more than that — which is the same "the gain grows with chip size" effect as the table
+above, seen from the other end.
+
+It matters because the search window is narrow on purpose. A scene rotated 8° is outside `±3°`
+entirely — every angle tried is wrong by at least 5°, and widening the tuple to reach it costs a
+correlation per angle for angles that can only ever lose. One scene-level estimate moves the whole
+window instead, so `±3°` around 8° searches 5-11° at the same 3x cost:
+
+```julia
+guess = first_guess(a, b, AKAZEGuess())
+α = scene_rotation(guess)                    # degrees, from the sparse vectors
+out = autorift(a, b, guess; rotation = RotationSearch(; about = α))
+```
+
+`sea_ice_drift` gets `alpha0` from *geolocation* — the bearing between two corners of the secondary
+scene reprojected into the reference's grid — which for a co-registered pair is identically zero.
+[`scene_rotation`](@ref) instead fits it from the sparse displacements, which is the quantity that
+is actually nonzero here and needs no geolocation at all.
 """
 abstract type RotationMethod end
 
@@ -479,22 +518,41 @@ struct NoRotationSearch <: RotationMethod end
 
 struct RotationSearch{A<:Tuple} <: RotationMethod
     angles::A
-    function RotationSearch(angles)
+    about::Float64
+    function RotationSearch(angles, about::Real)
         t = Tuple(Float64.(angles))
         isempty(t) && throw(ArgumentError(
             "`RotationSearch` needs at least one angle; use `NoRotationSearch()` to disable."))
         allunique(t) || throw(ArgumentError(
             "`RotationSearch` angles must be distinct, got $t — a repeated angle costs a full " *
             "correlation and can never win."))
-        return new{typeof(t)}(t)
+        a = Float64(about)
+        isfinite(a) || throw(ArgumentError(
+            "`RotationSearch` `about` must be finite, got $a. `scene_rotation` returns `NaN` when " *
+            "it cannot fit a rotation; check for that rather than passing it through."))
+        return new{typeof(t)}(t, a)
     end
 end
-RotationSearch() = RotationSearch((-3.0, 0.0, 3.0))
+# The keyword form is the documented one; the inner constructor is positional so `Params`'s
+# positional constructor -- the trimmable entry point -- can reach it without a keyword call.
+RotationSearch(angles = (-3.0, 0.0, 3.0); about::Real = 0.0) = RotationSearch(angles, about)
 
 """
     AutoRIFT.angles(method::RotationSearch) -> Tuple
 
-The chip rotations a pass will try, in degrees.
+The chip rotations a pass will try, in degrees — the rotations **applied to the chip**, so `about` is
+already subtracted out.
+
+That is why this is a function rather than a field read: `m.angles` is the search window and
+`m.about` is the scene rotation it is centred on, and what `_rotate_chip` needs is neither of those
+but `angles .- about`. Resolving it here means the correlator and the tests cannot disagree about the
+sign — which mattered, since the first version of this had it backwards and the table in
+[`RotationSearch`](@ref) is what caught it.
+
+No `about == 0` fast path. One was written, on the assumption the common case should skip the
+subtraction, and it is measurably *slower* than the unconditional form in **both** cases — 2.08
+against 1.83 ns at `about = 0` — because subtracting a constant from a tuple is free and the branch
+is not.
 
 Only defined for [`RotationSearch`](@ref). There was a `NoRotationSearch` method returning `(0.0,)`,
 justified as letting the caller skip a branch — but no such caller exists: the correlation dispatches
@@ -502,7 +560,7 @@ on the method *type* first (`_correlate_rotations!` has a `NoRotationSearch` met
 consults this), which is what makes the off path compile to the unrotated call. A method whose stated
 purpose is contradicted by the dispatch above it is worse than no method.
 """
-angles(m::RotationSearch) = m.angles
+angles(m::RotationSearch) = m.angles .- m.about
 
 """
     filter_width(method::PreprocessMethod)

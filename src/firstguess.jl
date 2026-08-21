@@ -341,6 +341,111 @@ function consistent_matches(points::AbstractVector, dx::AbstractVector, dy::Abst
     return keep
 end
 
+"""
+    scene_rotation(guess::PointSet) -> Float64
+    scene_rotation(x, y, dx, dy) -> Float64
+
+The single rotation, in degrees, that best explains a sparse displacement field.
+
+Feed it to [`RotationSearch`](@ref)'s `about` so the narrow per-chip angle search is centred on the
+scene's actual rotation rather than on zero:
+
+```julia
+guess = first_guess(a, b, AKAZEGuess())
+out = autorift(a, b, guess; rotation = RotationSearch(; about = scene_rotation(guess)))
+```
+
+# Why this rather than the reference's version
+
+`sea_ice_drift` computes `alpha0` in `get_initial_rotation` from **geolocation**: the bearing between
+two corners of the secondary scene reprojected into the reference's grid. For a co-registered pair —
+which is what [`first_guess`](@ref) requires and checks — that is identically zero, so porting it
+would have produced a function that always returns 0.0. The rotation that is actually nonzero here is
+the *ice*'s, and the sparse vectors already measure it.
+
+# What it is
+
+An orthogonal Procrustes fit, which for 2D reduces to one `atan2` over two sums — the same shape as
+[`Deramp`](@ref)'s estimator and for the same reason: summing the cross and dot products before
+taking the angle makes the estimate a least-squares fit over all points at once, with no wrapping and
+no per-point angle to average.
+
+Given reference positions `p` and displacements `d` (reference minus secondary, so the secondary
+position is `p - d`), the returned angle is the rotation carrying **secondary orientation onto
+reference**:
+
+```
+θ = atan2(Σ (sx·ty - sy·tx), Σ (sx·tx + sy·ty))
+```
+
+with `s` the centred `p - d` and `t` the centred `p`.
+
+That direction, rather than reference-onto-secondary, for the same reason `dx`/`dy` are reference
+minus secondary: it is the negative of the imaged features' own motion. So the sign here is
+consistent with the rest of the package, and it is what [`RotationSearch`](@ref)'s `about` consumes —
+the chip comes from the secondary and must be turned back, which is why that field is *subtracted*.
+Pinned by test in both directions, since a sign error would centre the search on the wrong side of
+the truth and be twice as wrong as not centring it at all.
+
+# Limitations, stated because they are the reason this is a separate opt-in step
+
+- **Translation is removed, scale is not fitted.** A rigid rotation plus translation is the model;
+  divergence and shear are residuals. That is the same model `RotationSearch` itself assumes.
+- **One rotation for the whole scene.** A field with two floes rotating opposite ways fits to
+  something near their average, which describes neither. The per-chip search is what handles that,
+  and `about` only moves where it starts looking.
+- **Returns `NaN`** when there is nothing to fit: fewer than two points, or a degenerate
+  configuration (all points coincident, or the fit's two sums both zero). `RotationSearch` rejects a
+  non-finite `about` rather than silently searching around zero, so the caller must decide.
+"""
+function scene_rotation(x::AbstractVector, y::AbstractVector, dx::AbstractVector,
+                        dy::AbstractVector)
+    n = length(x)
+    (length(y) == n && length(dx) == n && length(dy) == n) || throw(DimensionMismatch(
+        "x, y, dx and dy must be the same length, got $n, $(length(y)), $(length(dx)) and " *
+        "$(length(dy))"))
+    # Two points define a rotation; one defines only a translation.
+    n >= 2 || return NaN
+
+    # Centroids of both point sets. Removing them is what makes this a fit for rotation *alone* —
+    # otherwise a pure translation would masquerade as a rotation about a distant centre.
+    #
+    # Two passes, and deliberately. The sums below can be had from raw moments in one pass —
+    # `Σ(a-ā)(d-d̄) = Σad - n·ā·d̄` — which measures 1.84x faster at 40000 points, and loses two
+    # digits to cancellation doing it (1.5e-12 against 5e-14 error on a 7° fit). This runs **once per
+    # pair**: 71 µs against the 8.9 s the detection it feeds costs. Trading accuracy for 39 µs on a
+    # quantity that steers every subsequent correlation is the wrong side of that trade.
+    sx = sy = tx = ty = 0.0
+    @inbounds for i in 1:n
+        px, py = Float64(x[i]), Float64(y[i])
+        tx += px
+        ty += py
+        sx += px - Float64(dx[i])
+        sy += py - Float64(dy[i])
+    end
+    sx /= n; sy /= n; tx /= n; ty /= n
+
+    cross = dot = 0.0
+    @inbounds for i in 1:n
+        px, py = Float64(x[i]), Float64(y[i])
+        # Source: where the feature is in the secondary. Target: where it is in the reference.
+        a = px - Float64(dx[i]) - sx
+        b = py - Float64(dy[i]) - sy
+        c = px - tx
+        d = py - ty
+        cross += a * d - b * c
+        dot += a * c + b * d
+    end
+    # Both sums zero means every centred vector vanished — coincident points, or a field that is
+    # pure divergence with no rotational component to find. `atan2(0, 0)` is 0.0, which would be a
+    # confident wrong answer.
+    (cross == 0.0 && dot == 0.0) && return NaN
+    return rad2deg(atan(cross, dot))
+end
+
+scene_rotation(pts::PointSet) =
+    scene_rotation(vec(pts.x), vec(pts.y), vec(pts.dx_prior), vec(pts.dy_prior))
+
 # The `K` nearest neighbours of every point, as a vector of index vectors.
 #
 # Split out because the *complexity class* differs by strategy and the measurement is stark. The
