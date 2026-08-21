@@ -317,8 +317,10 @@ function _correlate_rotations!(ws, window, chip, radius, measure, rot::RotationS
     # `sea_ice_drift`'s `rotate_and_match`: rotate the template, correlate, keep the angle whose peak
     # is highest. Its comparison is on `result.max()`, so this one is too — the strongest peak across
     # angles wins, not the one closest to zero rotation.
-    best = nothing
     bestpeak = -Inf32
+    found = false
+    nr, nc = 2radius[2], 2radius[1]
+    hold = @view ws.rotbest[1:nr, 1:nc]
     for a in angles(rot)
         rotated = _rotate_chip(ws, chip, a)
         s = correlate!(ws, window, rotated, radius; measure)
@@ -326,13 +328,14 @@ function _correlate_rotations!(ws, window, chip, radius, measure, rot::RotationS
         pk = maximum(s)
         if pk > bestpeak
             bestpeak = pk
-            # The surface aliases the workspace and the next iteration overwrites it, so the winner
-            # must be copied. One allocation per point per pass, which is the price of comparing
-            # surfaces at all — and it is why this is opt-in.
-            best = copy(s)
+            # The surface aliases `ws.surface`, which the next angle overwrites, so the winner must
+            # be held elsewhere. Into a workspace buffer rather than a fresh `copy`: that was 877 of
+            # the 1177 allocations a 225-point rotation pass made, for no reason but convenience.
+            copyto!(hold, s)
+            found = true
         end
     end
-    if isnothing(best)
+    if !found
         # Every angle degenerate: report it the way a single degenerate chip is reported, so the
         # caller's existing check still works.
         ws.was_degenerate[] = true
@@ -341,8 +344,10 @@ function _correlate_rotations!(ws, window, chip, radius, measure, rot::RotationS
         return surf
     end
     ws.was_degenerate[] = false
-    surf = @view ws.surface[1:size(best, 1), 1:size(best, 2)]
-    copyto!(surf, best)
+    # Back into `surface`, because that is what every caller expects a correlation to return — and it
+    # is safe: the last angle's surface has already been compared and is no longer needed.
+    surf = @view ws.surface[1:nr, 1:nc]
+    copyto!(surf, hold)
     return surf
 end
 

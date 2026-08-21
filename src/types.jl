@@ -492,12 +492,16 @@ end
 RotationSearch() = RotationSearch((-3.0, 0.0, 3.0))
 
 """
-    AutoRIFT.angles(method::RotationMethod) -> Tuple
+    AutoRIFT.angles(method::RotationSearch) -> Tuple
 
-The chip rotations a pass will try, in degrees. `(0.0,)` when rotation search is off, so the caller
-needs no branch — one angle of zero is exactly the unrotated case.
+The chip rotations a pass will try, in degrees.
+
+Only defined for [`RotationSearch`](@ref). There was a `NoRotationSearch` method returning `(0.0,)`,
+justified as letting the caller skip a branch — but no such caller exists: the correlation dispatches
+on the method *type* first (`_correlate_rotations!` has a `NoRotationSearch` method that never
+consults this), which is what makes the off path compile to the unrotated call. A method whose stated
+purpose is contradicted by the dispatch above it is worse than no method.
 """
-angles(::NoRotationSearch) = (0.0,)
 angles(m::RotationSearch) = m.angles
 
 """

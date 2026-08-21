@@ -31,7 +31,7 @@
 module AutoRIFTAkazeFeaturesExt
 
 using AutoRIFT
-using AutoRIFT: FirstGuess, AKAZEGuess, consistent_matches, pointset
+using AutoRIFT: AKAZEGuess
 using AkazeFeatures: AKAZE, AKAZEOptions, Create_Nonlinear_Scale_Space, Feature_Detection,
                      Compute_Descriptors
 
@@ -39,26 +39,6 @@ using AkazeFeatures: AKAZE, AKAZEOptions, Create_Nonlinear_Scale_Space, Feature_
 # options and the work happens in `_akaze_describe`. `omin = 0` because the default (-1) doubles the
 # input first, which quadruples the scale-space cost for detail SAR speckle does not carry.
 AutoRIFT._detector(g::AKAZEGuess) = g.kwargs
-
-function _togray(img::AbstractMatrix)
-    lo, hi = Inf, -Inf
-    @inbounds for v in img
-        f = Float32(v)
-        isfinite(f) || continue
-        f < lo && (lo = f)
-        f > hi && (hi = f)
-    end
-    isfinite(lo) && hi > lo || throw(ArgumentError(
-        "image has no finite range to scale — every pixel is NaN, Inf, or identical, so there " *
-        "is nothing for a feature detector to find."))
-    scale = 1.0f0 / (hi - lo)
-    out = Matrix{Float64}(undef, size(img))
-    @inbounds for i in eachindex(out)
-        f = Float32(img[i])
-        out[i] = isfinite(f) ? Float64((f - lo) * scale) : 0.0
-    end
-    return out
-end
 
 # Keypoints and their descriptors for one image. Returns `(descriptors, points)` where `points` is a
 # vector of `(row, col)` — the same shape the ImageFeatures adapter produces, so `first_guess` need
@@ -80,26 +60,50 @@ end
 # Hamming matching over A-KAZE's packed-binary MLDB descriptors, with Lowe's ratio test.
 #
 # Written here rather than reused from ImageFeatures because its `match_keypoints` takes that
-# package's own `Keypoint` type. The descriptors are `Matrix{UInt8}`, 61 bytes per keypoint, so the
-# distance is `count_ones` over an XOR — which is a popcount instruction, not a loop over bits.
+# package's own `Keypoint` type.
 #
-# O(n²) in the keypoint count and deliberately so, for the same reason `consistent_matches` is:
-# thousands of keypoints, and the detection that produced them costs more. A `BKTree` would be the
-# next step if this ever reached tens of thousands.
+# **Packed into `UInt64` words first**, and that is the whole performance story of this function. The
+# descriptors are 61 bytes; a byte-wise `count_ones` over an XOR is 61 popcounts per pair, where the
+# same 61 bytes repacked into 8 words is 8. Measured 3.6x, with identical match counts:
+#
+#          n     byte-wise    UInt64 words
+#       1000      0.0086 s      0.0025 s
+#       2000      0.0345 s      0.0097 s
+#
+# Still O(n²) in the keypoint count, which at A-KAZE's ~42000 keypoints on 1024² is ~4 s after the
+# packing against ~15 s before. A `BKTree` would change the class rather than the constant, but a
+# metric tree over Hamming distance only prunes well at small radii and the ratio test needs the
+# *two* nearest — so it would have to be a k-nearest query with a loose bound, where the pruning is
+# weak. Left as future work with that caveat rather than assumed to be a win.
+function _pack_descriptors(d::AbstractMatrix{UInt8})
+    nb, n = size(d)
+    w = cld(nb, 8)
+    out = zeros(UInt64, w, n)
+    @inbounds for i in 1:n, b in 1:nb
+        # Little-endian within each word; the layout is arbitrary as long as both descriptor sets use
+        # the same one, since Hamming distance is invariant to a shared permutation of bit positions.
+        out[cld(b, 8), i] |= UInt64(d[b, i]) << (8 * ((b - 1) % 8))
+    end
+    return out
+end
+
 function _hamming_match(d1::AbstractMatrix{UInt8}, p1::Vector, d2::AbstractMatrix{UInt8},
                         p2::Vector, ratio::Float64)
     nb = size(d1, 1)
     size(d2, 1) == nb || throw(DimensionMismatch(
         "descriptors have $(nb) and $(size(d2, 1)) bytes; they must come from the same detector"))
+    w1 = _pack_descriptors(d1)
+    w2 = _pack_descriptors(d2)
+    nw = size(w1, 1)
     pts = Tuple{Float64,Float64}[]
     dxs = Float64[]
     dys = Float64[]
-    @inbounds for i in axes(d1, 2)
+    @inbounds for i in axes(w1, 2)
         best, second, bj = typemax(Int), typemax(Int), 0
-        for j in axes(d2, 2)
+        for j in axes(w2, 2)
             dist = 0
-            for b in 1:nb
-                dist += count_ones(d1[b, i] ⊻ d2[b, j])
+            for k in 1:nw
+                dist += count_ones(w1[k, i] ⊻ w2[k, j])
             end
             if dist < best
                 second, best, bj = best, dist, j
@@ -118,33 +122,15 @@ function _hamming_match(d1::AbstractMatrix{UInt8}, p1::Vector, d2::AbstractMatri
     return pts, dxs, dys
 end
 
-function AutoRIFT.first_guess(reference::AbstractMatrix, secondary::AbstractMatrix,
-                              method::AKAZEGuess;
-                              search_radius = 6, chip_size = 32, min_matches::Integer = 8,
-                              ratio::Real = 0.9, kwargs...)
-    size(reference) == size(secondary) || throw(DimensionMismatch(
-        "reference is $(size(reference)) but secondary is $(size(secondary)); the two images " *
-        "must be co-registered to a common grid"))
-
+# `ratio` here genuinely *is* Lowe's ratio — `_hamming_match` implements the two-nearest test itself.
+# Contrast the ORB path, where the same-named ImageFeatures parameter is an absolute distance; that
+# mismatch was a real bug and is why this one is spelled out.
+function AutoRIFT._match_features(reference::AbstractMatrix, secondary::AbstractMatrix,
+                                  method::AKAZEGuess; ratio::Real = 0.9)
     opts = AutoRIFT._detector(method)
-    da, pa = _akaze_describe(_togray(reference), opts)
-    db, pb = _akaze_describe(_togray(secondary), opts)
-    pts, dxs, dys = _hamming_match(da, pa, db, pb, Float64(ratio))
-
-    isempty(pts) && throw(ArgumentError(
-        "A-KAZE matching found no correspondences passing the ratio test. The pair may be fully " *
-        "decorrelated, or the time gap too long for features to persist."))
-
-    keep = consistent_matches(pts, dxs, dys; kwargs...)
-    length(keep) >= min_matches || throw(ArgumentError(
-        "only $(length(keep)) of $(length(pts)) matches survived the consistency filter, below " *
-        "`min_matches = $min_matches`. A-KAZE holds 95-99% precision under rotation in testing, " *
-        "so unlike ORB a low survival count here suggests genuinely incoherent motion rather " *
-        "than descriptor failure."))
-
-    return pointset([p[2] for p in pts[keep]], [p[1] for p in pts[keep]];
-                    search_radius, chip_size,
-                    dx_prior = dxs[keep], dy_prior = dys[keep])
+    da, pa = _akaze_describe(AutoRIFT._scale01(Float64, reference), opts)
+    db, pb = _akaze_describe(AutoRIFT._scale01(Float64, secondary), opts)
+    return _hamming_match(da, pa, db, pb, Float64(ratio))
 end
 
 end # module

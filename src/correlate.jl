@@ -122,6 +122,12 @@ struct CorrelationWorkspace
     # Unused — and untouched — when rotation search is off, which is the default.
     rotchip::Matrix{Float32}
 
+    # The best surface found across rotation angles. `correlate!` returns a view of `surface`, which
+    # the next angle overwrites, so the winner has to be held somewhere — and holding it here rather
+    # than in a fresh `copy` per point is worth 877 of the 1177 allocations a 225-point rotation pass
+    # made. Same extent as `surface`; unused when rotation search is off.
+    rotbest::Matrix{Float32}
+
     # Integral images of the search window, sum and sum-of-squares. Float64: see
     # the note in integral.jl.
     isum::Matrix{Float64}
@@ -236,6 +242,7 @@ function workspace(::Type{T}, chip_size, search_radius) where {T<:ImageElement}
         Matrix{ComplexF32}(undef, csy, csx),
         Matrix{Float32}(undef, 2ry, 2rx),
         Matrix{Float32}(undef, csy, csx),
+        Matrix{Float32}(undef, 2ry, 2rx),
         Matrix{Float64}(undef, winy + 1, winx + 1),
         Matrix{Float64}(undef, winy + 1, winx + 1),
         Matrix{ComplexF64}(undef, winy + 1, winx + 1),

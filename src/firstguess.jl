@@ -145,14 +145,80 @@ AKAZEGuess(; kwargs...) = AKAZEGuess(kwargs)
 # (2016) already measured as the best of three. A-KAZE earned its adapter by measuring better;
 # BRISK did not. The abstract type is what makes adding one a new method rather than a redesign.
 
+"""
+    AutoRIFT.required_package(method::FirstGuess) -> String
+
+Which package must be loaded for `method` to work.
+
+Exists so the "you forgot a dependency" error names the *right* dependency. The first version of that
+error hardcoded `ImageFeatures` for every subtype, so `AKAZEGuess` without `AkazeFeatures` told the
+caller to load a package that would not have helped.
+"""
+required_package(::ORBGuess) = "ImageFeatures"
+required_package(::AKAZEGuess) = "AkazeFeatures"
+
 # The detector itself, from the extension. Defined here so the error a caller sees names the missing
 # dependency rather than being a bare `MethodError` on an internal function.
 function _detector(g::FirstGuess)
+    pkg = required_package(g)
     throw(ArgumentError(
-        "`$(nameof(typeof(g)))` needs ImageFeatures to be loaded. Run `using ImageFeatures` " *
-        "first — the detector lives in a package extension, because it is a heavy dependency " *
-        "that the optical path does not need."))
+        "`$(nameof(typeof(g)))` needs $pkg to be loaded. Run `using $pkg` first — the detector " *
+        "lives in a package extension, because it is a heavy dependency that the optical path " *
+        "does not need."))
 end
+
+# Scale an image into [0, 1] for a feature detector, into a caller-chosen element type.
+#
+# One implementation rather than one per extension: ImageFeatures wants `Gray{Float32}` (it dispatches
+# on the colorant) and A-KAZE wants `Float64`, but the arithmetic is identical and
+# `Gray{Float32}(::Float32)` is a valid conversion. Two copies of this meant two copies of the
+# no-finite-range error message.
+#
+# Scaled by extrema over the *finite* values, since a reprojected scene carries NaN in its no-data
+# border and `maximum` over those gives NaN for the whole image. This mirrors Muckenhuber's Eq. 2,
+# which maps sigma0 onto 0-255 between user-chosen bounds specifically "to limit the influence of
+# speckle noise"; their bounds are per-sensor constants, ours come from the data, which is the more
+# conservative default. A caller with sensor-appropriate bounds should clamp before calling.
+function _scale01(::Type{T}, img::AbstractMatrix) where {T}
+    lo, hi = Inf32, -Inf32
+    @inbounds for v in img
+        f = Float32(v)
+        isfinite(f) || continue
+        f < lo && (lo = f)
+        f > hi && (hi = f)
+    end
+    isfinite(lo) && hi > lo || throw(ArgumentError(
+        "image has no finite range to scale — every pixel is NaN, Inf, or identical, so there " *
+        "is nothing for a feature detector to find."))
+    scale = 1.0f0 / (hi - lo)
+    out = Matrix{T}(undef, size(img))
+    @inbounds for i in eachindex(out)
+        f = Float32(img[i])
+        # Non-finite becomes zero rather than propagating: the detector has no mask, so a NaN would
+        # poison every descriptor whose patch touched it.
+        out[i] = T(isfinite(f) ? (f - lo) * scale : 0.0f0)
+    end
+    return out
+end
+
+"""
+    AutoRIFT._match_features(reference, secondary, method::FirstGuess; kwargs...)
+        -> (points, dx, dy)
+
+Detect, describe and match features between two images. **The one method an extension supplies.**
+
+`points` is a vector of `(row, col)`; `dx`/`dy` are the matched displacements, reference minus
+secondary to match `track!`'s convention. Everything around this call — scaling, the shape check, the
+consistency filter, `min_matches`, building the `PointSet` — belongs to [`first_guess`](@ref) and is
+written once.
+
+That split is the whole reason the abstract [`FirstGuess`](@ref) exists. It was not the first
+arrangement: each extension originally owned a whole `first_guess` method, which duplicated the
+keyword defaults, the sign convention, the NaN policy and two error messages per detector — so adding
+a third meant a third copy, and one of them dispatched on the *abstract* type and silently claimed
+every future subtype.
+"""
+function _match_features end
 
 """
     first_guess(reference, secondary, method::FirstGuess; kwargs...) -> PointSet
@@ -179,8 +245,41 @@ Requires `ImageFeatures` to be loaded — the methods are in a package extension
   will silently produce nothing. A first guess that found almost nothing is a signal about the data
   — decorrelated pair, wrong time gap — not a result to pass on.
 - Filtering keywords are forwarded to [`consistent_matches`](@ref).
+- Detector-specific keywords are forwarded to the matcher; see [`ORBGuess`](@ref) and
+  [`AKAZEGuess`](@ref).
+
+!!! tip "Load `NearestNeighbors` too"
+    The consistency filter's neighbour search is O(n²) without it and O(n log n) with — 90x at 20000
+    matches, and A-KAZE produces tens of thousands. It is a weak dependency of this package but *not*
+    installed by loading a detector, so `using NearestNeighbors` is a separate step and worth taking
+    for anything beyond a few thousand matches.
 """
-function first_guess end
+function first_guess(reference::AbstractMatrix, secondary::AbstractMatrix, method::FirstGuess;
+                     search_radius = 6, chip_size = 32, min_matches::Integer = 8,
+                     neighbours::Integer = 12, tolerance::Real = 6.0, min_agree::Integer = 5,
+                     kwargs...)
+    size(reference) == size(secondary) || throw(DimensionMismatch(
+        "reference is $(size(reference)) but secondary is $(size(secondary)); the two images " *
+        "must be co-registered to a common grid"))
+
+    pts, dxs, dys = _match_features(reference, secondary, method; kwargs...)
+    isempty(pts) && throw(ArgumentError(
+        "feature matching found no correspondences at all. The pair may be fully decorrelated, " *
+        "or the time gap too long for features to persist."))
+
+    keep = consistent_matches(pts, dxs, dys; neighbours, tolerance, min_agree)
+    length(keep) >= min_matches || throw(ArgumentError(
+        "only $(length(keep)) of $(length(pts)) matches survived the consistency filter, below " *
+        "`min_matches = $min_matches`. Raw descriptor matching on speckle is mostly wrong — " *
+        "9.5-62.5% correct in testing — so a low survival count is normal, but this few means no " *
+        "coherent motion field was found. Check the time gap, or loosen `tolerance`."))
+
+    # Row is y and column is x, which is the one place this conversion has to be right: matchers
+    # return `(row, col)` and `PointSet` takes `(x, y)`.
+    return pointset([p[2] for p in pts[keep]], [p[1] for p in pts[keep]];
+                    search_radius, chip_size,
+                    dx_prior = dxs[keep], dy_prior = dys[keep])
+end
 
 """
     consistent_matches(points, dx, dy; neighbours = 12, tolerance = 6.0, min_agree = 5)
@@ -224,23 +323,15 @@ function consistent_matches(points::AbstractVector, dx::AbstractVector, dy::Abst
     K = min(Int(neighbours), n - 1)
     K < min_agree && return Int[]     # too few points to judge consistency at all
 
+    # Neighbour indices from whichever strategy is available: a k-d tree when `NearestNeighbors` is
+    # loaded, the brute-force scan otherwise. Both produce the same answer; see `_neighbour_indices`.
+    nbrs = _neighbour_indices(points, K)
+
     keep = Int[]
-    d2 = Vector{Float64}(undef, n)
-    # O(n²) in the number of matches, deliberately. A k-d tree is asymptotically better, but n here
-    # is the *surviving descriptor matches* — thousands, not millions — and measured at 0.13 s for
-    # 3000 points against 2.1 s for the ORB detection that produced them. Spending a dependency
-    # (NearestNeighbors) and a spatial index to optimise 6% of the stage would be the wrong trade;
-    # revisit if the match count ever reaches tens of thousands.
     @inbounds for i in 1:n
-        pi = points[i]
-        for j in 1:n
-            pj = points[j]
-            d2[j] = (Float64(pi[1]) - pj[1])^2 + (Float64(pi[2]) - pj[2])^2
-        end
-        d2[i] = Inf                    # a match is not its own neighbour
-        nb = partialsortperm(d2, 1:K)
         agree = 0
-        for j in nb
+        for j in nbrs[i]
+            j == i && continue          # a match is not its own neighbour
             ddx = dx[i] - dx[j]
             ddy = dy[i] - dy[j]
             ddx * ddx + ddy * ddy <= tol && (agree += 1)
@@ -248,4 +339,79 @@ function consistent_matches(points::AbstractVector, dx::AbstractVector, dy::Abst
         agree >= min_agree && push!(keep, i)
     end
     return keep
+end
+
+# The `K` nearest neighbours of every point, as a vector of index vectors.
+#
+# Split out because the *complexity class* differs by strategy and the measurement is stark. The
+# brute-force scan below is O(n²); a k-d tree is O(n log n), and n is the surviving descriptor-match
+# count, which A-KAZE pushes into the tens of thousands:
+#
+#         n     brute force    k-d tree    speedup
+#      3000        0.041 s      0.0033 s      12x
+#     10000        0.451 s      0.0113 s      40x
+#     20000        2.139 s      0.0239 s      90x
+#     40000       ~8.9 s (est)  0.0495 s      ~180x
+#
+# Measured in place on a 1024² A-KAZE pair (41857 keypoints, 38200 matches), the whole stage now
+# breaks down as:
+#
+#     detection x2          8.91 s
+#     descriptor match      4.57 s   (was ~15 s before UInt64 packing)
+#     consistency filter    0.045 s  (was ~9 s brute force)
+#
+# So the filter went from dominating the stage to 0.3% of it, and detection is now the bottleneck —
+# which is the right shape, since that is the algorithm rather than the adapter. Identical output at
+# every size tested, since both strategies take the same K nearest neighbours.
+#
+# The tree method lives in its own extension rather than here: `NearestNeighbors` is only needed by
+# the sea-ice path, and a core dependency for one optional stage is the wrong trade. It is **not**
+# pulled in by loading a detector — extension triggers are a conjunction of what the user loaded, not
+# an install directive — so `first_guess`'s docstring names it.
+#
+# Dispatched on a *strategy* argument, and the reason is worth recording because the obvious
+# spellings both fail. Verified in a six-line reproduction package, not inferred:
+#
+#   * **Extension redefines the same signature.** Does not extend — it *overwrites*, and Julia then
+#     refuses: `Method overwriting is not permitted during Module precompilation`. Same for a
+#     zero-argument `_neighbour_strategy()`, which was the first thing tried here.
+#   * **Extension defines a method on a differently-named function, core checks `hasmethod`.** Looks
+#     tidiest and is **unsound**: the test package reported the fast path as available with the
+#     extension *not* loaded, because `hasmethod` is a runtime query against a world age that a
+#     precompiled image can already have advanced past. A wrong answer is worse than an indirection.
+#   * **Extension narrows the element type.** Works, but the axis is wrong — availability of a
+#     dependency has nothing to do with whether the points are `Float64`.
+#
+# So: a fallback on the abstract type that the extension specialises. Two distinct methods, resolved
+# by ordinary dispatch, correct in both states — verified `_BruteForceNeighbours` without
+# `NearestNeighbors` and `KDTreeNeighbours` with it.
+abstract type _NeighbourStrategy end
+struct _BruteForceNeighbours <: _NeighbourStrategy end
+
+# Which strategy is available.
+#
+# The seam is a *fallback on the abstract type*: the core defines it for `_NeighbourStrategy` and the
+# extension for its own concrete subtype, so the two are genuinely different methods and the more
+# specific one wins. A zero-argument function does not work here — the extension's version would have
+# the identical signature, which overwrites rather than extends and makes the extension unprecompilable.
+_neighbour_strategy(::Type{<:_NeighbourStrategy}) = _BruteForceNeighbours()
+_neighbour_strategy() = _neighbour_strategy(_NeighbourStrategy)
+
+_neighbour_indices(points::AbstractVector, K::Int) =
+    _neighbour_indices(points, K, _neighbour_strategy())
+
+function _neighbour_indices(points::AbstractVector, K::Int, ::_BruteForceNeighbours)
+    n = length(points)
+    out = Vector{Vector{Int}}(undef, n)
+    d2 = Vector{Float64}(undef, n)
+    @inbounds for i in 1:n
+        pi = points[i]
+        for j in 1:n
+            pj = points[j]
+            d2[j] = (Float64(pi[1]) - pj[1])^2 + (Float64(pi[2]) - pj[2])^2
+        end
+        d2[i] = Inf
+        out[i] = partialsortperm(d2, 1:K)
+    end
+    return out
 end

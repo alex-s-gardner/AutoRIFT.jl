@@ -39,6 +39,25 @@ end
     @test maximum(dx) - minimum(dx) > 1.0     # the field really does vary by more than `tolerance`
 end
 
+@testset "both neighbour strategies agree" begin
+    # The k-d tree in the NearestNeighbors extension must be a pure cost optimisation: same K nearest
+    # neighbours, same survivors. It is 12x faster at 3000 points and 90x at 20000, so the temptation
+    # to accept "close enough" is real — this pins exact agreement instead.
+    #
+    # Runs whichever strategy is active against the brute-force one explicitly, so it is meaningful
+    # with or without the extension loaded.
+    rng = Random.MersenneTwister(7)
+    n = 800
+    pts = [(rand(rng) * 512, rand(rng) * 512) for _ in 1:n]
+    dx = randn(rng, n) .* 2 .+ 20
+    dy = randn(rng, n) .* 2 .- 12
+    brute = AutoRIFT._neighbour_indices(pts, 12, AutoRIFT._BruteForceNeighbours())
+    active = AutoRIFT._neighbour_indices(pts, 12)
+    # Index for index, not merely as sets: both sort by distance.
+    @test all(i -> collect(brute[i]) == [j for j in active[i] if j != i][1:length(brute[i])],
+              eachindex(brute))
+end
+
 @testset "consistent_matches edge cases" begin
     # No points at all: an empty answer, not an error. A caller who found no matches gets to
     # decide what that means.
@@ -56,21 +75,28 @@ end
                                                  neighbours = 4, min_agree = 9)
 end
 
-@testset "a FirstGuess without ImageFeatures names the dependency" begin
-    # `ORBGuess` is declared in the core so it can be documented and dispatched on, but it cannot
-    # work until the extension loads. The error must say so — a bare `MethodError` on an internal
-    # function would send the reader into the wrong file.
+@testset "a FirstGuess without its package names the RIGHT dependency" begin
+    # `ORBGuess` and `AKAZEGuess` are declared in the core so they can be documented and dispatched
+    # on, but neither works until its extension loads. The error must name the package that would
+    # actually help — the first version hardcoded "ImageFeatures" for every subtype, so `AKAZEGuess`
+    # sent the reader to install a package that would not have fixed it.
     #
-    # This testset runs in the core suite, *before* `test/extensions.jl` loads ImageFeatures, which
-    # is what makes it meaningful: it asserts the pre-extension state.
-    err = try
-        AutoRIFT._detector(ORBGuess())
-        nothing
-    catch e
-        e
+    # This testset runs in the core suite, *before* `test/extensions.jl` loads any detector, which is
+    # what makes it meaningful: it asserts the pre-extension state.
+    for (guess, pkg, wrong) in ((ORBGuess(), "ImageFeatures", "AkazeFeatures"),
+                                (AKAZEGuess(), "AkazeFeatures", "ImageFeatures"))
+        err = try
+            AutoRIFT._detector(guess)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin(pkg, err.msg)
+        @test !occursin(wrong, err.msg)
     end
-    @test err isa ArgumentError
-    @test occursin("ImageFeatures", err.msg)
+    @test AutoRIFT.required_package(ORBGuess()) == "ImageFeatures"
+    @test AutoRIFT.required_package(AKAZEGuess()) == "AkazeFeatures"
 end
 
 
@@ -81,9 +107,6 @@ end
 using AutoRIFT: RotationSearch, NoRotationSearch, angles, params
 
 @testset "RotationSearch construction and the off case" begin
-    # `NoRotationSearch` reports a single zero angle, so the caller needs no branch — one angle of
-    # zero is exactly the unrotated case, and that is what keeps the default path free.
-    @test angles(NoRotationSearch()) == (0.0,)
     @test angles(RotationSearch()) == (-3.0, 0.0, 3.0)   # sea_ice_drift's own default
     @test angles(RotationSearch((-1, 0, 1))) == (-1.0, 0.0, 1.0)
 
@@ -98,6 +121,8 @@ using AutoRIFT: RotationSearch, NoRotationSearch, angles, params
     @test params(; rotation = false).rotation === NoRotationSearch()
     @test angles(params(; rotation = true).rotation) == (-3.0, 0.0, 3.0)
     @test angles(params(; rotation = (-2, 0, 2)).rotation) == (-2.0, 0.0, 2.0)
+    # A range works too, which the previous two-method `_rotation` silently rejected.
+    @test angles(params(; rotation = -6:3:6).rotation) == (-6.0, -3.0, 0.0, 3.0, 6.0)
     @test_throws ArgumentError params(; rotation = "yes")
 end
 
