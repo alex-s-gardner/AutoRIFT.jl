@@ -196,14 +196,25 @@ end
     # An O(w^2) implementation would be ~250x slower at 48 than at 3; this asserts a
     # generous bound that only a genuine complexity regression would breach.
     #
-    # This is the one timing-dependent assertion in the suite, and it *has* fired spuriously on a
-    # loaded machine — `@elapsed` over three iterations at 256² is a few milliseconds, which is
-    # within scheduler noise. If it fails, re-run before investigating: a real complexity regression
-    # fails by two orders of magnitude, not by a factor of two. The bound stays generous rather than
-    # tight for exactly this reason.
-    a = rand(Float32, 256, 256)
-    windowmax(a, 3); windowmax(a, 48)          # compile
-    t3 = @elapsed for _ in 1:3; windowmax(a, 3); end
-    t48 = @elapsed for _ in 1:3; windowmax(a, 48); end
-    @test t48 < 8 * t3
+    # This is the only timing-dependent assertion in the suite, and it fired spuriously twice —
+    # once locally under load, once on a shared CI runner — before being made robust. Two changes,
+    # both aimed at the same failure: a single `@elapsed` over a few milliseconds measures the
+    # scheduler as much as the code.
+    #
+    #   * **Minimum of several trials, not one.** A minimum is the right statistic for "how fast can
+    #     this be": noise only ever adds time, so the minimum converges on the true cost while a
+    #     single sample wanders.
+    #   * **Enough work per trial to clear the noise floor.** 384² with ten iterations puts each
+    #     trial in the tens of milliseconds, where a millisecond of interference is a rounding
+    #     error rather than a doubling.
+    #
+    # The bound stays deliberately loose. The claim is *complexity*, not constant factors: an
+    # O(w²) implementation is ~250x slower at 48 than at 3, so a 10x bound has two orders of
+    # magnitude of headroom and still fails instantly if the deque is ever replaced by a naive
+    # scan. Tightening it would only re-introduce the flakiness.
+    a = rand(Float32, 384, 384)
+    windowmax(a, 3); windowmax(a, 48)          # compile both widths
+    bench(w) = minimum(@elapsed(for _ in 1:10; windowmax(a, w); end) for _ in 1:5)
+    t3, t48 = bench(3), bench(48)
+    @test t48 < 10 * t3
 end
