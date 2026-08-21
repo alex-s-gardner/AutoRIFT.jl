@@ -2,7 +2,7 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "500c70300410aabfc816ca2da1da186b5c880cd2"
+project_hash = "c645805c2559ae73b1a8a86692cc907b22355dd6"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -27,7 +27,7 @@ uuid = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
 version = "1.11.0"
 
 [[deps.AutoRIFT]]
-deps = ["CommonSolve", "Dates", "FFTW", "LinearAlgebra", "PrecompileTools", "Scratch", "StableTasks"]
+deps = ["CommonSolve", "Dates", "FFTW", "FFTW_jll", "LinearAlgebra", "PrecompileTools", "Scratch", "StableTasks"]
 path = "."
 uuid = "52cb0ed0-aa80-430c-bd04-c52888a79add"
 version = "0.1.0"

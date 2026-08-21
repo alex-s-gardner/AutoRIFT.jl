@@ -14,16 +14,49 @@
 #
 #   * A plan is not safe to *execute* concurrently on the same plan object with
 #     different buffers. Plans are therefore per-size, and the buffers they operate
-#     on are per-task (each task has its own `CorrelationWorkspace`); `mul!` with
-#     explicit input and output is safe under that arrangement.
+#     on are per-task (each task has its own `CorrelationWorkspace`); executing a plan with
+#     explicit input and output buffers is safe under that arrangement.
 
-using FFTW: FFTW, plan_rfft, plan_irfft
-using LinearAlgebra: mul!
+using FFTW: FFTW
+using FFTW_jll: libfftw3f_path
 using Scratch: @get_scratch!
 
+# ---------------------------------------------------------------------------
+# Why raw C plan pointers rather than FFTW.jl's plan objects
+# ---------------------------------------------------------------------------
+#
+# An `FFTW.rFFTWPlan` is a mutable wrapper that registers a **finalizer** in its inner
+# constructor, so it can destroy the underlying C plan when collected. That is right for a plan
+# with a bounded lifetime. Ours have none: they live in a `const Dict` for the whole process and
+# are never evicted, because the set of sizes a run needs is tiny and every grid point reuses
+# them. A destructor we never want is machinery we should not carry.
+#
+# It also has two concrete costs. `mul!(dst, plan, src)` through an `Any`-typed cache is a dynamic
+# call in the hottest path in the package. And the finalizer makes the code untrimmable: Julia's
+# `--trim` cannot prove which finalizers run, and FFTW's is reached via `foreach` over a
+# `Vector{FFTWPlan}` with `@nospecialize`, so it is unresolvable by construction. Verified against
+# a bare ten-line FFTW program: one plan, no cache, still four trim errors, all in plan
+# destruction. Holding `Ptr{Cvoid}` avoids needing any of it — measured 37 MiB peak RSS for a
+# trimmed binary against 489 MiB for the equivalent Julia process.
+#
+# The library is named by `FFTW_jll.libfftw3f_path` and not by either obvious alternative, both of
+# which were tried and fail in opposite directions. `FFTW.libfftw3f` is a `FakeLazyLibrary`
+# resolved by a load-time callback; a trimmed binary has no such callback and the `ccall` dies at
+# *runtime* with a `TypeError`. A bare soname (`"libfftw3f.dylib"`) works in a trimmed binary with
+# the artifact on the loader path, but fails in an ordinary session, where it is not. The resolved
+# artifact path works in both.
+
+const LIBFFTW3F = libfftw3f_path
+
+# FFTW's own flag values, from `fftw3.h`. Hard-coded because the whole point is not to depend on
+# FFTW.jl's plan machinery; `FFTW.MEASURE` is the same integer.
+const FFTW_MEASURE = UInt32(0)
+const FFTW_ESTIMATE = UInt32(1 << 6)
+
 const PLAN_LOCK = ReentrantLock()
-const RFFT_PLANS = Dict{Tuple{Int,Int},Any}()
-const IRFFT_PLANS = Dict{Tuple{Int,Int},Any}()
+# `Ptr{Cvoid}`, so a cache hit yields a concrete type and the `ccall` below is a static call.
+const RFFT_PLANS = Dict{Tuple{Int,Int},Ptr{Cvoid}}()
+const IRFFT_PLANS = Dict{Tuple{Int,Int},Ptr{Cvoid}}()
 
 # ---------------------------------------------------------------------------
 # Wisdom persistence
@@ -90,7 +123,20 @@ function load_wisdom!()
     path = wisdom_path()
     isnothing(path) && return nothing
     try
-        isfile(path) && FFTW.import_wisdom(path)
+        # Raw `ccall` rather than `FFTW.import_wisdom`, for the same reason the plans are raw
+        # pointers: FFTW.jl's version is wrapped in `@exclusive`, which reaches its plan-lock
+        # machinery, and its export writes a 256-space separator with `" "^256` — which is the
+        # `Base.repeat` call `--trim` cannot resolve. Only the single-precision wisdom is touched,
+        # since every transform here is `Float32`.
+        if isfile(path)
+            f = ccall(:fopen, Ptr{Cvoid}, (Cstring, Cstring), path, "r")
+            f == C_NULL && return nothing
+            try
+                ccall((:fftwf_import_wisdom_from_file, LIBFFTW3F), Cint, (Ptr{Cvoid},), f)
+            finally
+                ccall(:fclose, Cint, (Ptr{Cvoid},), f)
+            end
+        end
     catch
         # A corrupt or partially-written file. Ignore it; the next export overwrites it.
     end
@@ -114,7 +160,13 @@ function save_wisdom!()
         # leave a half-written file that every later process then fails to read. `mv` within one
         # directory is atomic on every filesystem this will run on.
         tmp = path * "." * string(getpid()) * ".tmp"
-        FFTW.export_wisdom(tmp)
+        f = ccall(:fopen, Ptr{Cvoid}, (Cstring, Cstring), tmp, "w")
+        f == C_NULL && return nothing
+        try
+            ccall((:fftwf_export_wisdom_to_file, LIBFFTW3F), Cvoid, (Ptr{Cvoid},), f)
+        finally
+            ccall(:fclose, Cint, (Ptr{Cvoid},), f)
+        end
         mv(tmp, path; force = true)
         WISDOM_DIRTY[] = false
     catch
@@ -128,14 +180,17 @@ end
 
 Real-to-complex FFT plan for an `ny`-by-`nx` `Float32` array, from the cache.
 
+Returns FFTW's own `Ptr{Cvoid}` plan handle — see the note at the top of this file for why it is
+not an `FFTW.rFFTWPlan`. Execute it with [`fft_execute!`](@ref).
+
 Thread-safe. The common case is a cache hit, which takes no lock — an unsynchronised
 read of a `Dict` that is only ever grown under a lock is safe here because a miss
 falls through to the locked path and re-checks.
 """
 function fft_plan(ny::Int, nx::Int)
     key = (ny, nx)
-    p = get(RFFT_PLANS, key, nothing)
-    p === nothing || return p
+    p = get(RFFT_PLANS, key, C_NULL)
+    p === C_NULL || return p
     return lock(PLAN_LOCK) do
         get!(RFFT_PLANS, key) do
             # MEASURE rather than ESTIMATE: planning is paid once per size per
@@ -143,27 +198,88 @@ function fft_plan(ny::Int, nx::Int)
             # time is recovered immediately. Wisdom persistence (see `__init__`)
             # removes even that cost on subsequent runs.
             WISDOM_DIRTY[] = true
-            plan_rfft(Matrix{Float32}(undef, ny, nx); flags = FFTW.MEASURE)
+            # FFTW is row-major and Julia column-major, so an `ny`-by-`nx` Julia array is an
+            # `nx`-by-`ny` C array — the dimensions go in reversed. Getting this backwards
+            # transposes every transform, which for a symmetric test size looks like it works.
+            inb = Matrix{Float32}(undef, ny, nx)
+            outb = Matrix{ComplexF32}(undef, ny ÷ 2 + 1, nx)
+            plan = ccall((:fftwf_plan_dft_r2c_2d, LIBFFTW3F), Ptr{Cvoid},
+                         (Cint, Cint, Ptr{Float32}, Ptr{ComplexF32}, Cuint),
+                         nx, ny, inb, outb, FFTW_MEASURE)
+            plan == C_NULL && error("FFTW could not plan a $(ny)x$(nx) real-to-complex " *
+                                    "transform. This is not a recoverable condition: the " *
+                                    "correlator has no fallback for a size FFTW rejects.")
+            plan
         end
     end
+end
+
+"""
+    fft_execute!(plan, input, output)
+
+Run a real-to-complex plan from [`fft_plan`](@ref).
+
+The buffers must be the sizes the plan was created for. FFTW does not check, and a mismatch is a
+buffer overrun rather than an error — which is why `CorrelationWorkspace` sizes its FFT buffers
+from the same `next_fft_size` the plan is keyed on.
+"""
+@inline function fft_execute!(plan::Ptr{Cvoid}, input::Matrix{Float32},
+                              output::Matrix{ComplexF32})
+    ccall((:fftwf_execute_dft_r2c, LIBFFTW3F), Cvoid,
+          (Ptr{Cvoid}, Ptr{Float32}, Ptr{ComplexF32}), plan, input, output)
+    return output
 end
 
 """
     ifft_plan(ny, nx)
 
 Complex-to-real inverse FFT plan matching [`fft_plan`](@ref), from the cache.
+
+Execute it with [`ifft_execute!`](@ref), which applies the `1/n` scaling FFTW omits.
 """
 function ifft_plan(ny::Int, nx::Int)
     key = (ny, nx)
-    p = get(IRFFT_PLANS, key, nothing)
-    p === nothing || return p
+    p = get(IRFFT_PLANS, key, C_NULL)
+    p === C_NULL || return p
     return lock(PLAN_LOCK) do
         get!(IRFFT_PLANS, key) do
             WISDOM_DIRTY[] = true
-            plan_irfft(Matrix{ComplexF32}(undef, ny ÷ 2 + 1, nx), ny;
-                       flags = FFTW.MEASURE)
+            inb = Matrix{ComplexF32}(undef, ny ÷ 2 + 1, nx)
+            outb = Matrix{Float32}(undef, ny, nx)
+            plan = ccall((:fftwf_plan_dft_c2r_2d, LIBFFTW3F), Ptr{Cvoid},
+                         (Cint, Cint, Ptr{ComplexF32}, Ptr{Float32}, Cuint),
+                         nx, ny, inb, outb, FFTW_MEASURE)
+            plan == C_NULL && error("FFTW could not plan a $(ny)x$(nx) complex-to-real " *
+                                    "transform.")
+            plan
         end
     end
+end
+
+"""
+    ifft_execute!(plan, input, output)
+
+Run a complex-to-real plan from [`ifft_plan`](@ref), scaled.
+
+**FFTW's inverse transform is unnormalised** — it returns `n` times the inverse DFT, where
+`AbstractFFTs.plan_irfft` wrapped the same plan in a `ScaledPlan` that divided for us. The scaling
+is applied here so callers see the same values as before, and so the omission cannot be
+rediscovered per call site: a missing `1/n` scales every correlation numerator by the transform
+size, which produces a plausible-looking surface with the wrong normalisation.
+
+!!! warning "The input is destroyed"
+    FFTW's c2r transform overwrites its input buffer unless planned with `FFTW_PRESERVE_INPUT`,
+    which costs performance. Callers must not read the spectrum afterwards.
+"""
+@inline function ifft_execute!(plan::Ptr{Cvoid}, input::Matrix{ComplexF32},
+                               output::Matrix{Float32})
+    ccall((:fftwf_execute_dft_c2r, LIBFFTW3F), Cvoid,
+          (Ptr{Cvoid}, Ptr{ComplexF32}, Ptr{Float32}), plan, input, output)
+    scale = 1.0f0 / length(output)
+    @inbounds @simd for i in eachindex(output)
+        output[i] *= scale
+    end
+    return output
 end
 
 """

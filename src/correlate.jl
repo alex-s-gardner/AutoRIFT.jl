@@ -581,13 +581,15 @@ function _numerators_fft!(out, ws::CorrelationWorkspace, search, cd, nr, nc, ch,
     end
 
     plan = fft_plan(fy, fx)
-    mul!(ws.fspec_a, plan, a)
-    mul!(ws.fspec_b, plan, b)
+    fft_execute!(plan, a, ws.fspec_a)
+    fft_execute!(plan, b, ws.fspec_b)
     @inbounds for k in eachindex(ws.fspec_a)
         ws.fspec_a[k] *= ws.fspec_b[k]
     end
     iplan = ifft_plan(fy, fx)
-    mul!(a, iplan, ws.fspec_a)
+    # `ifft_execute!` applies the 1/n scaling FFTW omits, and destroys `ws.fspec_a` in the
+    # process — nothing reads it afterwards.
+    ifft_execute!(iplan, ws.fspec_a, a)
 
     @inbounds for j in 1:nc, i in 1:nr
         out[i, j] = Float64(a[i + ch - 1, j + cw - 1])
