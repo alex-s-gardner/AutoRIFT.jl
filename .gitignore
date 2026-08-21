@@ -8,6 +8,12 @@
 /docs/src/.vitepress/cache/
 /docs/package-lock.json
 
+# A library does not commit its Manifest: it pins exact versions resolved by one
+# Julia version, and CI tests against several. The root one *was* committed, which
+# broke every `lts` (1.10) job — the manifest had been resolved on 1.12, so Pkg
+# could not locate the stdlib sources it named. Applications pin; libraries resolve.
+/Manifest.toml
+
 # Benchmark runs are per-machine; only baseline.json and python.json are
 # committed, since those are the references everything else is compared against.
 /benchmark/results/history/

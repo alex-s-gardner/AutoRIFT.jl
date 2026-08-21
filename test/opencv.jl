@@ -114,14 +114,27 @@ else
             @test peak_index(got) == (r + 1, r + 1)
             @test maximum(got) ≈ 1.0f0 atol = 1e-3
             @test all(isfinite, got)
-            # A generous bound, and deliberately so: this fixture set is at the edge of what
-            # Float32 can represent, and the measured worst excursion beyond [-1, 1] is 9.2e-5 —
-            # 92% of this tolerance. That is not slack to be tightened. The coefficient is formed
-            # from a Float64 numerator over a Float64 denominator and then rounded to Float32, so
-            # a value that should be exactly 1 can land a few ulp above it; at a contrast of
-            # 0.001 on a base of 0.5, "a few ulp" is this large. The peak location, asserted
-            # above, is the claim that actually matters and it is exact.
-            @test all(-1.0001f0 .<= got .<= 1.0001f0)
+            # The coefficient must stay in [-1, 1] up to Float32 rounding, and the bound is
+            # *derived* rather than fitted — because a fitted one broke.
+            #
+            # It was `1.0001f0`, chosen just above a then-observed worst excursion of 9.2e-5, i.e.
+            # with 8% margin. That is not a tolerance, it is a record of one machine's rounding:
+            # the excursion is now 1.02e-4 here and larger still on CI, so the assertion failed on
+            # three platforms without anything having changed in the correlator.
+            #
+            # Where the magnitude comes from: the coefficient is a Float64 ratio rounded to
+            # Float32, so a value that should be exactly 1 lands a few ulp away. These fixtures
+            # carry a contrast of 0.001 on a base of 0.5, and a ZNCC denominator that small
+            # amplifies the relative error by roughly base/contrast = 500. So the expected scale is
+            # ~500-1000 ulp of 1.0f0, and the observed 1.02e-4 is 857 ulp — inside the predicted
+            # range rather than a surprise.
+            #
+            # 2048 ulp therefore: comfortably above what the arithmetic can produce, and still
+            # three orders of magnitude below the 0.1 that would indicate a genuinely broken
+            # normalisation. The claim this testset exists to make is the peak *location*, asserted
+            # above and exact; this one only guards against the coefficient going wild.
+            bound = 1.0f0 + 2048eps(1.0f0)
+            @test all(-bound .<= got .<= bound)
         end
     end
 end
