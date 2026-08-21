@@ -30,7 +30,12 @@ using JSON3
 using Printf
 
 const BENCH_DIR = @__DIR__
-const PROJECT = dirname(BENCH_DIR)
+# The *benchmark* environment, not the package directory. Every subprocess below needs `AutoRIFT`
+# and `FFTW` resolvable, and only this environment is guaranteed to have them instantiated: CI runs
+# `Pkg.develop(path=".")` into `benchmark/` and never instantiates the package env itself, so
+# pointing at `dirname(BENCH_DIR)` failed with `Package FFTW is required but does not seem to be
+# installed`. It worked locally only because the package env happened to be instantiated there.
+const PROJECT = BENCH_DIR
 
 """
     measure_rss(script; threads = "auto") -> Float64
