@@ -70,7 +70,10 @@ function _similarity(x::Tuple)
         "`similarity` cannot be an empty tuple; name at least one measure."))
     return map(_one_similarity, x)
 end
-_similarity(x::AbstractVector) = _similarity(Tuple(x))
+# Deliberately no `AbstractVector` method. It would work, but its return type infers as `Any` —
+# `Tuple(::Vector)` has no length in its type — which forfeits exactly the concreteness the tuple
+# design exists to preserve, and would be the one accepted spelling that silently costs the
+# specialization. A caller with a vector writes `Tuple(v)`, and sees why at the call site.
 _similarity(x) = _badtype(:similarity, x,
                          "a Symbol, a `SimilarityMeasure`, or a tuple of either")
 

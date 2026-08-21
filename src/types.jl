@@ -715,15 +715,15 @@ to make the whole package untrimmable (verified: it produced `unresolved call ..
 and broke `app/`'s build).
 
 For that reason the chip-size loop itself does not call this — it uses [`measure_at`](@ref), which
-needs no allocation and no `ntuple` over a runtime length. This function is the readable form, for
-callers inspecting a configuration.
+needs no allocation and no `ntuple` over a runtime length. **This function is for inspecting a
+configuration**, not for running one: answering "what will each level actually use?" in one call,
+which is otherwise a loop the caller has to write. The tests use it that way, and so would anyone
+debugging a hierarchy.
 """
-function chip_measures(p::Params, nlevels::Integer)
+function chip_measures(p::Params, nlevels::Integer = length(chip_sizes(p)))
     _check_measures(p, nlevels)
     return ntuple(k -> measure_at(p, k), nlevels)
 end
-
-chip_measures(p::Params) = chip_measures(p, length(chip_sizes(p)))
 
 """
     measure_at(p::Params, level::Integer) -> SimilarityMeasure

@@ -148,7 +148,7 @@ continuing.
 
 `measure` is the similarity measure for this level. Positional rather than a keyword because
 `p.similarity` is a tuple and a keyword carrying an abstract `SimilarityMeasure` is unresolvable
-under `--trim` — see [`chip_measures`](@ref).
+under `--trim` — see [`measure_at`](@ref).
 
 `wanted` marks the points this level should attempt — in the loop, those no finer level
 resolved. Returns `nothing` if the coarse pass found too little to be worth continuing,
@@ -219,8 +219,10 @@ end
 # Correlate a decimated sample of the points, filter for spatial consistency, and dilate what
 # survives. Returns a full-grid mask of where the fine pass should look, or `nothing` if too
 # little of the coarse grid was coherent for the level to be worth continuing.
+# `measure` is positional and has no default: the one caller always knows the level's measure, and a
+# default here would be a second spelling of `chipsize_level`'s that could silently diverge from it.
 function _coarse_pass(pair::ImagePair, pts::PointSet{2}, p::Params, csx::Int, csy::Int,
-                      measure::SimilarityMeasure = first(p.similarity))
+                      measure::SimilarityMeasure)
     stride = p.coarse_stride
     nr, nc = size(pts)
     rows = stride:stride:nr

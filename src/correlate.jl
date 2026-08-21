@@ -642,12 +642,6 @@ end
 # Everything downstream is shared: the surface is real `Float32`, so `peak_index`, `peak_offset`
 # and the whole Laplace subpixel cascade are the code the real path uses.
 #
-# The numerator is evaluated directly rather than by FFT, which is the one place this is slower
-# than the real measures. `_numerators_fft!` uses a real-to-complex transform and its buffers are
-# `Matrix{Float32}`; a complex chip needs a complex-to-complex transform, a second pair of plans
-# and two more workspace buffers. Deferred deliberately: correctness first, and the direct path is
-# what the FFT path is verified against anyway. `Coherence`'s docstring recommends it at the
-# *finest* chip size, where the direct path is at its most competitive.
 function _correlate_surface!(
     surface, ws::CorrelationWorkspace, search::AbstractMatrix{<:Complex},
     ch::Int, cw::Int, cnorm::Float64, ::Coherence,
