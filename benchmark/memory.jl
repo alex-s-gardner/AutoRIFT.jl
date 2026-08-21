@@ -15,12 +15,13 @@
 # So: one fresh process per configuration, `Sys.maxrss()` read once at the end, and the
 # baseline established by a matching process that allocates the inputs but skips the work.
 #
-# Why this matters enough to build the machinery. The Python reference's RSS grows ~17 MiB per
-# image pair without plateauing — 288 MiB after one pair, 801 MiB after thirty. Julia's `Cache`
-# path grows **0.0 MiB of live heap** over the same thirty. That difference only shows up if
-# memory is tracked as a metric rather than assumed to follow from runtime.
+# Why this matters enough to build the machinery. The Python reference's RSS grows without
+# plateauing — 376.9 MiB after one 512² pair, 542.3 MiB after thirty, or +5.7 MiB/pair, as *current*
+# RSS after an explicit `gc.collect()`. Julia's `Cache` path grows **0.0 MiB of live heap** over the
+# same thirty. That difference only shows up if memory is tracked as a metric rather than assumed to
+# follow from runtime.
 #
-# And it only shows up *correctly* if both quantities are tracked. Peak RSS grows 37 MiB across
+# And it only shows up *correctly* if both quantities are tracked. Peak RSS grows ~38 MiB across
 # those thirty pairs, which read alone would suggest the same accumulation the reference has. It
 # is allocator slack: the live heap is flat. `series_growth` therefore reports both, and the
 # difference between them is the difference between "needs process recycling" and "does not".
@@ -155,8 +156,14 @@ function run_memory()
     end
     # `upsampling` is included because it is the knob one would *expect* to matter — the
     # refinement workspace grows as its square, 0.2 MiB at 8x to 62.5 MiB at 128x. Measurement
-    # says peak RSS barely moves, because pooling means few exist at once. Tracked so that claim
-    # stays true rather than being remembered.
+    # says peak RSS barely moves (30.2 against 27.4 MiB), because pooling means few exist at once.
+    # Tracked so that claim stays true rather than being remembered.
+    #
+    # Thread count is *not* tracked as a knob, and that is a finding rather than an omission: it
+    # scatters 6.2-9.7 MiB at 512² with no ordering. An earlier reading of one sample per
+    # configuration showed peak apparently falling 14.3 -> 5.1 MiB with more threads, which
+    # repetition did not reproduce. One subprocess sample is enough to detect a regression against a
+    # stored baseline; it is not enough to assert a trend. See `docs/memory.md`.
     for up in (8, 128)
         record!("memory/pair 1024x1024 upsampling $up",
                 pair_peak(1024; threads = "auto", kw = ", upsampling = $up"))

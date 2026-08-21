@@ -204,6 +204,44 @@ autorift(reference::AbstractMatrix, secondary::AbstractMatrix; kwargs...) =
     autorift!(init(reference, secondary; kwargs...))
 
 """
+    autorift(reference, secondary, p::Params) -> MultichipResult
+
+Correlate with an already-resolved [`Params`](@ref), bypassing keyword resolution.
+
+Same computation and same result as the keyword form. What differs is that nothing between the
+call and the correlation is a runtime value: `Params`'s method choices are type parameters, so
+when `p` is built from method *objects* the whole pipeline below this call is statically
+resolvable.
+
+That matters in two places. It is the entry point a `--trim`ed binary needs, since
+[`AutoRIFT.params`](@ref) resolves Symbols through a `Dict{Symbol,Any}` and the constructor call
+after that lookup cannot be resolved at compile time. And it lets a caller who builds `Params`
+once reuse it across pairs without re-validating keywords — though [`AutoRIFT.init`](@ref) is
+the better tool for that, since it also reuses buffers.
+
+```julia
+p = AutoRIFT.Params(ZNCC(), Highpass(), QuantizeUInt8(), PyramidRefine(), GardnerFilter(),
+                    AutoRIFT.False(), 32, 32, 128, 1.0, 32, 25, 25, 6, 4, 8, 0.01, 0.0, 0.0,
+                    3, UInt64(0), false)
+out = autorift(image1, image2, p)
+```
+
+`Params` has no keyword constructor deliberately: `params()` is the documented way to build one
+with defaults, and a second spelling of the defaults would be a second place for them to drift.
+The positional form is stable API — the field order is `Params`'s own, in declaration order.
+
+Validity masks are not accepted here. They are per-image data rather than configuration, and the
+keyword form or [`ImagePair`](@ref) is where they belong; this overload exists for the case where
+*nothing* is a runtime value.
+"""
+function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, p::Params)
+    pair = _prepare(ImagePair(reference, secondary), p)
+    grid = _build_grid(size(pair), p)
+    _warm_grid_plans(grid, p)
+    return correlate_multichip(pair, grid, p)
+end
+
+"""
     autorift(reference, secondary, grid::PointSet; kwargs...) -> MultichipResult
 
 Correlate at a caller-supplied set of search points rather than a grid synthesized from

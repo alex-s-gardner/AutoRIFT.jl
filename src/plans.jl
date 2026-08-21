@@ -19,7 +19,7 @@
 
 using FFTW: FFTW
 using FFTW_jll: libfftw3f_path
-using Scratch: @get_scratch!
+using Scratch: scratch_dir
 
 # ---------------------------------------------------------------------------
 # Why raw C plan pointers rather than FFTW.jl's plan objects
@@ -83,6 +83,18 @@ const IRFFT_PLANS = Dict{Tuple{Int,Int},Ptr{Cvoid}}()
 # FFTW does not expose its own version as a constant, so take it from the package.
 const FFTW_VERSION = string(pkgversion(FFTW))
 
+# `scratch_dir` rather than `Scratch.@get_scratch!`, and the difference is the reason this UUID is
+# written out. The macro additionally *records* the access in the depot's usage log, so `Pkg.gc()`
+# knows the space is live and does not reclaim it. That bookkeeping stamps a `DateTime`, and
+# formatting one reaches `rpad(::String, ::Int, ::Char)` → `Base.repeat` → `textwidth`, which
+# `--trim` cannot resolve — four of the errors in a trimmed build, none of them about FFTs.
+#
+# What is given up is only garbage collection of the directory: `Pkg.gc()` may delete a wisdom file
+# that has not been used in a while, and the next run measures its plans again and rewrites it. That
+# is precisely the degradation `load_wisdom!` already tolerates for a read-only depot. Deleting a
+# cache is a cost of milliseconds; not trimming costs 450 MiB of resident memory.
+const PKG_UUID = Base.UUID("52cb0ed0-aa80-430c-bd04-c52888a79add")
+
 # Set once the wisdom file has been read, so a process imports at most once.
 const WISDOM_LOADED = Ref(false)
 # Sizes planned since the last export, so an export only happens when there is something new.
@@ -101,7 +113,8 @@ function wisdom_path()
         # `Sys.cpu_info()` can report a model string with spaces and slashes ("Apple M2 Max",
         # "Intel(R) Xeon(R) Gold 6248R CPU @ 3.00GHz"), none of which belong in a filename.
         cpu = replace(Sys.cpu_info()[1].model, r"[^A-Za-z0-9._-]+" => "_")
-        dir = @get_scratch!("fftw_wisdom")
+        dir = scratch_dir(string(PKG_UUID), "fftw_wisdom")
+        mkpath(dir)
         return joinpath(dir, "$(cpu)-fftw$(FFTW_VERSION).wisdom")
     catch
         # No writable scratch space. Planning still works; it is just never cached.

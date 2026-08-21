@@ -63,13 +63,14 @@ exercises the correlator.
 
 - [x] Package scaffold, parameter resolution, point sets
 - [x] Test and benchmark infrastructure, OpenCV fixture corpus, Python baseline
-- [ ] Correlation surface, peak location, subpixel refinement
-- [ ] Sliding-window reductions, pre-correlation filters, outlier rejection
-- [ ] The grid loop
-- [ ] Multi-scale pyramid
-- [ ] Public API and cache lifecycle
-- [ ] Rasters / DimensionalData extensions
-- [ ] Performance milestone
+- [x] Correlation surface, peak location, subpixel refinement
+- [x] Sliding-window reductions, pre-correlation filters, outlier rejection
+- [x] The grid loop
+- [x] Multi-chip-size search (not a pyramid — the imagery is never downsampled)
+- [x] Public API and cache lifecycle
+- [x] Rasters / DimensionalData extensions
+- [x] Performance milestone — 3.1x serial, 11.1x threaded against the reference
+- [x] Memory as a tracked metric, and a trimmed 29.7 MiB binary
 - [ ] Complex (SLC) input
 - [ ] Geogrid
 
@@ -86,4 +87,9 @@ The test suite runs on a bare clone: the OpenCV fixture corpus is committed, so 
 Python is needed. To regenerate fixtures or refresh the timing baseline, see
 [`tools/python_ref/README.md`](tools/python_ref/README.md).
 [`benchmark/README.md`](benchmark/README.md) covers the benchmark suite and the
-regression gate.
+regression gate, and [`docs/memory.md`](docs/memory.md) the memory comparison —
+including why peak RSS and live heap answer different questions.
+
+For small instances, [`app/`](app/README.md) builds a trimmed standalone binary:
+byte-identical output at **29.7 MiB peak RSS against 424.2 MiB**, since 97% of an
+ordinary process's memory floor is the Julia runtime rather than AutoRIFT.

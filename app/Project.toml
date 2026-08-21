@@ -1,0 +1,6 @@
+name = "AutoRIFTApp"
+uuid = "8f6b1c2e-4a3d-4f8e-9b5a-1c7d2e3f4a5b"
+version = "0.1.0"
+
+[deps]
+AutoRIFT = "52cb0ed0-aa80-430c-bd04-c52888a79add"

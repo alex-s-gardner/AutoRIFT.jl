@@ -96,8 +96,13 @@ other such chip. See `valid` on [`ImagePair`](@ref).
 """
 function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Params;
                 subpixel::SubpixelMethod = p.subpixel)
-    size(out) == size(pts) || throw(DimensionMismatch(
-        "output is $(size(out)) but the point set has $(size(pts)) points"))
+    # Interpolating the `Tuple`s directly would be the natural spelling, but showing a `Tuple`
+    # reaches `textwidth` and `Base.repeat`, which `--trim` cannot resolve — so this one message
+    # would make the whole package untrimmable. Element counts say the same thing here: `out`
+    # comes from `displacement_field(pts)`, so a mismatch is a different point set, not a
+    # transposed one.
+    length(out) == length(pts) || throw(DimensionMismatch(
+        "output has $(length(out)) points but the point set has $(length(pts))"))
 
     flat = scatter(pts)          # free: shares memory, discards only the layout
     chipx, chipy, rx, ry, pad, fits = _pass_geometry(flat, size(pair))

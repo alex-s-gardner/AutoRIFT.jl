@@ -1,5 +1,6 @@
 using AutoRIFT: autorift, autorift!, reinit!, init, Cache, MultichipResult, nmeasured,
-                pointset, gridpoints, params
+                pointset, gridpoints, params, Params, ZNCC, Highpass, QuantizeUInt8,
+                PyramidRefine, GardnerFilter
 
 med(v) = (s = sort(collect(v)); isempty(s) ? NaN : s[(length(s) + 1) ÷ 2])
 motion(r) = (med(filter(!isnan, -r.dx)), med(filter(!isnan, -r.dy)))
@@ -201,4 +202,35 @@ end
     @test all(isequal.(ser.dx, par.dx))
     @test all(isequal.(ser.dy, par.dy))
     @test ser.chip_size == par.chip_size
+end
+
+@testset "the Params path is statically inferrable" begin
+    # The keyword form and the positional-`Params` form must be the same computation. That is
+    # what the `autorift(ref, sec, ::Params)` docstring promises, and what makes it safe to
+    # document as the entry point a trimmed binary uses.
+    ref, sec = shifted_pair(512, (6, -4); T = Float32)
+    p = Params(ZNCC(), Highpass(), QuantizeUInt8(), PyramidRefine(), GardnerFilter(),
+               AutoRIFT.False(),
+               32, 32, 128, 1.0, 32, 25, 25, 6, 4, 8, 0.01, 0.0, 0.0, 3, UInt64(0), false)
+
+    # First: the hand-built `Params` is the one `params()` produces for these keywords. If a
+    # default drifts, this fails here rather than as a silent behaviour difference in the binary.
+    @test p == params(; chip_size = 32, search_radius = 25)
+
+    kwform = autorift(ref, sec; chip_size = 32, search_radius = 25)
+    posform = autorift(ref, sec, p)
+    @test all(isequal.(kwform.dx, posform.dx))
+    @test all(isequal.(kwform.dy, posform.dy))
+    @test all(isequal.(kwform.correlation, posform.correlation))
+
+    # The point of the overload: with method *objects*, nothing between the call and the
+    # correlation is a runtime value. `@inferred` is the gate — this is what `--trim` needs, and
+    # a regression here would break the binary while leaving every other test passing.
+    @test (@inferred autorift(ref, sec, p)) isa MultichipResult
+
+    # And the contrast that explains why the overload has to exist at all. `params()` resolves
+    # Symbols through a `Dict{Symbol,Any}`, so its return type is not concrete — hence the
+    # keyword path cannot be trimmed however concrete the arguments are.
+    @test !isconcretetype(Base.infer_return_type(params, Tuple{}))
+    @test isconcretetype(typeof(p))
 end

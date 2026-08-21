@@ -18,3 +18,8 @@
 # on a bare clone.
 /test/fixtures/scenes/
 /test/Manifest.toml
+
+# The trimmed binary and its bundled runtime libraries: build products, and the
+# bundle is ~71 MiB. Built on demand; see app/README.md.
+/app/build/
+/app/Manifest.toml
