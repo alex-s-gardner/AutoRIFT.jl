@@ -75,21 +75,28 @@ end
                                                  neighbours = 4, min_agree = 9)
 end
 
-@testset "a FirstGuess without ImageFeatures names the dependency" begin
-    # `ORBGuess` is declared in the core so it can be documented and dispatched on, but it cannot
-    # work until the extension loads. The error must say so — a bare `MethodError` on an internal
-    # function would send the reader into the wrong file.
+@testset "a FirstGuess without its package names the RIGHT dependency" begin
+    # `ORBGuess` and `AKAZEGuess` are declared in the core so they can be documented and dispatched
+    # on, but neither works until its extension loads. The error must name the package that would
+    # actually help — the first version hardcoded "ImageFeatures" for every subtype, so `AKAZEGuess`
+    # sent the reader to install a package that would not have fixed it.
     #
-    # This testset runs in the core suite, *before* `test/extensions.jl` loads ImageFeatures, which
-    # is what makes it meaningful: it asserts the pre-extension state.
-    err = try
-        AutoRIFT._detector(ORBGuess())
-        nothing
-    catch e
-        e
+    # This testset runs in the core suite, *before* `test/extensions.jl` loads any detector, which is
+    # what makes it meaningful: it asserts the pre-extension state.
+    for (guess, pkg, wrong) in ((ORBGuess(), "ImageFeatures", "AkazeFeatures"),
+                                (AKAZEGuess(), "AkazeFeatures", "ImageFeatures"))
+        err = try
+            AutoRIFT._detector(guess)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin(pkg, err.msg)
+        @test !occursin(wrong, err.msg)
     end
-    @test err isa ArgumentError
-    @test occursin("ImageFeatures", err.msg)
+    @test AutoRIFT.required_package(ORBGuess()) == "ImageFeatures"
+    @test AutoRIFT.required_package(AKAZEGuess()) == "AkazeFeatures"
 end
 
 

@@ -31,7 +31,7 @@
 module AutoRIFTAkazeFeaturesExt
 
 using AutoRIFT
-using AutoRIFT: FirstGuess, AKAZEGuess, consistent_matches, pointset
+using AutoRIFT: AKAZEGuess
 using AkazeFeatures: AKAZE, AKAZEOptions, Create_Nonlinear_Scale_Space, Feature_Detection,
                      Compute_Descriptors
 
@@ -39,26 +39,6 @@ using AkazeFeatures: AKAZE, AKAZEOptions, Create_Nonlinear_Scale_Space, Feature_
 # options and the work happens in `_akaze_describe`. `omin = 0` because the default (-1) doubles the
 # input first, which quadruples the scale-space cost for detail SAR speckle does not carry.
 AutoRIFT._detector(g::AKAZEGuess) = g.kwargs
-
-function _togray(img::AbstractMatrix)
-    lo, hi = Inf, -Inf
-    @inbounds for v in img
-        f = Float32(v)
-        isfinite(f) || continue
-        f < lo && (lo = f)
-        f > hi && (hi = f)
-    end
-    isfinite(lo) && hi > lo || throw(ArgumentError(
-        "image has no finite range to scale — every pixel is NaN, Inf, or identical, so there " *
-        "is nothing for a feature detector to find."))
-    scale = 1.0f0 / (hi - lo)
-    out = Matrix{Float64}(undef, size(img))
-    @inbounds for i in eachindex(out)
-        f = Float32(img[i])
-        out[i] = isfinite(f) ? Float64((f - lo) * scale) : 0.0
-    end
-    return out
-end
 
 # Keypoints and their descriptors for one image. Returns `(descriptors, points)` where `points` is a
 # vector of `(row, col)` — the same shape the ImageFeatures adapter produces, so `first_guess` need
@@ -142,33 +122,15 @@ function _hamming_match(d1::AbstractMatrix{UInt8}, p1::Vector, d2::AbstractMatri
     return pts, dxs, dys
 end
 
-function AutoRIFT.first_guess(reference::AbstractMatrix, secondary::AbstractMatrix,
-                              method::AKAZEGuess;
-                              search_radius = 6, chip_size = 32, min_matches::Integer = 8,
-                              ratio::Real = 0.9, kwargs...)
-    size(reference) == size(secondary) || throw(DimensionMismatch(
-        "reference is $(size(reference)) but secondary is $(size(secondary)); the two images " *
-        "must be co-registered to a common grid"))
-
+# `ratio` here genuinely *is* Lowe's ratio — `_hamming_match` implements the two-nearest test itself.
+# Contrast the ORB path, where the same-named ImageFeatures parameter is an absolute distance; that
+# mismatch was a real bug and is why this one is spelled out.
+function AutoRIFT._match_features(reference::AbstractMatrix, secondary::AbstractMatrix,
+                                  method::AKAZEGuess; ratio::Real = 0.9)
     opts = AutoRIFT._detector(method)
-    da, pa = _akaze_describe(_togray(reference), opts)
-    db, pb = _akaze_describe(_togray(secondary), opts)
-    pts, dxs, dys = _hamming_match(da, pa, db, pb, Float64(ratio))
-
-    isempty(pts) && throw(ArgumentError(
-        "A-KAZE matching found no correspondences passing the ratio test. The pair may be fully " *
-        "decorrelated, or the time gap too long for features to persist."))
-
-    keep = consistent_matches(pts, dxs, dys; kwargs...)
-    length(keep) >= min_matches || throw(ArgumentError(
-        "only $(length(keep)) of $(length(pts)) matches survived the consistency filter, below " *
-        "`min_matches = $min_matches`. A-KAZE holds 95-99% precision under rotation in testing, " *
-        "so unlike ORB a low survival count here suggests genuinely incoherent motion rather " *
-        "than descriptor failure."))
-
-    return pointset([p[2] for p in pts[keep]], [p[1] for p in pts[keep]];
-                    search_radius, chip_size,
-                    dx_prior = dxs[keep], dy_prior = dys[keep])
+    da, pa = _akaze_describe(AutoRIFT._scale01(Float64, reference), opts)
+    db, pb = _akaze_describe(AutoRIFT._scale01(Float64, secondary), opts)
+    return _hamming_match(da, pa, db, pb, Float64(ratio))
 end
 
 end # module

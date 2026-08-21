@@ -145,14 +145,80 @@ AKAZEGuess(; kwargs...) = AKAZEGuess(kwargs)
 # (2016) already measured as the best of three. A-KAZE earned its adapter by measuring better;
 # BRISK did not. The abstract type is what makes adding one a new method rather than a redesign.
 
+"""
+    AutoRIFT.required_package(method::FirstGuess) -> String
+
+Which package must be loaded for `method` to work.
+
+Exists so the "you forgot a dependency" error names the *right* dependency. The first version of that
+error hardcoded `ImageFeatures` for every subtype, so `AKAZEGuess` without `AkazeFeatures` told the
+caller to load a package that would not have helped.
+"""
+required_package(::ORBGuess) = "ImageFeatures"
+required_package(::AKAZEGuess) = "AkazeFeatures"
+
 # The detector itself, from the extension. Defined here so the error a caller sees names the missing
 # dependency rather than being a bare `MethodError` on an internal function.
 function _detector(g::FirstGuess)
+    pkg = required_package(g)
     throw(ArgumentError(
-        "`$(nameof(typeof(g)))` needs ImageFeatures to be loaded. Run `using ImageFeatures` " *
-        "first — the detector lives in a package extension, because it is a heavy dependency " *
-        "that the optical path does not need."))
+        "`$(nameof(typeof(g)))` needs $pkg to be loaded. Run `using $pkg` first — the detector " *
+        "lives in a package extension, because it is a heavy dependency that the optical path " *
+        "does not need."))
 end
+
+# Scale an image into [0, 1] for a feature detector, into a caller-chosen element type.
+#
+# One implementation rather than one per extension: ImageFeatures wants `Gray{Float32}` (it dispatches
+# on the colorant) and A-KAZE wants `Float64`, but the arithmetic is identical and
+# `Gray{Float32}(::Float32)` is a valid conversion. Two copies of this meant two copies of the
+# no-finite-range error message.
+#
+# Scaled by extrema over the *finite* values, since a reprojected scene carries NaN in its no-data
+# border and `maximum` over those gives NaN for the whole image. This mirrors Muckenhuber's Eq. 2,
+# which maps sigma0 onto 0-255 between user-chosen bounds specifically "to limit the influence of
+# speckle noise"; their bounds are per-sensor constants, ours come from the data, which is the more
+# conservative default. A caller with sensor-appropriate bounds should clamp before calling.
+function _scale01(::Type{T}, img::AbstractMatrix) where {T}
+    lo, hi = Inf32, -Inf32
+    @inbounds for v in img
+        f = Float32(v)
+        isfinite(f) || continue
+        f < lo && (lo = f)
+        f > hi && (hi = f)
+    end
+    isfinite(lo) && hi > lo || throw(ArgumentError(
+        "image has no finite range to scale — every pixel is NaN, Inf, or identical, so there " *
+        "is nothing for a feature detector to find."))
+    scale = 1.0f0 / (hi - lo)
+    out = Matrix{T}(undef, size(img))
+    @inbounds for i in eachindex(out)
+        f = Float32(img[i])
+        # Non-finite becomes zero rather than propagating: the detector has no mask, so a NaN would
+        # poison every descriptor whose patch touched it.
+        out[i] = T(isfinite(f) ? (f - lo) * scale : 0.0f0)
+    end
+    return out
+end
+
+"""
+    AutoRIFT._match_features(reference, secondary, method::FirstGuess; kwargs...)
+        -> (points, dx, dy)
+
+Detect, describe and match features between two images. **The one method an extension supplies.**
+
+`points` is a vector of `(row, col)`; `dx`/`dy` are the matched displacements, reference minus
+secondary to match `track!`'s convention. Everything around this call — scaling, the shape check, the
+consistency filter, `min_matches`, building the `PointSet` — belongs to [`first_guess`](@ref) and is
+written once.
+
+That split is the whole reason the abstract [`FirstGuess`](@ref) exists. It was not the first
+arrangement: each extension originally owned a whole `first_guess` method, which duplicated the
+keyword defaults, the sign convention, the NaN policy and two error messages per detector — so adding
+a third meant a third copy, and one of them dispatched on the *abstract* type and silently claimed
+every future subtype.
+"""
+function _match_features end
 
 """
     first_guess(reference, secondary, method::FirstGuess; kwargs...) -> PointSet
@@ -179,8 +245,35 @@ Requires `ImageFeatures` to be loaded — the methods are in a package extension
   will silently produce nothing. A first guess that found almost nothing is a signal about the data
   — decorrelated pair, wrong time gap — not a result to pass on.
 - Filtering keywords are forwarded to [`consistent_matches`](@ref).
+- Detector-specific keywords are forwarded to the matcher; see [`ORBGuess`](@ref) and
+  [`AKAZEGuess`](@ref).
 """
-function first_guess end
+function first_guess(reference::AbstractMatrix, secondary::AbstractMatrix, method::FirstGuess;
+                     search_radius = 6, chip_size = 32, min_matches::Integer = 8,
+                     neighbours::Integer = 12, tolerance::Real = 6.0, min_agree::Integer = 5,
+                     kwargs...)
+    size(reference) == size(secondary) || throw(DimensionMismatch(
+        "reference is $(size(reference)) but secondary is $(size(secondary)); the two images " *
+        "must be co-registered to a common grid"))
+
+    pts, dxs, dys = _match_features(reference, secondary, method; kwargs...)
+    isempty(pts) && throw(ArgumentError(
+        "feature matching found no correspondences at all. The pair may be fully decorrelated, " *
+        "or the time gap too long for features to persist."))
+
+    keep = consistent_matches(pts, dxs, dys; neighbours, tolerance, min_agree)
+    length(keep) >= min_matches || throw(ArgumentError(
+        "only $(length(keep)) of $(length(pts)) matches survived the consistency filter, below " *
+        "`min_matches = $min_matches`. Raw descriptor matching on speckle is mostly wrong — " *
+        "9.5-62.5% correct in testing — so a low survival count is normal, but this few means no " *
+        "coherent motion field was found. Check the time gap, or loosen `tolerance`."))
+
+    # Row is y and column is x, which is the one place this conversion has to be right: matchers
+    # return `(row, col)` and `PointSet` takes `(x, y)`.
+    return pointset([p[2] for p in pts[keep]], [p[1] for p in pts[keep]];
+                    search_radius, chip_size,
+                    dx_prior = dxs[keep], dy_prior = dys[keep])
+end
 
 """
     consistent_matches(points, dx, dy; neighbours = 12, tolerance = 6.0, min_agree = 5)
@@ -268,11 +361,22 @@ end
 # The tree method lives in its own extension rather than here: `NearestNeighbors` is only needed by
 # the sea-ice path, and a core dependency for one optional stage is the wrong trade.
 #
-# Dispatched on a *strategy* argument rather than by the extension redefining this signature. An
-# extension adding a method with the identical signature does not extend, it **overwrites** — which
-# Julia reports as `Method overwriting is not permitted during Module precompilation` and then refuses
-# to precompile. `_NeighbourStrategy` gives the two implementations distinct signatures, and
-# `_neighbour_strategy()` is the one method an extension replaces, returning its own singleton.
+# Dispatched on a *strategy* argument, and the reason is worth recording because the obvious
+# spellings both fail. Verified in a six-line reproduction package, not inferred:
+#
+#   * **Extension redefines the same signature.** Does not extend — it *overwrites*, and Julia then
+#     refuses: `Method overwriting is not permitted during Module precompilation`. Same for a
+#     zero-argument `_neighbour_strategy()`, which was the first thing tried here.
+#   * **Extension defines a method on a differently-named function, core checks `hasmethod`.** Looks
+#     tidiest and is **unsound**: the test package reported the fast path as available with the
+#     extension *not* loaded, because `hasmethod` is a runtime query against a world age that a
+#     precompiled image can already have advanced past. A wrong answer is worse than an indirection.
+#   * **Extension narrows the element type.** Works, but the axis is wrong — availability of a
+#     dependency has nothing to do with whether the points are `Float64`.
+#
+# So: a fallback on the abstract type that the extension specialises. Two distinct methods, resolved
+# by ordinary dispatch, correct in both states — verified `_BruteForceNeighbours` without
+# `NearestNeighbors` and `KDTreeNeighbours` with it.
 abstract type _NeighbourStrategy end
 struct _BruteForceNeighbours <: _NeighbourStrategy end
 
