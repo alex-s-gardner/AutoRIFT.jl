@@ -122,6 +122,78 @@ function integral_sq!(S::AbstractMatrix{Float64}, A::AbstractMatrix)
 end
 
 """
+    integral!(S::AbstractMatrix{ComplexF64}, A::AbstractMatrix{<:Complex})
+
+Integral image of a complex array, so a window's complex sum — and hence its complex mean — is
+four reads.
+
+[`Coherence`](@ref) needs this for the same reason [`ZNCC`](@ref) needs the real version: the
+measure removes the mean from *both* sides, and the window's mean is only affordable per shift
+through a summed-area table. Removing it from the chip alone would leave the numerator and the
+denominator normalised about different points, which caps the self-correlation of a chip below 1
+by exactly the ratio of the two norms.
+"""
+function integral!(S::AbstractMatrix{ComplexF64}, A::AbstractMatrix{<:Complex})
+    m, n = size(A)
+    size(S) == (m + 1, n + 1) || throw(DimensionMismatch(
+        "integral image must be $(m + 1)x$(n + 1) for a $(m)x$(n) input, " *
+        "got $(size(S))"))
+
+    @inbounds begin
+        for j in 1:(n + 1)
+            S[1, j] = zero(ComplexF64)
+        end
+        for i in 1:(m + 1)
+            S[i, 1] = zero(ComplexF64)
+        end
+        for j in 1:n
+            run = zero(ComplexF64)
+            for i in 1:m
+                run += ComplexF64(A[i, j])
+                S[i + 1, j + 1] = run + S[i + 1, j]
+            end
+        end
+    end
+    return S
+end
+
+"""
+    integral_sq!(S, A::AbstractMatrix{<:Complex})
+
+Integral image of `abs2.(A)` — the squared *magnitude* — for complex (SLC) input.
+
+The energy of a complex sample is `|z|²`, not `z²`: the latter is complex and its integral image
+would make [`Coherence`](@ref)'s denominator complex, which is meaningless as a normaliser.
+
+Separate method rather than a generic `abs2` in the real version, because `abs2` on a `Real` is
+`v*v` and the compiler would produce identical code — but writing it that way would put a
+`Complex` union through the real path, which is the hot path for every optical pair.
+"""
+function integral_sq!(S::AbstractMatrix{Float64}, A::AbstractMatrix{<:Complex})
+    m, n = size(A)
+    size(S) == (m + 1, n + 1) || throw(DimensionMismatch(
+        "integral image must be $(m + 1)x$(n + 1) for a $(m)x$(n) input, " *
+        "got $(size(S))"))
+
+    @inbounds begin
+        for j in 1:(n + 1)
+            S[1, j] = 0.0
+        end
+        for i in 1:(m + 1)
+            S[i, 1] = 0.0
+        end
+        for j in 1:n
+            run = 0.0
+            for i in 1:m
+                run += abs2(ComplexF64(A[i, j]))
+                S[i + 1, j + 1] = run + S[i + 1, j]
+            end
+        end
+    end
+    return S
+end
+
+"""
     integral(A) -> Matrix{Float64}
 
 Allocating form of [`integral!`](@ref), for tests and one-off use. The hot path
@@ -149,6 +221,7 @@ No bounds checking: the caller is responsible for `i + h <= size(S, 1)` and
 hundreds of millions of times per image pair — so the check is hoisted to the
 loop that computes the shift range instead.
 """
-@inline function boxsum(S::AbstractMatrix{Float64}, i::Int, j::Int, h::Int, w::Int)
+@inline function boxsum(S::AbstractMatrix{<:Union{Float64,ComplexF64}}, i::Int, j::Int,
+                        h::Int, w::Int)
     @inbounds return S[i + h, j + w] - S[i, j + w] - S[i + h, j] + S[i, j]
 end

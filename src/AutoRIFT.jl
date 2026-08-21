@@ -137,7 +137,7 @@ end
 export autorift, autorift!, reinit!
 export SimilarityMeasure, ZNCC, NCC, Coherence
 export PreprocessMethod, Highpass, Wallis, WallisGapfill, Sobel, Laplacian,
-       Decibel, NoPreprocess
+       Decibel, Deramp, NoPreprocess
 export SubpixelMethod, PyramidRefine, NoRefine
 export QuantizeMethod, QuantizeUInt8, NoQuantize
 export OutlierMethod, GardnerFilter, NoOutlierFilter

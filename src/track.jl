@@ -75,7 +75,8 @@ nmeasured(d::DisplacementField) = count(!isnan, d.dx)
 # ---------------------------------------------------------------------------
 
 """
-    track!(out, pair, pts, p; subpixel = p.subpixel) -> DisplacementField
+    track!(out, pair, pts, p; subpixel = p.subpixel, measure = first(p.similarity))
+        -> DisplacementField
 
 Correlate `pair` at every searchable point of `pts`, writing into `out`.
 
@@ -88,6 +89,11 @@ boundary.
 `subpixel` overrides the parameter set's refinement method, which the caller needs: a
 coarse pass wants integer peaks only, and paying for refinement there would be wasted.
 
+`measure` likewise overrides the similarity measure. `p.similarity` is a tuple, one entry per
+chip-size level, so a single level cannot read it without knowing which level it is — the
+chip-size loop passes the right one. The default is the first, which is correct for a caller
+running `track!` directly on a single scale.
+
 A point is skipped, leaving `NaN`, if its search radius is zero in either axis, if its
 chip lies wholly outside the image, or if its chip contains no valid pixel. The last is
 what keeps zero-padding out of the result: the images are padded so the inner loop needs
@@ -95,7 +101,8 @@ no bounds test, but padding is not data, and a chip made of it would correlate w
 other such chip. See `valid` on [`ImagePair`](@ref).
 """
 function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Params;
-                subpixel::SubpixelMethod = p.subpixel)
+                subpixel::SubpixelMethod = p.subpixel,
+                measure::SimilarityMeasure = first(p.similarity))
     # Interpolating the `Tuple`s directly would be the natural spelling, but showing a `Tuple`
     # reaches `textwidth` and `Base.repeat`, which `--trim` cannot resolve — so this one message
     # would make the whole package untrimmable. Element counts say the same thing here: `out`
@@ -138,9 +145,9 @@ function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Param
     _warm_pass_plans(chipx, chipy, rx, ry)
 
     istrue(p.threaded) ? _track_threaded!(out, ref, sec, okmask, shifted, chipx, chipy,
-                                          rx, ry, up, p) :
+                                          rx, ry, up, p, measure) :
                          _track_chunk!(out, ref, sec, okmask, shifted, chipx, chipy,
-                                       rx, ry, up, p, eachindex(shifted))
+                                       rx, ry, up, p, measure, eachindex(shifted))
     return out
 end
 
@@ -231,7 +238,7 @@ end
 # bitwise, and sharing the body is how that is guaranteed rather than tested for.
 function _track_chunk!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
                        chipx::Int, chipy::Int, rx::Int, ry::Int, up::Int,
-                       p::Params, idx)
+                       p::Params, measure::SimilarityMeasure, idx)
     T = eltype(ref)
     ws = take_workspace!(T, (chipx, chipy), (rx, ry))
     rw = up > 1 ? take_refinement!(up) : nothing
@@ -262,7 +269,7 @@ function _track_chunk!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
 
             chip = @view sec[chip_rows, chip_cols]
             window = @view ref[win_rows, win_cols]
-            surface = correlate!(ws, window, chip, (prx, pry); measure = p.similarity)
+            surface = correlate!(ws, window, chip, (prx, pry); measure)
             # A chip with no texture carries no information about displacement, so it is left
             # as no measurement. The reference reports the search-window corner here, which
             # over masked or featureless terrain is a systematic corner-pinned bias.
@@ -308,13 +315,14 @@ end
 # where a searched one costs microseconds — so an even split of the index range leaves some
 # tasks with almost nothing to do. Oversubscribing lets the scheduler even that out.
 function _track_threaded!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
-                          chipx::Int, chipy::Int, rx::Int, ry::Int, up::Int, p::Params)
+                          chipx::Int, chipy::Int, rx::Int, ry::Int, up::Int, p::Params,
+                          measure::SimilarityMeasure)
     n = length(pts)
     nchunks = min(n, max(1, 2 * Threads.nthreads()))
     chunk = cld(n, nchunks)
     tasks = map(Iterators.partition(eachindex(pts), chunk)) do range
         StableTasks.@spawn _track_chunk!(out, ref, sec, okmask, pts, chipx, chipy,
-                                         rx, ry, up, p, range)
+                                         rx, ry, up, p, measure, range)
     end
     foreach(wait, tasks)
     return out

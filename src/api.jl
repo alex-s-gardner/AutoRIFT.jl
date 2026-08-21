@@ -220,7 +220,7 @@ once reuse it across pairs without re-validating keywords — though [`AutoRIFT.
 the better tool for that, since it also reuses buffers.
 
 ```julia
-p = AutoRIFT.Params(ZNCC(), Highpass(), QuantizeUInt8(), PyramidRefine(), GardnerFilter(),
+p = AutoRIFT.Params((ZNCC(),), Highpass(), QuantizeUInt8(), PyramidRefine(), GardnerFilter(),
                     AutoRIFT.False(), 32, 32, 128, 1.0, 32, 25, 25, 6, 4, 8, 0.01, 0.0, 0.0,
                     3, UInt64(0), false)
 out = autorift(image1, image2, p)

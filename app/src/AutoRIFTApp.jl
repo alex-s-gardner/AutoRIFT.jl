@@ -89,6 +89,10 @@ end
 # and the whole downstream pipeline specializes. This is the same object `params()` produces for
 # the default keywords; the difference is only that no `Dict` lookup stands between the two.
 #
+# `similarity` is a 1-tuple, not a bare measure: `Params` carries one measure per chip-size level
+# so a run can escalate between them, and the last entry applies to every remaining level. A
+# 1-tuple therefore means "ZNCC everywhere", and keeps `S` concrete for trimming.
+#
 # `False()` rather than `false` for `threaded`: `Params` carries threading as a *type* so the grid
 # loop's branch is resolved at compile time.
 #
@@ -107,7 +111,7 @@ end
 # wants is many single-threaded processes, which is exactly what it is.
 function app_params(chip_size::Int, search_radius::Int)
     return Params(
-        ZNCC(), Highpass(), QuantizeUInt8(), PyramidRefine(), GardnerFilter(), False(),
+        (ZNCC(),), Highpass(), QuantizeUInt8(), PyramidRefine(), GardnerFilter(), False(),
         chip_size, chip_size, 4chip_size, 1.0,
         chip_size,
         search_radius, search_radius, 6,

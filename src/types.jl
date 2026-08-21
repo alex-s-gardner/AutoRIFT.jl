@@ -141,12 +141,54 @@ struct NCC <: SimilarityMeasure end
 Complex coherence magnitude, for single-look-complex (SLC) radar input.
 
 ```math
-\\gamma = \\frac{\\left| \\sum \\overline{T} \\cdot I \\right|}{\\sqrt{\\sum |T|^2 \\sum |I|^2}}
+\\gamma = \\frac{\\left| \\sum \\overline{T'} \\cdot W' \\right|}
+               {\\sqrt{\\sum |T'|^2 \\sum |W'|^2}}
 ```
 
-The correlation surface is real-valued (the magnitude), so peak location and
-subpixel refinement are unchanged; the phase at the peak is available as an
-extra output.
+where ``T'`` and ``W'`` are the chip and the window with their (complex) means removed — the
+complex analogue of [`ZNCC`](@ref), and mean-removed on *both* sides for the same reason: it is
+what makes ``\\gamma(T, T) = 1`` exactly. The surface is real — the magnitude — so peak location
+and the subpixel cascade are the same code the real measures use.
+
+Requires complex input; a real image has no phase to exploit and [`ZNCC`](@ref) is the measure
+for it.
+
+# Why bother, and when not to
+
+Complex matching buys **resolution**, not accuracy. Joughin (2002) found the complex
+cross-correlation function "more strongly peaked" in low-correlation regions, so a match that
+amplitude needs 64x64 to achieve is available at 24x24 — and on ice, where speckle decorrelates
+fast, that difference decides whether a shear margin is resolved or smoothed over.
+
+The cost is that it fails where amplitude does not:
+
+!!! warning "Phase variation destroys the peak"
+    Interferometric phase across the chip can *reduce or eliminate* the correlation peak, which
+    is worst exactly where the science is most interesting — high shear and steep topography.
+    Amplitude matching is unaffected there.
+
+    Two consequences. First, run [`Deramp`](@ref) as the preprocessing step: it removes the
+    linear component of that phase variation, which is the part that is both dominant and
+    cheap to estimate. Second, expect to fall back. Passing a *tuple* to `similarity` runs
+    coherence at the finest chip size and a real measure above it, so a point coherence cannot
+    resolve is left for a larger amplitude chip:
+
+    ```julia
+    autorift(z1, z2; similarity = (:coherence, :zncc), preprocess = :deramp,
+             chip_size = 32, chip_size_max = 128)
+    ```
+
+# Provenance
+
+There is no reference implementation of this to match, which is worth stating plainly.
+autoRIFT v2.1.2 has no complex path at all — its core exposes only real and `UInt8` entry
+points — and ISCE2's `cuAmpcor` takes `abs` of complex input before correlating, so both
+reduce to amplitude matching. The estimator above and the escalation strategy follow Joughin
+(2002); the implementation is verified against analytic cases (γ(T,T) = 1, a known shift, a
+known phase ramp) rather than against another program's output.
+
+Joughin, I. (2002). Ice-sheet velocity mapping: a combined interferometric and speckle-tracking
+approach. *Annals of Glaciology* 34, 195-201.
 """
 struct Coherence <: SimilarityMeasure end
 
@@ -323,11 +365,56 @@ where the dynamic range is large and multiplicative.
 struct Decibel <: PreprocessMethod end
 
 """
+    Deramp(; axis = :both)
+
+Remove the linear phase ramp from a complex image. **Complex input only.**
+
+A phase ramp is a frequency shift: it moves the band centre away from zero, and a signal whose
+band is off-centre aliases when oversampled. Since [`PyramidRefine`](@ref) oversamples the
+correlation surface, this is a correctness requirement for complex correlation rather than an
+enhancement — ISCE2's `cuAmpcor` says the same in `cuDeramp.cu`: removing the ramp "is necessary
+before oversampling a complex signal".
+
+It also directly addresses the failure mode [`Coherence`](@ref) warns about. Phase variation
+across a chip suppresses the correlation peak; the linear component of that variation is both the
+dominant part and the part that can be estimated from the chip alone, with no interferogram.
+
+The estimate follows `cuAmpcor`'s method 1. For each axis, sum the conjugate product of adjacent
+pixels and take the argument of that sum:
+
+```math
+\\phi_x = \\arg \\sum_{i} \\overline{z_i} \\, z_{i + \\Delta x}
+```
+
+Summing the product rather than averaging per-pixel phase differences makes the estimate
+**amplitude-weighted for free** — a bright pixel pair contributes more than a dim one, which is
+what you want when speckle means dim pixels are mostly noise. It also avoids wrapping: no
+`atan` is taken until after the sum.
+
+`axis` selects `:x`, `:y`, or `:both`. Deramping one axis is occasionally right for data whose
+ramp is known to lie along track.
+
+!!! note "Not a substitute for amplitude fallback"
+    A linear ramp is the first term of the phase variation, not all of it. Steep topography and
+    high shear produce higher-order variation this cannot remove, which is why
+    [`Coherence`](@ref) recommends a measure tuple that falls back to amplitude.
+"""
+struct Deramp <: PreprocessMethod
+    axis::Symbol
+    function Deramp(axis::Symbol)
+        axis in (:x, :y, :both) || throw(ArgumentError(
+            "`Deramp` axis must be `:x`, `:y`, or `:both`, got `:$axis`"))
+        return new(axis)
+    end
+end
+Deramp(; axis = :both) = Deramp(axis)
+
+"""
     filter_width(method::PreprocessMethod)
 
 Side length of the filter window, or `0` for methods that take no window.
 """
-filter_width(::Union{NoPreprocess,Decibel}) = 0
+filter_width(::Union{NoPreprocess,Decibel,Deramp}) = 0
 filter_width(m::Union{Highpass,Wallis,WallisGapfill,Sobel,Laplacian}) = m.width
 
 function _check_filter_width(width::Integer, who::Symbol)
@@ -518,9 +605,14 @@ nothing downstream ever re-checks or re-dispatches on a `Symbol`.
 
 The method choices are type parameters, not fields, so the correlation and
 filtering kernels specialize on them.
+
+`similarity` is a *tuple* of measures, one per chip-size level, because a run may escalate
+between them — coherence at the finest chip, amplitude above it. A scalar keyword resolves to a
+1-tuple, and a tuple shorter than the level list has its last entry repeated, so the common case
+of one measure everywhere is the 1-tuple and costs nothing. See [`chip_measures`](@ref).
 """
-struct Params{S<:SimilarityMeasure,P<:PreprocessMethod,Q<:QuantizeMethod,R<:SubpixelMethod,
-              O<:OutlierMethod,T<:BoolAsType}
+struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:PreprocessMethod,
+              Q<:QuantizeMethod,R<:SubpixelMethod,O<:OutlierMethod,T<:BoolAsType}
     similarity::S
     preprocess::P
     quantize::Q
@@ -586,6 +678,62 @@ function chip_sizes(p::Params)
         cs *= 2
     end
     return sizes
+end
+
+"""
+    chip_measures(p::Params, nlevels::Integer) -> Tuple
+
+The similarity measure for each of `nlevels` chip-size levels, in order.
+
+`p.similarity` is a tuple. Where it is shorter than the level list — which includes the usual
+case of a single measure — the last entry repeats, so `similarity = :zncc` means ZNCC at every
+level and `similarity = (:coherence, :zncc)` means coherence at the finest chip and ZNCC at every
+coarser one.
+
+That padding rule is what makes the escalation of Joughin (2002) expressible without a second way
+to specify levels: the finest chip tries the sharper, more fragile measure, and the coarser chips
+— which exist precisely to succeed where the fine ones failed — use the robust one. A measure
+tuple *longer* than the level list is an error, since the extra entries would silently do nothing.
+
+Returns a **tuple**, not a vector, and that is load-bearing rather than stylistic: a
+`Vector{SimilarityMeasure}` has an abstract element type, so the measure reaching `chipsize_level`
+would be known only as `SimilarityMeasure` — a dynamic dispatch in the chip-size loop, and enough
+to make the whole package untrimmable (verified: it produced `unresolved call ... Core.kwcall`
+and broke `app/`'s build).
+
+For that reason the chip-size loop itself does not call this — it uses [`measure_at`](@ref), which
+needs no allocation and no `ntuple` over a runtime length. This function is the readable form, for
+callers inspecting a configuration.
+"""
+function chip_measures(p::Params, nlevels::Integer)
+    _check_measures(p, nlevels)
+    return ntuple(k -> measure_at(p, k), nlevels)
+end
+
+chip_measures(p::Params) = chip_measures(p, length(chip_sizes(p)))
+
+"""
+    measure_at(p::Params, level::Integer) -> SimilarityMeasure
+
+The measure for chip-size level `level` (1 = finest), with the last tuple entry repeating.
+
+The indexed form of [`chip_measures`](@ref), and what the chip-size loop actually calls: it
+allocates nothing, and because `p.similarity` is a tuple the result keeps its concrete type, so
+the correlation kernel specializes and `--trim` can resolve the call.
+"""
+@inline measure_at(p::Params, level::Integer) =
+    p.similarity[min(level, length(p.similarity))]
+
+# Shared by `chip_measures` and the chip-size loop. A tuple longer than the level list means the
+# extra measures would silently never run, which is a configuration error rather than something to
+# quietly ignore.
+function _check_measures(p::Params, nlevels::Integer)
+    n = length(p.similarity)
+    n <= nlevels || throw(ArgumentError(
+        "`similarity` names $n measures but there are only $nlevels chip-size levels. Widen " *
+        "the `chip_size_min`/`chip_size_max` range, or name fewer measures — the last one " *
+        "applies to every remaining level."))
+    return nothing
 end
 
 """

@@ -89,6 +89,18 @@ struct CorrelationWorkspace
     # the FFT path require contiguous Float32.
     chip::Matrix{Float32}
 
+    # The same, for complex (SLC) input, which `Coherence` correlates without taking magnitude.
+    # A second buffer rather than a type parameter on the first: the struct is deliberately
+    # concrete, and parameterising it would make `CorrelationWorkspace{Float32}` and
+    # `CorrelationWorkspace{ComplexF32}` distinct types that specialize every method in this file
+    # twice — including the real path, which must stay bit-identical.
+    #
+    # Sized to the chip, so it is 8 bytes per element against the real buffer's 4: 32 KiB at chip
+    # 64. Allocated unconditionally, as the FFT scratch already is, so a pooled workspace can
+    # serve either measure without reallocating. Measured against the alternative of allocating it
+    # only for complex runs: not worth a second pool key.
+    cchip::Matrix{ComplexF32}
+
     # Correlation surface, (2*radius_y, 2*radius_x) at full radius.
     surface::Matrix{Float32}
 
@@ -96,6 +108,11 @@ struct CorrelationWorkspace
     # the note in integral.jl.
     isum::Matrix{Float64}
     isqsum::Matrix{Float64}
+
+    # The complex sum table, for `Coherence`. `isqsum` is shared with the real path — a sum of
+    # squared *magnitudes* is real either way — but the plain sum is not, because coherence removes
+    # a complex mean and the mean of a complex window is complex.
+    cisum::Matrix{ComplexF64}
 
     # Raw correlation numerators, one per shift. Kept separate from the integral
     # images rather than sharing their storage: the integral images are read
@@ -135,14 +152,15 @@ One workspace per task, never shared: the buffers are written during correlation
 so two tasks sharing one would corrupt each other.
 
 `T` is the element type of the images to be correlated. It is accepted for readability at the
-call site and asserted to be a `Real`, but the buffers do not depend on it — the chip is
-`Float32` because it is stored mean-removed, and the integral images are `Float64` to hold a
-sum of squares without loss. Any `T<:Real` correlates correctly, including `Int16` and other
-integer sensor types.
+call site and asserted to be a `Real` or `Complex`, but the buffers do not depend on it — the
+chip is `Float32` because it is stored mean-removed, and the integral images are `Float64` to
+hold a sum of squares without loss. Any `T<:Real` correlates correctly, including `Int16` and
+other integer sensor types; `T<:Complex` is for SLC input under [`Coherence`](@ref) and uses the
+workspace's separate complex chip buffer.
 """
 workspace(chip_size, search_radius) = workspace(Float32, chip_size, search_radius)
 
-function workspace(::Type{T}, chip_size, search_radius) where {T<:Real}
+function workspace(::Type{T}, chip_size, search_radius) where {T<:Number}
     csx, csy = chip_size isa Tuple ? chip_size : (chip_size, chip_size)
     rx, ry = search_radius isa Tuple ? search_radius : (search_radius, search_radius)
 
@@ -165,9 +183,11 @@ function workspace(::Type{T}, chip_size, search_radius) where {T<:Real}
 
     return CorrelationWorkspace(
         Matrix{Float32}(undef, csy, csx),
+        Matrix{ComplexF32}(undef, csy, csx),
         Matrix{Float32}(undef, 2ry, 2rx),
         Matrix{Float64}(undef, winy + 1, winx + 1),
         Matrix{Float64}(undef, winy + 1, winx + 1),
+        Matrix{ComplexF64}(undef, winy + 1, winx + 1),
         Matrix{Float64}(undef, 2ry, 2rx),
         Matrix{Float32}(undef, fy, fx),
         Matrix{Float32}(undef, fy, fx),
@@ -226,7 +246,7 @@ Return it with [`give_workspace!`](@ref) when done. The caller has exclusive use
 concurrent chunks never share buffers — the same guarantee per-chunk allocation gave, without
 the garbage.
 """
-function take_workspace!(::Type{T}, chip_size, search_radius) where {T<:Real}
+function take_workspace!(::Type{T}, chip_size, search_radius) where {T<:Number}
     csx, csy = chip_size isa Tuple ? chip_size : (chip_size, chip_size)
     rx, ry = search_radius isa Tuple ? search_radius : (search_radius, search_radius)
     key = ((Int(csx), Int(csy)), (Int(rx), Int(ry)))
@@ -370,6 +390,45 @@ function prepare_chip!(ws::CorrelationWorkspace, chip::AbstractMatrix)
     return sqrt(sq), ok
 end
 
+# The complex chip, into the workspace's own complex buffer.
+#
+# Structurally the real version with a complex accumulator, and deliberately a separate method
+# rather than a generic one: the real path is the hot path for every optical pair and must not
+# acquire a `Complex` union or an extra branch. The two are short enough that one transcription
+# each is cheaper than an abstraction over both.
+#
+# The mean is complex — subtracting it removes the *constant* phasor as well as the DC amplitude,
+# which is what makes coherence invariant to a global phase offset between the two acquisitions.
+# That matters: an SLC pair generally has an arbitrary absolute phase difference, and a measure
+# sensitive to it would report nothing useful.
+#
+# The norm is `sqrt(Σ|z|²)`, so it is real even though the data are not, and `Coherence`'s
+# denominator therefore has the same shape as `ZNCC`'s.
+function prepare_chip!(ws::CorrelationWorkspace, chip::AbstractMatrix{<:Complex})
+    ch, cw = size(chip)
+    (ch <= size(ws.cchip, 1) && cw <= size(ws.cchip, 2)) || throw(DimensionMismatch(
+        "chip is $(ch)x$(cw) but the workspace was built for at most " *
+        "$(size(ws.cchip, 1))x$(size(ws.cchip, 2))"))
+
+    dst = @view ws.cchip[1:ch, 1:cw]
+
+    s = zero(ComplexF64)
+    @inbounds for j in 1:cw, i in 1:ch
+        s += ComplexF64(chip[i, j])
+    end
+    mean = s / (ch * cw)
+
+    sq = 0.0
+    @inbounds for j in 1:cw, i in 1:ch
+        d = ComplexF64(chip[i, j]) - mean
+        dst[i, j] = ComplexF32(d)
+        sq += abs2(d)
+    end
+
+    ok = sq > eps(Float64) * ch * cw
+    return sqrt(sq), ok
+end
+
 # ---------------------------------------------------------------------------
 # The surface
 # ---------------------------------------------------------------------------
@@ -494,6 +553,86 @@ function _correlate_surface!(
         surface[i, j] = den > 0 ? Float32(numerators[i, j] / den) : 0.0f0
     end
     return surface
+end
+
+# Complex coherence magnitude. Requires complex input; see `Coherence` for why it is worth having
+# and when it fails.
+#
+# Structurally `ZNCC` over complex data, and deliberately so — the same three rearrangements the
+# file header describes still apply:
+#
+#   * The chip's complex mean and its norm are computed once, in `prepare_chip!`.
+#   * **The window's mean still drops out of the numerator**, for the same reason and with the
+#     same proof: `Σ conj(T')(W - W̄) = Σ conj(T')W - W̄ Σ conj(T')`, and `Σ conj(T') = 0` because
+#     the chip was mean-removed. So the numerator correlates against the *unmodified* window.
+#   * The window variance comes from integral images: `Σ|W - W̄|² = Σ|W|² - |ΣW|²/n`. This is
+#     where complex differs — it needs the complex sum table `cisum` as well as `isqsum`, since
+#     `|ΣW|²` is the squared magnitude of a *complex* sum.
+#
+# Getting that last term wrong is not a rounding matter. Normalising by `Σ|W|²` instead — removing
+# the mean from the chip but not the window — caps `γ(T, T)` below 1 by exactly `‖T'‖/‖T‖`, which
+# measured 0.9983 on a speckle chip. Predicted and observed agreed to 8 digits, which is how the
+# omission was found; the `γ(T,T) == 1` test in `test/complex.jl` is what keeps it found.
+#
+# The one genuine difference from the real measures: the numerator is `Σ conj(T') · W`, a *complex*
+# accumulation whose magnitude is taken per shift. Taking `abs` at the end rather than accumulating
+# magnitudes is the entire point — summing `|conj(T')·W|` would discard the phase alignment that
+# makes the peak sharp and would give a surface that is large everywhere.
+#
+# Everything downstream is shared: the surface is real `Float32`, so `peak_index`, `peak_offset`
+# and the whole Laplace subpixel cascade are the code the real path uses.
+#
+# The numerator is evaluated directly rather than by FFT, which is the one place this is slower
+# than the real measures. `_numerators_fft!` uses a real-to-complex transform and its buffers are
+# `Matrix{Float32}`; a complex chip needs a complex-to-complex transform, a second pair of plans
+# and two more workspace buffers. Deferred deliberately: correctness first, and the direct path is
+# what the FFT path is verified against anyway. `Coherence`'s docstring recommends it at the
+# *finest* chip size, where the direct path is at its most competitive.
+function _correlate_surface!(
+    surface, ws::CorrelationWorkspace, search::AbstractMatrix{<:Complex},
+    ch::Int, cw::Int, cnorm::Float64, ::Coherence,
+)
+    nr, nc = size(surface)
+    n = ch * cw
+    cd = @view ws.cchip[1:ch, 1:cw]
+
+    S = @view ws.cisum[1:(size(search, 1) + 1), 1:(size(search, 2) + 1)]
+    S2 = @view ws.isqsum[1:(size(search, 1) + 1), 1:(size(search, 2) + 1)]
+    integral!(S, search)
+    integral_sq!(S2, search)
+
+    @inbounds for j in 1:nc
+        for i in 1:nr
+            acc = zero(ComplexF64)
+            for jj in 1:cw
+                # Column-major inner loop, as in `_numerators_direct!`: both arrays walk
+                # contiguous memory.
+                for ii in 1:ch
+                    acc += conj(ComplexF64(cd[ii, jj])) *
+                           ComplexF64(search[i + ii - 1, j + jj - 1])
+                end
+            end
+            s1 = boxsum(S, i, j, ch, cw)
+            s2 = boxsum(S2, i, j, ch, cw)
+            # Σ|W - W̄|² = Σ|W|² - |ΣW|²/n. Clamped for the same cancellation reason as `ZNCC`.
+            wvar = max(s2 - abs2(s1) / n, 0.0)
+            den = cnorm * sqrt(wvar)
+            surface[i, j] = den > 0 ? Float32(abs(acc) / den) : 0.0f0
+        end
+    end
+    return surface
+end
+
+# A real image has no phase, so `Coherence` on one is a caller error rather than something to
+# silently degrade to `NCC`. Caught here, where the element type is known, with the fix named.
+function _correlate_surface!(
+    ::Any, ::CorrelationWorkspace, ::AbstractMatrix{<:Real},
+    ::Int, ::Int, ::Float64, ::Coherence,
+)
+    throw(ArgumentError(
+        "`Coherence` needs complex input, but the images are real. Coherence exploits the " *
+        "phase of an SLC pair; a real image has none, so there is nothing for it to measure. " *
+        "Use `similarity = :zncc` for real imagery, or pass the complex data."))
 end
 
 # ---------------------------------------------------------------------------

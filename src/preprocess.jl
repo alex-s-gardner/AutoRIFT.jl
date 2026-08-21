@@ -38,14 +38,14 @@ arise from sensor gaps, cloud masks, and the no-data border left by reprojection
 they must not be allowed to contribute to a correlation — a chip full of fill values
 correlates beautifully with any other chip full of fill values.
 """
-struct ImagePair{T<:Real,A<:AbstractMatrix{T},M<:AbstractMatrix{Bool}}
+struct ImagePair{T<:Number,A<:AbstractMatrix{T},M<:AbstractMatrix{Bool}}
     reference::A
     secondary::A
     reference_valid::M
     secondary_valid::M
 
     function ImagePair(reference::A, secondary::A, reference_valid::M,
-                       secondary_valid::M) where {T<:Real,A<:AbstractMatrix{T},
+                       secondary_valid::M) where {T<:Number,A<:AbstractMatrix{T},
                                                   M<:AbstractMatrix{Bool}}
         size(reference) == size(secondary) || throw(DimensionMismatch(
             "reference is $(size(reference)) but secondary is $(size(secondary)); " *
@@ -149,11 +149,126 @@ so filtering per image rather than per pair halves the work.
 preprocess(img::AbstractMatrix, mask::AbstractMatrix{Bool}, ::NoPreprocess) =
     (copy(img), copy(mask))
 
-preprocess(img::AbstractMatrix, mask::AbstractMatrix{Bool}, m::Highpass) =
+# `{<:Real}` rather than a bare `AbstractMatrix`: these are amplitude filters, and saying so in the
+# signature is what makes the complex rejection below unambiguous rather than a tie the compiler
+# has to be told how to break. Aqua's ambiguity check catches the alternative.
+preprocess(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::Highpass) =
     _filtered(highpass(img, mask, m.width), mask, m.width)
 
-preprocess(img::AbstractMatrix, mask::AbstractMatrix{Bool}, m::Wallis) =
+preprocess(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::Wallis) =
     _filtered(wallis(img, mask, m.width, m.min_std), mask, m.width)
+
+# ---------------------------------------------------------------------------
+# Complex input
+# ---------------------------------------------------------------------------
+
+"""
+    deramp(img::AbstractMatrix{<:Complex}, mask, axis = :both) -> Matrix{ComplexF32}
+
+Remove the linear phase ramp from a complex image. See [`Deramp`](@ref) for why.
+
+The ramp is estimated from the image itself: for each axis, sum the conjugate product of adjacent
+pixels and take the argument of the sum. Following ISCE2's `cuAmpcor` (`cuDeramp.cu`, method 1).
+
+Two properties follow from summing the product rather than averaging per-pixel phase differences,
+and both matter for speckle:
+
+  * **Amplitude weighting is free.** `conj(z_i) · z_{i+1}` carries `|z_i||z_{i+1}|`, so bright
+    pixel pairs dominate — which is what you want when dim pixels are mostly noise.
+  * **No phase wrapping.** The `atan2` is taken once, after the sum, so a per-pixel difference
+    near ±π cannot alias. Averaging angles would need unwrapping first.
+
+Invalid pixels are excluded from the estimate but still deramped, so the output stays a complete
+image and the mask keeps its own record of what is real.
+"""
+function deramp(img::AbstractMatrix{<:Complex}, mask::AbstractMatrix{Bool},
+                axis::Symbol = :both)
+    nr, nc = size(img)
+
+    # Accumulate in ComplexF64: this is a sum over the whole image, so it is exactly the long
+    # accumulation chain that `integral.jl` argues for double precision on.
+    phase_y = 0.0
+    if axis !== :x
+        acc = zero(ComplexF64)
+        @inbounds for j in 1:nc, i in 1:(nr - 1)
+            # Both pixels must be real data for their phase difference to mean anything.
+            (mask[i, j] && mask[i + 1, j]) || continue
+            acc += conj(ComplexF64(img[i, j])) * ComplexF64(img[i + 1, j])
+        end
+        phase_y = atan(imag(acc), real(acc))
+    end
+
+    phase_x = 0.0
+    if axis !== :y
+        acc = zero(ComplexF64)
+        @inbounds for j in 1:(nc - 1), i in 1:nr
+            (mask[i, j] && mask[i, j + 1]) || continue
+            acc += conj(ComplexF64(img[i, j])) * ComplexF64(img[i, j + 1])
+        end
+        phase_x = atan(imag(acc), real(acc))
+    end
+
+    # Zero-based offsets, so the ramp is removed *about the first sample* rather than about the
+    # origin of a 1-based index. Either is a valid deramp — they differ by a constant phase, which
+    # coherence is invariant to after the complex mean is removed — but matching cuAmpcor's
+    # convention keeps the recovered coefficients directly comparable to it.
+    out = Matrix{ComplexF32}(undef, nr, nc)
+    @inbounds for j in 1:nc, i in 1:nr
+        out[i, j] = ComplexF32(ComplexF64(img[i, j]) *
+                               cis(-((i - 1) * phase_y + (j - 1) * phase_x)))
+    end
+    return out
+end
+
+"""
+    ramp_phase(img::AbstractMatrix{<:Complex}, mask) -> (phase_x, phase_y)
+
+The per-sample linear phase gradient [`deramp`](@ref) would remove, in radians per pixel.
+
+Exposed because it is the testable part: a synthetic image built with a known ramp must return
+that ramp, which is how the estimator is verified without a reference implementation to compare
+against.
+"""
+function ramp_phase(img::AbstractMatrix{<:Complex}, mask::AbstractMatrix{Bool})
+    nr, nc = size(img)
+    accy = zero(ComplexF64)
+    @inbounds for j in 1:nc, i in 1:(nr - 1)
+        (mask[i, j] && mask[i + 1, j]) || continue
+        accy += conj(ComplexF64(img[i, j])) * ComplexF64(img[i + 1, j])
+    end
+    accx = zero(ComplexF64)
+    @inbounds for j in 1:(nc - 1), i in 1:nr
+        (mask[i, j] && mask[i, j + 1]) || continue
+        accx += conj(ComplexF64(img[i, j])) * ComplexF64(img[i, j + 1])
+    end
+    return atan(imag(accx), real(accx)), atan(imag(accy), real(accy))
+end
+
+preprocess(img::AbstractMatrix{<:Complex}, mask::AbstractMatrix{Bool}, m::Deramp) =
+    (deramp(img, mask, m.axis), copy(mask))
+
+# Deramping a real image is a no-op that would look like it did something, so it is an error
+# naming the mismatch instead.
+preprocess(::AbstractMatrix{<:Real}, ::AbstractMatrix{Bool}, ::Deramp) = throw(ArgumentError(
+    "`Deramp` needs complex input, but the image is real. A real image has no phase ramp to " *
+    "remove. Use `preprocess = :highpass` for real imagery, or pass the complex data."))
+
+# The windowed filters are amplitude operations, and applying one to complex data is very
+# unlikely to be what a caller meant: `Highpass` would subtract a local *complex* mean, mixing
+# amplitude and phase structure into each other, and `Wallis` would divide by a standard
+# deviation computed across that mixture. Rather than silently produce something defensible-looking
+# but meaningless, say so and name the two things a caller probably wants.
+#
+# `Union` in one method rather than one per filter, because the message is the same and the list
+# of amplitude filters is the thing being described.
+function preprocess(::AbstractMatrix{<:Complex}, ::AbstractMatrix{Bool},
+                    m::Union{Highpass,Wallis,WallisGapfill,Sobel,Laplacian,Decibel})
+    throw(ArgumentError(
+        "`$(nameof(typeof(m)))` is an amplitude filter and the image is complex. Applying it " *
+        "would mix amplitude and phase structure into each other rather than filtering either. " *
+        "For complex input use `preprocess = :deramp` (see `Coherence`), or take `abs` of the " *
+        "images first and correlate the amplitudes."))
+end
 
 # The mask bookkeeping every windowed filter needs, written once. Doing it per filter is how
 # the reference ended up inconsistent about it.
@@ -391,8 +506,29 @@ function quantize(img::AbstractMatrix{<:AbstractFloat}, mask::AbstractMatrix{Boo
     return out, copy(mask)
 end
 
+# Complex input under `NoQuantize`: the same non-finite replacement as the float method, since a
+# complex value is non-finite if either component is.
+function quantize(img::AbstractMatrix{<:Complex}, mask::AbstractMatrix{Bool}, ::NoQuantize)
+    out = similar(img)
+    @inbounds for i in eachindex(out)
+        v = img[i]
+        out[i] = isfinite(v) ? v : zero(v)
+    end
+    return out, copy(mask)
+end
+
 quantize(img::AbstractMatrix, mask::AbstractMatrix{Bool}, ::QuantizeUInt8) =
     (_to_uint8(img, mask), copy(mask))
+
+# Quantizing complex data to UInt8 would have to discard the phase, which is the only reason to
+# hold complex data in the first place. An error rather than a silent `abs`: a caller who wants
+# amplitude matching should say so, and then the whole real pipeline applies unchanged.
+quantize(::AbstractMatrix{<:Complex}, ::AbstractMatrix{Bool}, ::QuantizeUInt8) =
+    throw(ArgumentError(
+        "`quantize = :uint8` cannot represent complex input — scaling to 8-bit integers would " *
+        "discard the phase, which is the only thing `Coherence` measures. Use " *
+        "`quantize = :none` for complex data, or take `abs` of the images to correlate " *
+        "amplitudes with the full real pipeline."))
 
 """
     _to_uint8(img, mask) -> Matrix{UInt8}

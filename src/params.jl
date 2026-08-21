@@ -29,6 +29,7 @@ const SYMBOL2PREPROCESS = Dict{Symbol,Any}(
     :sobel          => Sobel,
     :laplacian      => Laplacian,
     :decibel        => Decibel,
+    :deramp         => Deramp,
     :none           => NoPreprocess,
 )
 
@@ -56,9 +57,28 @@ function _resolve(table::AbstractDict, x::Symbol, kw::Symbol)
     throw(ArgumentError("`$kw = :$x` is not recognised. Valid options are $valid."))
 end
 
-_similarity(x::SimilarityMeasure) = x
-_similarity(x::Symbol) = _resolve(SYMBOL2SIMILARITY, x, :similarity)
-_similarity(x) = _badtype(:similarity, x, "a Symbol or a `SimilarityMeasure`")
+# `similarity` resolves to a *tuple*, one measure per chip-size level. A scalar becomes a 1-tuple,
+# whose last entry then applies to every level — so the single-measure case, which is nearly every
+# call, is unchanged and stays concretely typed.
+_similarity(x::SimilarityMeasure) = (x,)
+_similarity(x::Symbol) = (_resolve(SYMBOL2SIMILARITY, x, :similarity),)
+# `map` rather than a comprehension: it preserves the tuple, so `S` remains a concrete
+# `Tuple{Coherence,ZNCC}` rather than a `Vector{SimilarityMeasure}` the kernels cannot specialize
+# on. An empty tuple would type-check and then silently correlate nothing.
+function _similarity(x::Tuple)
+    isempty(x) && throw(ArgumentError(
+        "`similarity` cannot be an empty tuple; name at least one measure."))
+    return map(_one_similarity, x)
+end
+_similarity(x::AbstractVector) = _similarity(Tuple(x))
+_similarity(x) = _badtype(:similarity, x,
+                         "a Symbol, a `SimilarityMeasure`, or a tuple of either")
+
+# One element of a measure tuple. Separate from `_similarity` because that returns a tuple and
+# this must not, or nesting would compound.
+_one_similarity(x::SimilarityMeasure) = x
+_one_similarity(x::Symbol) = _resolve(SYMBOL2SIMILARITY, x, :similarity)
+_one_similarity(x) = _badtype(:similarity, x, "a Symbol or a `SimilarityMeasure`")
 
 _quantize(x::QuantizeMethod) = x
 _quantize(x::Symbol) = _resolve(SYMBOL2QUANTIZE, x, :quantize)
@@ -67,8 +87,10 @@ _quantize(x) = _badtype(:quantize, x, "a Symbol or a `QuantizeMethod`")
 _preprocess(x::PreprocessMethod, _width) = x
 function _preprocess(x::Symbol, width)
     T = _resolve(SYMBOL2PREPROCESS, x, :preprocess)
-    # Methods with no window ignore `filter_width` entirely; the rest take it.
-    return T <: Union{NoPreprocess,Decibel} ? T() :
+    # Methods with no window ignore `filter_width` entirely; the rest take it. `Deramp` takes an
+    # `axis` instead, so it joins the no-window group — a caller wanting a single axis passes the
+    # instance, `preprocess = Deramp(; axis = :x)`.
+    return T <: Union{NoPreprocess,Decibel,Deramp} ? T() :
            isnokw(width) ? T() : T(; width)
 end
 _preprocess(x, _width) = _badtype(:preprocess, x, "a Symbol or a `PreprocessMethod`")
@@ -194,6 +216,12 @@ choice is a known defect — see the package documentation for the list.
 
 ## Method selection
 - `similarity = :zncc`: [`ZNCC`](@ref), [`NCC`](@ref), or [`Coherence`](@ref).
+
+  A **tuple** assigns measures to chip-size levels in order, with the last repeated for any
+  remaining levels — so `(:coherence, :zncc)` tries complex coherence at the finest chip and
+  falls back to amplitude at every coarser one. That is the escalation of Joughin (2002):
+  coherence resolves finer detail but is destroyed by phase variation, so points it cannot
+  resolve are left to a larger amplitude chip. Requires complex input; see [`Coherence`](@ref).
 - `preprocess = :highpass`: pre-correlation filter; see [`PreprocessMethod`](@ref).
 - `quantize = :uint8`: element type used for correlation; see [`QuantizeMethod`](@ref).
 - `subpixel = :pyramid`: peak refinement; see [`SubpixelMethod`](@ref).

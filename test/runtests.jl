@@ -52,6 +52,12 @@ include("utils.jl")
     @testset "vs OpenCV" begin
         include("opencv.jl")
     end
+    # Complex/SLC support. Last of the numerical testsets because it has no fixture corpus behind
+    # it — there is no reference implementation of complex correlation to compare against, so
+    # every assertion is analytic. See the file header.
+    @testset "complex" begin
+        include("complex.jl")
+    end
 
     @testset "code quality" begin
         include("aqua.jl")

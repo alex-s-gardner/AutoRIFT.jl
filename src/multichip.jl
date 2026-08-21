@@ -111,17 +111,25 @@ function correlate_multichip(pair::ImagePair, grid::PointSet{2}, p::Params)
     sizes = chip_sizes(p)
     @assert !isempty(sizes) "no chip-size levels for chip_size $(p.chip_size_base) in " *
                             "[$(p.chip_size_min), $(p.chip_size_max)]"
+    # Reject a too-long `similarity` tuple before any correlation runs, rather than discovering it
+    # at the level that would have used the extra entry.
+    _check_measures(p, length(sizes))
 
     sz = size(grid)
     result = MultichipResult(fill(NaN32, sz), fill(NaN32, sz), fill(NaN32, sz),
                            zeros(UInt16, sz), falses(sz))
 
-    for cs in sizes
+    # `eachindex` and two index reads rather than `zip` over a `Vector` and a tuple: `zip` of a
+    # `Vector` with anything is `Iterators.Zip{<:Tuple{Vector,Vararg}}`, which `--trim` cannot
+    # resolve. Indexing is also how the measure keeps its concrete type — `p.similarity[k]` is
+    # typed by the tuple, where an iterated element would not be.
+    for k in eachindex(sizes)
+        cs = sizes[k]
         # Only points still without a value are candidates, so a level's work shrinks as the
         # finer ones succeed.
         wanted = result.chip_size .== 0
         any(wanted) || break                     # every point resolved
-        level = chipsize_level(pair, grid, p, cs, wanted)
+        level = chipsize_level(pair, grid, p, cs, wanted, measure_at(p, k))
         isnothing(level) && continue              # level found nothing coherent
         _merge_level!(result, level.field, level.filled, cs)
     end
@@ -138,6 +146,10 @@ Returns `(; field, filled)` — the displacement field, and the linear indices t
 from neighbours rather than measured — or `nothing` if the level found nothing worth
 continuing.
 
+`measure` is the similarity measure for this level. Positional rather than a keyword because
+`p.similarity` is a tuple and a keyword carrying an abstract `SimilarityMeasure` is unresolvable
+under `--trim` — see [`chip_measures`](@ref).
+
 `wanted` marks the points this level should attempt — in the loop, those no finer level
 resolved. Returns `nothing` if the coarse pass found too little to be worth continuing,
 which is what `min_coarse_valid_fraction` decides.
@@ -145,7 +157,8 @@ which is what `min_coarse_valid_fraction` decides.
 Separately callable so a caller can run one chip size without the loop.
 """
 function chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params,
-                       chip_size::Integer, wanted::AbstractMatrix{Bool})
+                       chip_size::Integer, wanted::AbstractMatrix{Bool},
+                       measure::SimilarityMeasure = first(p.similarity))
     csx = Int(chip_size)
     csy = chip_size_y(p, csx)
 
@@ -153,7 +166,7 @@ function chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params,
     pts = _level_points(grid, p, csx, csy, wanted)
     nsearchable(pts) == 0 && return nothing
 
-    coarse_mask = _coarse_pass(pair, pts, p, csx, csy)
+    coarse_mask = _coarse_pass(pair, pts, p, csx, csy, measure)
     isnothing(coarse_mask) && return nothing
 
     # The coarse result restricts the fine search: zero the radius outside it. This is the
@@ -166,7 +179,7 @@ function chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params,
     end
     nsearchable(pts) == 0 && return nothing
 
-    fine = track(pair, pts, p)
+    fine = track(pair, pts, p; measure)
     filled = _reject_and_fill!(fine, pts, p)
     return (; field = fine, filled)
 end
@@ -206,7 +219,8 @@ end
 # Correlate a decimated sample of the points, filter for spatial consistency, and dilate what
 # survives. Returns a full-grid mask of where the fine pass should look, or `nothing` if too
 # little of the coarse grid was coherent for the level to be worth continuing.
-function _coarse_pass(pair::ImagePair, pts::PointSet{2}, p::Params, csx::Int, csy::Int)
+function _coarse_pass(pair::ImagePair, pts::PointSet{2}, p::Params, csx::Int, csy::Int,
+                      measure::SimilarityMeasure = first(p.similarity))
     stride = p.coarse_stride
     nr, nc = size(pts)
     rows = stride:stride:nr
@@ -237,7 +251,10 @@ function _coarse_pass(pair::ImagePair, pts::PointSet{2}, p::Params, csx::Int, cs
 
     # Integer peaks only: the coarse pass decides *where* to look, and sub-pixel precision
     # would not change that answer while costing most of the pass.
-    cd = track(pair, coarse, p; subpixel = NoRefine())
+    # The same measure as the fine pass: the coarse pass decides *where* the fine pass looks, so
+    # judging coherence by a different measure than the one that will be used there would gate on
+    # the wrong thing.
+    cd = track(pair, coarse, p; subpixel = NoRefine(), measure)
     measured = map(!isnan, cd.dx)
     any(measured) || return nothing
 
