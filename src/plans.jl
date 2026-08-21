@@ -97,6 +97,10 @@ const PKG_UUID = Base.UUID("52cb0ed0-aa80-430c-bd04-c52888a79add")
 
 # Set once the wisdom file has been read, so a process imports at most once.
 const WISDOM_LOADED = Ref(false)
+# The resolved wisdom path, and whether resolution has happened. Two refs rather than one because
+# `nothing` — no writable scratch space — is a real answer worth caching, not a "not yet" sentinel.
+const WISDOM_PATH = Ref{Union{String,Nothing}}(nothing)
+const WISDOM_PATH_RESOLVED = Ref(false)
 # Sizes planned since the last export, so an export only happens when there is something new.
 const WISDOM_DIRTY = Ref(false)
 
@@ -109,17 +113,45 @@ Keyed by CPU model and FFTW version: wisdom is portable across neither, and impo
 machine's would produce plans tuned for the wrong cache hierarchy.
 """
 function wisdom_path()
-    try
+    # Resolved once per process. The path is derived from the CPU model, the FFTW version and the
+    # depot — none of which change while a process runs — so recomputing it is pure waste, and it
+    # is not free: `Sys.cpu_info()` allocates a vector of per-core structs and `mkpath` stats the
+    # directory, together 9.6 us and 4.1 KiB per call.
+    #
+    # Caching also closes a hole that only opens when the scratch directory is *unwritable*. There
+    # `save_wisdom!` returns before clearing `WISDOM_DIRTY`, so the flag stays set and every later
+    # `warm_plans!` — once per chip-size level per pair, forever — re-pays the lookup and its
+    # failure. Measured at 116 us and 6.6 KiB per call, or 202 extra allocations per image pair.
+    # `nothing` is a legitimate cached answer, hence the two-state `Ref` rather than a sentinel.
+    WISDOM_PATH_RESOLVED[] && return WISDOM_PATH[]
+    WISDOM_PATH_RESOLVED[] = true
+    WISDOM_PATH[] = try
         # `Sys.cpu_info()` can report a model string with spaces and slashes ("Apple M2 Max",
         # "Intel(R) Xeon(R) Gold 6248R CPU @ 3.00GHz"), none of which belong in a filename.
         cpu = replace(Sys.cpu_info()[1].model, r"[^A-Za-z0-9._-]+" => "_")
         dir = scratch_dir(string(PKG_UUID), "fftw_wisdom")
         mkpath(dir)
-        return joinpath(dir, "$(cpu)-fftw$(FFTW_VERSION).wisdom")
+        joinpath(dir, "$(cpu)-fftw$(FFTW_VERSION).wisdom")
     catch
         # No writable scratch space. Planning still works; it is just never cached.
-        return nothing
+        nothing
     end
+    return WISDOM_PATH[]
+end
+
+"""
+    AutoRIFT.reset_wisdom_path!()
+
+Forget the cached wisdom path, so the next [`wisdom_path`](@ref) resolves it afresh.
+
+Called from `__init__`, because a path resolved while *precompiling* would otherwise be serialised
+into the image and inherited by whatever machine loads it. Also used by tests that move the scratch
+directory.
+"""
+function reset_wisdom_path!()
+    WISDOM_PATH_RESOLVED[] = false
+    WISDOM_PATH[] = nothing
+    return nothing
 end
 
 """

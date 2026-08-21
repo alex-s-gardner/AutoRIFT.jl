@@ -1,12 +1,12 @@
 # A standalone AutoRIFT binary
 
-A trimmed, statically-compiled `autorift` executable: **29.7 MiB peak RSS against 424.2 MiB** for
+A trimmed, statically-compiled `autorift` executable: **25.8 MiB peak RSS against 424.2 MiB** for
 the equivalent Julia process, 0.06 s to run a 512² pair, and no Julia installation needed at run time.
 
 This exists for one reason. 97% of an ordinary AutoRIFT process's 408 MiB memory floor is the Julia
 runtime itself — AutoRIFT is ~7 MiB of it (see [`docs/memory.md`](../docs/memory.md)). No
 optimization inside the package reaches the rest, and `--compile=min` recovers only 18 MiB. On a
-`t3.micro` the difference is 43% of the instance against 3.6%.
+`t3.micro` the difference is 43% of the instance against 3.1%.
 
 Not in CI, not a dependency of the package, and not part of `Pkg.test()`. JuliaC needs
 `--experimental` on Julia 1.12, so this is a supported build recipe rather than a release artifact.
@@ -15,8 +15,8 @@ Not in CI, not a dependency of the package, and not part of `Pkg.test()`. JuliaC
 
 | | trimmed binary | `julia -t1`, same work |
 |---|---:|---:|
-| peak RSS, 512² pair | **29.7 MiB** | 424.2 MiB |
-| peak RSS, 2048² pair | **149.6 MiB** | 542.7 MiB |
+| peak RSS, 512² pair | **25.8 MiB** | 424.2 MiB |
+| peak RSS, 2048² pair | **117.8 MiB** | 542.7 MiB |
 | wall clock, 512², warm wisdom | **0.06 s** | 1.20 s |
 | binary | 3.2 MiB | — |
 | bundle (with runtime libraries + FFTW) | 71 MiB | — |

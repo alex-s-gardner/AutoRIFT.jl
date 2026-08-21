@@ -70,7 +70,7 @@ exercises the correlator.
 - [x] Public API and cache lifecycle
 - [x] Rasters / DimensionalData extensions
 - [x] Performance milestone â€” 3.1x serial, 11.1x threaded against the reference
-- [x] Memory as a tracked metric, and a trimmed 29.7 MiB binary
+- [x] Memory as a tracked metric, and a trimmed 25.8 MiB binary
 - [ ] Complex (SLC) input
 - [ ] Geogrid
 
@@ -91,5 +91,5 @@ regression gate, and [`docs/memory.md`](docs/memory.md) the memory comparison â€
 including why peak RSS and live heap answer different questions.
 
 For small instances, [`app/`](app/README.md) builds a trimmed standalone binary:
-byte-identical output at **29.7 MiB peak RSS against 424.2 MiB**, since 97% of an
+byte-identical output at **25.8 MiB peak RSS against 424.2 MiB**, since 97% of an
 ordinary process's memory floor is the Julia runtime rather than AutoRIFT.

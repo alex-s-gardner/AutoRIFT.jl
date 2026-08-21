@@ -124,6 +124,12 @@ function __init__()
     # Nothing is lost: what the workload precompiles is Julia code, and the *wisdom* from its
     # planning persists through the file below, so the first real plan is still cheap.
     clear_plans!()
+    # Discard the wisdom path resolved during precompilation, for a milder version of the same
+    # reason. It is derived from the depot and the CPU model, and the machine that builds the image
+    # need not be the machine that loads it — a relocated depot or a different CPU would otherwise
+    # inherit the builder's path and read wisdom measured for the wrong microarchitecture. Cheap to
+    # re-resolve: once per process.
+    reset_wisdom_path!()
     load_wisdom!()
     return nothing
 end

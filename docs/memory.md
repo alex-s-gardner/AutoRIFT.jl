@@ -14,12 +14,12 @@ Peak RSS and live heap disagree, and the disagreement is the useful part.
 
 | Over 30 consecutive 512² pairs through one `Cache` | AutoRIFT | autoRIFT v2.1.2 |
 |---|---:|---:|
-| peak RSS growth | +38.7 MiB | — |
+| peak RSS growth | +41.2 MiB | — |
 | live heap growth (`gc_live_bytes`, after full GC) | **+0.0 MiB** | — |
 | current RSS after `gc.collect()` | — | **+5.7 MiB/pair, no plateau** |
 
 Read `rss` alone and AutoRIFT looks like it accumulates the way the reference does. It does not:
-the live heap is flat, so the 38.7 MiB is allocator slack the collector has not returned to the OS.
+the live heap is flat, so the 41.2 MiB is allocator slack the collector has not returned to the OS.
 A long batch run does **not** need process recycling.
 
 The reference does. 376.9 MiB after the first pair, 542.3 MiB after thirty, as *current* RSS after
@@ -59,7 +59,7 @@ skips the correlation.
 **97% of the floor is the runtime.** AutoRIFT itself is ~7 MiB. There is no optimization inside
 this package that reaches the other 397; `--compile=min` recovers 18 MiB, which is not the right
 order of magnitude. That is what makes a trimmed binary the only real lever — see
-[`app/`](../app/README.md), which runs the same correlation at **29.7 MiB peak against 424.2 MiB**.
+[`app/`](../app/README.md), which runs the same correlation at **25.8 MiB peak against 424.2 MiB**.
 
 ## Per-pair peak
 
@@ -68,9 +68,44 @@ Scene size is the only knob that scales peak memory, and it does so roughly line
 
 | Scene | serial | threaded |
 |---|---:|---:|
-| 512² | 8.2 MiB | 9.3 MiB |
-| 1024² | 28.6 MiB | 32.0 MiB |
-| 2048² | 113.3 MiB | 114.5 MiB |
+| 512² | 4.3 MiB | 4.7 MiB |
+| 1024² | 11.5 MiB | 11.4 MiB |
+| 2048² | 49.6 MiB | 35.7 MiB |
+
+## Allocation per pair, and where it went
+
+`preprocess` was 92% of a pair's allocations — 31.5 of 34.0 MiB on 1024² — and almost all of that was
+`windowmean` scratch. The column pass produces one `Float64` sum per pixel and the row pass consumes
+one row of them at a time, so a full-image scratch was written entirely before any of it was read:
+every value evicted from cache before use. The NaN-aware path carried two such arrays, `Float64` sums
+and `Int32` counts, 12 MiB on 1024² to produce 4 MiB of output.
+
+Processing a band of 16 rows at a time keeps the scratch in L2. It is **faster and smaller at once**,
+which is unusual enough to be worth stating plainly — the locality is worth more than the cost of
+restarting each band's running sum:
+
+| `windowmean` on 1024² | before | after |
+|---|---:|---:|
+| dense (gap-free) | 5.6 ms / 8.01 MiB | **3.3 ms / 0.13 MiB** |
+| masked (any NaN) | 9.8 ms / 12.01 MiB | **3.7 ms / 0.11 MiB** |
+
+Per whole pair, allocation roughly halves:
+
+| Pair | before | after |
+|---|---:|---:|
+| 512² dense | 8.08 MiB | **4.20 MiB** |
+| 1024² dense | 32.45 MiB | **16.70 MiB** |
+| 2048² dense | 129.84 MiB | **66.34 MiB** |
+| 1024² masked | 72.49 MiB | **48.87 MiB** |
+| 2048² masked | 289.92 MiB | **194.67 MiB** |
+
+Bit-identical throughout, which is the property that makes banding safe: each band reseeds its
+running sum from exactly the window its first row sees, so no value is the result of a longer or
+differently-ordered accumulation. Verified exactly rather than to a tolerance, end to end, across
+dense, masked and Wallis paths at 512² and 1024².
+
+The masked path is not a corner case worth less attention than the dense one — a single NaN anywhere
+sends the whole array down it, and reprojection to a common grid routinely leaves a no-data border.
 
 ## The non-knobs
 
@@ -85,7 +120,8 @@ That reading was noise: three repetitions do not reproduce the trend or its dire
 are pooled and few exist at once, so there is nothing here to scale. Threading is not a
 memory-versus-speed tradeoff in either direction.
 
-**`upsampling` has no trend** — 30.2 MiB at 8× against 27.4 MiB at 128× on 1024², despite the
+**`upsampling` has no trend** — measured 30.2 MiB at 8× against 27.4 MiB at 128× on 1024² before the
+banding change, and the *absence* of a trend is what matters, not the absolute figures, despite the
 refinement workspace itself growing from 0.2 MiB to 62.5 MiB. Pooling again: few exist
 simultaneously. It costs time (31 ms → 64 ms), not memory. Tracked in the suite so the claim stays
 true rather than being remembered.
@@ -109,5 +145,5 @@ that does scale, and it is deferred rather than dismissed.
 - **Reuse a `Cache` across pairs** via `init`/`reinit!`/`autorift!`. The live heap is flat, so this
   is bounded regardless of batch length.
 - **No process recycling needed** — the measurement above is what establishes that.
-- **Small instances: use the trimmed binary.** 29.7 MiB against 424.2 MiB is the difference between
-  3.6% and 43% of a `t3.micro`.
+- **Small instances: use the trimmed binary.** 25.8 MiB against 424.2 MiB is the difference between
+  3.1% and 43% of a `t3.micro`.
