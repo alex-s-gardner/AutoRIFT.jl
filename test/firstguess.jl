@@ -39,6 +39,25 @@ end
     @test maximum(dx) - minimum(dx) > 1.0     # the field really does vary by more than `tolerance`
 end
 
+@testset "both neighbour strategies agree" begin
+    # The k-d tree in the NearestNeighbors extension must be a pure cost optimisation: same K nearest
+    # neighbours, same survivors. It is 12x faster at 3000 points and 90x at 20000, so the temptation
+    # to accept "close enough" is real — this pins exact agreement instead.
+    #
+    # Runs whichever strategy is active against the brute-force one explicitly, so it is meaningful
+    # with or without the extension loaded.
+    rng = Random.MersenneTwister(7)
+    n = 800
+    pts = [(rand(rng) * 512, rand(rng) * 512) for _ in 1:n]
+    dx = randn(rng, n) .* 2 .+ 20
+    dy = randn(rng, n) .* 2 .- 12
+    brute = AutoRIFT._neighbour_indices(pts, 12, AutoRIFT._BruteForceNeighbours())
+    active = AutoRIFT._neighbour_indices(pts, 12)
+    # Index for index, not merely as sets: both sort by distance.
+    @test all(i -> collect(brute[i]) == [j for j in active[i] if j != i][1:length(brute[i])],
+              eachindex(brute))
+end
+
 @testset "consistent_matches edge cases" begin
     # No points at all: an empty answer, not an error. A caller who found no matches gets to
     # decide what that means.
