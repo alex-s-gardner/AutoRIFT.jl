@@ -161,6 +161,17 @@ end
 
 _outliers(x, _kw) = _badtype(:outliers, x, "a Symbol or an `OutlierMethod`")
 
+# `nothing`/`false` off, `true` the paper's default, a tuple the explicit angles. Accepting a `Bool`
+# because "should I search rotations" reads as a yes/no question at the call site even though the
+# answer carries parameters.
+_rotation(::Nothing) = NoRotationSearch()
+_rotation(x::Bool) = x ? RotationSearch() : NoRotationSearch()
+_rotation(x::RotationMethod) = x
+_rotation(x::Tuple) = RotationSearch(x)
+_rotation(x::AbstractVector) = RotationSearch(Tuple(x))
+_rotation(x) = _badtype(:rotation, x,
+                       "`nothing`, a `Bool`, a tuple of angles, or a `RotationMethod`")
+
 _badtype(kw::Symbol, x, expected) =
     throw(ArgumentError("`$kw` must be $expected, got a $(typeof(x))."))
 
@@ -255,6 +266,11 @@ choice is a known defect — see the package documentation for the list.
   validates a smaller fraction than this.
 
 ## Outlier rejection and filling
+- `rotation = nothing`: try several chip rotations and keep the best, per
+  [`RotationSearch`](@ref). `nothing` or `false` disables it, which is the default because it
+  multiplies correlation cost by the number of angles. `true` uses ±3°, following
+  `nansencenter/sea_ice_drift`; a tuple names the angles. Only useful where the ice rotates —
+  see [`RotationSearch`](@ref) for the measurement.
 - `outliers = :gardner`: which implausible displacements to drop. `:gardner` is the
   two-stage filter of Gardner et al. (2018) that autoRIFT uses; `:none` keeps everything,
   which is useful for telling the correlator's failures from the filter's rejections. An
@@ -299,6 +315,7 @@ function params(;
     coarse_buffer = 8,
     min_coarse_valid_fraction = 0.01,
     outliers = :gardner,
+    rotation = nothing,
     outlier_window = nokw,
     outlier_iterations = nokw,
     min_agree_fraction = nokw,
@@ -318,6 +335,7 @@ function params(;
     # `fill_window` and `filter_width`. Translated here, in the one file that owns keywords.
     out = _outliers(outliers, (; window = outlier_window, iterations = outlier_iterations,
                                min_agree_fraction, agree_tolerance, mad_scale))
+    rot = _rotation(rotation)
 
     base = _check_chip_size(:chip_size, chip_size)
     cmin = isnokw(chip_size_min) ? base : _check_chip_size(:chip_size_min, chip_size_min)
@@ -349,7 +367,7 @@ function params(;
         "`search_radius` is zero in both axes, so no pixel can be searched."))
 
     return Params(
-        sim, pre, quant, sub, out, booltype(threaded),
+        sim, pre, quant, sub, out, booltype(threaded), rot,
         base, cmin, cmax, Float64(_check_positive(:chip_aspect, chip_aspect)),
         spacing,
         rx, ry, Int(min_search_radius),

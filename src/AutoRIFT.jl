@@ -143,7 +143,7 @@ export SubpixelMethod, PyramidRefine, NoRefine
 export QuantizeMethod, QuantizeUInt8, NoQuantize
 export OutlierMethod, GardnerFilter, NoOutlierFilter
 export ImagePair
-export FirstGuess, ORBGuess, first_guess
+export FirstGuess, ORBGuess, AKAZEGuess, first_guess
 
 # ---------------------------------------------------------------------------
 # Precompilation

@@ -51,7 +51,8 @@
 
 Abstract supertype for sparse feature-tracking methods used to seed the dense search.
 
-Concrete subtype: [`ORBGuess`](@ref), declared here but only *working* once `ImageFeatures` is loaded — the detector is a heavy dependency the optical path has no
+Concrete subtypes: [`ORBGuess`](@ref) and [`AKAZEGuess`](@ref), declared here but only *working* once
+`ImageFeatures` or `AkazeFeatures` respectively is loaded — the detector is a heavy dependency the optical path has no
 use for, so the methods live in a package extension.
 
 The types are declared in the core rather than in the extension deliberately. An extension may add
@@ -82,11 +83,26 @@ three detectors on Sentinel-1 sea ice over Fram Strait and north-east Greenland:
 Four times the vectors of SIFT in a third of the time. ORB is also unencumbered, where SIFT and SURF
 were patented when that paper was written — which is why its title says *open-source*.
 
-!!! note "A-KAZE would likely be better, and is not available"
+!!! note "A-KAZE is more precise under rotation, and costs 5x"
     Demchev et al. (2017) report A-KAZE outperforming ORB "up to an order of magnitude" on ice drift:
     Gaussian scale space blurs speckle and signal alike, while A-KAZE's nonlinear diffusion preserves
-    edges. It is not in the Julia ecosystem, and its diffusion scale space is precisely the expensive
-    part — so it is a real candidate, not a free one. Measure this first.
+    edges. Measured here against synthetic speckle with known ground truth, at matched keypoint
+    counts on 512²:
+
+    | rotation | ORB matches (correct) | A-KAZE matches (correct) |
+    |---:|---:|---:|
+    | 0° | 9000 (78.4%) | 8406 (**99.3%**) |
+    | 3° | 6434 (33.5%) | 6257 (**96.0%**) |
+    | 8° | 5666 (19.4%) | 5937 (**95.8%**) |
+
+    ORB's precision collapses as the field rotates; A-KAZE's does not. In *usable* vectors that is
+    1.2x at 0° rising to **5.2x at 8°** — against 5x the detection time (0.49 s vs 0.10 s at ~9000
+    keypoints). So the two roughly break even on cost per usable vector once there is rotation, and
+    A-KAZE wins outright on the precision that determines whether the consistency filter has
+    anything to keep.
+
+    Available as [`AKAZEGuess`](@ref) when `AkazeFeatures` is loaded. Not the default, because it is
+    unregistered — see that docstring.
 
 Keywords are forwarded to `ImageFeatures.ORB`.
 """
@@ -95,12 +111,39 @@ struct ORBGuess{K} <: FirstGuess
 end
 ORBGuess(; kwargs...) = ORBGuess(kwargs)
 
-# Deliberately only one concrete `FirstGuess`. A second detector was written (BRISK) and removed:
+"""
+    AKAZEGuess(; omax = 4, nsublevels = 4, dthreshold = 0.001)
+
+Sparse first guess from A-KAZE features. Needs `AkazeFeatures` loaded.
+
+More precise than [`ORBGuess`](@ref) under rotation and about five times slower — see the table in
+`ORBGuess`. The reason is the scale space: A-KAZE diffuses *nonlinearly*, so edges survive smoothing
+while speckle does not, where a Gaussian pyramid blurs both equally. On SAR that difference is the
+whole game, and it is why Demchev et al. (2017) chose it.
+
+!!! warning "Unregistered dependency"
+    `AkazeFeatures.jl` is a pure-Julia port of Alcantarilla's original, actively maintained, and
+    **not in the General registry** — it must be installed by URL:
+
+    ```julia
+    Pkg.add(url = "https://github.com/nlw0/AkazeFeatures.jl")
+    ```
+
+    That is why `ORBGuess` is the documented default despite being less precise: a registered
+    dependency can be a `[weakdeps]` entry that resolves for every user, and an unregistered one
+    cannot. Use this when the extra precision matters and you control the environment.
+"""
+struct AKAZEGuess{K} <: FirstGuess
+    kwargs::K
+end
+AKAZEGuess(; kwargs...) = AKAZEGuess(kwargs)
+
+# Two concrete `FirstGuess`es, and a third was written and removed: BRISK.
 # ORB is the only ImageFeatures descriptor that detects its own keypoints, so every other one needs
 # FAST detection, orientation assignment, per-`Feature` construction and a different match structure
 # unwrapped — four pieces of adapter for a comparison point against the detector Muckenhuber et al.
-# (2016) already measured as the best of three. The abstract type is what makes adding one later a
-# new method rather than a redesign; see `ext/AutoRIFTImageFeaturesExt.jl`.
+# (2016) already measured as the best of three. A-KAZE earned its adapter by measuring better;
+# BRISK did not. The abstract type is what makes adding one a new method rather than a redesign.
 
 # The detector itself, from the extension. Defined here so the error a caller sees names the missing
 # dependency rather than being a bare `MethodError` on an internal function.

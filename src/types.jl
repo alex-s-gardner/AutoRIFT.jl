@@ -423,6 +423,84 @@ end
 Deramp(; axis = :both) = Deramp(axis)
 
 """
+    RotationSearch(angles = (-3.0, 0.0, 3.0))
+    NoRotationSearch()
+
+Whether the dense stage tries several chip rotations and keeps the best.
+
+Opt-in, and off by default, because it multiplies the correlation cost by `length(angles)` — the
+whole point of `nansencenter/sea_ice_drift`'s `rotate_and_match` is that you pay 3x to recover the
+matches a rotating field would otherwise lose. Its own default is `angles=[-3, 0, 3]`, which is
+where this default comes from.
+
+```julia
+autorift(a, b, guess; rotation = RotationSearch())              # ±3°, 3x cost
+autorift(a, b, guess; rotation = RotationSearch((-6, -3, 0, 3, 6)))
+```
+
+# When this earns its cost
+
+Sea ice rotates, and a rotated chip decorrelates against an unrotated window — the peak weakens even
+though the ice is perfectly trackable. Measured on synthetic speckle, median peak correlation with
+five angles (±3°, ±6°, 0°) against none:
+
+| scene rotation | chip 32 | chip 64 |
+|---:|---:|---:|
+| 0° | 0.571 → 0.571 (0%) | 0.571 → 0.571 (0%) |
+| 3° | 0.113 → 0.146 (**+29%**) | 0.112 → 0.279 (**+149%**) |
+| 6° | 0.085 → 0.103 (+21%) | 0.043 → 0.052 (+21%) |
+| 10° | 0.082 → 0.101 (+23%) | 0.042 → 0.053 (+25%) |
+
+Two things worth reading off that. **The gain grows with chip size** — a 64-px chip's corners travel
+twice as far as a 32-px chip's under the same rotation, so it has more to lose and more to recover.
+And **the benefit is real but modest against decorrelation**: at 6° and beyond the correlation is
+weak with or without the search, because rotating a square chip pulls in padding that was never part
+of it. That is why `sea_ice_drift`'s own default is only ±3°.
+
+Cost measured at **1.7x** for five angles, not 5x, because the surrounding per-point work — window
+extraction, integral images, the peak search — is shared across angles.
+
+Also measured through the first-guess path: usable vectors fall from 2327 at 0° rotation to 29 at
+10°. Most of that loss is in the *sparse* stage's descriptor matching rather than the dense
+correlation, so chip rotation alone does not recover it — see [`AKAZEGuess`](@ref), which holds
+95-99% match precision where ORB falls to 19%.
+
+It is *not* a substitute for [`Deramp`](@ref) or for the consistency filter, and it does not handle
+**shear** — no published sea-ice tracker does. Both references tolerate shear instead by keeping the
+filtering neighbourhood small enough that shear looks locally like rotation; deformation is then
+computed *from* the vector field afterwards rather than corrected for during matching.
+
+The best-fitting angle is available per point, which makes it a measurement rather than only a
+correction — `sea_ice_drift` returns it as `best_a`.
+"""
+abstract type RotationMethod end
+
+struct NoRotationSearch <: RotationMethod end
+
+struct RotationSearch{A<:Tuple} <: RotationMethod
+    angles::A
+    function RotationSearch(angles)
+        t = Tuple(Float64.(angles))
+        isempty(t) && throw(ArgumentError(
+            "`RotationSearch` needs at least one angle; use `NoRotationSearch()` to disable."))
+        allunique(t) || throw(ArgumentError(
+            "`RotationSearch` angles must be distinct, got $t — a repeated angle costs a full " *
+            "correlation and can never win."))
+        return new{typeof(t)}(t)
+    end
+end
+RotationSearch() = RotationSearch((-3.0, 0.0, 3.0))
+
+"""
+    AutoRIFT.angles(method::RotationMethod) -> Tuple
+
+The chip rotations a pass will try, in degrees. `(0.0,)` when rotation search is off, so the caller
+needs no branch — one angle of zero is exactly the unrotated case.
+"""
+angles(::NoRotationSearch) = (0.0,)
+angles(m::RotationSearch) = m.angles
+
+"""
     filter_width(method::PreprocessMethod)
 
 Side length of the filter window, or `0` for methods that take no window.
@@ -625,13 +703,15 @@ between them — coherence at the finest chip, amplitude above it. A scalar keyw
 of one measure everywhere is the 1-tuple and costs nothing. See [`chip_measures`](@ref).
 """
 struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:PreprocessMethod,
-              Q<:QuantizeMethod,R<:SubpixelMethod,O<:OutlierMethod,T<:BoolAsType}
+              Q<:QuantizeMethod,R<:SubpixelMethod,O<:OutlierMethod,T<:BoolAsType,
+              W<:RotationMethod}
     similarity::S
     preprocess::P
     quantize::Q
     subpixel::R
     outliers::O
     threaded::T
+    rotation::W
 
     # Chip geometry (pixels). `chip_size_base` is the finest chip-size level and
     # the reference for grid spacing; levels are base * 2^k.

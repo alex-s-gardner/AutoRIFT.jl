@@ -25,7 +25,7 @@
 module AutoRIFTApp
 
 using AutoRIFT: AutoRIFT, ZNCC, Highpass, QuantizeUInt8, PyramidRefine, GardnerFilter,
-                Params, False, autorift
+                Params, False, NoRotationSearch, autorift
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -112,6 +112,7 @@ end
 function app_params(chip_size::Int, search_radius::Int)
     return Params(
         (ZNCC(),), Highpass(), QuantizeUInt8(), PyramidRefine(), GardnerFilter(), False(),
+        NoRotationSearch(),
         chip_size, chip_size, 4chip_size, 1.0,
         chip_size,
         search_radius, search_radius, 6,

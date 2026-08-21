@@ -14,17 +14,20 @@ Scratch = "6c6a2e73-6563-6170-7368-637461726353"
 StableTasks = "91464d47-22a1-43fe-8b7f-2d57ee82463f"
 
 [weakdeps]
+AkazeFeatures = "23406c00-28fe-5193-aec2-b0bcaddf547d"
 DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
 ImageCore = "a09fc81d-aa75-5fe9-8630-4744c3626534"
 ImageFeatures = "92ff4b2b-8094-53d3-b29d-97f740f06cef"
 Rasters = "a3a2b9e3-a471-40c9-b274-f788e487c689"
 
 [extensions]
+AutoRIFTAkazeFeaturesExt = "AkazeFeatures"
 AutoRIFTDimensionalDataExt = "DimensionalData"
 AutoRIFTImageFeaturesExt = ["ImageFeatures", "ImageCore"]
 AutoRIFTRastersExt = ["Rasters", "DimensionalData"]
 
 [compat]
+AkazeFeatures = "0.1"
 Aqua = "0.8"
 CommonSolve = "0.2"
 Dates = "1"

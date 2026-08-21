@@ -210,7 +210,7 @@ end
     # document as the entry point a trimmed binary uses.
     ref, sec = shifted_pair(512, (6, -4); T = Float32)
     p = Params((ZNCC(),), Highpass(), QuantizeUInt8(), PyramidRefine(), GardnerFilter(),
-               AutoRIFT.False(),
+               AutoRIFT.False(), AutoRIFT.NoRotationSearch(),
                32, 32, 128, 1.0, 32, 25, 25, 6, 4, 8, 0.01, 0.0, 0.0, 3, UInt64(0), false)
 
     # First: the hand-built `Params` is the one `params()` produces for these keywords. If a

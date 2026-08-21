@@ -279,7 +279,7 @@ function _track_chunk!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
 
             chip = @view sec[chip_rows, chip_cols]
             window = @view ref[win_rows, win_cols]
-            surface = correlate!(ws, window, chip, (prx, pry); measure)
+            surface = _correlate_rotations!(ws, window, chip, (prx, pry), measure, p.rotation)
             # A chip with no texture carries no information about displacement, so it is left
             # as no measurement. The reference reports the search-window corner here, which
             # over masked or featureless terrain is a systematic corner-pinned bias.
@@ -302,6 +302,90 @@ function _track_chunk!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
         give_workspace!(ws)
         isnothing(rw) || give_refinement!(rw)
     end
+end
+
+# One correlation, or several at different chip rotations with the best kept.
+#
+# `NoRotationSearch` is a separate method rather than a one-angle loop, and that is the point: it must
+# compile to exactly the call it replaced, with no surface copy and no comparison, so enabling this
+# feature cannot cost anything for the callers who do not. The `RotationSearch` method is where the
+# expense lives, and it is proportional to the angle count by construction.
+@inline _correlate_rotations!(ws, window, chip, radius, measure, ::NoRotationSearch) =
+    correlate!(ws, window, chip, radius; measure)
+
+function _correlate_rotations!(ws, window, chip, radius, measure, rot::RotationSearch)
+    # `sea_ice_drift`'s `rotate_and_match`: rotate the template, correlate, keep the angle whose peak
+    # is highest. Its comparison is on `result.max()`, so this one is too — the strongest peak across
+    # angles wins, not the one closest to zero rotation.
+    best = nothing
+    bestpeak = -Inf32
+    for a in angles(rot)
+        rotated = _rotate_chip(ws, chip, a)
+        s = correlate!(ws, window, rotated, radius; measure)
+        degenerate(ws) && continue
+        pk = maximum(s)
+        if pk > bestpeak
+            bestpeak = pk
+            # The surface aliases the workspace and the next iteration overwrites it, so the winner
+            # must be copied. One allocation per point per pass, which is the price of comparing
+            # surfaces at all — and it is why this is opt-in.
+            best = copy(s)
+        end
+    end
+    if isnothing(best)
+        # Every angle degenerate: report it the way a single degenerate chip is reported, so the
+        # caller's existing check still works.
+        ws.was_degenerate[] = true
+        surf = @view ws.surface[1:(2radius[2]), 1:(2radius[1])]
+        fill!(surf, 0.0f0)
+        return surf
+    end
+    ws.was_degenerate[] = false
+    surf = @view ws.surface[1:size(best, 1), 1:size(best, 2)]
+    copyto!(surf, best)
+    return surf
+end
+
+# The chip, rotated about its own centre by `deg` degrees, into the workspace's rotation buffer.
+#
+# Bilinear, and nearest-neighbour was rejected: a rotated chip is correlated against an *unrotated*
+# window, so any resampling artefact enters the correlation directly. Bilinear is what
+# `sea_ice_drift` uses (`cv2.warpAffine` defaults to it) and what the subpixel refinement already
+# assumes elsewhere.
+#
+# Out-of-chip samples become zero, matching the reference's `borderValue=0`. That is a real
+# limitation rather than a detail: rotating a square chip necessarily pulls in corners that were not
+# in it, so a large angle dilutes the correlation with padding. It is why the useful angle range is
+# small — the reference's own default is ±3°.
+function _rotate_chip(ws::CorrelationWorkspace, chip::AbstractMatrix, deg::Float64)
+    deg == 0.0 && return chip
+    ch, cw = size(chip)
+    dst = @view ws.rotchip[1:ch, 1:cw]
+    s, c = sincos(deg2rad(deg))
+    # Rotate about the chip centre, in the half-pixel convention the grid already uses.
+    yc = (ch + 1) / 2
+    xc = (cw + 1) / 2
+    T = eltype(dst)
+    @inbounds for j in 1:cw, i in 1:ch
+        dy = i - yc
+        dx = j - xc
+        # Inverse rotation: where in the source does this destination pixel come from?
+        sy = yc + c * dy + s * dx
+        sx = xc - s * dy + c * dx
+        i0 = floor(Int, sy)
+        j0 = floor(Int, sx)
+        if i0 < 1 || j0 < 1 || i0 + 1 > ch || j0 + 1 > cw
+            dst[i, j] = zero(T)
+            continue
+        end
+        fy = sy - i0
+        fx = sx - j0
+        v00 = Float64(chip[i0, j0]);     v10 = Float64(chip[i0 + 1, j0])
+        v01 = Float64(chip[i0, j0 + 1]); v11 = Float64(chip[i0 + 1, j0 + 1])
+        dst[i, j] = T((1 - fy) * ((1 - fx) * v00 + fx * v01) +
+                      fy * ((1 - fx) * v10 + fx * v11))
+    end
+    return dst
 end
 
 # Explicit loop rather than `any` over a view. Both short-circuit and neither allocates, but

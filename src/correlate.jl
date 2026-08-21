@@ -116,6 +116,12 @@ struct CorrelationWorkspace
     # Correlation surface, (2*radius_y, 2*radius_x) at full radius.
     surface::Matrix{Float32}
 
+    # The chip, rotated, for `RotationSearch`. `Float32` regardless of input type: a rotation is a
+    # bilinear resample, so the result is fractional even for `UInt8` imagery, and rounding it back
+    # to the input type would quantise away the very sub-pixel information the resample computed.
+    # Unused — and untouched — when rotation search is off, which is the default.
+    rotchip::Matrix{Float32}
+
     # Integral images of the search window, sum and sum-of-squares. Float64: see
     # the note in integral.jl.
     isum::Matrix{Float64}
@@ -229,6 +235,7 @@ function workspace(::Type{T}, chip_size, search_radius) where {T<:ImageElement}
         Matrix{Float32}(undef, csy, csx),
         Matrix{ComplexF32}(undef, csy, csx),
         Matrix{Float32}(undef, 2ry, 2rx),
+        Matrix{Float32}(undef, csy, csx),
         Matrix{Float64}(undef, winy + 1, winx + 1),
         Matrix{Float64}(undef, winy + 1, winx + 1),
         Matrix{ComplexF64}(undef, winy + 1, winx + 1),
