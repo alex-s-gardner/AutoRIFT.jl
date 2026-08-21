@@ -231,6 +231,6 @@ end
     # And the contrast that explains why the overload has to exist at all. `params()` resolves
     # Symbols through a `Dict{Symbol,Any}`, so its return type is not concrete — hence the
     # keyword path cannot be trimmed however concrete the arguments are.
-    @test !isconcretetype(Base.infer_return_type(params, Tuple{}))
+    @test !isconcretetype(inferred_type(params, ()))
     @test isconcretetype(typeof(p))
 end

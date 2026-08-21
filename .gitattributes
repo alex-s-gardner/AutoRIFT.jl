@@ -1,0 +1,22 @@
+# The fixture corpus is raw binary, and must survive checkout untouched.
+#
+# Without this, git on Windows applies `core.autocrlf` and rewrites every 0x0A byte in a `.bin`
+# file as 0x0D 0x0A. That is not a subtle corruption: the first CI run on Windows read a 5x5
+# Float32 kernel as 125 bytes instead of 100 — 25 of its bytes happened to be 0x0A — and the
+# fixture loader rejected it. Every fixture-backed assertion in the suite, including the OpenCV
+# comparison that is the package's correctness gate, depends on these bytes being exact.
+#
+# `-text` marks a path as never subject to end-of-line conversion, in either direction.
+*.bin -text
+
+# The wisdom file is FFTW's own serialisation format, written and read through C `fopen`/`fclose`.
+# Not currently committed, but the same rule must apply if one ever is.
+*.wisdom -text
+
+# Text files that must keep LF regardless of platform, because tools other than git read them.
+*.jl text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.py text eol=lf

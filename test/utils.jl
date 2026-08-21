@@ -250,3 +250,19 @@ function _shift_bilinear(a::Matrix{Float64}, shift::Tuple{Real,Real})
     end
     return out
 end
+
+"""
+    inferred_type(f, argtypes::Tuple) -> Type
+
+The return type Julia's inference derives for `f(::argtypes...)`.
+
+`Base.infer_return_type` would be the direct spelling, but it does not exist before Julia 1.11 and
+this package supports 1.10 — using it made every `lts` CI job error rather than fail, which is how
+the gap surfaced. `Base.return_types` is available on both and returns a vector of candidates, one
+per matching method; these call sites all have a single method, so the sole element is the answer.
+"""
+function inferred_type(f, argtypes::Tuple)
+    ts = Base.return_types(f, argtypes)
+    length(ts) == 1 || error("expected one method for $f$(argtypes), inference gave $(length(ts))")
+    return only(ts)
+end

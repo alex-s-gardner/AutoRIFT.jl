@@ -130,7 +130,7 @@ end
     @test !AutoRIFT.istrue(AutoRIFT.False())
     # The return annotation on `booltype` is what keeps this inferrable; without
     # it the threaded/serial dispatch downstream goes unstable.
-    @test Base.infer_return_type(AutoRIFT.booltype, (Bool,)) <: AutoRIFT.BoolAsType
+    @test inferred_type(AutoRIFT.booltype, (Bool,)) <: AutoRIFT.BoolAsType
 end
 
 @testset "nokw sentinel" begin
