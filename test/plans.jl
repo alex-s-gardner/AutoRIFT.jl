@@ -76,6 +76,59 @@ end
     end
 end
 
+@testset "the scratch directory is resolved per call, not cached" begin
+    # A regression test for a bug that made the *other* wisdom tests pass for the wrong reason.
+    #
+    # `wisdom_path` caches the expensive part of its answer — the CPU-derived filename — but must
+    # re-resolve the directory on every call, because `Scratch.with_scratch_directory` redirects it
+    # dynamically and the two testsets below rely on that redirect to avoid touching the real depot.
+    # When the whole path was cached, the redirect became a silent no-op: those testsets kept
+    # passing while writing into the developer's own scratch space, and the "read-only depot" case
+    # was no longer testing a read-only depot at all.
+    outside = wisdom_path()
+    if !isnothing(outside)
+        mktempdir() do dir
+            with_scratch_directory(dir) do
+                inside = wisdom_path()
+                @test !isnothing(inside)
+                # The load-bearing assertion: the redirect is honoured even though `wisdom_path`
+                # was already called once in this process.
+                @test startswith(inside, dir)
+                @test inside != outside
+                # And the cached half is genuinely reused rather than re-derived differently.
+                @test basename(inside) == basename(outside)
+            end
+        end
+        # Leaving the block restores the real location.
+        @test wisdom_path() == outside
+    end
+end
+
+@testset "a hopeless export is not retried forever" begin
+    # `save_wisdom!` clears `WISDOM_DIRTY` on every exit path, not only the successful one. None of
+    # the ways it fails is worth retrying — an unwritable depot does not become writable between two
+    # chip-size levels of one image pair — and leaving the flag set turned one dead export into a
+    # permanent one: `warm_plans!` calls this per level per pair, so every later call re-derived the
+    # path and retried the doomed write, measured at 116 us and 6.6 KiB a time.
+    mktempdir() do dir
+        ro = joinpath(dir, "readonly")
+        mkpath(ro)
+        chmod(ro, 0o500)
+        try
+            with_scratch_directory(ro) do
+                clear_plans!()
+                fft_plan(next_fft_size(149), next_fft_size(149))
+                @test AutoRIFT.WISDOM_DIRTY[]          # a new size was planned
+                save_wisdom!()
+                # The export could not have succeeded here, and the flag is clear regardless.
+                @test !AutoRIFT.WISDOM_DIRTY[]
+            end
+        finally
+            chmod(ro, 0o700)
+        end
+    end
+end
+
 @testset "wisdom round-trips" begin
     # The actual claim: exporting and re-importing wisdom makes a re-plan cheap. Done in an
     # isolated scratch directory so the test cannot disturb the real one, and so a machine with

@@ -237,10 +237,36 @@ function windowmean!(out, A::AbstractMatrix, w; hasnan = nothing)
                   _windowmean_dense!(out, A, wx, wy)
 end
 
+"""
+    _window_margins(wx, wy) -> (lx, ly, rx, ry)
+
+How far a window of `(wx, wy)` reaches left/up and right/down from its centre.
+
+For an even width the extra element goes to the **left**, matching
+`scipy.ndimage.generic_filter` at its default origin — which is what the reference's filter does,
+and what `LocalFilters.localmap` does, so the whole file agrees on one convention. Getting this
+backwards shifts even-window results by one pixel, and the chip-size search uses even windows at
+every level above the base.
+
+One transcription of that convention rather than four. The file header warns this is the thing
+easiest to get backwards; four copies is four chances to.
+"""
+@inline function _window_margins(wx::Int, wy::Int)
+    lx, ly = wx ÷ 2, wy ÷ 2
+    return lx, ly, wx - 1 - lx, wy - 1 - ly
+end
+
 # Band height for the column-sum scratch in both `windowmean` paths. 16 rows of `Float64` is 128 KiB
 # at 1024 columns, which stays in L2 while the row pass reads it. Measured across 4/8/16/32 at both
 # window widths and at 128²/256²/512²/1024²: 8 and 16 are within noise of each other and both beat 4
 # (too many restarts) and 32 (leaves cache).
+#
+# Each band reseeds its column recurrence rather than carrying it across, so the redundant work is
+# one window prefix per band per column — O(nr/band * wy * nc), which grows with the window. Measured
+# on 1024²: 3.16 ms at width 3 rising to 4.4 ms at 49. Mild, and mild in the right place, since
+# `windowmean`'s only in-package callers are the preprocessing filters at `filter_width` (default 5).
+# The 48-wide windows mentioned at the top of this file belong to the deque reductions, which carry
+# no scratch and are untouched by this. A wider default would want a larger band.
 const _BAND_ROWS = 16
 
 # The masked path, in the same row bands as the dense one below.
@@ -255,10 +281,14 @@ const _BAND_ROWS = 16
 # This path is not a corner case. A single NaN anywhere sends the whole array here, and reprojection
 # routinely leaves a no-data border — so a scene that has been warped to a common grid, which is
 # every scene in a production run, takes this branch.
+#
+# `rowbuf`/`cntbuf` look redundant now that `sums` is only 16 rows tall — the row pass could slide
+# over `sums` directly. Tried, and it is 6% *slower* (3.55 ms against 3.35): the row pass makes four
+# reads per output at a stride of `nb`, and copying the row into a contiguous vector first is worth
+# more than the copy costs. Keeping the buffer.
 function _windowmean_masked!(out, A::AbstractMatrix, wx::Int, wy::Int)
     nr, nc = size(A)
-    lx, ly = wx ÷ 2, wy ÷ 2        # even windows are left-biased
-    rx, ry = wx - 1 - lx, wy - 1 - ly
+    lx, ly, rx, ry = _window_margins(wx, wy)
     nb = min(_BAND_ROWS, nr)
     sums = Matrix{Float64}(undef, nb, nc)
     counts = Matrix{Int32}(undef, nb, nc)
@@ -350,10 +380,14 @@ end
 # Bit-identical to the unbanded version, which is the property that makes banding safe here: each
 # band restarts its running sum from the window that its first row sees, so no value is the result
 # of a longer or differently-ordered accumulation than before. Verified exactly, not to a tolerance.
+#
+# The scratch is allocated per call rather than pooled the way `CorrelationWorkspace` is, and now
+# deliberately so: banding took it to ~140 KiB, and allocating it measures 0.34 us against a 3.4 ms
+# call — 0.01%. Joining the pool would add plumbing for nothing. Before banding, at 8 MiB a call,
+# pooling would have been the obvious move; the cheaper change removed the reason for it.
 function _windowmean_dense!(out, A::AbstractMatrix, wx::Int, wy::Int)
     nr, nc = size(A)
-    lx, ly = wx ÷ 2, wy ÷ 2        # even windows are left-biased
-    rx, ry = wx - 1 - lx, wy - 1 - ly
+    lx, ly, rx, ry = _window_margins(wx, wy)
     nb = min(_BAND_ROWS, nr)
     sums = Matrix{Float64}(undef, nb, nc)
     rowbuf = Vector{Float64}(undef, nc)
@@ -480,8 +514,7 @@ function _window_sorted(A::AbstractMatrix, w, reduce!::F, ::Val{N} = Val(1)) whe
     wx, wy = _window_size(w, A)
     nr, nc = size(A)
     outs = ntuple(_ -> fill(NaN32, nr, nc), Val(N))
-    lx, ly = wx ÷ 2, wy ÷ 2        # even windows are left-biased
-    rx, ry = wx - 1 - lx, wy - 1 - ly
+    lx, ly, rx, ry = _window_margins(wx, wy)
     buf = Vector{Float32}(undef, wx * wy)
 
     @inbounds for j in 1:nc, i in 1:nr
@@ -563,8 +596,7 @@ function count_agreeing(A::AbstractMatrix, w, tol::Real)
     nr, nc = size(A)
     out = similar(A, Float32)
     t = Float32(tol)
-    lx, ly = wx ÷ 2, wy ÷ 2    # even windows are left-biased; see `_deque_pass!`
-    rx, ry = wx - 1 - lx, wy - 1 - ly
+    lx, ly, rx, ry = _window_margins(wx, wy)
 
     @inbounds for j in 1:nc, i in 1:nr
         centre = Float32(A[i, j])

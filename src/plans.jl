@@ -76,6 +76,17 @@ const IRFFT_PLANS = Dict{Tuple{Int,Int},Ptr{Cvoid}}()
 # encodes cache and SIMD-width assumptions that do not hold; and FFTW's serialisation format
 # is its own business. Reading another machine's file would be worse than planning fresh.
 #
+# One consequence worth stating, because it will otherwise be mistaken for a bug in the correlator.
+# **Wisdom makes `correlation` reproducible only against a fixed wisdom file, not absolutely.** The
+# planner picks a different algorithm for the same transform size depending on what it has measured,
+# and different algorithms reassociate the same floating-point sum differently. Measured: the same
+# binary, run twice with the wisdom file restored in between, gives `correlation` values differing by
+# up to 3.6e-7 — while `dx` and `dy` are bit-identical, because a peak's *location* is far from
+# sensitive to a 1e-7 perturbation of the surface. That is the honest characterisation: displacements
+# are reproducible, the similarity value is reproducible to ~1e-7. Verified across four scene and
+# filter combinations at 512² and 1024². It is also why `test/opencv.jl`'s reported worst deviation
+# moves between runs without anything having changed.
+#
 # Every filesystem touch is guarded. A read-only depot, a full disk, or a sandbox with no
 # writable scratch directory must degrade to today's behaviour — plan every time — rather than
 # fail a correlation. That is the difference between an optimization and a dependency.
@@ -97,12 +108,18 @@ const PKG_UUID = Base.UUID("52cb0ed0-aa80-430c-bd04-c52888a79add")
 
 # Set once the wisdom file has been read, so a process imports at most once.
 const WISDOM_LOADED = Ref(false)
-# The resolved wisdom path, and whether resolution has happened. Two refs rather than one because
-# `nothing` — no writable scratch space — is a real answer worth caching, not a "not yet" sentinel.
-const WISDOM_PATH = Ref{Union{String,Nothing}}(nothing)
-const WISDOM_PATH_RESOLVED = Ref(false)
 # Sizes planned since the last export, so an export only happens when there is something new.
 const WISDOM_DIRTY = Ref(false)
+
+# The filename component, cached because it is the expensive part and the only part that cannot
+# change while the process runs. `Sys.cpu_info()` allocates a vector of per-core structs and the
+# regex over its model string costs another 6 us — 12.3 of the 9.6 us a full uncached resolution
+# takes. The *directory* is deliberately not cached; see `wisdom_path`.
+#
+# `Ref` rather than a `const` binding because `__init__` must be able to re-resolve it: a value
+# computed during precompilation would be serialised into the image and inherited by whatever
+# machine loads it, which for a CPU-keyed filename is exactly wrong.
+const WISDOM_FILENAME = Ref("")
 
 """
     AutoRIFT.wisdom_path() -> String or nothing
@@ -113,44 +130,40 @@ Keyed by CPU model and FFTW version: wisdom is portable across neither, and impo
 machine's would produce plans tuned for the wrong cache hierarchy.
 """
 function wisdom_path()
-    # Resolved once per process. The path is derived from the CPU model, the FFTW version and the
-    # depot — none of which change while a process runs — so recomputing it is pure waste, and it
-    # is not free: `Sys.cpu_info()` allocates a vector of per-core structs and `mkpath` stats the
-    # directory, together 9.6 us and 4.1 KiB per call.
-    #
-    # Caching also closes a hole that only opens when the scratch directory is *unwritable*. There
-    # `save_wisdom!` returns before clearing `WISDOM_DIRTY`, so the flag stays set and every later
-    # `warm_plans!` — once per chip-size level per pair, forever — re-pays the lookup and its
-    # failure. Measured at 116 us and 6.6 KiB per call, or 202 extra allocations per image pair.
-    # `nothing` is a legitimate cached answer, hence the two-state `Ref` rather than a sentinel.
-    WISDOM_PATH_RESOLVED[] && return WISDOM_PATH[]
-    WISDOM_PATH_RESOLVED[] = true
-    WISDOM_PATH[] = try
+    try
         # `Sys.cpu_info()` can report a model string with spaces and slashes ("Apple M2 Max",
-        # "Intel(R) Xeon(R) Gold 6248R CPU @ 3.00GHz"), none of which belong in a filename.
-        cpu = replace(Sys.cpu_info()[1].model, r"[^A-Za-z0-9._-]+" => "_")
+        # "Intel(R) Xeon(R) Gold 6248R CPU @ 3.00GHz"), none of which belong in a filename. Cached:
+        # it is 12.3 us of the cost and cannot change under a running process.
+        if isempty(WISDOM_FILENAME[])
+            cpu = replace(Sys.cpu_info()[1].model, r"[^A-Za-z0-9._-]+" => "_")
+            WISDOM_FILENAME[] = "$(cpu)-fftw$(FFTW_VERSION).wisdom"
+        end
+        # The directory is resolved every call, and that is not an oversight. `Scratch`'s
+        # `with_scratch_directory` redirects `scratch_dir` *dynamically*, and the test suite relies
+        # on it to exercise the read-only-depot and corrupt-file paths without touching the real
+        # depot. Caching the whole path made that redirect a silent no-op — the isolation tests kept
+        # passing while writing into the developer's own scratch space and asserting against the
+        # wrong directory. A test that passes for the wrong reason is worse than the 2.3 us this
+        # costs (`scratch_dir` 1.0 us, `mkpath` 1.3 us).
         dir = scratch_dir(string(PKG_UUID), "fftw_wisdom")
         mkpath(dir)
-        joinpath(dir, "$(cpu)-fftw$(FFTW_VERSION).wisdom")
+        return joinpath(dir, WISDOM_FILENAME[])
     catch
         # No writable scratch space. Planning still works; it is just never cached.
-        nothing
+        return nothing
     end
-    return WISDOM_PATH[]
 end
 
 """
     AutoRIFT.reset_wisdom_path!()
 
-Forget the cached wisdom path, so the next [`wisdom_path`](@ref) resolves it afresh.
+Forget the cached wisdom filename, so the next [`wisdom_path`](@ref) re-derives it.
 
-Called from `__init__`, because a path resolved while *precompiling* would otherwise be serialised
-into the image and inherited by whatever machine loads it. Also used by tests that move the scratch
-directory.
+Called from `__init__`: a filename derived from the CPU model while *precompiling* would otherwise be
+serialised into the image and inherited by a machine with a different one.
 """
 function reset_wisdom_path!()
-    WISDOM_PATH_RESOLVED[] = false
-    WISDOM_PATH[] = nothing
+    WISDOM_FILENAME[] = ""
     return nothing
 end
 
@@ -198,6 +211,20 @@ killed by a scheduler, which for batch work is the normal way for a process to e
 """
 function save_wisdom!()
     WISDOM_DIRTY[] || return nothing
+    # Cleared up front, on every exit path rather than only the successful one. The distinction that
+    # matters is not success versus failure but "worth retrying" versus not, and none of the ways
+    # this fails is worth retrying: an unwritable depot, a full disk and a missing scratch directory
+    # are all properties of the environment, and they do not become writable between two chip-size
+    # levels of the same image pair.
+    #
+    # Leaving the flag set on failure is what the earlier version did, and it turned one dead export
+    # into a permanent one. `warm_plans!` calls this once per chip-size level per pair, so every
+    # later call re-derived the path and retried the doomed write: measured 116 us and 6.6 KiB a
+    # call, 202 extra allocations per image pair, for the whole life of the process. The cost of
+    # clearing eagerly is that a genuinely transient failure — a disk that frees up mid-run — is not
+    # retried until some new size is planned. That is the right trade: wisdom is an optimization, and
+    # the next process picks it up anyway.
+    WISDOM_DIRTY[] = false
     path = wisdom_path()
     isnothing(path) && return nothing
     try
@@ -213,7 +240,6 @@ function save_wisdom!()
             ccall(:fclose, Cint, (Ptr{Cvoid},), f)
         end
         mv(tmp, path; force = true)
-        WISDOM_DIRTY[] = false
     catch
         # Read-only depot, full disk, or a race with another process. Planning is unaffected.
     end

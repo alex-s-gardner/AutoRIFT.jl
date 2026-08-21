@@ -195,6 +195,12 @@ end
     # expensive as the window grows, because the chip-size loop's dilations reach width 48.
     # An O(w^2) implementation would be ~250x slower at 48 than at 3; this asserts a
     # generous bound that only a genuine complexity regression would breach.
+    #
+    # This is the one timing-dependent assertion in the suite, and it *has* fired spuriously on a
+    # loaded machine — `@elapsed` over three iterations at 256² is a few milliseconds, which is
+    # within scheduler noise. If it fails, re-run before investigating: a real complexity regression
+    # fails by two orders of magnitude, not by a factor of two. The bound stays generous rather than
+    # tight for exactly this reason.
     a = rand(Float32, 256, 256)
     windowmax(a, 3); windowmax(a, 48)          # compile
     t3 = @elapsed for _ in 1:3; windowmax(a, 3); end
