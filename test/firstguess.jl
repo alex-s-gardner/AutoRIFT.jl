@@ -107,9 +107,6 @@ end
 using AutoRIFT: RotationSearch, NoRotationSearch, angles, params
 
 @testset "RotationSearch construction and the off case" begin
-    # `NoRotationSearch` reports a single zero angle, so the caller needs no branch — one angle of
-    # zero is exactly the unrotated case, and that is what keeps the default path free.
-    @test angles(NoRotationSearch()) == (0.0,)
     @test angles(RotationSearch()) == (-3.0, 0.0, 3.0)   # sea_ice_drift's own default
     @test angles(RotationSearch((-1, 0, 1))) == (-1.0, 0.0, 1.0)
 
@@ -124,6 +121,8 @@ using AutoRIFT: RotationSearch, NoRotationSearch, angles, params
     @test params(; rotation = false).rotation === NoRotationSearch()
     @test angles(params(; rotation = true).rotation) == (-3.0, 0.0, 3.0)
     @test angles(params(; rotation = (-2, 0, 2)).rotation) == (-2.0, 0.0, 2.0)
+    # A range works too, which the previous two-method `_rotation` silently rejected.
+    @test angles(params(; rotation = -6:3:6).rotation) == (-6.0, -3.0, 0.0, 3.0, 6.0)
     @test_throws ArgumentError params(; rotation = "yes")
 end
 

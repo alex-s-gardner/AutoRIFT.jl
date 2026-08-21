@@ -3,7 +3,12 @@
 # Its own extension rather than living inside either detector's, because both need it and neither
 # should depend on the other. Loading `NearestNeighbors` alongside `ImageFeatures` or `AkazeFeatures`
 # is what turns the filter from O(n²) into O(n log n) — see `AutoRIFT._neighbour_indices` for the
-# measurements. Both detector extensions list it, so installing a detector brings this along.
+# measurements.
+#
+# **Not installed automatically**, which is worth being clear about: an extension's trigger list is a
+# conjunction of packages the *user* has loaded, not an install directive, so neither detector
+# extension can pull this in. A caller who follows `first_guess`'s docstring and loads only a detector
+# gets the O(n²) path. `first_guess` says so.
 
 module AutoRIFTNearestNeighborsExt
 
@@ -11,10 +16,8 @@ using AutoRIFT
 using AutoRIFT: _NeighbourStrategy
 using NearestNeighbors: KDTree, knn
 
-# A *new* strategy type, and a method on `_neighbour_strategy` selecting it — not a redefinition of
-# `_neighbour_indices(::AbstractVector, ::Int)`. Adding a method with a signature the core already
-# defines does not extend it, it overwrites it, and Julia then refuses to precompile the extension:
-# `Method overwriting is not permitted during Module precompilation`. Found the hard way.
+# A *new* strategy type rather than a redefinition of the core's `_neighbour_indices` — see that
+# function for why the obvious spellings fail.
 struct KDTreeNeighbours <: _NeighbourStrategy end
 # More specific than the core's `::Type{<:_NeighbourStrategy}` fallback, so this wins by dispatch
 # rather than by replacing it.

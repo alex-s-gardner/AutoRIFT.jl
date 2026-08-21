@@ -167,10 +167,18 @@ _outliers(x, _kw) = _badtype(:outliers, x, "a Symbol or an `OutlierMethod`")
 _rotation(::Nothing) = NoRotationSearch()
 _rotation(x::Bool) = x ? RotationSearch() : NoRotationSearch()
 _rotation(x::RotationMethod) = x
-_rotation(x::Tuple) = RotationSearch(x)
-_rotation(x::AbstractVector) = RotationSearch(Tuple(x))
+# One method over any real-valued iterable rather than a `Tuple` method plus an `AbstractVector` one:
+# `RotationSearch`'s inner constructor already does `Tuple(Float64.(angles))`, so both were
+# duplicating its work — and the pair silently rejected a *range*, which is the natural spelling for
+# `-6:3:6`.
+#
+# Constrained to `Real` eltype rather than left as a bare fallback. `RotationSearch("yes")` does throw
+# on its own, but as `MethodError: no method matching Float64(::String)` — which says nothing about
+# which keyword was wrong. `_badtype` names it.
+_rotation(x::Union{Tuple{Vararg{Real}},AbstractVector{<:Real},AbstractRange{<:Real}}) =
+    RotationSearch(x)
 _rotation(x) = _badtype(:rotation, x,
-                       "`nothing`, a `Bool`, a tuple of angles, or a `RotationMethod`")
+                       "`nothing`, a `Bool`, a collection of angles, or a `RotationMethod`")
 
 _badtype(kw::Symbol, x, expected) =
     throw(ArgumentError("`$kw` must be $expected, got a $(typeof(x))."))

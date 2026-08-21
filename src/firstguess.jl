@@ -247,6 +247,12 @@ Requires `ImageFeatures` to be loaded — the methods are in a package extension
 - Filtering keywords are forwarded to [`consistent_matches`](@ref).
 - Detector-specific keywords are forwarded to the matcher; see [`ORBGuess`](@ref) and
   [`AKAZEGuess`](@ref).
+
+!!! tip "Load `NearestNeighbors` too"
+    The consistency filter's neighbour search is O(n²) without it and O(n log n) with — 90x at 20000
+    matches, and A-KAZE produces tens of thousands. It is a weak dependency of this package but *not*
+    installed by loading a detector, so `using NearestNeighbors` is a separate step and worth taking
+    for anything beyond a few thousand matches.
 """
 function first_guess(reference::AbstractMatrix, secondary::AbstractMatrix, method::FirstGuess;
                      search_radius = 6, chip_size = 32, min_matches::Integer = 8,
@@ -359,7 +365,9 @@ end
 # every size tested, since both strategies take the same K nearest neighbours.
 #
 # The tree method lives in its own extension rather than here: `NearestNeighbors` is only needed by
-# the sea-ice path, and a core dependency for one optional stage is the wrong trade.
+# the sea-ice path, and a core dependency for one optional stage is the wrong trade. It is **not**
+# pulled in by loading a detector — extension triggers are a conjunction of what the user loaded, not
+# an install directive — so `first_guess`'s docstring names it.
 #
 # Dispatched on a *strategy* argument, and the reason is worth recording because the obvious
 # spellings both fail. Verified in a six-line reproduction package, not inferred:
