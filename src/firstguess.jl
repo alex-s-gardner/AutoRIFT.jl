@@ -409,6 +409,12 @@ function scene_rotation(x::AbstractVector, y::AbstractVector, dx::AbstractVector
 
     # Centroids of both point sets. Removing them is what makes this a fit for rotation *alone* —
     # otherwise a pure translation would masquerade as a rotation about a distant centre.
+    #
+    # Two passes, and deliberately. The sums below can be had from raw moments in one pass —
+    # `Σ(a-ā)(d-d̄) = Σad - n·ā·d̄` — which measures 1.84x faster at 40000 points, and loses two
+    # digits to cancellation doing it (1.5e-12 against 5e-14 error on a 7° fit). This runs **once per
+    # pair**: 71 µs against the 8.9 s the detection it feeds costs. Trading accuracy for 39 µs on a
+    # quantity that steers every subsequent correlation is the wrong side of that trade.
     sx = sy = tx = ty = 0.0
     @inbounds for i in 1:n
         px, py = Float64(x[i]), Float64(y[i])

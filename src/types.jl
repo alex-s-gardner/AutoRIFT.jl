@@ -533,8 +533,9 @@ struct RotationSearch{A<:Tuple} <: RotationMethod
         return new{typeof(t)}(t, a)
     end
 end
-RotationSearch(angles; about::Real = 0.0) = RotationSearch(angles, about)
-RotationSearch(; about::Real = 0.0) = RotationSearch((-3.0, 0.0, 3.0), about)
+# The keyword form is the documented one; the inner constructor is positional so `Params`'s
+# positional constructor -- the trimmable entry point -- can reach it without a keyword call.
+RotationSearch(angles = (-3.0, 0.0, 3.0); about::Real = 0.0) = RotationSearch(angles, about)
 
 """
     AutoRIFT.angles(method::RotationSearch) -> Tuple
@@ -548,13 +549,18 @@ but `angles .- about`. Resolving it here means the correlator and the tests cann
 sign — which mattered, since the first version of this had it backwards and the table in
 [`RotationSearch`](@ref) is what caught it.
 
+No `about == 0` fast path. One was written, on the assumption the common case should skip the
+subtraction, and it is measurably *slower* than the unconditional form in **both** cases — 2.08
+against 1.83 ns at `about = 0` — because subtracting a constant from a tuple is free and the branch
+is not.
+
 Only defined for [`RotationSearch`](@ref). There was a `NoRotationSearch` method returning `(0.0,)`,
 justified as letting the caller skip a branch — but no such caller exists: the correlation dispatches
 on the method *type* first (`_correlate_rotations!` has a `NoRotationSearch` method that never
 consults this), which is what makes the off path compile to the unrotated call. A method whose stated
 purpose is contradicted by the dispatch above it is worse than no method.
 """
-angles(m::RotationSearch) = m.about == 0.0 ? m.angles : m.angles .- m.about
+angles(m::RotationSearch) = m.angles .- m.about
 
 """
     filter_width(method::PreprocessMethod)
