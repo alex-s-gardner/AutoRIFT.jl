@@ -122,6 +122,12 @@ struct CorrelationWorkspace
     # radius 25 — small enough that the separation costs nothing worth having.
     numerator::Matrix{Float64}
 
+    # The complex numerator, for `Coherence`. `ComplexF32` rather than `ComplexF64`: it is written
+    # by the inverse transform, which is `ComplexF32` throughout, so a wider buffer would only
+    # widen after the fact. The direct path accumulates in `ComplexF64` and narrows on store, which
+    # is the same treatment the real path gives its `Float64` accumulator.
+    cnumerator::Matrix{ComplexF32}
+
     # FFT scratch. Sized to the padded search-window extent; unused by the direct
     # path, but allocated once either way so that a pass can switch strategies
     # without reallocating.
@@ -129,6 +135,19 @@ struct CorrelationWorkspace
     fbuf_b::Matrix{Float32}
     fspec_a::Matrix{ComplexF32}
     fspec_b::Matrix{ComplexF32}
+
+    # Complex FFT scratch, for `Coherence`. Four full-size complex buffers rather than the real
+    # path's two-real-plus-two-half-spectrum: a complex transform has no conjugate symmetry to
+    # exploit, so the spectra are full size, and the c2c transform cannot write in place over a
+    # differently-shaped input.
+    #
+    # These are the largest buffers in the workspace — 4 x fy x fx x 8 bytes, about 226 KiB at
+    # chip 32 with radius 25. Justified by what they buy: the direct numerator they replace was
+    # measured at 47x the ZNCC path at chip 32 and 183x at chip 128.
+    cbuf_a::Matrix{ComplexF32}
+    cbuf_b::Matrix{ComplexF32}
+    cspec_a::Matrix{ComplexF32}
+    cspec_b::Matrix{ComplexF32}
 
     # Maximum extents this workspace was built for, so a mismatched call is an
     # error rather than a silent out-of-bounds read.
@@ -189,10 +208,15 @@ function workspace(::Type{T}, chip_size, search_radius) where {T<:Number}
         Matrix{Float64}(undef, winy + 1, winx + 1),
         Matrix{ComplexF64}(undef, winy + 1, winx + 1),
         Matrix{Float64}(undef, 2ry, 2rx),
+        Matrix{ComplexF32}(undef, 2ry, 2rx),
         Matrix{Float32}(undef, fy, fx),
         Matrix{Float32}(undef, fy, fx),
         Matrix{ComplexF32}(undef, fy ÷ 2 + 1, fx),
         Matrix{ComplexF32}(undef, fy ÷ 2 + 1, fx),
+        Matrix{ComplexF32}(undef, fy, fx),
+        Matrix{ComplexF32}(undef, fy, fx),
+        Matrix{ComplexF32}(undef, fy, fx),
+        Matrix{ComplexF32}(undef, fy, fx),
         (csx, csy),
         (rx, ry),
         Ref(false),
@@ -601,8 +625,57 @@ function _correlate_surface!(
     integral!(S, search)
     integral_sq!(S2, search)
 
+    numerators = _cnumerators!(ws, search, cd, nr, nc, ch, cw)
+
+    @inbounds for j in 1:nc, i in 1:nr
+        s1 = boxsum(S, i, j, ch, cw)
+        s2 = boxsum(S2, i, j, ch, cw)
+        # Σ|W - W̄|² = Σ|W|² - |ΣW|²/n. Clamped for the same cancellation reason as `ZNCC`.
+        wvar = max(s2 - abs2(s1) / n, 0.0)
+        den = cnorm * sqrt(wvar)
+        surface[i, j] = den > 0 ? Float32(abs(numerators[i, j]) / den) : 0.0f0
+    end
+    return surface
+end
+
+"""
+    COMPLEX_DIRECT_THRESHOLD
+
+Work below which the *complex* numerator is evaluated directly, in the same
+`nshifts * chip_area` units as [`DIRECT_THRESHOLD`](@ref).
+
+Much lower than the real threshold, and measured rather than inherited. The direct complex loop
+does four real multiplies and four adds per sample where the real one does one of each, so it falls
+behind the transform far sooner. Swept at radius 1-4 and chip 4-12: the crossover sits between 256
+work (direct wins, 217 ns against 254) and 576 (FFT wins, 406 against 477).
+
+512 therefore, which is *below every configuration the public API can reach* — the smallest legal
+chip is 4 and the default `min_search_radius` is 6, giving 4x4x12x12 = 2304 — so in practice the
+complex path always transforms. That is deliberate: sharing the real path's 20,000 would have sent
+every real configuration down the direct branch, where the FFT is 5.8x faster at the smallest
+reachable size and 113x faster at chip 128. The direct path survives for verification, which is
+what `test/complex.jl` uses it for.
+"""
+const COMPLEX_DIRECT_THRESHOLD = 512
+
+# Direct or FFT, on the same criterion the real path uses but its own threshold. Both write
+# `ws.cnumerator` and return the same view type, so the choice costs one branch per call and
+# introduces no instability.
+function _cnumerators!(ws::CorrelationWorkspace, search, cd, nr, nc, ch, cw)
+    out = @view ws.cnumerator[1:nr, 1:nc]
+    if nr * nc * ch * cw <= COMPLEX_DIRECT_THRESHOLD
+        _cnumerators_direct!(out, search, cd, nr, nc, ch, cw)
+    else
+        _cnumerators_fft!(out, ws, search, cd, nr, nc, ch, cw)
+    end
+    return out
+end
+
+function _cnumerators_direct!(out, search, cd, nr, nc, ch, cw)
     @inbounds for j in 1:nc
         for i in 1:nr
+            # `ComplexF64` accumulator, narrowed on store: the same treatment the real direct path
+            # gives its `Float64` one.
             acc = zero(ComplexF64)
             for jj in 1:cw
                 # Column-major inner loop, as in `_numerators_direct!`: both arrays walk
@@ -612,15 +685,10 @@ function _correlate_surface!(
                            ComplexF64(search[i + ii - 1, j + jj - 1])
                 end
             end
-            s1 = boxsum(S, i, j, ch, cw)
-            s2 = boxsum(S2, i, j, ch, cw)
-            # Σ|W - W̄|² = Σ|W|² - |ΣW|²/n. Clamped for the same cancellation reason as `ZNCC`.
-            wvar = max(s2 - abs2(s1) / n, 0.0)
-            den = cnorm * sqrt(wvar)
-            surface[i, j] = den > 0 ? Float32(abs(acc) / den) : 0.0f0
+            out[i, j] = ComplexF32(acc)
         end
     end
-    return surface
+    return out
 end
 
 # A real image has no phase, so `Coherence` on one is a caller error rather than something to
@@ -732,6 +800,50 @@ function _numerators_fft!(out, ws::CorrelationWorkspace, search, cd, nr, nc, ch,
 
     @inbounds for j in 1:nc, i in 1:nr
         out[i, j] = Float64(a[i + ch - 1, j + cw - 1])
+    end
+    return out
+end
+
+# The complex numerator, `Σ conj(T') · W` for every shift, by FFT.
+#
+# Written into a caller-supplied `ComplexF32` matrix rather than `ws.numerator`, which is
+# `Float64`: the numerator is complex here and only becomes real when its magnitude is taken.
+#
+# Structurally the real version, with one correctness trap worth spelling out. Correlation is
+# convolution with a *reflected* kernel, and the complex measure needs `conj(T')` — so the buffer
+# takes the conjugate of the reversed chip. Conjugating and reversing commute, but forgetting
+# either one produces a plausible surface with the wrong peak: reversal alone gives the
+# *convolution* rather than the correlation, and conjugation alone mirrors the displacement.
+# `test/complex.jl`'s known-shift cases catch both, and the direct/FFT agreement test catches any
+# disagreement between the two paths.
+function _cnumerators_fft!(out, ws::CorrelationWorkspace, search, cd, nr, nc, ch, cw)
+    sh, sw = size(search)
+    fy, fx = size(ws.cbuf_a)
+
+    a, b = ws.cbuf_a, ws.cbuf_b
+    fill!(a, zero(ComplexF32))
+    fill!(b, zero(ComplexF32))
+    @inbounds for j in 1:sw, i in 1:sh
+        a[i, j] = ComplexF32(search[i, j])
+    end
+    @inbounds for j in 1:cw, i in 1:ch
+        b[i, j] = conj(cd[ch - i + 1, cw - j + 1])
+    end
+
+    plan = cfft_plan(fy, fx)
+    cfft_execute!(plan, a, ws.cspec_a)
+    cfft_execute!(plan, b, ws.cspec_b)
+    @inbounds for k in eachindex(ws.cspec_a)
+        ws.cspec_a[k] *= ws.cspec_b[k]
+    end
+    iplan = icfft_plan(fy, fx)
+    # Unnormalised in both directions, so the 1/n is applied on the read below rather than in a
+    # separate pass over the whole buffer — only `nr*nc` of `fy*fx` values are ever used.
+    cfft_execute!(iplan, ws.cspec_a, a)
+
+    scale = 1.0f0 / (fy * fx)
+    @inbounds for j in 1:nc, i in 1:nr
+        out[i, j] = a[i + ch - 1, j + cw - 1] * scale
     end
     return out
 end

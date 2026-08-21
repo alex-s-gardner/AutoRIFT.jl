@@ -57,6 +57,16 @@ const PLAN_LOCK = ReentrantLock()
 # `Ptr{Cvoid}`, so a cache hit yields a concrete type and the `ccall` below is a static call.
 const RFFT_PLANS = Dict{Tuple{Int,Int},Ptr{Cvoid}}()
 const IRFFT_PLANS = Dict{Tuple{Int,Int},Ptr{Cvoid}}()
+# Complex-to-complex, for `Coherence`. Separate caches rather than a flag in the key: these are
+# different FFTW plan kinds operating on differently-shaped buffers, and a plan executed with the
+# wrong kind is a buffer overrun rather than an error.
+const CFFT_PLANS = Dict{Tuple{Int,Int},Ptr{Cvoid}}()
+const ICFFT_PLANS = Dict{Tuple{Int,Int},Ptr{Cvoid}}()
+
+# FFTW's sign convention for `fftwf_plan_dft_2d`, from `fftw3.h`. The forward transform uses
+# `FFTW_FORWARD`; the inverse uses `FFTW_BACKWARD` and is unnormalised, exactly as the c2r plan is.
+const FFTW_FORWARD = Cint(-1)
+const FFTW_BACKWARD = Cint(1)
 
 # ---------------------------------------------------------------------------
 # Wisdom persistence
@@ -328,6 +338,71 @@ function ifft_plan(ny::Int, nx::Int)
 end
 
 """
+    cfft_plan(ny, nx)   /   icfft_plan(ny, nx)
+
+Complex-to-complex forward and inverse FFT plans for an `ny`-by-`nx` `ComplexF32` array.
+
+Used by [`Coherence`](@ref), whose chip is complex and so cannot go through the real-to-complex
+transform the real measures use. Both directions are full `ny`-by-`nx` — there is no conjugate
+symmetry to exploit — so a complex transform moves about twice the data of the real one at the
+same size. That is the price of phase, and it is far below the price of not transforming at all.
+
+Same `(nx, ny)` argument reversal and the same wisdom persistence as [`fft_plan`](@ref).
+"""
+function cfft_plan(ny::Int, nx::Int)
+    key = (ny, nx)
+    p = get(CFFT_PLANS, key, C_NULL)
+    p === C_NULL || return p
+    return lock(PLAN_LOCK) do
+        get!(CFFT_PLANS, key) do
+            WISDOM_DIRTY[] = true
+            inb = Matrix{ComplexF32}(undef, ny, nx)
+            outb = Matrix{ComplexF32}(undef, ny, nx)
+            plan = ccall((:fftwf_plan_dft_2d, LIBFFTW3F), Ptr{Cvoid},
+                         (Cint, Cint, Ptr{ComplexF32}, Ptr{ComplexF32}, Cint, Cuint),
+                         nx, ny, inb, outb, FFTW_FORWARD, FFTW_MEASURE)
+            plan == C_NULL && error("FFTW could not plan a $(ny)x$(nx) forward complex " *
+                                    "transform.")
+            plan
+        end
+    end
+end
+
+function icfft_plan(ny::Int, nx::Int)
+    key = (ny, nx)
+    p = get(ICFFT_PLANS, key, C_NULL)
+    p === C_NULL || return p
+    return lock(PLAN_LOCK) do
+        get!(ICFFT_PLANS, key) do
+            WISDOM_DIRTY[] = true
+            inb = Matrix{ComplexF32}(undef, ny, nx)
+            outb = Matrix{ComplexF32}(undef, ny, nx)
+            plan = ccall((:fftwf_plan_dft_2d, LIBFFTW3F), Ptr{Cvoid},
+                         (Cint, Cint, Ptr{ComplexF32}, Ptr{ComplexF32}, Cint, Cuint),
+                         nx, ny, inb, outb, FFTW_BACKWARD, FFTW_MEASURE)
+            plan == C_NULL && error("FFTW could not plan a $(ny)x$(nx) inverse complex " *
+                                    "transform.")
+            plan
+        end
+    end
+end
+
+"""
+    cfft_execute!(plan, input, output)
+
+Run a complex-to-complex plan from [`cfft_plan`](@ref) or [`icfft_plan`](@ref).
+
+**Unnormalised in both directions**, like FFTW's c2r transform — the caller applies `1/n` after
+the inverse. Unlike c2r, this transform does *not* destroy its input, so a spectrum may be reused.
+"""
+@inline function cfft_execute!(plan::Ptr{Cvoid}, input::Matrix{ComplexF32},
+                               output::Matrix{ComplexF32})
+    ccall((:fftwf_execute_dft, LIBFFTW3F), Cvoid,
+          (Ptr{Cvoid}, Ptr{ComplexF32}, Ptr{ComplexF32}), plan, input, output)
+    return output
+end
+
+"""
     ifft_execute!(plan, input, output)
 
 Run a complex-to-real plan from [`ifft_plan`](@ref), scaled.
@@ -383,6 +458,12 @@ function clear_plans!()
     lock(PLAN_LOCK) do
         empty!(RFFT_PLANS)
         empty!(IRFFT_PLANS)
+        # The complex caches must be emptied here too, and this is not tidiness: `__init__` calls
+        # this to discard plans serialised into the precompile image, and a dangling plan handle
+        # segfaults inside FFTW rather than erroring. Missing a cache here would reintroduce
+        # precisely the crash `test/plans.jl`'s regression test exists to catch.
+        empty!(CFFT_PLANS)
+        empty!(ICFFT_PLANS)
     end
     return nothing
 end

@@ -18,7 +18,8 @@
 # realisation would be a flaky test rather than a stronger one.
 
 using AutoRIFT: workspace, correlate!, prepare_chip!, peak_index, deramp, ramp_phase,
-                Coherence, ZNCC, Deramp, chip_measures, params
+                Coherence, ZNCC, Deramp, chip_measures, params,
+                _cnumerators_direct!, _cnumerators_fft!
 
 # A speckle-like complex field: circular Gaussian, which is what fully-developed speckle is.
 # Smoothed so neighbouring samples correlate, otherwise a shifted copy has no structure to find.
@@ -156,6 +157,35 @@ end
     @test spoiled < 0.3
     @test restored > 0.8
     @test restored > 4 * spoiled
+end
+
+@testset "the direct and FFT complex numerators agree" begin
+    # The complex numerator has two implementations for the same reason the real one does: the FFT
+    # is what makes it affordable (113x at chip 128), and the direct loop is what the FFT is checked
+    # against. They must agree to Float32 rounding.
+    #
+    # This also guards the trap in `_cnumerators_fft!`: correlation needs the *conjugate* of the
+    # *reversed* chip, and dropping either operation yields a plausible surface with a wrong peak —
+    # reversal alone gives convolution, conjugation alone mirrors the displacement.
+    worst = 0.0
+    for (cs, r) in ((16, 6), (24, 8), (32, 10), (32, 25))
+        z = speckle(cs + 2r - 1)
+        chip = z[(r + 1):(r + cs), (r + 1):(r + cs)]
+        ws = workspace(ComplexF32, cs, r)
+        prepare_chip!(ws, chip)
+        cd = @view ws.cchip[1:cs, 1:cs]
+        nr, nc = 2r, 2r
+        d = Matrix{ComplexF32}(undef, nr, nc)
+        f = Matrix{ComplexF32}(undef, nr, nc)
+        _cnumerators_direct!(d, z, cd, nr, nc, cs, cs)
+        _cnumerators_fft!(f, ws, z, cd, nr, nc, cs, cs)
+        # Relative to the scale of the numerator, which is what a tolerance on a correlation sum
+        # has to be — the absolute magnitude grows with the chip area.
+        rel = maximum(abs.(d .- f)) / maximum(abs, d)
+        worst = max(worst, rel)
+        @test rel < 1e-6
+    end
+    @info "worst direct-vs-FFT complex numerator deviation" worst
 end
 
 @testset "uncorrelated speckle gives low coherence" begin
