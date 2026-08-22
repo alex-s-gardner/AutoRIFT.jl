@@ -116,10 +116,20 @@ end
 @testset "Params is concrete" begin
     # A field of abstract type would make every downstream kernel type-unstable,
     # so this is a structural guarantee, not a style preference.
-    p = AutoRIFT.params()
-    @test isconcretetype(typeof(p))
-    for name in fieldnames(typeof(p))
-        @test isconcretetype(fieldtype(typeof(p), name))
+    #
+    # Checked with a rotation method as well as without. `RotationSearch` carries a tuple type
+    # parameter, and the whole reason it is a *tuple* rather than a `Vector` is this property: a
+    # `Vector` field is concrete but **not** isbits, which would stop `Params` storing inline.
+    # Measured, that parameterisation buys 1.000x at chip 32/64/128 — nothing — so the tuple is
+    # here for `isbits` and for the trimmed binary, not for speed. `isconcretetype` alone does not
+    # catch a regression to `Vector`; `isbitstype` does, which is why both are asserted.
+    for p in (AutoRIFT.params(), AutoRIFT.params(; rotation = true),
+              AutoRIFT.params(; rotation = (-6, -3, 0, 3, 6)))
+        @test isconcretetype(typeof(p))
+        @test isbitstype(typeof(p))
+        for name in fieldnames(typeof(p))
+            @test isconcretetype(fieldtype(typeof(p), name))
+        end
     end
 end
 

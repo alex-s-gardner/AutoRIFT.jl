@@ -508,6 +508,24 @@ abstract type RotationMethod end
 
 struct NoRotationSearch <: RotationMethod end
 
+# The angles are a *tuple* type parameter, and the reason is `isbits` rather than speed.
+#
+# The cost is real and was measured: each distinct angle *count* is a distinct `RotationSearch`
+# type, hence a distinct `Params`, hence a full recompile of the correlation pipeline — ~600 ms
+# per new count (785 / 607 / 520 ms for 3, 5 and 7 angles cold), where new angle *values* at a
+# count already seen are free at 7.6 ms. A caller sweeping counts pays that per count, once per
+# session.
+#
+# And the parameterisation buys **nothing** at runtime: against a byte-identical copy of
+# `_correlate_rotations!` iterating a `Vector{Float64}` of the same angles, the ratio is
+# 1.000 / 1.001 / 1.000 at chip 32 / 64 / 128. Of course it is — the loop body is one
+# `_rotate_chip` plus one `correlate!` at 49-550 µs, so unrolling three iterations is unmeasurable.
+#
+# What a `Vector` field would cost is the deciding measurement: it is `isconcretetype` but **not**
+# `isbitstype`, and `Params` is currently `isbitstype` — which is what lets it store inline with no
+# dispatch and is load-bearing for the `--trim`ed binary in `app/`. Trading that for a one-time
+# ~600 ms of recompile is the wrong direction, so the tuple stays. `test/params.jl` asserts
+# `isbitstype` and not merely `isconcretetype` for exactly this reason.
 struct RotationSearch{A<:Tuple} <: RotationMethod
     angles::A
     about::Float64
