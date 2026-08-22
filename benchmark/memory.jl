@@ -173,6 +173,19 @@ function run_memory()
         record!("memory/pair 1024x1024 upsampling $up",
                 pair_peak(1024; threads = "auto", kw = ", upsampling = $up"))
     end
+    # The rotation search, whose whole cost claim is that it adds *buffers* and not per-point
+    # allocation. Measured: 324 allocations against 323 without it, byte-identical at 22.69 MiB of
+    # transient allocation, at any angle count — the extra work goes into the workspace's
+    # `rotchip`/`rotbest`, so churn does not move at all. Peak above the runtime floor is 13.1 MiB
+    # without rotation, 13.0 with three angles, 16.6 with five: three angles is free and the growth
+    # from there is the pooled surface copies, not per-point work.
+    #
+    # Tracked because "one more allocation, whatever the angle count" is exactly the kind of
+    # property a later refactor breaks silently.
+    record!("memory/pair 1024x1024 rotation x3",
+            pair_peak(1024; threads = "auto", kw = ", rotation = true"))
+    record!("memory/pair 1024x1024 rotation x5",
+            pair_peak(1024; threads = "auto", kw = ", rotation = (-6, -3, 0, 3, 6)"))
     g = series_growth(30)
     record!("memory/series 30 pairs 512x512 rss", g.rss)
     # The one that answers "does it leak?". Tracked separately because `rss` never falls and so

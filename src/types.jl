@@ -499,23 +499,33 @@ above, seen from the other end.
 It matters because the search window is narrow on purpose. A scene rotated 8° is outside `±3°`
 entirely — every angle tried is wrong by at least 5°, and widening the tuple to reach it costs a
 correlation per angle for angles that can only ever lose. One scene-level estimate moves the whole
-window instead, so `±3°` around 8° searches 5-11° at the same 3x cost:
+window instead, so `±3°` around 8° searches 5-11° at the same 3x cost.
 
-```julia
-guess = first_guess(a, b, AKAZEGuess())
-α = scene_rotation(guess)                    # degrees, from the sparse vectors
-out = autorift(a, b, guess; rotation = RotationSearch(; about = α))
-```
-
-`sea_ice_drift` gets `alpha0` from *geolocation* — the bearing between two corners of the secondary
-scene reprojected into the reference's grid — which for a co-registered pair is identically zero.
-[`scene_rotation`](@ref) instead fits it from the sparse displacements, which is the quantity that
-is actually nonzero here and needs no geolocation at all.
+[`scene_rotation`](@ref) is where that estimate comes from, and where the choice to fit it from the
+sparse vectors rather than from geolocation is argued.
 """
 abstract type RotationMethod end
 
 struct NoRotationSearch <: RotationMethod end
 
+# The angles are a *tuple* type parameter, and the reason is `isbits` rather than speed.
+#
+# The cost is real and was measured: each distinct angle *count* is a distinct `RotationSearch`
+# type, hence a distinct `Params`, hence a full recompile of the correlation pipeline — ~600 ms
+# per new count (785 / 607 / 520 ms for 3, 5 and 7 angles cold), where new angle *values* at a
+# count already seen are free at 7.6 ms. A caller sweeping counts pays that per count, once per
+# session.
+#
+# And the parameterisation buys **nothing** at runtime: against a byte-identical copy of
+# `_correlate_rotations!` iterating a `Vector{Float64}` of the same angles, the ratio is
+# 1.000 / 1.001 / 1.000 at chip 32 / 64 / 128. Of course it is — the loop body is one
+# `_rotate_chip` plus one `correlate!` at 49-550 µs, so unrolling three iterations is unmeasurable.
+#
+# What a `Vector` field would cost is the deciding measurement: it is `isconcretetype` but **not**
+# `isbitstype`, and `Params` is currently `isbitstype` — which is what lets it store inline with no
+# dispatch and is load-bearing for the `--trim`ed binary in `app/`. Trading that for a one-time
+# ~600 ms of recompile is the wrong direction, so the tuple stays. `test/params.jl` asserts
+# `isbitstype` and not merely `isconcretetype` for exactly this reason.
 struct RotationSearch{A<:Tuple} <: RotationMethod
     angles::A
     about::Float64
@@ -526,10 +536,14 @@ struct RotationSearch{A<:Tuple} <: RotationMethod
         allunique(t) || throw(ArgumentError(
             "`RotationSearch` angles must be distinct, got $t — a repeated angle costs a full " *
             "correlation and can never win."))
+        # The invariant is that every angle *tried* is finite, and the angles tried are
+        # `t .- about` — so both halves need checking. Enforcing it only on `about` was the first
+        # version, and it let `RotationSearch((NaN, 0.0, 3.0))` construct: `_rotate_chip` then
+        # produces an all-NaN chip that disappears into the degenerate path, reported as a
+        # textureless chip rather than as the bad input it is.
         a = Float64(about)
-        isfinite(a) || throw(ArgumentError(
-            "`RotationSearch` `about` must be finite, got $a. `scene_rotation` returns `NaN` when " *
-            "it cannot fit a rotation; check for that rather than passing it through."))
+        (all(isfinite, t) && isfinite(a)) || throw(ArgumentError(
+            "`RotationSearch` needs finite angles and a finite `about`, got angles $t about $a."))
         return new{typeof(t)}(t, a)
     end
 end

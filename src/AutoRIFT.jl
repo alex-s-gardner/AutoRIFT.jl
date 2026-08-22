@@ -187,11 +187,27 @@ using PrecompileTools: @setup_workload, @compile_workload
                        (round.(Int16, base .* 10_000), round.(Int16, shifted .* 10_000)))
             autorift(a, b; chip_size = 32, search_radius = 6, chip_size_max = 32)
             # The batch path, which compiles separately from the one-shot one.
+            # (rotation is covered once, below, rather than per element type)
             cache = init(a, b; chip_size = 32, search_radius = 6, chip_size_max = 32)
             autorift!(cache)
             reinit!(cache; secondary = b)
             autorift!(cache)
         end
+        # The rotation search, which `NoRotationSearch` does *not* cover: `_correlate_rotations!`
+        # has a separate method per rotation type, so the calls above — all at the default
+        # `rotation = nothing` — leave `_rotate_chip`, the `RotationSearch` method, and the whole
+        # `Params{…,RotationSearch{…}}` specialisation of the track loop cold. Measured: 606 ms on
+        # first call against 2.6 ms warm, which is 23x the fully-precompiled no-rotation call and
+        # lands on exactly the sea-ice callers this path exists for. Precompilation is ~1% slower,
+        # within noise, because it reuses everything above.
+        #
+        # Float32 only, and one angle count. The element types above buy nothing here — the
+        # rotation buffer is `Float32` regardless of input type — and each distinct *angle count*
+        # is a distinct `RotationSearch` type, so covering more than one would multiply precompile
+        # cost for a caller who may use neither. Three angles is `RotationSearch`'s default and
+        # `sea_ice_drift`'s.
+        autorift(base, shifted; chip_size = 32, search_radius = 6, chip_size_max = 32,
+                 rotation = true)
     end
 end
 

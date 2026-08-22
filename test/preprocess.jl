@@ -199,13 +199,11 @@ end
     b = tex .* ramp .+ (ramp .- 0.4f0)          # gain and offset both vary across x
 
     cs, r = 32, 10
-    h = cs ÷ 2
     cx = cy = 100
     ws = workspace(Float32, cs, r)
 
     function corr_at(ref, sec)
-        chip = sec[(cy - h):(cy + h - 1), (cx - h):(cx + h - 1)]
-        search = ref[(cy - h - r):(cy + h + r - 2), (cx - h - r):(cx + h + r - 2)]
+        chip, search = chip_and_window(sec, (cy, cx), cs, r; window_from = ref)
         surface = correlate!(ws, search, chip, r)
         return peak_offset(surface, (r, r))
     end

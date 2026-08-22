@@ -99,11 +99,10 @@ end
     cs, r = 32, 25
     ws = workspace(Float32, cs, r)
     cx, cy = 150, 150
-    h = cs ÷ 2
-    search = img[(cy - h - r):(cy + h + r - 2), (cx - h - r):(cx + h + r - 2)]
 
     for (sx, sy) in ((0, 0), (3, -2), (7, 11), (-13, 5), (24, -24), (-24, 24))
-        chip = img[(cy - h + sy):(cy + h - 1 + sy), (cx - h + sx):(cx + h - 1 + sx)]
+        # The window stays put and the chip is cut `(sx, sy)` away, so the peak must land there.
+        chip, search = chip_and_window(img, (cy, cx), cs, r; shift = (sy, sx))
         surface = correlate!(ws, search, chip, r)
         dx, dy, c = peak_offset(surface, (r, r))
         @test (dx, dy) == (sx, sy)
@@ -119,9 +118,7 @@ end
     img = synthetic_texture(120; seed = 3)
     cs, r = 32, 10
     ws = workspace(Float32, cs, r)
-    h = cs ÷ 2
-    chip = img[(60 - h):(60 + h - 1), (60 - h):(60 + h - 1)]
-    search = img[(60 - h - r):(60 + h + r - 2), (60 - h - r):(60 + h + r - 2)]
+    chip, search = chip_and_window(img, (60, 60), cs, r)
     surface = correlate!(ws, search, chip, r)
     dx, dy, c = peak_offset(surface, (r, r))
     @test (dx, dy) == (0, 0)
@@ -194,9 +191,7 @@ end
     # as chip size crosses it.
     img = synthetic_texture(400; seed = 11)
     cs, r = 64, 25
-    h = cs ÷ 2
-    chip = img[(200 - h):(200 + h - 1), (200 - h):(200 + h - 1)]
-    search = img[(200 - h - r):(200 + h + r - 2), (200 - h - r):(200 + h + r - 2)]
+    chip, search = chip_and_window(img, (200, 200), cs, r)
 
     ws = workspace(Float32, cs, r)
     direct = copy(correlate!(ws, search, chip, r))

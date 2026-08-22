@@ -92,6 +92,13 @@ Only the images that actually changed are re-filtered, and an image already prep
 slot is reused — so a walk along consecutive acquisitions, where each new reference is the
 previous secondary, filters each image once rather than twice.
 
+!!! warning "`Params` is not reinitialised, which matters for `about`"
+    The cache keeps its `Params`, and that is the point — the plans and buffers depend on it. But
+    [`RotationSearch`](@ref)'s `about` is a **per-pair** quantity, so a cache built with
+    `about = scene_rotation(guess)` from the first pair applies that pair's ice rotation to every
+    later one, and `reinit!` cannot update it. For a rotating time series, call [`autorift`](@ref)
+    per pair with a freshly fitted `about` instead of walking a cache.
+
 Returns the cache, so it composes with [`autorift!`](@ref).
 """
 function reinit!(cache::Cache; reference = nothing, secondary = nothing,

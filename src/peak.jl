@@ -43,6 +43,13 @@ is false; an all-`NaN` surface returns `(1, 1)`.
     # row-major order. That yields the same element OpenCV's `minMaxLoc` would
     # return, reached in a different order. Verified against 300 randomised
     # surfaces including heavily-tied and all-equal cases.
+    #
+    # This is the top self-time frame in a profiled pass, so the two-pass alternative was
+    # measured: a strict-max sweep in memory order, then a row-major scan for the first
+    # element equal to it. That is 2x *slower* at every size and content tried (0.40-0.56x,
+    # over random, heavily-tied and all-NaN surfaces at 16² through 64²) -- the row-major
+    # second pass strides across memory and costs more than the tie clause it removes. The
+    # fused pass below is the fast form, not merely the simple one.
     @inbounds for j in 1:nc, i in 1:nr
         v = surface[i, j]
         if v > best || (v == best && (i < best_i || (i == best_i && j < best_j)))

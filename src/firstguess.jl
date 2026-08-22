@@ -1,8 +1,16 @@
-# Sparse feature tracking, to seed the dense search.
+# Sparse feature tracking, to seed the dense search — and what can be read off the result.
 #
 # Layer 2.5: depends on `points.jl` for the output type and on nothing else in the package. The
 # detector itself lives in a package extension, because `ImageFeatures` is a heavy dependency and
 # the optical path has no use for it.
+#
+# `scene_rotation` lives here rather than in `points.jl` despite being a pure function of a
+# `PointSet`, and the reason is its precondition rather than its dependencies. It is only meaningful
+# for priors that are *measurements of this pair* — which is what `first_guess` produces and what
+# `points.jl` cannot promise, since a caller-supplied `PointSet` may carry priors projected from an
+# a-priori velocity model (see `Params.dx_prior`). Fitting a rotation to those returns a confident
+# angle describing the model's geometry rather than the ice's. Adjacency to the one producer whose
+# output satisfies the precondition is worth more here than grouping by argument type.
 #
 # ---------------------------------------------------------------------------
 # Why a first guess at all
@@ -342,8 +350,8 @@ function consistent_matches(points::AbstractVector, dx::AbstractVector, dy::Abst
 end
 
 """
-    scene_rotation(guess::PointSet) -> Float64
-    scene_rotation(x, y, dx, dy) -> Float64
+    scene_rotation(guess::PointSet) -> Union{Float64,Nothing}
+    scene_rotation(x, y, dx, dy) -> Union{Float64,Nothing}
 
 The single rotation, in degrees, that best explains a sparse displacement field.
 
@@ -354,6 +362,17 @@ scene's actual rotation rather than on zero:
 guess = first_guess(a, b, AKAZEGuess())
 out = autorift(a, b, guess; rotation = RotationSearch(; about = scene_rotation(guess)))
 ```
+
+!!! warning "Only for priors that measure *this* pair"
+    A `PointSet`'s priors are not always measured displacements. [`Params`](@ref)'s `dx_prior`/
+    `dy_prior` and a Geogrid-supplied `PointSet` carry an a-priori *velocity model* projected onto
+    the image axes, and fitting a rotation to those returns a confident nonzero angle describing the
+    model's projection geometry rather than the pair's rotation — after which every chip in the run
+    is rotated by it.
+
+    Nothing in the `PointSet` type distinguishes the two, which is why `about` is something the
+    caller passes explicitly rather than something the pipeline fits for itself: passing it is the
+    assertion that these particular priors came from matching these particular images.
 
 # Why this rather than the reference's version
 
@@ -381,9 +400,12 @@ reference**:
 with `s` the centred `p - d` and `t` the centred `p`.
 
 That direction, rather than reference-onto-secondary, for the same reason `dx`/`dy` are reference
-minus secondary: it is the negative of the imaged features' own motion. So the sign here is
-consistent with the rest of the package, and it is what [`RotationSearch`](@ref)'s `about` consumes —
-the chip comes from the secondary and must be turned back, which is why that field is *subtracted*.
+minus secondary: it is the negative of the imaged features' own motion. So the sign is consistent
+with the rest of the package, and `about` takes this value directly with no negation at the call
+site — [`angles`](@ref) is where the subtraction that follows from it is justified, and it is
+justified there rather than restated here so the two cannot drift apart on the one point the
+measurement actually pinned.
+
 Pinned by test in both directions, since a sign error would centre the search on the wrong side of
 the truth and be twice as wrong as not centring it at all.
 
@@ -394,9 +416,16 @@ the truth and be twice as wrong as not centring it at all.
 - **One rotation for the whole scene.** A field with two floes rotating opposite ways fits to
   something near their average, which describes neither. The per-chip search is what handles that,
   and `about` only moves where it starts looking.
-- **Returns `NaN`** when there is nothing to fit: fewer than two points, or a degenerate
-  configuration (all points coincident, or the fit's two sums both zero). `RotationSearch` rejects a
-  non-finite `about` rather than silently searching around zero, so the caller must decide.
+- **Returns `nothing`** when there is nothing to fit: fewer than two points, or a degenerate
+  configuration (all points coincident, or a field with no rotational component, where both sums
+  vanish and `atan(0, 0)` would report a confident zero).
+
+  `nothing` rather than `NaN`, and the distinction is deliberate. NaN is this package's "no
+  measurement" marker in a *field* — see [`track!`](@ref) — where every downstream reduction is
+  written to skip it. A scalar NaN has no such consumer: it survives `α / 2`, `round(α)` and
+  `min(α, 10)` unremarked and only surfaces much later, at whatever finally checks. `nothing` fails
+  at first use instead, so `RotationSearch(; about = scene_rotation(pts))` on an unfittable field is
+  an immediate `MethodError` at the line that made the mistake.
 """
 function scene_rotation(x::AbstractVector, y::AbstractVector, dx::AbstractVector,
                         dy::AbstractVector)
@@ -405,7 +434,7 @@ function scene_rotation(x::AbstractVector, y::AbstractVector, dx::AbstractVector
         "x, y, dx and dy must be the same length, got $n, $(length(y)), $(length(dx)) and " *
         "$(length(dy))"))
     # Two points define a rotation; one defines only a translation.
-    n >= 2 || return NaN
+    n >= 2 || return nothing
 
     # Centroids of both point sets. Removing them is what makes this a fit for rotation *alone* —
     # otherwise a pure translation would masquerade as a rotation about a distant centre.
@@ -436,10 +465,9 @@ function scene_rotation(x::AbstractVector, y::AbstractVector, dx::AbstractVector
         cross += a * d - b * c
         dot += a * c + b * d
     end
-    # Both sums zero means every centred vector vanished — coincident points, or a field that is
-    # pure divergence with no rotational component to find. `atan2(0, 0)` is 0.0, which would be a
-    # confident wrong answer.
-    (cross == 0.0 && dot == 0.0) && return NaN
+    # Both sums zero means every centred vector vanished — coincident points, or a field with no
+    # rotational component to find. `atan(0, 0)` is 0.0, which would be a confident wrong answer.
+    (cross == 0.0 && dot == 0.0) && return nothing
     return rad2deg(atan(cross, dot))
 end
 

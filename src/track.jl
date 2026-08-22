@@ -362,6 +362,21 @@ end
 # limitation rather than a detail: rotating a square chip necessarily pulls in corners that were not
 # in it, so a large angle dilutes the correlation with padding. It is why the useful angle range is
 # small — the reference's own default is ±3°.
+#
+# Not worth optimizing, and the measurement that says so is worth recording because an isolated
+# benchmark says the opposite. Timed against one `correlate!` on the same buffers this looks like
+# 22-32% of per-angle cost, which invites exactly the micro-optimization attempts below. **Profiled in
+# place** — 1024² pair, chip 32, three angles — it is 42 of 1650 snapshots, or **2.5%**: the real
+# self-time is in `fft_execute!` and `peak_index`. Amdahl's filter puts this under the threshold, and
+# the isolated ratio was misleading because it ignores the per-point work that dominates a real pass.
+#
+# Three optimizations were measured anyway, and all three rejected:
+#
+#   * incremental `sy`/`sx` recurrence down each column: 1.13-1.24x, bit-identical at three sizes,
+#     but accumulating a coordinate drifts in general and three sizes cannot prove otherwise.
+#   * hoisting the bounds test out of the inner loop by finding each column's in-bounds interval:
+#     0.92-0.99x, a *regression* — the branch was already well predicted.
+#   * interpolating in Float32 rather than widening to Float64: 1.05-1.14x for 1 ULP of drift.
 function _rotate_chip(ws::CorrelationWorkspace, chip::AbstractMatrix, deg::Float64)
     deg == 0.0 && return chip
     ch, cw = size(chip)

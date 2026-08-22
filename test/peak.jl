@@ -256,13 +256,11 @@ end
     cs, r, up = 32, 10, 32
     ws = workspace(Float32, cs, r)
     rw = refinement_workspace(up)
-    h = cs ÷ 2
 
     for (sx, sy) in ((0.5, 0.0), (0.0, -0.5), (0.25, 0.75), (-1.5, 2.25))
         ref, sec = shifted_pair(160, (sx, sy); T = Float32)
         cx = cy = 80
-        chip = sec[(cy - h):(cy + h - 1), (cx - h):(cx + h - 1)]
-        search = ref[(cy - h - r):(cy + h + r - 2), (cx - h - r):(cx + h + r - 2)]
+        chip, search = chip_and_window(sec, (cy, cx), cs, r; window_from = ref)
         surface = correlate!(ws, search, chip, r)
         dx, dy, c = subpixel_peak(rw, surface, (r, r), up)
         # Bilinear interpolation smooths the shifted image, so the recovered offset
@@ -281,12 +279,10 @@ end
     # convention, from which the image-pair convention above follows by negation.
     img = synthetic_texture(300; seed = 7)
     cs, r = 32, 25
-    h = cs ÷ 2
     cx = cy = 150
     ws = workspace(Float32, cs, r)
-    search = img[(cy - h - r):(cy + h + r - 2), (cx - h - r):(cx + h + r - 2)]
     for (sx, sy) in ((3, -2), (-7, 5), (0, 0))
-        chip = img[(cy - h + sy):(cy + h - 1 + sy), (cx - h + sx):(cx + h - 1 + sx)]
+        chip, search = chip_and_window(img, (cy, cx), cs, r; shift = (sy, sx))
         surface = correlate!(ws, search, chip, r)
         @test peak_offset(surface, (r, r))[1:2] == (Float64(sx), Float64(sy))
     end

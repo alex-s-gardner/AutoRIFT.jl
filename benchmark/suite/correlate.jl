@@ -67,10 +67,17 @@ let g = addgroup!(SUITE, "correlate")
 
     # One upsampling step at each size the cascade passes through, so the cascade's
     # cost can be attributed to its steps.
+    # The four-argument form, with the scratch buffer and the tap table supplied — which is what
+    # `subpixel_peak` calls at `src/peak.jl:505`. The two-argument convenience overload defaults
+    # both, so benchmarking *it* measured a `scratch` allocation and a freshly built tap table per
+    # call: 672 bytes at n=5 rising to 70800 at n=80, growing with the work, on a kernel the
+    # zero-allocation gate covers. That is allocation the production path does not do.
     for n in (5, 10, 20, 40, 80)
         src = bench_texture((n, n); seed = n)
         dst = Matrix{Float32}(undef, 2n, 2n)
-        g["pyrup $(n)x$(n)"] = @benchmarkable AutoRIFT.pyrup!($dst, $src)
+        scratch = Matrix{Float32}(undef, 2n, n)
+        taps = AutoRIFT._pyrup_row_taps(n)
+        g["pyrup $(n)x$(n)"] = @benchmarkable AutoRIFT.pyrup!($dst, $src, $scratch, $taps)
     end
 
     # Integral images: the denominator's entire cost.
