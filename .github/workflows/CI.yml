@@ -111,7 +111,15 @@ jobs:
           julia --project=benchmark benchmark/run.jl --tag pr
 
       - name: Compare
+        # `pipefail` is load-bearing, not boilerplate. `compare.jl` signals a regression by
+        # `exit(1)`, and a pipeline's status is its *last* command's — so piping into `tee` reported
+        # `tee`'s success and swallowed every failure. The job had therefore never once failed a PR
+        # on a regression or an allocation: it went green while printing "REGRESSED beyond 1.1x" and
+        # "ALLOCATED where none is allowed" into its own summary. The two times it did fail, a
+        # harness bug had killed the step outright before the pipe could mask it, which is why the
+        # gate looked functional.
         run: |
+          set -o pipefail
           {
             echo "### Benchmark: PR vs merge base"
             echo
