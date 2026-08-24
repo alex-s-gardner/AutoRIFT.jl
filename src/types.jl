@@ -584,6 +584,35 @@ Side length of the filter window, or `0` for methods that take no window.
 filter_width(::Union{NoPreprocess,Decibel,Deramp}) = 0
 filter_width(m::Union{Highpass,Wallis,WallisGapfill,Sobel,Laplacian}) = m.width
 
+"""
+    AutoRIFT.filter_reach(method::PreprocessMethod) -> Int
+
+How many pixels beyond a region must be supplied for the filter's output *inside* that region to
+equal what filtering the whole image would give.
+
+Separate from [`filter_width`](@ref) because the two differ, and the difference is not a detail: a
+filter that applies two chained window passes reaches twice its half-width, since the second pass
+consumes the first's output over its own window. Tiled processing sizes its halo from this, so a
+value that is too small produces a filter output that is quietly wrong near every block edge rather
+than merely different — measured at 792 of 10201 points differing by up to 0.21 for `Wallis(5)` when
+padded by `width ÷ 2` instead of twice that.
+
+Pinned per method by a test that measures the true reach and compares it against this trait, so the
+two cannot drift.
+"""
+filter_reach(m::PreprocessMethod) = filter_width(m) ÷ 2
+
+# `Wallis` and its gap-filling variant subtract a local mean and then divide by a local standard
+# deviation computed *about that mean*, so the window is applied twice in sequence and each output
+# depends on a neighbourhood twice as wide.
+filter_reach(m::Union{Wallis,WallisGapfill}) = 2 * (filter_width(m) ÷ 2)
+
+# A whole-image reduction rather than a window: `deramp` sums adjacent-pixel conjugate products
+# over every pixel and takes one `atan2`. No finite reach expresses that, so it is `-1` rather than
+# a large number — a caller dividing work into blocks has to be told this cannot be done blockwise
+# from local data, not handed a halo that would merely be less wrong.
+filter_reach(::Deramp) = -1
+
 function _check_filter_width(width::Integer, who::Symbol)
     width >= 3 ||
         throw(ArgumentError("$who `width` must be >= 3, got $width"))

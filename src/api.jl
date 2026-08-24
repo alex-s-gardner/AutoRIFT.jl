@@ -42,6 +42,12 @@ mutable struct Cache{P<:Params}
     # accumulates dirtiness rather than overwriting it, so two swaps before one run still
     # leave the cache correctly marked.
     isfresh::Bool
+    # Grid points per block, or `nothing` for one block over the whole grid. Here rather than in
+    # `Params` because it is a scheduling choice and not an algorithm parameter: it changes peak
+    # memory and nothing else, since the tiled and untiled paths agree bit for bit. Keeping it out
+    # of `Params` also keeps that type's 22 positional fields — and every construction of it,
+    # including the trimmed binary's — unchanged.
+    block_size::Union{Nothing,Tuple{Int,Int}}
 end
 
 """
@@ -65,7 +71,8 @@ the FFT plans are then built once rather than per pair. For a single pair, call
 [`autorift`](@ref) instead.
 """
 function CommonSolve.init(reference::AbstractMatrix, secondary::AbstractMatrix;
-              reference_valid = nothing, secondary_valid = nothing, kwargs...)
+              reference_valid = nothing, secondary_valid = nothing,
+              process_block_size = nothing, kwargs...)
     p = params(; kwargs...)
     raw = ImagePair(reference, secondary; reference_valid, secondary_valid)
     prepared = _prepare(raw, p)
@@ -73,8 +80,25 @@ function CommonSolve.init(reference::AbstractMatrix, secondary::AbstractMatrix;
     # Plans are created here rather than on first use so that a batch driver pays for them
     # once, on the task that builds the cache, and never inside a correlation.
     _warm_grid_plans(grid, p)
-    return Cache{typeof(p)}(p, raw, prepared, grid, nothing, true)
+    bs = _block_size(process_block_size)
+    # Validated here rather than at the first run, so a block size that cannot work is an error at
+    # the call that set it. `block_layout` is what knows the halo, so it is what checks.
+    isnothing(bs) || block_layout(grid, p, size(prepared), bs)
+    return Cache{typeof(p)}(p, raw, prepared, grid, nothing, true, bs)
 end
+
+# `process_block_size` as a tuple, or `nothing` for one block.
+#
+# A tuple and only a tuple. A bare `Int` is rejected rather than read as a square block: a
+# full-width band is the cheaper shape at a given halo — halo on two sides rather than four — and
+# inferring "square" from a scalar would quietly pick the more expensive one on the caller's behalf.
+_block_size(::Nothing) = nothing
+_block_size(bs::Tuple{Integer,Integer}) = (Int(bs[1]), Int(bs[2]))
+_block_size(bs) = throw(ArgumentError(
+    "`process_block_size` must be a tuple of two integers, `(X, Y)` grid points, or `nothing` " *
+    "for one block over the whole grid. Got a $(typeof(bs)). A scalar is not accepted: a " *
+    "full-width band costs less halo than a square block of the same area, so which one you " *
+    "want is worth saying."))
 
 """
     reinit!(cache; reference, secondary, reference_valid, secondary_valid) -> cache
@@ -165,10 +189,18 @@ than recomputing it.
 """
 function autorift!(cache::Cache)
     cache.isfresh || isnothing(cache.result) || return cache.result
-    cache.result = correlate_multichip(cache.prepared, cache.grid, cache.params)
+    cache.result = _correlate(cache.prepared, cache.grid, cache.params, cache.block_size)
     cache.isfresh = false
     return cache.result
 end
+
+# One block over the whole grid is the untiled path itself, not a tiled run that happens to have
+# one block. The two agree bit for bit, but taking the same code keeps that a property of having
+# one implementation rather than something to re-verify.
+_correlate(pair::ImagePair, grid::PointSet{2}, p::Params, ::Nothing) =
+    correlate_multichip(pair, grid, p)
+_correlate(pair::ImagePair, grid::PointSet{2}, p::Params, bs::Tuple{Int,Int}) =
+    correlate_tiled(pair, grid, p, bs)
 
 """
     autorift(reference, secondary; kwargs...) -> MultichipResult
@@ -189,6 +221,18 @@ All of [`AutoRIFT.params`](@ref)'s, plus:
 - `reference_valid`, `secondary_valid`: per-pixel validity masks. Defaults to finiteness. Pass
   these for sensors with a fill value, or to apply a cloud or shadow mask — an invalid pixel
   never contributes to a correlation.
+- `process_block_size`: `(X, Y)` grid points per block, or `nothing` (the default) for one block
+  over the whole scene. Bounds peak memory by the block rather than by the scene, which is what
+  makes a large scene fit a small instance. **Bit-identical to the untiled run** — this changes
+  where the work happens, not what it computes.
+
+  A tuple and only a tuple: a full-width band costs halo on two sides where a square block pays it
+  on four, so which shape you want is worth saying rather than inferring from a scalar. Pass the
+  grid's full width as `X` for a band.
+
+  Each block reads its own extent grown by a halo, so a block reads more than it writes — see
+  [`AutoRIFT.halo`](@ref). A block smaller than that halo would be almost entirely overlap and is
+  rejected.
 
 ```julia
 out = autorift(image1, image2; chip_size = 32, search_radius = 25)
@@ -264,15 +308,23 @@ single scale via [`track`](@ref), since the chip-size loop's coarse pass and mer
 operations that need a layout.
 """
 function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, grid::PointSet;
-                  reference_valid = nothing, secondary_valid = nothing, kwargs...)
+                  reference_valid = nothing, secondary_valid = nothing,
+                  process_block_size = nothing, kwargs...)
     p = params(; kwargs...)
     pair = _prepare(ImagePair(reference, secondary; reference_valid, secondary_valid), p)
-    return _run(pair, grid, p)
+    return _run(pair, grid, p, _block_size(process_block_size))
 end
 
 # Dispatch on the point set's dimensionality: only a gridded one can run multiple chip sizes.
-_run(pair::ImagePair, grid::PointSet{2}, p::Params) = correlate_multichip(pair, grid, p)
-_run(pair::ImagePair, pts::PointSet{1}, p::Params) = track(pair, pts, p)
+_run(pair::ImagePair, grid::PointSet{2}, p::Params, bs) = _correlate(pair, grid, p, bs)
+_run(pair::ImagePair, pts::PointSet{1}, p::Params, ::Nothing) = track(pair, pts, p)
+
+# Blocks are laid out over a *gridded* point set, since the halo is derived from where points sit
+# relative to each other. A scattered set has no such layout, so there is nothing to divide.
+_run(::ImagePair, ::PointSet{1}, ::Params, ::Tuple{Int,Int}) = throw(ArgumentError(
+    "`process_block_size` needs a gridded `PointSet`, but this one is scattered. Blocks are " *
+    "rectangles of the output grid, and a scattered point set has no grid to cut. Drop the " *
+    "keyword, or pass a gridded point set."))
 
 """
     AutoRIFT.autorift_with_grid(reference, secondary; kwargs...) -> (result, grid)
@@ -287,12 +339,13 @@ Exists so the DimensionalData and Rasters extensions share one path into the cor
 each rebuilding the grid and hoping it matches. Not exported: the array API has no use for it.
 """
 function autorift_with_grid(reference::AbstractMatrix, secondary::AbstractMatrix;
-                            reference_valid = nothing, secondary_valid = nothing, kwargs...)
+                            reference_valid = nothing, secondary_valid = nothing,
+                            process_block_size = nothing, kwargs...)
     p = params(; kwargs...)
     pair = _prepare(ImagePair(reference, secondary; reference_valid, secondary_valid), p)
     grid = _build_grid(size(pair), p)
     _warm_grid_plans(grid, p)
-    return _run(pair, grid, p), grid
+    return _run(pair, grid, p, _block_size(process_block_size)), grid
 end
 
 # ---------------------------------------------------------------------------

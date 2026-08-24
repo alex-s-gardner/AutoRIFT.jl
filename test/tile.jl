@@ -1,5 +1,53 @@
 using AutoRIFT: ImagePair, gridpoints, params, scatter, issearchable,
-                chip_bounds, search_bounds
+                chip_bounds, search_bounds, Highpass, Wallis, NoPreprocess, Deramp
+
+@testset "filter_reach is the measured reach" begin
+    # The trait exists to size a block's halo, so it has to equal what the filter actually needs
+    # rather than what its window width suggests. Measured here by filtering a padded block and
+    # finding the smallest pad whose interior matches a whole-image filter bit for bit.
+    #
+    # This is the check that catches the failure the trait was introduced for: `Wallis` subtracts a
+    # local mean and then divides by a local standard deviation computed *about that mean*, so its
+    # window is applied twice and its reach is twice its half-width. At `Wallis(5)` a halo of
+    # `width ÷ 2` leaves 792 of 10201 interior points differing by up to 0.21 — a visibly wrong
+    # filter output, not a rounding artefact.
+    n = 512
+    img = synthetic_texture(n; seed = 1)
+    mask = trues(n, n)
+    rows, cols = 200:300, 150:250
+
+    function measured_reach(m)
+        whole, = AutoRIFT.preprocess(img, mask, m)
+        for pad in 0:24
+            rr = (first(rows) - pad):(last(rows) + pad)
+            cc = (first(cols) - pad):(last(cols) + pad)
+            block, = AutoRIFT.preprocess(img[rr, cc], mask[rr, cc], m)
+            inner = block[(pad + 1):(length(rr) - pad), (pad + 1):(length(cc) - pad)]
+            all(isequal.(inner, whole[rows, cols])) && return pad
+        end
+        return -1                      # no finite reach found within the search
+    end
+
+    for w in (5, 9, 21)
+        for m in (Highpass(w), Wallis(; width = w))
+            @test AutoRIFT.filter_reach(m) == measured_reach(m)
+        end
+        # And the property that motivated the trait: these two are not the same number.
+        @test AutoRIFT.filter_reach(Wallis(; width = w)) ==
+              2 * AutoRIFT.filter_reach(Highpass(w))
+    end
+
+    # Windowless methods reach nothing.
+    @test AutoRIFT.filter_reach(NoPreprocess()) == 0
+
+    # `Deramp` estimates from the whole image, so no halo makes a block agree with the scene. A
+    # negative reach says "not blockwise-reproducible" rather than naming a large number that would
+    # merely be less wrong.
+    @test AutoRIFT.filter_reach(Deramp()) < 0
+    grid = gridpoints((n, n), 32; chip_size = 32, search_radius = 25)
+    @test_throws "no halo fixes that" AutoRIFT.halo(
+        grid, params(; preprocess = :deramp, similarity = :coherence), (n, n))
+end
 
 @testset "halo is the sum of the reaches, not the largest" begin
     # Each stage acts on the previous one's output, so the correlation reach and the filter's
@@ -12,11 +60,18 @@ using AutoRIFT: ImagePair, gridpoints, params, scatter, issearchable,
     pad = AutoRIFT._pass_geometry(scatter(grid), (n, n))[5]
     @test AutoRIFT.halo(grid, params(; preprocess = :none), (n, n)) == pad
 
-    # A 5-wide filter adds 2 in each direction; a 21-wide one adds 10.
+    # A 5-wide highpass adds 2 in each direction; a 21-wide one adds 10.
     @test AutoRIFT.halo(grid, params(; preprocess = :highpass, filter_width = 5), (n, n)) ==
           (pad[1] + 2, pad[2] + 2)
     @test AutoRIFT.halo(grid, params(; preprocess = :highpass, filter_width = 21), (n, n)) ==
           (pad[1] + 10, pad[2] + 10)
+
+    # And `Wallis` adds twice that, because its window is applied twice. Taking `filter_width ÷ 2`
+    # here would under-halo every block by half the filter's reach.
+    @test AutoRIFT.halo(grid, params(; preprocess = :wallis, filter_width = 5), (n, n)) ==
+          (pad[1] + 4, pad[2] + 4)
+    @test AutoRIFT.halo(grid, params(; preprocess = :wallis, filter_width = 21), (n, n)) ==
+          (pad[1] + 20, pad[2] + 20)
 
     # A wider search radius widens the halo through the correlation term.
     wide = gridpoints((n, n), 32; chip_size = 32, search_radius = 40)
