@@ -274,11 +274,29 @@ end
 # the reference ended up inconsistent about it.
 function _filtered(out::Matrix{Float32}, mask::AbstractMatrix{Bool}, width::Integer)
     v = _erode_mask(mask, Int(width))
+    return _filtered_finish!(out, v)
+end
+
+"""
+    _filtered!(out, v, mask, width) -> (out, v)
+
+[`_filtered`](@ref)'s work, writing the eroded mask into `v` rather than allocating it.
+
+For tiled processing, where a fresh mask per block is churn `Sys.maxrss` reports as a requirement.
+`out` is modified in place, as in the allocating form.
+"""
+function _filtered!(out::AbstractMatrix{Float32}, v::AbstractMatrix{Bool},
+                    mask::AbstractMatrix{Bool}, width::Integer)
+    _erode_mask!(v, mask, Int(width))
+    return _filtered_finish!(out, v)
+end
+
+# Shared tail: a filter can produce a non-finite value from finite input, so finiteness of the
+# output is part of validity too.
+function _filtered_finish!(out::AbstractMatrix{Float32}, v::AbstractMatrix{Bool})
     @inbounds for i in eachindex(out)
-        # A filter can produce a non-finite value from finite input (a zero divisor in the
-        # Wallis case), so finiteness of the output is part of validity too. The value itself
-        # becomes zero to keep downstream arithmetic finite; the mask is what records that it
-        # carries no information.
+        # The value becomes zero to keep downstream arithmetic finite; the mask is what records
+        # that it carries no information.
         if !isfinite(out[i])
             out[i] = 0.0f0
             v[i] = false
@@ -301,10 +319,27 @@ driver applies inside the correlator. Invalid pixels are excluded from the local
 rather than contributing zeros to it, which is where this differs from the reference —
 its zero-padded convolution lets a no-data border bias the mean of every pixel near it.
 """
-function highpass(img::AbstractMatrix, mask::AbstractMatrix{Bool}, width::Integer)
+highpass(img::AbstractMatrix, mask::AbstractMatrix{Bool}, width::Integer) =
+    highpass!(Matrix{Float32}(undef, size(img)), img, mask, width)
+
+"""
+    highpass!(out, img, mask, width; scratch = nothing) -> out
+
+[`highpass`](@ref) writing into `out`, which must have `img`'s shape.
+
+Exists for tiled processing, where the alternative is a fresh output and scratch array per block —
+churn that `Sys.maxrss` records as a requirement even though the collector frees it. `scratch` is a
+second `Float32` array of the same shape, needed only when `mask` excludes something; pass one to
+make the call allocation-free in that case too.
+"""
+function highpass!(out::AbstractMatrix{Float32}, img::AbstractMatrix,
+                   mask::AbstractMatrix{Bool}, width::Integer;
+                   scratch::Union{Nothing,AbstractMatrix{Float32}} = nothing)
+    axes(out) == axes(img) == axes(mask) || throw(DimensionMismatch(
+        "out, img and mask must share axes"))
     # In place over the local mean: each output reads only the mean at its own index, and the
     # mean is not wanted afterwards. Saves a full-size temporary on an image-sized array.
-    out = _masked_boxmean(img, mask, Int(width))
+    _masked_boxmean!(out, img, mask, Int(width), scratch)
     @inbounds for i in eachindex(out)
         out[i] = mask[i] && isfinite(out[i]) ? Float32(img[i]) - out[i] : NaN32
     end
@@ -368,8 +403,14 @@ end
 # A bandwidth estimate puts the floor at 0.4 ms, so what remains is per-element scalar
 # work that cv2 vectorises. Closing it means cache tiling, an M8 item. Filtering runs
 # once per image rather than once per grid point, so this is not on the hot path.
-function _masked_boxmean(img::AbstractMatrix, mask::AbstractMatrix{Bool}, w::Int)
-    out = Matrix{Float32}(undef, size(img))
+_masked_boxmean(img::AbstractMatrix, mask::AbstractMatrix{Bool}, w::Int) =
+    _masked_boxmean!(Matrix{Float32}(undef, size(img)), img, mask, w, nothing)
+
+# `scratch`, when given, is the NaN-encoded copy this would otherwise allocate. Supplying it is what
+# makes a per-block call allocation-free; `nothing` allocates as before.
+function _masked_boxmean!(out::AbstractMatrix{Float32}, img::AbstractMatrix,
+                          mask::AbstractMatrix{Bool}, w::Int,
+                          scratch::Union{Nothing,AbstractMatrix{Float32}})
     # The copy exists only to encode invalidity as NaN, which is what makes the running sum
     # skip those pixels. With nothing masked there is nothing to encode, so read `img`
     # directly — `windowmean!` is generic in its input. On a gap-free image, which is the
@@ -380,7 +421,9 @@ function _masked_boxmean(img::AbstractMatrix, mask::AbstractMatrix{Bool}, w::Int
     # otherwise would silently take the dense path over an image that needs the masked one.
     all(mask) && return windowmean!(out, img, w)
 
-    masked = Matrix{Float32}(undef, size(img))
+    masked = isnothing(scratch) ? Matrix{Float32}(undef, size(img)) : scratch
+    axes(masked) == axes(img) || throw(DimensionMismatch(
+        "scratch must share axes with the image"))
     gaps = false
     @inbounds for i in eachindex(masked)
         if mask[i]
@@ -444,15 +487,20 @@ end
 # A whole-array shortcut first, because it is the common case and it is free to check: if
 # nothing is masked, eroding changes nothing. That skips three full-size temporaries and
 # two passes on every gap-free image, which is most of them.
-function _erode_mask(mask::AbstractMatrix{Bool}, w::Int)
-    all(mask) && return copy(mask)
+_erode_mask(mask::AbstractMatrix{Bool}, w::Int) =
+    _erode_mask!(Matrix{Bool}(undef, size(mask)), mask, w)
+
+function _erode_mask!(out::AbstractMatrix{Bool}, mask::AbstractMatrix{Bool}, w::Int)
+    if all(mask)
+        copyto!(out, mask)
+        return out
+    end
     f = Matrix{Float32}(undef, size(mask))
     @inbounds for i in eachindex(f)
         f[i] = mask[i] ? 1.0f0 : 0.0f0
     end
     # No NaN by construction, so the sliding minimum takes its cheap path directly.
     lo = windowmin(f, w)
-    out = Matrix{Bool}(undef, size(mask))
     @inbounds for i in eachindex(out)
         out[i] = lo[i] > 0.5f0
     end

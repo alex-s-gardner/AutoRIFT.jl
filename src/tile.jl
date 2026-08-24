@@ -205,6 +205,21 @@ struct BlockBuffers{T,M}
     secondary::Matrix{T}
     reference_valid::Matrix{M}
     secondary_valid::Matrix{M}
+    # The filter's output for each image, and one shared scratch array for the NaN-encoded copy
+    # `_masked_boxmean!` needs when a mask excludes something. `Float32` because every filter
+    # produces signed values whatever the input type.
+    #
+    # Scratch is shared between the two images because the two filter calls are sequential: the
+    # reference's is complete before the secondary's begins, so the array is dead in between. One
+    # per image would be correct and would waste half of it.
+    filtered_reference::Matrix{Float32}
+    filtered_secondary::Matrix{Float32}
+    filter_scratch::Matrix{Float32}
+    # Eroded masks. `_filtered` shrinks a mask by the filter width, so these cannot alias the raw
+    # masks above — `track!` intersects the pair's two masks and would then be reading a mask that
+    # its own filtering had already narrowed.
+    filtered_reference_valid::Matrix{M}
+    filtered_secondary_valid::Matrix{M}
 end
 
 """
@@ -217,6 +232,9 @@ function block_buffers(pair::ImagePair, layout::BlockLayout)
     nc = maximum(length(b.read_cols) for b in layout.blocks)
     T = eltype(pair)
     return BlockBuffers(Matrix{T}(undef, nr, nc), Matrix{T}(undef, nr, nc),
+                        Matrix{Bool}(undef, nr, nc), Matrix{Bool}(undef, nr, nc),
+                        Matrix{Float32}(undef, nr, nc), Matrix{Float32}(undef, nr, nc),
+                        Matrix{Float32}(undef, nr, nc),
                         Matrix{Bool}(undef, nr, nc), Matrix{Bool}(undef, nr, nc))
 end
 
@@ -265,8 +283,40 @@ end
 # filter everywhere the block writes. Verified on both, including with invalid pixels present, since
 # `_filtered` erodes the mask by the filter width and that erosion must not bite at a read edge
 # where the untiled run had data.
-_prepared_block_pair(buf::BlockBuffers, pair::ImagePair, b::Block, p::Params) =
-    _prepare(_block_pair!(buf, pair, b), p)
+function _prepared_block_pair(buf::BlockBuffers, pair::ImagePair, b::Block, p::Params)
+    raw = _block_pair!(buf, pair, b)
+    return _prepare_block(buf, raw, p, p.preprocess, length(b.read_rows), length(b.read_cols))
+end
+
+# Filtering a block into pooled storage, for the filters that have an in-place form.
+#
+# `Highpass` is the one that matters — the default, and the only filter the production driver runs
+# inside the correlator — so it is the one pooled. Anything else falls through to the allocating
+# path below: correct, and costing a filter output per block, which is worth having as the honest
+# fallback rather than blocking those filters from tiled runs.
+function _prepare_block(buf::BlockBuffers, raw::ImagePair, p::Params, m::Highpass,
+                        nr::Int, nc::Int)
+    w = filter_width(m)
+    fr = @view buf.filtered_reference[1:nr, 1:nc]
+    fs = @view buf.filtered_secondary[1:nr, 1:nc]
+    scratch = @view buf.filter_scratch[1:nr, 1:nc]
+    rv = @view buf.filtered_reference_valid[1:nr, 1:nc]
+    sv = @view buf.filtered_secondary_valid[1:nr, 1:nc]
+
+    highpass!(fr, raw.reference, raw.reference_valid, w; scratch)
+    highpass!(fs, raw.secondary, raw.secondary_valid, w; scratch)
+    # `_filtered!` does the mask bookkeeping every windowed filter needs: erode by the filter
+    # width, and drop any pixel whose filtered value came out non-finite.
+    _filtered!(fr, rv, raw.reference_valid, w)
+    _filtered!(fs, sv, raw.secondary_valid, w)
+    # No `replace_nonfinite` pass: `_filtered!` already zeroed the non-finite values and recorded
+    # them in the mask, which is exactly what that function does.
+    return ImagePair(fr, fs, rv, sv)
+end
+
+# Every other filter: allocate, as the untiled path does. Bit-identical either way.
+_prepare_block(::BlockBuffers, raw::ImagePair, p::Params, ::PreprocessMethod, ::Int, ::Int) =
+    _prepare(raw, p)
 
 # A block's points, in its read window's coordinate frame.
 #
