@@ -383,10 +383,62 @@ end
     @test !isnan(d.dx[1])
 end
 
+@testset "a subset correlates as the whole set does, given its geometry" begin
+    # The property tiled processing needs, and it does not hold by default. A pass sizes its
+    # workspace from its own largest chip and radius, and a workspace sizes its FFT buffers from
+    # its extents — so a subset whose radii are all smaller runs a *shorter transform* than the
+    # full grid did over the same points, and the two agree only to ~4e-7.
+    #
+    # Radii that vary across the grid are what expose it, and that is the realistic case: the
+    # coarse pass zeroes and `sanitize!` floors radii in spatially clustered patterns.
+    n = 512
+    ref, sec = shifted_pair(n, (4, -6); T = Float32)
+    pair = ImagePair(ref, sec)
+    p = params(; chip_size = 32, search_radius = 25)
+    grid = gridpoints((n, n), 32; chip_size = 32, search_radius = 25)
+    nr, nc = size(grid)
+    for j in 1:nc, i in 1:nr
+        r = j <= nc ÷ 2 ? 25 : 10          # a coherent left half, a restricted right half
+        grid.radius_x[i, j] = r
+        grid.radius_y[i, j] = r
+    end
+
+    full = track(pair, grid, p)
+    # Reproducible against itself first: FFTW's planner drifts, and a mismatch below means
+    # nothing if the baseline does not agree with itself.
+    @test all(isequal.(full.correlation, track(pair, grid, p).correlation))
+
+    geom = AutoRIFT.pass_geometry(grid)
+    @test geom == AutoRIFT.PassGeometry(32, 32, 25, 25)
+
+    # A sub-block wholly inside the small-radius half, so its own maxima are genuinely smaller.
+    rows, cols = 3:8, (nc ÷ 2 + 2):(nc ÷ 2 + 7)
+    sub = grid[rows, cols]
+    @test AutoRIFT.pass_geometry(sub) == AutoRIFT.PassGeometry(32, 32, 10, 10)
+
+    with = track(pair, sub, p; geometry = geom)
+    @test all(isequal.(full.dx[rows, cols], with.dx))
+    @test all(isequal.(full.dy[rows, cols], with.dy))
+    # Correlation is the unrounded quantity, so it is where the transform length shows. dx/dy
+    # are quantized to subpixel steps and can absorb the difference; this cannot.
+    @test all(isequal.(full.correlation[rows, cols], with.correlation))
+
+    # And without it the correlation does *not* match, which is why the keyword exists. Asserted
+    # so the keyword cannot be quietly dropped as redundant.
+    without = track(pair, sub, p)
+    @test !all(isequal.(full.correlation[rows, cols], without.correlation))
+end
+
 @testset "validation" begin
     ref, sec = shifted_pair(200, (0, 0); T = Float32)
     pair = ImagePair(ref, sec)
     pts = gridpoints((200, 200), 32; chip_size = 32, search_radius = 25)
     @test_throws DimensionMismatch track!(
         displacement_field(pointset([1.0], [1.0])), pair, pts, params())
+
+    # A geometry narrower than the pass needs is rejected by name. Letting it through would
+    # surface as a `DimensionMismatch` about workspace extents from deep inside `correlate!`,
+    # which does not mention the argument that caused it.
+    @test_throws "may widen a pass but never narrow it" track(
+        pair, pts, params(); geometry = AutoRIFT.PassGeometry(32, 32, 4, 4))
 end
