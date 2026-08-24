@@ -216,13 +216,33 @@ end
 # Coarse pass
 # ---------------------------------------------------------------------------
 
-# Correlate a decimated sample of the points, filter for spatial consistency, and dilate what
-# survives. Returns a full-grid mask of where the fine pass should look, or `nothing` if too
-# little of the coarse grid was coherent for the level to be worth continuing.
-# `measure` is positional and has no default: the one caller always knows the level's measure, and a
-# default here would be a second spelling of `chipsize_level`'s that could silently diverge from it.
-function _coarse_pass(pair::ImagePair, pts::PointSet{2}, p::Params, csx::Int, csy::Int,
-                      measure::SimilarityMeasure)
+# The coarse pass splits into two halves, and the seam is load-bearing rather than cosmetic.
+#
+# **Correlating** the decimated points is per-point work: each coarse point's displacement depends
+# only on the imagery around it, so a caller processing a scene in blocks can produce this evidence
+# a block at a time and scatter it into one coarse-grid array.
+#
+# **Deciding** from that evidence is not. `reject_outliers` compares a point against its
+# neighbourhood, the `min_coarse_valid_fraction` gate is a ratio over the whole coarse grid, and
+# `dilate_within` grows across it — so all three need the *assembled* grid. Run per block they would
+# each answer a different question: a block over open water would fail the gate and drop a whole
+# chip-size level for itself alone, reported as "level found nothing coherent" and indistinguishable
+# from a real result.
+#
+# Splitting them is what lets the halo be the correlation reach alone. The alternative — a halo
+# covering the filter and the dilation — reaches 1792 px at defaults, which is more overlap than
+# data at any block size worth asking for. See `docs/plan-tiling.md`.
+#
+# The coarse grid is affordable to hold whole even when the imagery is not: at the default spacing
+# and stride it is about 1/1024 the size of the scene.
+
+# Which points the coarse pass correlates, and where they sit on the full grid.
+#
+# `nothing` when the coarse grid is too small for the filter to judge consistency on — the caller
+# decides what that means, because the two callers differ: a whole-scene run falls back to searching
+# everything rather than rejecting on no evidence, while a block-at-a-time run must treat it as a
+# configuration error, since per block it would silently skip the coarse restriction entirely.
+function _coarse_points(pts::PointSet{2}, p::Params, csx::Int, csy::Int)
     stride = p.coarse_stride
     nr, nc = size(pts)
     rows = stride:stride:nr
@@ -231,11 +251,8 @@ function _coarse_pass(pair::ImagePair, pts::PointSet{2}, p::Params, csx::Int, cs
     # coarse point's neighbours are genuinely further away and less like it. `relax` is where
     # each method says what that means for it.
     filt = relax(p.outliers)
-
-    # Too few coarse points to judge consistency against their neighbours: the filter needs a
-    # neighbourhood, so fall back to searching everything rather than rejecting on no evidence.
     w = window(filt)
-    (length(rows) < w || length(cols) < w) && return trues(nr, nc)
+    (length(rows) < w || length(cols) < w) && return nothing
 
     # The coarse point's radius must cover its whole cell, since it stands in for every fine
     # point inside it — hence the max over the cell rather than a sample of one point.
@@ -249,14 +266,31 @@ function _coarse_pass(pair::ImagePair, pts::PointSet{2}, p::Params, csx::Int, cs
     _cell_max_radius!(coarse.radius_y, pts.radius_y, rows, cols, stride)
     fill!(coarse.chip_size_x, csx)
     fill!(coarse.chip_size_y, csy)
-    nsearchable(coarse) == 0 && return nothing
+    return (; coarse, rows, cols, filt)
+end
 
-    # Integer peaks only: the coarse pass decides *where* to look, and sub-pixel precision
-    # would not change that answer while costing most of the pass.
-    # The same measure as the fine pass: the coarse pass decides *where* the fine pass looks, so
-    # judging coherence by a different measure than the one that will be used there would gate on
-    # the wrong thing.
-    cd = track(pair, coarse, p; subpixel = NoRefine(), measure)
+# The per-point half: correlate the coarse points. Nothing here looks outside a point.
+#
+# Integer peaks only: the coarse pass decides *where* to look, and sub-pixel precision would not
+# change that answer while costing most of the pass. The same measure as the fine pass, since
+# judging coherence by a different measure than the one that will be used there would gate on the
+# wrong thing.
+#
+# `geometry` is forwarded so a block can run the transform the whole coarse grid would have run —
+# see [`AutoRIFT.PassGeometry`](@ref). Absent, each pass derives its own, which is correct for a
+# whole-scene run.
+_coarse_evidence(pair::ImagePair, coarse::PointSet{2}, p::Params,
+                 measure::SimilarityMeasure;
+                 geometry::Union{Nothing,PassGeometry} = nothing) =
+    track(pair, coarse, p; subpixel = NoRefine(), measure, geometry)
+
+# The whole-grid half: from coarse displacements to a full-grid mask of where the fine pass should
+# look. `nothing` when the level is not worth continuing.
+#
+# Every operation here is a neighbourhood or a whole-grid reduction, which is why this must see the
+# assembled coarse grid rather than one block of it.
+function _coarse_decide(cd::DisplacementField, coarse::PointSet{2}, p::Params,
+                        filt::OutlierMethod, gridsize::Tuple{Int,Int})
     measured = map(!isnan, cd.dx)
     any(measured) || return nothing
 
@@ -284,7 +318,29 @@ function _coarse_pass(pair::ImagePair, pts::PointSet{2}, p::Params, csx::Int, cs
     grown = dilate_within(keep, p.coarse_buffer)
     # Back to the full grid. Nearest-neighbour because this is a mask: an interpolated value
     # between "search" and "do not search" would mean nothing.
-    return resample(grown, (nr, nc), Nearest()) .> 0.5f0
+    return resample(grown, gridsize, Nearest()) .> 0.5f0
+end
+
+# Correlate a decimated sample of the points, filter for spatial consistency, and dilate what
+# survives. Returns a full-grid mask of where the fine pass should look, or `nothing` if too
+# little of the coarse grid was coherent for the level to be worth continuing.
+#
+# The whole-scene composition of the two halves above.
+# `measure` is positional and has no default: the one caller always knows the level's measure, and a
+# default here would be a second spelling of `chipsize_level`'s that could silently diverge from it.
+function _coarse_pass(pair::ImagePair, pts::PointSet{2}, p::Params, csx::Int, csy::Int,
+                      measure::SimilarityMeasure)
+    nr, nc = size(pts)
+    setup = _coarse_points(pts, p, csx, csy)
+    # Too few coarse points to judge consistency against their neighbours: search everything
+    # rather than rejecting on no evidence.
+    isnothing(setup) && return trues(nr, nc)
+
+    coarse = setup.coarse
+    nsearchable(coarse) == 0 && return nothing
+
+    cd = _coarse_evidence(pair, coarse, p, measure)
+    return _coarse_decide(cd, coarse, p, setup.filt, (nr, nc))
 end
 
 # Maximum radius over each coarse cell, matching the left-biased window convention the sliding
