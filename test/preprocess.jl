@@ -1,4 +1,4 @@
-using AutoRIFT: ImagePair, preprocess, quantize, highpass, wallis, valid,
+using AutoRIFT: ImagePair, preprocess, replace_nonfinite, highpass, wallis, valid,
                 workspace, correlate!, peak_offset
 
 @testset "ImagePair construction" begin
@@ -140,51 +140,33 @@ end
     @test_throws "not recognised" preprocess(p, :sharpen)
 end
 
-@testset "quantize to UInt8" begin
-    n = 40
-    tex = synthetic_texture(n; seed = 7)
-    p = ImagePair(tex, tex)
-    q = quantize(preprocess(p, :highpass), :uint8)
-    @test eltype(q) === UInt8
-    # The ±3σ window should use most of the range without saturating everything.
-    @test maximum(q.reference) > 200
-    @test minimum(q.reference) < 60
-    @test count(==(0x00), q.reference) < length(q.reference) ÷ 10
-    @test count(==(0xff), q.reference) < length(q.reference) ÷ 10
-end
+@testset "non-finite pixels become zero, and the type is preserved" begin
+    # The images reach the correlator in the caller's own type: nothing here converts, so an
+    # integer image stays 2 bytes per pixel rather than becoming 4.
+    for T in (Float32, Float64, Int16, UInt8)
+        img = synthetic_texture(20; seed = 7, T)
+        out, _ = replace_nonfinite(img, trues(20, 20))
+        @test eltype(out) === T
+        @test out == img
+        # A copy, not an alias: the pipeline must not write through to the caller's array.
+        @test out !== img
+    end
 
-@testset "quantize excludes invalid pixels from its statistics" begin
-    # A large fill-valued region would otherwise drag the mean and inflate the spread,
-    # compressing the real data into a fraction of the available range.
-    n = 40
-    tex = synthetic_texture(n; seed = 7)
-    img = copy(tex)
-    mask = trues(n, n)
-    img[1:20, :] .= -999.0f0      # a fill value far outside the data range
-    mask[1:20, :] .= false
+    # NaN and Inf become zero so downstream arithmetic stays finite. The mask is what records
+    # that those pixels carry no information, which is why the value itself can be anything.
+    img = Float32[1 NaN32; Inf32 -Inf32]
+    out, mask = replace_nonfinite(img, trues(2, 2))
+    @test out == Float32[1 0; 0 0]
+    @test all(mask)
 
-    p = ImagePair(img, img; reference_valid = mask, secondary_valid = mask)
-    q = quantize(p, :uint8)
-    # The valid half still spans the range, which it would not if -999 were included.
-    live = q.reference[21:n, :]
-    @test maximum(live) > 200
-    @test minimum(live) < 60
-    # Invalid pixels are zeroed rather than mapped somewhere meaningful.
-    @test all(==(0x00), q.reference[1:20, :])
-end
+    # Complex is non-finite if either component is, and the same replacement applies.
+    z = ComplexF32[1+2im NaN32+0im; 0+NaN32*im 3-1im]
+    zout, _ = replace_nonfinite(z, trues(2, 2))
+    @test zout == ComplexF32[1+2im 0; 0 3-1im]
 
-@testset "quantize handles a uniform image" begin
-    # No texture to preserve, so mid-grey is the neutral answer; pinning it to an
-    # endpoint would be arbitrary.
-    p = ImagePair(fill(5.0f0, 10, 10), fill(5.0f0, 10, 10))
-    q = quantize(p, :uint8)
-    @test all(==(0x80), q.reference)
-
-    # Nothing valid at all: all zero rather than an error, since the grid will have no
-    # searchable points anyway.
-    p = ImagePair(fill(5.0f0, 10, 10), fill(5.0f0, 10, 10);
-                  reference_valid = falses(10, 10), secondary_valid = falses(10, 10))
-    @test all(==(0x00), quantize(p, :uint8).reference)
+    # An integer image cannot hold a non-finite value, so nothing is replaced.
+    iout, _ = replace_nonfinite(Int16[1 -2; 3 -4], trues(2, 2))
+    @test iout == Int16[1 -2; 3 -4]
 end
 
 @testset "filtering improves correlation across a brightness change" begin

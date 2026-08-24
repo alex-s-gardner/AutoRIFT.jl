@@ -1,5 +1,5 @@
 using AutoRIFT: autorift, autorift!, reinit!, init, Cache, MultichipResult, nmeasured,
-                pointset, gridpoints, params, Params, ZNCC, Highpass, QuantizeUInt8,
+                pointset, gridpoints, params, Params, ZNCC, Highpass,
                 PyramidRefine, GardnerFilter
 
 med(v) = (s = sort(collect(v)); isempty(s) ? NaN : s[(length(s) + 1) ÷ 2])
@@ -97,8 +97,8 @@ end
     # Swapping one image advances a time series while holding the other fixed.
     c2 = init(a_ref, a_sec; kw...)
     reinit!(c2; secondary = b_sec)
-    # The reference must be re-prepared from the *original*, not from the already-filtered and
-    # quantized array the cache is holding — filtering twice would silently change the answer.
+    # The reference must be re-prepared from the *original*, not from the already-filtered array
+    # the cache is holding — filtering twice would silently change the answer.
     @test AutoRIFT.imagepair(c2).reference == AutoRIFT.imagepair(init(a_ref, b_sec; kw...)).reference
 
     # Nothing to change is a no-op, not an error.
@@ -180,13 +180,12 @@ end
     @test -d.dx[1] ≈ 20 atol = 1.0
 end
 
-@testset "UInt8 and Float32 correlation paths" begin
-    # `quantize` decides the element type the correlator sees. Both must recover the shift; the
-    # UInt8 path is the reference's default and the one production uses.
-    ref, sec = shifted_pair(512, (7, 5); T = Float32)
-    for q in (:uint8, :none)
-        r = autorift(ref, sec; chip_size = 32, search_radius = 25, quantize = q,
-                     subpixel = :none)
+@testset "input element types reach the correlator unwidened" begin
+    # The images pass through in the caller's own type, so a raw sensor type is correlated as
+    # itself. Every one of these must recover the same shift.
+    for T in (Float32, Float64, UInt8, Int16)
+        ref, sec = shifted_pair(512, (7, 5); T)
+        r = autorift(ref, sec; chip_size = 32, search_radius = 25, subpixel = :none)
         mx, my = motion(r)
         @test mx == 7
         @test my == 5
@@ -209,7 +208,7 @@ end
     # what the `autorift(ref, sec, ::Params)` docstring promises, and what makes it safe to
     # document as the entry point a trimmed binary uses.
     ref, sec = shifted_pair(512, (6, -4); T = Float32)
-    p = Params((ZNCC(),), Highpass(), QuantizeUInt8(), PyramidRefine(), GardnerFilter(),
+    p = Params((ZNCC(),), Highpass(), PyramidRefine(), GardnerFilter(),
                AutoRIFT.False(), AutoRIFT.NoRotationSearch(),
                32, 32, 128, 1.0, 32, 25, 25, 6, 4, 8, 0.01, 0.0, 0.0, 3, UInt64(0), false)
 

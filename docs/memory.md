@@ -68,9 +68,27 @@ Scene size is the only knob that scales peak memory, and it does so roughly line
 
 | Scene | serial | threaded |
 |---|---:|---:|
-| 512² | 4.3 MiB | 4.7 MiB |
-| 1024² | 11.5 MiB | 11.4 MiB |
-| 2048² | 49.6 MiB | 35.7 MiB |
+| 512² | 6.6 MiB | 7.9 MiB |
+| 1024² | 18.8 MiB | 9.9 MiB |
+| 2048² | 42.4 MiB | 26.5 MiB |
+
+The threaded column carries the scatter described under "The non-knobs" below and should not be
+read as a trend against the serial one.
+
+### The images are correlated in the caller's own element type
+
+There is no conversion step: an `Int16` sensor product is correlated as `Int16`, and only the
+chip is widened, to `Float32`, because it is stored mean-removed. An earlier 8-bit rescaling stage
+mapped `mean ± 3σ` of each image onto `0..255` first, and removing it **costs 8.1 MiB of peak at
+2048²** — 34.2 against the 42.4 above, measured serial.
+
+That is the honest price of three things. The rescale claimed to buy exact integer accumulation,
+which it never did — the numerator accumulates in `Float64` either way — and the repo's own
+measurement put 8-bit and `Float32` chips at 27.8 against 27.9 µs on 200², i.e. equal. Accuracy is
+marginally *better* without it, since quantizing ahead of a `Float64` accumulation can only lose
+information: on a 1024² pair against a known fractional shift, `dx` RMS error 0.02463 against
+0.02482. And its scale came from a whole-image statistic, which is the kind of quantity that makes
+a block of a scene disagree with the scene.
 
 ## Allocation per pair, and where it went
 

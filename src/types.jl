@@ -51,9 +51,9 @@ The element types the correlator accepts: `Real` for optical and amplitude image
 single-look-complex radar under [`Coherence`](@ref).
 
 `Union{Real,Complex}` rather than `Number`, which is what the type walls first said. `Number` admits
-types no path here handles — `Rational` reaches `quantize` and dies as a bare `MethodError` five
-layers down, with no mention of the actual constraint. Naming the real bound once makes the
-signatures state what the pipeline supports instead of merely more than it supports.
+types no path here handles, which die as a bare `MethodError` several layers down with no mention of
+the actual constraint. Naming the real bound once makes the signatures state what the pipeline
+supports instead of merely more than it supports.
 """
 const ImageElement = Union{Real,Complex}
 
@@ -594,38 +594,6 @@ function _check_filter_width(width::Integer, who::Symbol)
 end
 
 # ---------------------------------------------------------------------------
-# Quantization
-# ---------------------------------------------------------------------------
-
-"""
-    QuantizeMethod
-
-Abstract supertype for how filtered images are converted to the element type
-used for correlation. Concrete subtypes: [`QuantizeUInt8`](@ref),
-[`NoQuantize`](@ref).
-"""
-abstract type QuantizeMethod end
-
-"""
-    QuantizeUInt8()
-
-Rescale each image so that `[mean - 3 std, mean + 3 std]` maps onto the `UInt8`
-range, then round and clamp. Correlating in `UInt8` allows exact integer
-accumulation of the correlation numerator, which is both faster and more
-accurate than accumulating in `Float32`.
-"""
-struct QuantizeUInt8 <: QuantizeMethod end
-
-"""
-    NoQuantize()
-
-Keep the filtered images in floating point, replacing non-finite values with
-zero. Preserves full radiometric precision at the cost of a slower correlation
-inner loop.
-"""
-struct NoQuantize <: QuantizeMethod end
-
-# ---------------------------------------------------------------------------
 # Outlier rejection
 # ---------------------------------------------------------------------------
 
@@ -779,11 +747,9 @@ between them — coherence at the finest chip, amplitude above it. A scalar keyw
 of one measure everywhere is the 1-tuple and costs nothing. See [`chip_measures`](@ref).
 """
 struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:PreprocessMethod,
-              Q<:QuantizeMethod,R<:SubpixelMethod,O<:OutlierMethod,T<:BoolAsType,
-              W<:RotationMethod}
+              R<:SubpixelMethod,O<:OutlierMethod,T<:BoolAsType,W<:RotationMethod}
     similarity::S
     preprocess::P
-    quantize::Q
     subpixel::R
     outliers::O
     threaded::T

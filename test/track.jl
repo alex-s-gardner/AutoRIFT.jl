@@ -192,11 +192,12 @@ end
     @test median_of(filter(!isnan, my)) ≈ -3 atol = 0.05
 end
 
-@testset "quantized input" begin
-    # UInt8 is the reference's default correlation type, and the whole pipeline has to work
-    # in it: an 8-bit chip still resolves an integer shift exactly.
-    ref, sec = shifted_pair(400, (7, 5); T = Float32)
-    pair = AutoRIFT.quantize(ImagePair(ref, sec), :uint8)
+@testset "8-bit input" begin
+    # 8 bits is the narrowest imagery the pipeline sees, and it is the reference's correlation
+    # type. Worth its own case because the quantization step is coarsest here, and an integer
+    # shift must still resolve exactly.
+    ref, sec = shifted_pair(400, (7, 5); T = UInt8)
+    pair = ImagePair(ref, sec)
     @test eltype(pair) === UInt8
     pts = gridpoints((400, 400), 32; chip_size = 32, search_radius = 25)
     d = track(pair, pts, params())
@@ -235,16 +236,14 @@ end
     end
 end
 
-@testset "no quantization preserves the element type" begin
-    # `quantize = :none` means the caller's type reaches the correlator. It matters because this
-    # stage is memory-bandwidth-bound: widening `Int16` to `Float32` would double the traffic
-    # over the whole image and change no result, since the correlator converts per element
-    # anyway. Asserted rather than left implicit, as it is the only thing distinguishing this
-    # path from `:uint8`.
+@testset "preparing an image preserves its element type" begin
+    # The caller's type reaches the correlator. It matters because this stage is
+    # memory-bandwidth-bound: widening `Int16` to `Float32` would double the traffic over the
+    # whole image and change no result, since the correlator converts per element anyway.
     ref, sec = shifted_pair(200, (0, 0); T = Float64)
     for T in (Int16, UInt16, Float32, Float64)
         raw = T <: Integer ? round.(T, ref .* 10_000) : T.(ref)
-        img, mask = AutoRIFT.quantize(raw, trues(size(raw)), AutoRIFT.NoQuantize())
+        img, mask = AutoRIFT.replace_nonfinite(raw, trues(size(raw)))
         @test eltype(img) === T
         @test img == raw            # values untouched, not merely representable
         @test img !== raw           # a copy: the caller's array must not be aliased
@@ -261,7 +260,7 @@ end
     # mask recording that it is not data. An integer image cannot be in that state at all.
     withnan = Float32.(ref)
     withnan[5, 5] = NaN32
-    img, _ = AutoRIFT.quantize(withnan, trues(size(withnan)), AutoRIFT.NoQuantize())
+    img, _ = AutoRIFT.replace_nonfinite(withnan, trues(size(withnan)))
     @test img[5, 5] == 0
     @test count(iszero, img) == 1
 end

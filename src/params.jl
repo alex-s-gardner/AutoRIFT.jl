@@ -15,11 +15,6 @@ const SYMBOL2SIMILARITY = Dict{Symbol,SimilarityMeasure}(
     :coherence => Coherence(),
 )
 
-const SYMBOL2QUANTIZE = Dict{Symbol,QuantizeMethod}(
-    :uint8 => QuantizeUInt8(),
-    :none  => NoQuantize(),
-)
-
 # Preprocessing and subpixel Symbols map to *constructors*, not instances,
 # because their defaults depend on other keywords (`filter_width`, `upsampling`).
 const SYMBOL2PREPROCESS = Dict{Symbol,Any}(
@@ -82,10 +77,6 @@ _similarity(x) = _badtype(:similarity, x,
 _one_similarity(x::SimilarityMeasure) = x
 _one_similarity(x::Symbol) = _resolve(SYMBOL2SIMILARITY, x, :similarity)
 _one_similarity(x) = _badtype(:similarity, x, "a Symbol or a `SimilarityMeasure`")
-
-_quantize(x::QuantizeMethod) = x
-_quantize(x::Symbol) = _resolve(SYMBOL2QUANTIZE, x, :quantize)
-_quantize(x) = _badtype(:quantize, x, "a Symbol or a `QuantizeMethod`")
 
 _preprocess(x::PreprocessMethod, _width) = x
 function _preprocess(x::Symbol, width)
@@ -250,7 +241,6 @@ choice is a known defect — see the package documentation for the list.
   coherence resolves finer detail but is destroyed by phase variation, so points it cannot
   resolve are left to a larger amplitude chip. Requires complex input; see [`Coherence`](@ref).
 - `preprocess = :highpass`: pre-correlation filter; see [`PreprocessMethod`](@ref).
-- `quantize = :uint8`: element type used for correlation; see [`QuantizeMethod`](@ref).
 - `subpixel = :pyramid`: peak refinement; see [`SubpixelMethod`](@ref).
 
 ## Chip and grid geometry, in pixels
@@ -306,7 +296,6 @@ already carries its own — that is an error rather than a silent override.
 function params(;
     similarity = :zncc,
     preprocess = :highpass,
-    quantize = :uint8,
     subpixel = :pyramid,
     filter_width = nokw,
     upsampling = nokw,
@@ -338,7 +327,6 @@ function params(;
 )
     sim = _similarity(similarity)
     pre = _preprocess(preprocess, filter_width)
-    quant = _quantize(quantize)
     sub = _subpixel(subpixel, upsampling)
     # The public keywords are prefixed (`outlier_window`) where the method's own are not
     # (`window`), because at the top level `window` alone would be ambiguous against
@@ -377,7 +365,7 @@ function params(;
         "`search_radius` is zero in both axes, so no pixel can be searched."))
 
     return Params(
-        sim, pre, quant, sub, out, booltype(threaded), rot,
+        sim, pre, sub, out, booltype(threaded), rot,
         base, cmin, cmax, Float64(_check_positive(:chip_aspect, chip_aspect)),
         spacing,
         rx, ry, Int(min_search_radius),

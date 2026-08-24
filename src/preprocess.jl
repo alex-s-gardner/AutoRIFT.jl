@@ -1,4 +1,4 @@
-# Pre-correlation filtering, and conversion to the correlation element type.
+# Pre-correlation filtering.
 #
 # Layer 2: depends on nothing else in the package.
 #
@@ -460,133 +460,43 @@ function _erode_mask(mask::AbstractMatrix{Bool}, w::Int)
 end
 
 # ---------------------------------------------------------------------------
-# Conversion to the correlation element type
+# Non-finite replacement
 # ---------------------------------------------------------------------------
 
 """
-    quantize(pair::ImagePair, method) -> ImagePair
+    replace_nonfinite(pair::ImagePair) -> ImagePair
 
-Convert filtered images to the element type used for correlation.
+Replace non-finite pixels with zero, leaving the element type alone.
 
-`method` is a [`QuantizeMethod`](@ref) or the `Symbol` naming one.
+The images reach the correlator in the caller's own type, so `Int16` sensor data is
+correlated as `Int16`. The correlator is generic over its element type and widens per
+element where it must — the chip to `Float32` because it is stored mean-removed, the sums
+to `Float64` — so converting a whole image here would double its memory traffic and change
+no result.
 """
-quantize(pair::ImagePair, method::Symbol) = quantize(pair, _quantize(method))
-
-# Per image, for the same reason as `preprocess`: the UInt8 scaling is computed from one
-# image's own statistics and nothing crosses between the two.
-quantize(pair::ImagePair, m::QuantizeMethod) = ImagePair(
-    quantize(pair.reference, pair.reference_valid, m),
-    quantize(pair.secondary, pair.secondary_valid, m))
+replace_nonfinite(pair::ImagePair) = ImagePair(
+    replace_nonfinite(pair.reference, pair.reference_valid),
+    replace_nonfinite(pair.secondary, pair.secondary_valid))
 
 """
-    quantize(img, mask, method) -> (converted, mask)
+    replace_nonfinite(img, mask) -> (replaced, mask)
 
-Convert a single filtered image to the correlation element type, with its mask.
-
-See [`preprocess`](@ref) for why the per-image form exists.
+Per-image form, for the same reason [`preprocess`](@ref) has one.
 """
-# No quantization means the element type is the caller's, so `Int16` sensor data reaches the
-# correlator as `Int16`. The correlator is generic over `T<:Real` and converts per element where
-# it must — the chip to `Float32` because it is stored mean-removed, the sums to `Float64` — so
-# widening the whole image here would double its memory traffic and change no result.
-quantize(img::AbstractMatrix{<:Integer}, mask::AbstractMatrix{Bool}, ::NoQuantize) =
+# An integer image cannot hold a non-finite value, so there is nothing to replace and the
+# copy is the whole operation.
+replace_nonfinite(img::AbstractMatrix{<:Integer}, mask::AbstractMatrix{Bool}) =
     (copy(img), copy(mask))
 
-function quantize(img::AbstractMatrix{<:AbstractFloat}, mask::AbstractMatrix{Bool},
-                  ::NoQuantize)
-    # Only a float type can hold a non-finite value, so only this method needs to replace one.
-    # They become zero so downstream arithmetic stays finite, and the mask records that they
-    # carry no information. An integer image cannot be in that state, which is why the method
-    # above can be a plain copy rather than this loop with a test that is always false.
+# Float and complex share one method: `isfinite` of a complex number is false if either
+# component is, so the same test and the same replacement serve both. Zero keeps downstream
+# arithmetic finite, and the mask is what records that those pixels carry no information.
+function replace_nonfinite(img::AbstractMatrix{<:Union{AbstractFloat,Complex}},
+                           mask::AbstractMatrix{Bool})
     out = similar(img)
     @inbounds for i in eachindex(out)
         v = img[i]
         out[i] = isfinite(v) ? v : zero(v)
     end
     return out, copy(mask)
-end
-
-# Complex input under `NoQuantize`: the same non-finite replacement as the float method, since a
-# complex value is non-finite if either component is.
-function quantize(img::AbstractMatrix{<:Complex}, mask::AbstractMatrix{Bool}, ::NoQuantize)
-    out = similar(img)
-    @inbounds for i in eachindex(out)
-        v = img[i]
-        out[i] = isfinite(v) ? v : zero(v)
-    end
-    return out, copy(mask)
-end
-
-quantize(img::AbstractMatrix, mask::AbstractMatrix{Bool}, ::QuantizeUInt8) =
-    (_to_uint8(img, mask), copy(mask))
-
-# Quantizing complex data to UInt8 would have to discard the phase, which is the only reason to
-# hold complex data in the first place. An error rather than a silent `abs`: a caller who wants
-# amplitude matching should say so, and then the whole real pipeline applies unchanged.
-quantize(::AbstractMatrix{<:Complex}, ::AbstractMatrix{Bool}, ::QuantizeUInt8) =
-    throw(ArgumentError(
-        "`quantize = :uint8` cannot represent complex input — scaling to 8-bit integers would " *
-        "discard the phase, which is the only thing `Coherence` measures. Use " *
-        "`quantize = :none` for complex data, or take `abs` of the images to correlate " *
-        "amplitudes with the full real pipeline."))
-
-"""
-    _to_uint8(img, mask) -> Matrix{UInt8}
-
-Rescale so that `mean ± 3 std` of the valid pixels spans the `UInt8` range.
-
-Three standard deviations captures essentially all of a roughly normal distribution
-while keeping the quantization step small; the tails are clipped, which costs nothing
-because correlation depends on texture rather than on extremes.
-
-Statistics are computed over valid pixels only, in `Float64`. Including fill values
-would drag the mean and inflate the spread, compressing the real data into a fraction
-of the available range and throwing away precision exactly where it is needed.
-"""
-function _to_uint8(img::AbstractMatrix, mask::AbstractMatrix{Bool})
-    n = 0
-    s = 0.0
-    @inbounds for i in eachindex(img)
-        v = Float64(img[i])
-        if mask[i] && isfinite(v)
-            n += 1
-            s += v
-        end
-    end
-    out = zeros(UInt8, size(img))
-    n == 0 && return out            # nothing valid; all zero
-
-    mean = s / n
-    ss = 0.0
-    @inbounds for i in eachindex(img)
-        v = Float64(img[i])
-        if mask[i] && isfinite(v)
-            d = v - mean
-            ss += d * d
-        end
-    end
-    # Sample standard deviation (Bessel-corrected), matching the reference. Here the
-    # correction is worth applying because the statistics are global rather than
-    # per-window, so it costs nothing.
-    sd = n > 1 ? sqrt(ss / (n - 1)) : 0.0
-    if sd == 0
-        # A uniform image has no texture to preserve; mid-grey keeps it neutral rather
-        # than pinning it to an endpoint.
-        @inbounds for i in eachindex(out)
-            out[i] = mask[i] ? 0x80 : 0x00
-        end
-        return out
-    end
-
-    lo = mean - 3sd
-    scale = 255.0 / (6sd)
-    @inbounds for i in eachindex(out)
-        v = Float64(img[i])
-        if !mask[i] || !isfinite(v)
-            out[i] = 0x00
-            continue
-        end
-        out[i] = round(UInt8, clamp((v - lo) * scale, 0.0, 255.0))
-    end
-    return out
 end

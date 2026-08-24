@@ -140,7 +140,6 @@ export SimilarityMeasure, ZNCC, NCC, Coherence
 export PreprocessMethod, Highpass, Wallis, WallisGapfill, Sobel, Laplacian,
        Decibel, Deramp, NoPreprocess
 export SubpixelMethod, PyramidRefine, NoRefine
-export QuantizeMethod, QuantizeUInt8, NoQuantize
 export OutlierMethod, GardnerFilter, NoOutlierFilter
 export ImagePair
 export FirstGuess, ORBGuess, AKAZEGuess, first_guess, scene_rotation
@@ -159,9 +158,8 @@ export RotationMethod, RotationSearch, NoRotationSearch
 # for each element type the correlator can see, not running it on large inputs. So this uses the
 # smallest images that produce a grid at all and covers the type axes that matter —
 #
-#   * `UInt8`, the reference's default and what `quantize = :uint8` produces;
-#   * `Float32`, what `quantize = :none` produces after filtering;
-#   * `Int16`, a raw sensor type that reaches the correlator unwidened.
+#   * `Float32`, what a filter produces from real input;
+#   * `UInt8` and `Int16`, raw sensor types that reach the correlator unwidened.
 #
 # and the two entry points, since `autorift` and the `init`/`autorift!` cache path compile
 # separately. The extensions precompile their own workloads: a package cannot precompile code

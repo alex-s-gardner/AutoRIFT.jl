@@ -368,7 +368,7 @@ end
     n, shift = 512, (37, -23)
     a = _speckle_amp(n)
     b = circshift(a, shift)
-    kw = (; chip_size = 32, chip_size_max = 32, quantize = :none)
+    kw = (; chip_size = 32, chip_size_max = 32)
 
     # Without a guess, radius 6 finds nothing at all.
     blind = autorift(a, b; search_radius = 6, kw...)
@@ -376,7 +376,7 @@ end
 
     # With one, radius 6 measures every point — the prior did the reaching.
     g = first_guess(a, b, ORBGuess(; num_keypoints = 3000))
-    guided = autorift(a, b, g; quantize = :none)
+    guided = autorift(a, b, g)
     @test nmeasured(guided) == length(guided.dx)
     @test med(filter(!isnan, guided.dx)) ≈ 23 atol = 0.5
     @test med(filter(!isnan, guided.dy)) ≈ -37 atol = 0.5

@@ -19,8 +19,8 @@ let g = addgroup!(SUITE, "multichip")
         # work. An uncorrelated pair measures the early-exit path instead.
         sec = circshift(ref, (-4, 6))
         pair = AutoRIFT.ImagePair(ref, sec)
-        prepared = AutoRIFT.quantize(
-            AutoRIFT.preprocess(pair, AutoRIFT.Highpass(; width = 5)), :uint8)
+        prepared = AutoRIFT.replace_nonfinite(
+            AutoRIFT.preprocess(pair, AutoRIFT.Highpass(; width = 5)))
         p = AutoRIFT.params(; chip_size = 32, search_radius = 25, threaded = false)
         grid = AutoRIFT.gridpoints((n, n), 32; chip_size = 128, search_radius = 25)
 

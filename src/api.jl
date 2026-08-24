@@ -11,9 +11,10 @@
 #
 # Every keyword is resolved to a concrete `Params` here, at the boundary, and nothing below
 # this file sees a `Symbol` or re-validates a number. That is also why the work is handed to
-# `_run` rather than done inline: the images may be `UInt8` or `Float32` depending on
-# `quantize`, so the call crosses a type boundary, and putting a function barrier there keeps
-# everything downstream monomorphic instead of leaving the whole pipeline inferring a union.
+# `_run` rather than done inline: the filter may change the element type — an integer image
+# filtered by `Highpass` comes back `Float32` — so the call crosses a type boundary, and putting
+# a function barrier there keeps everything downstream monomorphic instead of leaving the whole
+# pipeline inferring a union.
 
 """
     Cache
@@ -29,11 +30,11 @@ concurrently, which is the intended shape for batch processing — see [`autorif
 """
 mutable struct Cache{P<:Params}
     params::P
-    # The pair as supplied, before filtering or quantization. Kept because `reinit!` may replace
-    # only one of the two images, and the other must then be re-prepared from its original —
-    # preparing the already-prepared one would filter and quantize it a second time.
+    # The pair as supplied, before filtering. Kept because `reinit!` may replace only one of the
+    # two images, and the other must then be re-prepared from its original — preparing the
+    # already-prepared one would filter it a second time.
     raw::ImagePair
-    # The pair the correlator sees: filtered and converted to the correlation element type.
+    # The pair the correlator sees: filtered, with non-finite pixels replaced.
     prepared::ImagePair
     grid::PointSet{2}
     result::Union{Nothing,MultichipResult}
@@ -56,8 +57,8 @@ imagepair(cache::Cache) = cache.prepared
 Prepare to correlate `reference` against `secondary`, allocating buffers and planning
 transforms once.
 
-Accepts the same keywords as [`autorift`](@ref). The images are preprocessed and quantized
-immediately, since that is configuration-dependent work that does not need repeating per run.
+Accepts the same keywords as [`autorift`](@ref). The images are preprocessed immediately, since
+that is configuration-dependent work that does not need repeating per run.
 
 Use this with [`reinit!`](@ref) when processing many pairs: the grid, the output arrays, and
 the FFT plans are then built once rather than per pair. For a single pair, call
@@ -227,7 +228,7 @@ once reuse it across pairs without re-validating keywords — though [`AutoRIFT.
 the better tool for that, since it also reuses buffers.
 
 ```julia
-p = AutoRIFT.Params((ZNCC(),), Highpass(), QuantizeUInt8(), PyramidRefine(), GardnerFilter(),
+p = AutoRIFT.Params((ZNCC(),), Highpass(), PyramidRefine(), GardnerFilter(),
                     AutoRIFT.False(), AutoRIFT.NoRotationSearch(), 32, 32, 128, 1.0, 32, 25, 25,
                     6, 4, 8, 0.01, 0.0, 0.0, 3, UInt64(0), false)
 out = autorift(image1, image2, p)
@@ -296,14 +297,14 @@ end
 
 # ---------------------------------------------------------------------------
 
-# Filter and quantize, in that order. Both are configuration-dependent and neither depends on
-# the grid, so a cache does this once per image pair rather than once per run.
+# Filter, then replace non-finite pixels. The filter is configuration-dependent and neither step
+# depends on the grid, so a cache does this once per image pair rather than once per run.
 #
 # Per image, because that is the unit of reuse. In a time series each acquisition is the
 # secondary of one pair and the reference of the next, so `reinit!` swapping one image must not
 # re-filter the other — on 1024² that is 23 ms and 23 MiB of pure waste per pair.
 _prepare(img::AbstractMatrix, mask::AbstractMatrix{Bool}, p::Params) =
-    quantize(preprocess(img, mask, p.preprocess)..., p.quantize)
+    replace_nonfinite(preprocess(img, mask, p.preprocess)...)
 
 
 _prepare(pair::ImagePair, p::Params) = ImagePair(
@@ -314,7 +315,7 @@ _prepare(pair::ImagePair, p::Params) = ImagePair(
 #
 # Matched against *both* slots of the old pair, not just the corresponding one. In a time series
 # the pairs are consecutive acquisitions, so the new reference is the old secondary: the array
-# the caller passes has already been filtered and quantized, just into the other slot. Checking
+# the caller passes has already been filtered, just into the other slot. Checking
 # only like-for-like would miss that and re-filter every image twice over its lifetime.
 #
 # Identity (`===`), not equality: comparing 4 MiB of pixels to decide whether to spend 12 ms

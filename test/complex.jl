@@ -224,14 +224,13 @@ end
     @test_throws ArgumentError correlate!(ws, a, b, r; measure = Coherence())
 end
 
-@testset "amplitude filters and uint8 quantization reject complex input" begin
+@testset "amplitude filters reject complex input" begin
     z = speckle(32)
     m = trues(32, 32)
     # Each of these would produce something plausible-looking and meaningless.
     for filt in (Highpass(), Wallis(), Sobel(), Laplacian(), Decibel())
         @test_throws ArgumentError AutoRIFT.preprocess(z, m, filt)
     end
-    @test_throws ArgumentError AutoRIFT.quantize(z, m, QuantizeUInt8())
     # And deramping a real image is the mirror-image error.
     @test_throws ArgumentError AutoRIFT.preprocess(rand(Float32, 32, 32), m, Deramp())
 end
@@ -277,7 +276,7 @@ end
     z1 = speckle(384; seed = 0xABCD)
     z2 = circshift(z1, (5, -3))
     AutoRIFT.clear_plans!()
-    autorift(z1, z2; similarity = :coherence, preprocess = :deramp, quantize = :none,
+    autorift(z1, z2; similarity = :coherence, preprocess = :deramp,
              chip_size = 32, search_radius = 20, chip_size_max = 32)
     # The complex plans are the ones a coherence surface executes.
     @test !isempty(AutoRIFT.CFFT_PLANS)
@@ -288,7 +287,7 @@ end
 
     # The mirror case: a real pass must not warm complex plans.
     AutoRIFT.clear_plans!()
-    autorift(abs.(z1), abs.(z2); quantize = :none, chip_size = 32, search_radius = 20,
+    autorift(abs.(z1), abs.(z2); chip_size = 32, search_radius = 20,
              chip_size_max = 32)
     @test !isempty(AutoRIFT.RFFT_PLANS)
     @test isempty(AutoRIFT.CFFT_PLANS)
@@ -300,7 +299,7 @@ end
     z1 = speckle(n; seed = 0xABCD)
     z2 = circshift(z1, shift)
 
-    out = autorift(z1, z2; similarity = :coherence, preprocess = :deramp, quantize = :none,
+    out = autorift(z1, z2; similarity = :coherence, preprocess = :deramp,
                    chip_size = 32, search_radius = 20, chip_size_max = 32)
     @test out isa MultichipResult
     @test nmeasured(out) > 0
@@ -312,7 +311,7 @@ end
     # And the hierarchy: coherence at the finest chip, ZNCC above it. Both levels run, and the
     # result must still recover the shift — this is the option the milestone exists to provide.
     hier = autorift(z1, z2; similarity = (:coherence, :zncc), preprocess = :deramp,
-                    quantize = :none, chip_size = 32, chip_size_max = 64, search_radius = 20)
+                    chip_size = 32, chip_size_max = 64, search_radius = 20)
     @test nmeasured(hier) > 0
     @test med(filter(!isnan, hier.dy)) ≈ -5 atol = 0.5
     @test med(filter(!isnan, hier.dx)) ≈ 3 atol = 0.5

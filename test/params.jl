@@ -3,13 +3,11 @@
     # A tuple, one measure per chip-size level; a scalar keyword becomes a 1-tuple.
     @test p.similarity === (ZNCC(),)
     @test p.preprocess == Highpass(5)
-    @test p.quantize === QuantizeUInt8()
     @test p.subpixel == PyramidRefine(64)
     @test p.threaded === AutoRIFT.False()
 
     @test AutoRIFT.params(; similarity = :ncc).similarity === (NCC(),)
     @test AutoRIFT.params(; similarity = :coherence).similarity === (Coherence(),)
-    @test AutoRIFT.params(; quantize = :none).quantize === NoQuantize()
     @test AutoRIFT.params(; subpixel = :none).subpixel === NoRefine()
     @test AutoRIFT.params(; preprocess = :none).preprocess === NoPreprocess()
 
