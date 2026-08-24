@@ -104,6 +104,7 @@ include("preprocess.jl")
 include("firstguess.jl")
 include("track.jl")
 include("multichip.jl")
+include("tile.jl")
 include("api.jl")
 
 # Import this machine's saved FFTW wisdom, so a fresh process does not re-measure plans it has
