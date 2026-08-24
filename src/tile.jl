@@ -183,6 +183,91 @@ _block_pair(pair::ImagePair, b::Block) = ImagePair(
     _read_block(pair.reference_valid, b.read_rows, b.read_cols),
     _read_block(pair.secondary_valid, b.read_rows, b.read_cols))
 
+"""
+    AutoRIFT.BlockBuffers
+
+Reusable storage for one block's raw imagery, so a run allocates one block's worth rather than one
+per block.
+
+Peak resident memory is what an instance's limit sees, and a blocked run holds no more *live* data
+than an untiled one — measured live-heap growth is ~1 MiB either way. What it does is churn: a fresh
+block pair per block, 22.9 MiB each at a 888-pixel read window, 1467 MiB over 64 blocks. The
+collector returns none of that to the OS promptly, so `Sys.maxrss` records the high-water mark of
+churn rather than a requirement, and a scheduler packing jobs onto a small instance is bounded by
+exactly that figure.
+
+Sized to the largest read window in the layout. Smaller blocks — the trailing ones where the grid
+does not divide evenly — take a view of the corner, which is why nothing here is sized per block.
+Not thread-safe: one set per task, the same contract as a correlation workspace.
+"""
+struct BlockBuffers{T,M}
+    reference::Matrix{T}
+    secondary::Matrix{T}
+    reference_valid::Matrix{M}
+    secondary_valid::Matrix{M}
+end
+
+"""
+    AutoRIFT.block_buffers(pair::ImagePair, layout::BlockLayout) -> BlockBuffers
+
+Storage for the largest block in `layout`, to be reused across all of them.
+"""
+function block_buffers(pair::ImagePair, layout::BlockLayout)
+    nr = maximum(length(b.read_rows) for b in layout.blocks)
+    nc = maximum(length(b.read_cols) for b in layout.blocks)
+    T = eltype(pair)
+    return BlockBuffers(Matrix{T}(undef, nr, nc), Matrix{T}(undef, nr, nc),
+                        Matrix{Bool}(undef, nr, nc), Matrix{Bool}(undef, nr, nc))
+end
+
+# A block's raw pair, read into reusable storage.
+#
+# `_read_block!` writes into a view of the buffer rather than returning a fresh array, so a run's
+# raw-read cost is one block's worth however many blocks there are. The views are what let one
+# buffer serve a short trailing block as well as a full interior one.
+function _block_pair!(buf::BlockBuffers, pair::ImagePair, b::Block)
+    nr, nc = length(b.read_rows), length(b.read_cols)
+    r = @view buf.reference[1:nr, 1:nc]
+    s = @view buf.secondary[1:nr, 1:nc]
+    rv = @view buf.reference_valid[1:nr, 1:nc]
+    sv = @view buf.secondary_valid[1:nr, 1:nc]
+    _read_block!(r, pair.reference, b.read_rows, b.read_cols)
+    _read_block!(s, pair.secondary, b.read_rows, b.read_cols)
+    _read_block!(rv, pair.reference_valid, b.read_rows, b.read_cols)
+    _read_block!(sv, pair.secondary_valid, b.read_rows, b.read_cols)
+    return ImagePair(r, s, rv, sv)
+end
+
+"""
+    AutoRIFT._read_block!(dest, img, rows, cols)
+
+Read `img[rows, cols]` into `dest`, which must have that shape.
+
+The in-place counterpart of [`AutoRIFT._read_block`](@ref), and the form the tiled driver uses so a
+run allocates one block's storage rather than one per block. A lazy input's method reads only this
+window from disk.
+"""
+function _read_block!(dest::AbstractMatrix, img::AbstractMatrix, rows, cols)
+    size(dest) == (length(rows), length(cols)) || throw(DimensionMismatch(
+        "destination is $(size(dest)) but the window is $((length(rows), length(cols)))"))
+    copyto!(dest, view(img, rows, cols))
+    return dest
+end
+
+# The *filtered* pair a block sees, from raw input.
+#
+# Filtering per block rather than once over the scene is what makes tiling save memory at all: a
+# whole-scene `_prepare` leaves the filtered pair resident, and a block copied out of it then costs
+# more than it saves. Filtering the block instead means the scene is never materialized.
+#
+# Exact, and the halo is why: `filter_reach` is the neighbourhood a filter's output depends on, and
+# `halo` includes it, so a block's filtered values *and* its eroded mask agree with a whole-scene
+# filter everywhere the block writes. Verified on both, including with invalid pixels present, since
+# `_filtered` erodes the mask by the filter width and that erosion must not bite at a read edge
+# where the untiled run had data.
+_prepared_block_pair(buf::BlockBuffers, pair::ImagePair, b::Block, p::Params) =
+    _prepare(_block_pair!(buf, pair, b), p)
+
 # A block's points, in its read window's coordinate frame.
 #
 # Grid coordinates are in scene pixels and the block holds a sub-window, so every coordinate shifts
@@ -231,7 +316,7 @@ decision that looks at more than one point is taken once, on the assembled grid,
 block.
 """
 function correlate_tiled(pair::ImagePair, grid::PointSet{2}, p::Params,
-                         block_size::Tuple{Int,Int})
+                         block_size::Tuple{Int,Int}; prepare_blocks::Bool = false)
     sizes = chip_sizes(p)
     @assert !isempty(sizes) "no chip-size levels for chip_size $(p.chip_size_base) in " *
                             "[$(p.chip_size_min), $(p.chip_size_max)]"
@@ -246,7 +331,8 @@ function correlate_tiled(pair::ImagePair, grid::PointSet{2}, p::Params,
         cs = sizes[k]
         wanted = result.chip_size .== 0
         any(wanted) || break
-        level = _tiled_level(pair, grid, p, cs, wanted, measure_at(p, k), layout)
+        level = _tiled_level(pair, grid, p, cs, wanted, measure_at(p, k), layout,
+                             prepare_blocks)
         isnothing(level) && continue
         _merge_level!(result, level.field, level.filled, cs)
     end
@@ -256,7 +342,7 @@ end
 # One chip-size level, in blocks. The block-parallel steps are 1 and 3; everything else is global.
 function _tiled_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size::Integer,
                       wanted::AbstractMatrix{Bool}, measure::SimilarityMeasure,
-                      layout::BlockLayout)
+                      layout::BlockLayout, prepare_blocks::Bool)
     csx = Int(chip_size)
     csy = chip_size_y(p, csx)
 
@@ -280,7 +366,7 @@ function _tiled_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size::
     # would have run, which is what `geometry` is for.
     cgeom = pass_geometry(coarse)
     cd = _run_blocked(pair, coarse, p, layout, _coarse_block_layout(layout, setup, size(pts)),
-                      cgeom, measure; subpixel = NoRefine())
+                      cgeom, measure, prepare_blocks; subpixel = NoRefine())
 
     # Step 2, once: the decisions.
     mask = _coarse_decide(cd, coarse, p, setup.filt, size(pts))
@@ -296,7 +382,7 @@ function _tiled_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size::
 
     # Step 3, per block: the fine pass.
     fgeom = pass_geometry(pts)
-    fine = _run_blocked(pair, pts, p, layout, layout.blocks, fgeom, measure)
+    fine = _run_blocked(pair, pts, p, layout, layout.blocks, fgeom, measure, prepare_blocks)
 
     # Step 4, once: reject, fill, and hand back for the merge.
     filled = _reject_and_fill!(fine, pts, p)
@@ -315,7 +401,7 @@ end
 # before spawning, because FFTW's planner is not thread-safe.
 function _run_blocked(pair::ImagePair, pts::PointSet{2}, p::Params, layout::BlockLayout,
                       blocks::Vector{Block}, geometry::PassGeometry,
-                      measure::SimilarityMeasure;
+                      measure::SimilarityMeasure, prepare_blocks::Bool;
                       subpixel::SubpixelMethod = p.subpixel)
     out = displacement_field(pts)
     # Every block shares the geometry, so one warm-up serves all of them — and it must happen here,
@@ -325,26 +411,33 @@ function _run_blocked(pair::ImagePair, pts::PointSet{2}, p::Params, layout::Bloc
 
     serial = _serial_params(p)
     if istrue(p.threaded)
+        # One buffer set per task, not one per block: they are written into, so sharing them across
+        # concurrent blocks would race. That is the same contract a correlation workspace has.
         tasks = map(blocks) do b
-            StableTasks.@spawn _run_one_block!(out, pair, pts, serial, b, geometry, measure,
-                                              subpixel)
+            StableTasks.@spawn _run_one_block!(out, block_buffers(pair, layout), pair, pts,
+                                              serial, b, geometry, measure, subpixel,
+                                              prepare_blocks)
         end
         foreach(wait, tasks)
     else
+        buf = block_buffers(pair, layout)
         for b in blocks
-            _run_one_block!(out, pair, pts, serial, b, geometry, measure, subpixel)
+            _run_one_block!(out, buf, pair, pts, serial, b, geometry, measure, subpixel,
+                            prepare_blocks)
         end
     end
     return out
 end
 
-function _run_one_block!(out::DisplacementField, pair::ImagePair, pts::PointSet{2},
-                         p::Params, b::Block, geometry::PassGeometry,
-                         measure::SimilarityMeasure, subpixel::SubpixelMethod)
+function _run_one_block!(out::DisplacementField, buf::BlockBuffers, pair::ImagePair,
+                         pts::PointSet{2}, p::Params, b::Block, geometry::PassGeometry,
+                         measure::SimilarityMeasure, subpixel::SubpixelMethod,
+                         prepare_blocks::Bool)
     bpts = _block_points(pts, b)
     # A block all of whose points a previous level resolved, or which the coarse mask emptied.
+    # Checked before reading, so an empty block costs no I/O at all.
     nsearchable(bpts) == 0 && return out
-    bpair = _block_pair(pair, b)
+    bpair = prepare_blocks ? _prepared_block_pair(buf, pair, b, p) : _block_pair!(buf, pair, b)
     bout = displacement_field(bpts)
     track!(bout, bpair, bpts, p; subpixel, measure, geometry)
     # Assembly is a copy: the halo grew what this block read, never what it writes.
