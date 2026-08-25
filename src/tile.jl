@@ -123,22 +123,13 @@ function _worst_level_points(grid::PointSet, p::Params)
     flat = scatter(grid)
     csx = p.chip_size_max
     n = size(flat.radius_x)
-    rx = similar(flat.radius_x)
-    ry = similar(flat.radius_y)
-    # `sanitize!`'s rule, read off rather than re-implemented: a point with either radius
-    # non-positive is not searched at all, and one that is searched has both radii floored.
-    @inbounds for i in eachindex(rx)
-        if flat.radius_x[i] <= 0 || flat.radius_y[i] <= 0
-            rx[i] = 0
-            ry[i] = 0
-        else
-            rx[i] = max(flat.radius_x[i], p.min_search_radius)
-            ry[i] = max(flat.radius_y[i], p.min_search_radius)
-        end
-    end
-    return rebuild(flat; radius_x = rx, radius_y = ry,
-                   chip_size_x = fill(csx, n),
-                   chip_size_y = fill(chip_size_y(p, csx), n))
+    # Copies, because `sanitize!` writes in place and `scatter` shares the grid's own arrays.
+    pts = rebuild(flat; radius_x = copy(flat.radius_x), radius_y = copy(flat.radius_y),
+                  chip_size_x = fill(csx, n),
+                  chip_size_y = fill(chip_size_y(p, csx), n))
+    # The same floor a level applies, applied by the same function, so the two cannot drift.
+    sanitize!(pts, p.min_search_radius)
+    return pts
 end
 
 """
@@ -207,32 +198,21 @@ end
 
 The sub-window `img[rows, cols]`, materialized.
 
-A seam, and the reason it exists is memory rather than clarity: a `Raster` backed by a disk array
-reads only the window asked for, so the Rasters extension's method makes peak memory `O(block)`
-where this core method is `O(scene)` — the array is already resident. The core cannot do the lazy
-read itself without depending on Rasters.
+The allocating counterpart of [`AutoRIFT._read_block!`](@ref), which is what the driver uses. A
+disk-backed `img` reads only this window, so no method for a lazy array is needed — indexing is
+already the windowed read.
 
 A `copy` rather than a `view` deliberately. The correlator's inner loop wants contiguous memory,
 and a strided view of a large scene would make every chip read stride the full row.
 """
 _read_block(img::AbstractMatrix, rows, cols) = img[rows, cols]
 
-# The pair a block sees: its read window out of both images and both masks.
-#
-# Built through `_read_block` so a disk-backed input reads only this window. The masks come from
-# the *raw* pair's fields rather than from `valid`, because intersecting them is `track!`'s job and
-# doing it here would produce an `ImagePair` whose two masks are already the same array.
-_block_pair(pair::ImagePair, b::Block) = ImagePair(
-    _read_block(pair.reference, b.read_rows, b.read_cols),
-    _read_block(pair.secondary, b.read_rows, b.read_cols),
-    _read_block(pair.reference_valid, b.read_rows, b.read_cols),
-    _read_block(pair.secondary_valid, b.read_rows, b.read_cols))
-
 """
     AutoRIFT.BlockBuffers
 
 Reusable storage for one block's raw imagery, so a run allocates one block's worth rather than one
-per block.
+per block — and one set per *run*, not per pass: the layout fixes the largest window, so the coarse
+and fine passes of every level want identically-sized arrays.
 
 Peak resident memory is what an instance's limit sees, and a blocked run holds no more *live* data
 than an untiled one — measured live-heap growth is ~1 MiB either way. What it does is churn: a fresh
@@ -424,12 +404,16 @@ function correlate_tiled(raw::ImagePair, grid::PointSet{2}, p::Params,
     sizes = _level_sizes(p)
     layout = block_layout(grid, p, size(raw), block_size)
     result = _empty_result(size(grid))
+    # One set for the whole run. `block_buffers` sizes from the layout's largest read window, which
+    # no level changes, so allocating per pass would allocate the same nine arrays twice per level.
+    # A threaded run takes its own set per task instead, since blocks then write concurrently.
+    buffers = istrue(p.threaded) ? nothing : block_buffers(raw, layout)
 
     for k in eachindex(sizes)
         cs = sizes[k]
         wanted = result.chip_size .== 0
         any(wanted) || break
-        level = _tiled_level(raw, grid, p, cs, wanted, measure_at(p, k), layout)
+        level = _tiled_level(raw, grid, p, cs, wanted, measure_at(p, k), layout, buffers)
         isnothing(level) && continue
         _merge_level!(result, level.field, level.filled, cs)
     end
@@ -439,13 +423,32 @@ end
 # One chip-size level, in blocks. The block-parallel steps are 1 and 3; everything else is global.
 function _tiled_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size::Integer,
                       wanted::AbstractMatrix{Bool}, measure::SimilarityMeasure,
-                      layout::BlockLayout)
+                      layout::BlockLayout, buffers::Union{Nothing,BlockBuffers})
     csx = Int(chip_size)
     csy = chip_size_y(p, csx)
 
     pts = _level_points(grid, p, csx, csy, wanted)
     nsearchable(pts) == 0 && return nothing
 
+    mask = _coarse_mask(pair, pts, p, csx, csy, measure, layout, buffers)
+    isnothing(mask) && return nothing
+    _apply_coarse_mask!(pts, mask) == 0 && return nothing
+
+    # Step 3, per block: the fine pass.
+    fgeom = pass_geometry(pts)
+    fine = _run_blocked(pair, pts, p, layout, layout.blocks, fgeom, measure, buffers)
+
+    # Step 4, once: reject, fill, and hand back for the merge.
+    filled = _reject_and_fill!(fine, pts, p)
+    return (; field = fine, filled)
+end
+
+# Steps 1 and 2: where the fine pass should look, or `nothing` if this level is not worth
+# continuing. Separated from the level so the fine pass reads as one statement rather than as the
+# tail of a two-branch block.
+function _coarse_mask(pair::ImagePair, pts::PointSet{2}, p::Params, csx::Int, csy::Int,
+                      measure::SimilarityMeasure, layout::BlockLayout,
+                      buffers::Union{Nothing,BlockBuffers})
     setup = _coarse_points(pts, p, csx, csy)
     if isnothing(setup)
         # Too few coarse points to judge consistency against their neighbours, so there is no
@@ -456,32 +459,20 @@ function _tiled_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size::
         @warn "coarse grid smaller than the outlier filter's window; searching every point at " *
               "full radius, which costs roughly 100x the restricted pass. Reduce " *
               "`coarse_stride`, reduce `grid_spacing`, or process a larger area per call." chip_size=csx
-        mask = trues(size(pts))
-    else
-        coarse = setup.coarse
-        nsearchable(coarse) == 0 && return nothing
-
-        # Step 1, per block: the coarse evidence. Every block runs the transform the whole coarse
-        # pass would have run, which is what `geometry` is for.
-        cgeom = pass_geometry(coarse)
-        cd = _run_blocked(pair, coarse, p, layout, _coarse_block_layout(layout, setup, size(pts)),
-                          cgeom, measure; subpixel = NoRefine())
-
-        # Step 2, once: the decisions.
-        m = _coarse_decide(cd, coarse, p, setup.filt, size(pts))
-        isnothing(m) && return nothing
-        mask = m
+        return trues(size(pts))
     end
 
-    _apply_coarse_mask!(pts, mask) == 0 && return nothing
+    coarse = setup.coarse
+    nsearchable(coarse) == 0 && return nothing
 
-    # Step 3, per block: the fine pass.
-    fgeom = pass_geometry(pts)
-    fine = _run_blocked(pair, pts, p, layout, layout.blocks, fgeom, measure)
+    # Step 1, per block: the coarse evidence. Every block runs the transform the whole coarse pass
+    # would have run, which is what `geometry` is for.
+    cgeom = pass_geometry(coarse)
+    cd = _run_blocked(pair, coarse, p, layout, _coarse_block_layout(layout, setup, size(pts)),
+                      cgeom, measure, buffers; subpixel = NoRefine())
 
-    # Step 4, once: reject, fill, and hand back for the merge.
-    filled = _reject_and_fill!(fine, pts, p)
-    return (; field = fine, filled)
+    # Step 2, once: the decisions.
+    return _coarse_decide(cd, coarse, p, setup.filt, size(pts))
 end
 
 # Correlate `pts` block by block, writing into one field.
@@ -496,7 +487,7 @@ end
 # before spawning, because FFTW's planner is not thread-safe.
 function _run_blocked(raw::ImagePair, pts::PointSet{2}, p::Params, layout::BlockLayout,
                       blocks::Vector{Block}, geometry::PassGeometry,
-                      measure::SimilarityMeasure;
+                      measure::SimilarityMeasure, buffers::Union{Nothing,BlockBuffers};
                       subpixel::SubpixelMethod = p.subpixel)
     out = displacement_field(pts)
     # Every block shares the geometry, so one warm-up serves all of them — and it must happen here,
@@ -507,14 +498,23 @@ function _run_blocked(raw::ImagePair, pts::PointSet{2}, p::Params, layout::Block
     serial = _serial_params(p)
     if istrue(p.threaded)
         # One buffer set per task, not one per block: they are written into, so sharing them across
-        # concurrent blocks would race. That is the same contract a correlation workspace has.
+        # concurrent blocks would race. That is the same contract a correlation workspace has, and it
+        # is why a threaded run cannot take the caller's single set.
+        #
+        # Pooling these — borrowing `nthreads` sets rather than allocating one per block — saves real
+        # memory (48 of 105 MiB at 64 blocks on 8 threads) and is *not* correct as written: a
+        # `Channel` of sets made a threaded run disagree with an untiled one at 1330 of 3721 points.
+        # The buffers alias into `ImagePair` views that outlive `_run_one_block!`'s frame, so a set
+        # returned to the pool is still referenced by the pair a later block reads. Fixing that means
+        # making the borrow span the whole read-filter-correlate sequence, not just the call.
         tasks = map(blocks) do b
             StableTasks.@spawn _run_one_block!(out, block_buffers(raw, layout), raw, pts,
                                               serial, b, geometry, measure, subpixel)
         end
         foreach(wait, tasks)
     else
-        buf = block_buffers(raw, layout)
+        # Serial: one set serves every block, and the caller's serves every pass.
+        buf = isnothing(buffers) ? block_buffers(raw, layout) : buffers
         for b in blocks
             _run_one_block!(out, buf, raw, pts, serial, b, geometry, measure, subpixel)
         end

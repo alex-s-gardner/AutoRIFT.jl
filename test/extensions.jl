@@ -466,9 +466,10 @@ end
     bs = (8, 8)
     layout = AutoRIFT.block_layout(grid, p, (n, n), bs)
 
-    autorift(a, b; chip_size = 32, chip_size_max = 32, grid_spacing = 32,
-                      search_radius = 12, process_block_size = bs,
-                      reference_valid = trues(n, n), secondary_valid = trues(n, n))
+    opts = (; chip_size = 32, chip_size_max = 32, grid_spacing = 32, search_radius = 12,
+            process_block_size = bs)
+    lazy = autorift(a, b; opts..., reference_valid = trues(n, n),
+                    secondary_valid = trues(n, n))
 
     # No single read is scene-sized: every read is a block's window or a chunk of one.
     largest_window = maximum(length(blk.read_rows) * length(blk.read_cols)
@@ -485,18 +486,9 @@ end
     @test a.elements <= total_window
     @test a.elements > n * n                      # strictly more than the scene: the halo overlap
 
-    # And the answer is the same one a resident array gives, so the windowed read is not a
-    # different computation.
+    # And the answer is the one a resident array gives, so the windowed read is not a different
+    # computation. Compared against the run above rather than repeating it.
     resident_ref = [_disk_value(Float32, i, j, 1) for i in 1:n, j in 1:n]
     resident_sec = [_disk_value(Float32, i, j, 2) for i in 1:n, j in 1:n]
-    lazy = autorift(CountingDisk{Float32}((n, n), 1), CountingDisk{Float32}((n, n), 2);
-                             chip_size = 32, chip_size_max = 32, grid_spacing = 32,
-                             search_radius = 12, process_block_size = bs,
-                             reference_valid = trues(n, n), secondary_valid = trues(n, n))
-    eager = autorift(resident_ref, resident_sec;
-                              chip_size = 32, chip_size_max = 32, grid_spacing = 32,
-                              search_radius = 12, process_block_size = bs)
-    for f in (:dx, :dy, :correlation, :chip_size, :interpolated)
-        @test isequal(getfield(lazy, f), getfield(eager, f))
-    end
+    assert_same_result(autorift(resident_ref, resident_sec; opts...), lazy, "lazy equals resident")
 end

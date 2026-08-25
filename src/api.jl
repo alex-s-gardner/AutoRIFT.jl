@@ -55,17 +55,19 @@ end
 """
     AutoRIFT.imagepair(cache) -> ImagePair
 
-The pair the correlator will see: filtered and converted to the correlation element type.
+The filtered pair the correlator will see.
 
 Throws for a cache built with `process_block_size`. Such a run filters each block from its own read
 window and never forms a filtered scene, so there is no whole-scene pair to return — and returning
 the raw one would silently answer a different question.
 """
-imagepair(cache::Cache) = isnothing(cache.prepared) ? throw(ArgumentError(
-    "this cache was built with `process_block_size`, so no whole-scene filtered pair exists: each " *
-    "block is filtered from its own read window, which is what bounds peak memory. Use " *
-    "`cache.raw` for the input as supplied, or build the cache without `process_block_size`.")) :
-    cache.prepared
+function imagepair(cache::Cache)
+    isnothing(cache.prepared) && throw(ArgumentError(
+        "this cache was built with `process_block_size`, so no whole-scene filtered pair exists: " *
+        "each block is filtered from its own read window, which is what bounds peak memory. Use " *
+        "`cache.raw` for the input as supplied, or build the cache without `process_block_size`."))
+    return cache.prepared
+end
 
 """
     AutoRIFT.init(reference, secondary; kwargs...) -> Cache
