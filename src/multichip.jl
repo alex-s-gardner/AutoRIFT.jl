@@ -89,6 +89,41 @@ How many grid points carry a displacement.
 """
 nmeasured(r::MultichipResult) = count(!isnan, r.dx)
 
+# A result with nothing resolved: `NaN` where no displacement was measured, and a zero chip size
+# marking every point as still wanted by the level loop.
+_empty_result(sz::Tuple{Int,Int}) = MultichipResult(
+    fill(NaN32, sz), fill(NaN32, sz), fill(NaN32, sz), zeros(UInt16, sz), falses(sz))
+
+# The chip sizes a run will step through, checked against the measures it was given.
+#
+# `params` already guarantees at least one level: it requires `chip_size <= chip_size_min <=
+# chip_size_max` and that the bounds are power-of-two multiples of `chip_size`, so the sequence
+# always contains `chip_size_min`. Asserted rather than handled, since a caller cannot reach the
+# empty case through the public constructor.
+#
+# The measure check happens here, before any correlation, rather than at the level that would have
+# used a surplus entry.
+function _level_sizes(p::Params)
+    sizes = chip_sizes(p)
+    @assert !isempty(sizes) "no chip-size levels for chip_size $(p.chip_size_base) in " *
+                            "[$(p.chip_size_min), $(p.chip_size_max)]"
+    _check_measures(p, length(sizes))
+    return sizes
+end
+
+# Restrict a level's search to where the coarse pass found coherent motion, by zeroing the radius
+# everywhere else. This is what the coarse pass is *for*, and the reason radius is a per-point
+# field. Returns how many points remain searchable, so a caller can stop when none do.
+function _apply_coarse_mask!(pts::PointSet{2}, mask::AbstractMatrix{Bool})
+    @inbounds for i in eachindex(pts)
+        if !mask[i]
+            pts.radius_x[i] = 0
+            pts.radius_y[i] = 0
+        end
+    end
+    return nsearchable(pts)
+end
+
 # ---------------------------------------------------------------------------
 
 """
@@ -104,20 +139,8 @@ Each level runs [`chipsize_level`](@ref) and contributes only where no finer lev
 succeeded, so the smallest chip that yields a coherent estimate wins at every point.
 """
 function correlate_multichip(pair::ImagePair, grid::PointSet{2}, p::Params)
-    # `params` already guarantees at least one level: it requires `chip_size <= chip_size_min
-    # <= chip_size_max` and that the bounds are power-of-two multiples of `chip_size`, so the
-    # sequence always contains `chip_size_min`. Asserted rather than handled, since a caller
-    # cannot reach the empty case through the public constructor.
-    sizes = chip_sizes(p)
-    @assert !isempty(sizes) "no chip-size levels for chip_size $(p.chip_size_base) in " *
-                            "[$(p.chip_size_min), $(p.chip_size_max)]"
-    # Reject a too-long `similarity` tuple before any correlation runs, rather than discovering it
-    # at the level that would have used the extra entry.
-    _check_measures(p, length(sizes))
-
-    sz = size(grid)
-    result = MultichipResult(fill(NaN32, sz), fill(NaN32, sz), fill(NaN32, sz),
-                           zeros(UInt16, sz), falses(sz))
+    sizes = _level_sizes(p)
+    result = _empty_result(size(grid))
 
     # `eachindex` and two index reads rather than `zip` over a `Vector` and a tuple: `zip` of a
     # `Vector` with anything is `Iterators.Zip{<:Tuple{Vector,Vararg}}`, which `--trim` cannot
@@ -168,16 +191,7 @@ function chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params,
 
     coarse_mask = _coarse_pass(pair, pts, p, csx, csy, measure)
     isnothing(coarse_mask) && return nothing
-
-    # The coarse result restricts the fine search: zero the radius outside it. This is the
-    # whole point of the coarse pass, and the reason radius is a per-point field.
-    @inbounds for i in eachindex(pts)
-        if !coarse_mask[i]
-            pts.radius_x[i] = 0
-            pts.radius_y[i] = 0
-        end
-    end
-    nsearchable(pts) == 0 && return nothing
+    _apply_coarse_mask!(pts, coarse_mask) == 0 && return nothing
 
     fine = track(pair, pts, p; measure)
     filled = _reject_and_fill!(fine, pts, p)

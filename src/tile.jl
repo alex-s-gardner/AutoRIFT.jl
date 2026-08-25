@@ -412,15 +412,9 @@ block.
 """
 function correlate_tiled(pair::ImagePair, grid::PointSet{2}, p::Params,
                          block_size::Tuple{Int,Int}; prepare_blocks::Bool = false)
-    sizes = chip_sizes(p)
-    @assert !isempty(sizes) "no chip-size levels for chip_size $(p.chip_size_base) in " *
-                            "[$(p.chip_size_min), $(p.chip_size_max)]"
-    _check_measures(p, length(sizes))
-
+    sizes = _level_sizes(p)
     layout = block_layout(grid, p, size(pair), block_size)
-    sz = size(grid)
-    result = MultichipResult(fill(NaN32, sz), fill(NaN32, sz), fill(NaN32, sz),
-                             zeros(UInt16, sz), falses(sz))
+    result = _empty_result(size(grid))
 
     for k in eachindex(sizes)
         cs = sizes[k]
@@ -471,13 +465,7 @@ function _tiled_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size::
         mask = m
     end
 
-    @inbounds for i in eachindex(pts)
-        if !mask[i]
-            pts.radius_x[i] = 0
-            pts.radius_y[i] = 0
-        end
-    end
-    nsearchable(pts) == 0 && return nothing
+    _apply_coarse_mask!(pts, mask) == 0 && return nothing
 
     # Step 3, per block: the fine pass.
     fgeom = pass_geometry(pts)
