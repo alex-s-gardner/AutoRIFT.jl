@@ -34,8 +34,10 @@ mutable struct Cache{P<:Params}
     # two images, and the other must then be re-prepared from its original — preparing the
     # already-prepared one would filter it a second time.
     raw::ImagePair
-    # The pair the correlator sees: filtered, with non-finite pixels replaced.
-    prepared::ImagePair
+    # The pair the correlator sees: filtered, with non-finite pixels replaced. `nothing` under
+    # `block_size`, where each block is filtered from its own read window instead and a whole-scene
+    # filtered copy is exactly the allocation blocking exists to avoid.
+    prepared::Union{Nothing,ImagePair}
     grid::PointSet{2}
     result::Union{Nothing,MultichipResult}
     # Set when the images change and cleared once a run has consumed them. `reinit!`
@@ -54,8 +56,16 @@ end
     AutoRIFT.imagepair(cache) -> ImagePair
 
 The pair the correlator will see: filtered and converted to the correlation element type.
+
+Throws for a cache built with `process_block_size`. Such a run filters each block from its own read
+window and never forms a filtered scene, so there is no whole-scene pair to return — and returning
+the raw one would silently answer a different question.
 """
-imagepair(cache::Cache) = cache.prepared
+imagepair(cache::Cache) = isnothing(cache.prepared) ? throw(ArgumentError(
+    "this cache was built with `process_block_size`, so no whole-scene filtered pair exists: each " *
+    "block is filtered from its own read window, which is what bounds peak memory. Use " *
+    "`cache.raw` for the input as supplied, or build the cache without `process_block_size`.")) :
+    cache.prepared
 
 """
     AutoRIFT.init(reference, secondary; kwargs...) -> Cache
@@ -64,7 +74,10 @@ Prepare to correlate `reference` against `secondary`, allocating buffers and pla
 transforms once.
 
 Accepts the same keywords as [`autorift`](@ref). The images are preprocessed immediately, since
-that is configuration-dependent work that does not need repeating per run.
+that is configuration-dependent work that does not need repeating per run — except under
+`process_block_size`, where each block is filtered from its own read window during the run and no
+whole-scene filtered copy is ever formed. [`AutoRIFT.imagepair`](@ref) therefore has nothing to
+return for such a cache and says so.
 
 Use this with [`reinit!`](@ref) when processing many pairs: the grid, the output arrays, and
 the FFT plans are then built once rather than per pair. For a single pair, call
@@ -75,15 +88,19 @@ function CommonSolve.init(reference::AbstractMatrix, secondary::AbstractMatrix;
               process_block_size = nothing, kwargs...)
     p = params(; kwargs...)
     raw = ImagePair(reference, secondary; reference_valid, secondary_valid)
-    prepared = _prepare(raw, p)
-    grid = _build_grid(size(prepared), p)
+    bs = _block_size(process_block_size)
+    # A blocked run filters each block from its own read window, so the filtered scene is never
+    # formed — which is what bounds peak memory by the block rather than by the scene, and is the
+    # reason `process_block_size` exists. Preparing here would defeat it, and would also filter
+    # every block twice.
+    prepared = isnothing(bs) ? _prepare(raw, p) : nothing
+    grid = _build_grid(size(raw), p)
     # Plans are created here rather than on first use so that a batch driver pays for them
     # once, on the task that builds the cache, and never inside a correlation.
     _warm_grid_plans(grid, p)
-    bs = _block_size(process_block_size)
     # Validated here rather than at the first run, so a block size that cannot work is an error at
     # the call that set it. `block_layout` is what knows the halo, so it is what checks.
-    isnothing(bs) || block_layout(grid, p, size(prepared), bs)
+    isnothing(bs) || block_layout(grid, p, size(raw), bs)
     return Cache{typeof(p)}(p, raw, prepared, grid, nothing, true, bs)
 end
 
@@ -149,9 +166,13 @@ function reinit!(cache::Cache; reference = nothing, secondary = nothing,
 
     cache.raw = ImagePair(ref, sec; reference_valid = rv, secondary_valid = sv)
     p = cache.params
-    newref = _reprepare(ref, cache.raw.reference_valid, old, oldprep, p)
-    newsec = _reprepare(sec, cache.raw.secondary_valid, old, oldprep, p)
-    cache.prepared = ImagePair(newref, newsec)
+    # A blocked cache holds no filtered scene to refresh, and the reuse below has nothing to reuse:
+    # its filtering happens per block, inside the run, from whichever raw pair is current.
+    if !isnothing(oldprep)
+        newref = _reprepare(ref, cache.raw.reference_valid, old, oldprep, p)
+        newsec = _reprepare(sec, cache.raw.secondary_valid, old, oldprep, p)
+        cache.prepared = ImagePair(newref, newsec)
+    end
     # `|=` rather than `=`: two swaps before a single run must still leave the cache dirty.
     cache.isfresh |= true
     cache.result = nothing
@@ -189,7 +210,8 @@ than recomputing it.
 """
 function autorift!(cache::Cache)
     cache.isfresh || isnothing(cache.result) || return cache.result
-    cache.result = _correlate(cache.prepared, cache.grid, cache.params, cache.block_size)
+    cache.result = _correlate(cache.prepared, cache.raw, cache.grid, cache.params,
+                              cache.block_size)
     cache.isfresh = false
     return cache.result
 end
@@ -197,10 +219,14 @@ end
 # One block over the whole grid is the untiled path itself, not a tiled run that happens to have
 # one block. The two agree bit for bit, but taking the same code keeps that a property of having
 # one implementation rather than something to re-verify.
-_correlate(pair::ImagePair, grid::PointSet{2}, p::Params, ::Nothing) =
-    correlate_multichip(pair, grid, p)
-_correlate(pair::ImagePair, grid::PointSet{2}, p::Params, bs::Tuple{Int,Int}) =
-    correlate_tiled(pair, grid, p, bs)
+#
+# The two take *different pairs*, which is the whole point rather than an inconsistency: the untiled
+# path correlates a filtered scene, while a blocked run filters each block from raw and so never
+# forms one. Handing the blocked path a prepared pair would filter it twice.
+_correlate(prepared::ImagePair, ::ImagePair, grid::PointSet{2}, p::Params, ::Nothing) =
+    correlate_multichip(prepared, grid, p)
+_correlate(::Nothing, raw::ImagePair, grid::PointSet{2}, p::Params, bs::Tuple{Int,Int}) =
+    correlate_tiled(raw, grid, p, bs)
 
 """
     autorift(reference, secondary; kwargs...) -> MultichipResult
@@ -311,13 +337,20 @@ function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, grid::Po
                   reference_valid = nothing, secondary_valid = nothing,
                   process_block_size = nothing, kwargs...)
     p = params(; kwargs...)
-    pair = _prepare(ImagePair(reference, secondary; reference_valid, secondary_valid), p)
-    return _run(pair, grid, p, _block_size(process_block_size))
+    raw = ImagePair(reference, secondary; reference_valid, secondary_valid)
+    return _run(raw, grid, p, _block_size(process_block_size))
 end
 
 # Dispatch on the point set's dimensionality: only a gridded one can run multiple chip sizes.
-_run(pair::ImagePair, grid::PointSet{2}, p::Params, bs) = _correlate(pair, grid, p, bs)
-_run(pair::ImagePair, pts::PointSet{1}, p::Params, ::Nothing) = track(pair, pts, p)
+#
+# Whether the scene is filtered here at all depends on the block size, which is why `_prepare` sits
+# inside these methods rather than at the call: a blocked run filters per block and must never form a
+# filtered scene, since that copy is the allocation it exists to avoid.
+_run(raw::ImagePair, grid::PointSet{2}, p::Params, ::Nothing) =
+    _correlate(_prepare(raw, p), raw, grid, p, nothing)
+_run(raw::ImagePair, grid::PointSet{2}, p::Params, bs::Tuple{Int,Int}) =
+    _correlate(nothing, raw, grid, p, bs)
+_run(raw::ImagePair, pts::PointSet{1}, p::Params, ::Nothing) = track(_prepare(raw, p), pts, p)
 
 # Blocks are laid out over a *gridded* point set, since the halo is derived from where points sit
 # relative to each other. A scattered set has no such layout, so there is nothing to divide.
@@ -342,10 +375,11 @@ function autorift_with_grid(reference::AbstractMatrix, secondary::AbstractMatrix
                             reference_valid = nothing, secondary_valid = nothing,
                             process_block_size = nothing, kwargs...)
     p = params(; kwargs...)
-    pair = _prepare(ImagePair(reference, secondary; reference_valid, secondary_valid), p)
-    grid = _build_grid(size(pair), p)
+    raw = ImagePair(reference, secondary; reference_valid, secondary_valid)
+    # From the raw pair's size, which the filters preserve.
+    grid = _build_grid(size(raw), p)
     _warm_grid_plans(grid, p)
-    return _run(pair, grid, p, _block_size(process_block_size)), grid
+    return _run(raw, grid, p, _block_size(process_block_size)), grid
 end
 
 # ---------------------------------------------------------------------------

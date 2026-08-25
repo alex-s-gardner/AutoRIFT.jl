@@ -324,16 +324,14 @@ end
 # more than it saves. Filtering the block instead means the scene is never materialized.
 #
 # `pair` must be **raw**. This filters what it is given, so a pair `_prepare` has already filtered
-# comes back filtered twice — which is not an edge effect but a wrong image everywhere, and one that
-# still looks like imagery. `correlate_tiled`'s caller in `api.jl` passes a prepared pair, so
-# reaching here through the public API is currently that mistake; the assertion is what makes it
-# loud rather than a field of plausible numbers.
+# comes back filtered twice — not an edge effect but a wrong image everywhere, and one that still
+# looks like imagery.
 #
-# Exact where it applies, and the halo is why: `filter_reach` is the neighbourhood a filter's output
-# depends on, and `halo` includes it, so a block's filtered values *and* its eroded mask agree with a
-# whole-scene filter everywhere the block writes. That holds for the values and for the mask, since
-# `_filtered` erodes by the filter width and that erosion must not bite at a read edge where the
-# untiled run had data.
+# Exact, and the halo is why: `filter_reach` is the neighbourhood a filter's output depends on, and
+# `halo` includes it, so a block's filtered values *and* its eroded mask agree with a whole-scene
+# filter everywhere the block writes. The mask matters as much as the values, since `_filtered`
+# erodes by the filter width and that erosion must not bite at a read edge where the untiled run had
+# data.
 function _prepared_block_pair(buf::BlockBuffers, pair::ImagePair, b::Block, p::Params)
     raw = _block_pair!(buf, pair, b)
     return _prepare_block(buf, raw, p, p.preprocess, length(b.read_rows), length(b.read_cols))
@@ -406,28 +404,32 @@ end
 # Steps 2 and 4 work on the grid, which is ~1/1024 the scene at the default spacing and stride.
 
 """
-    AutoRIFT.correlate_tiled(pair, grid, p, block_size) -> MultichipResult
+    AutoRIFT.correlate_tiled(raw, grid, p, block_size) -> MultichipResult
 
 [`AutoRIFT.correlate_multichip`](@ref)'s result, computed in blocks of at most `block_size` grid
 points so that peak memory tracks the block rather than the scene.
 
+`raw` is the **unfiltered** pair, and that is what makes this bound memory rather than merely
+reorganize it: each block is filtered from its own read window, so the filtered scene the untiled
+path holds resident is never formed. Handing this an already-filtered pair filters it twice.
+
 Bit-identical to the untiled path. Every block is handed the whole grid's
-[`AutoRIFT.PassGeometry`](@ref), so it runs the transform the untiled pass would have run; and every
+[`AutoRIFT.PassGeometry`](@ref), so it runs the transform the untiled pass would have run; every
 decision that looks at more than one point is taken once, on the assembled grid, rather than per
-block.
+block; and a block's filtered values and eroded mask agree with a whole-scene filter everywhere the
+block writes, which is what the filter term in [`AutoRIFT.halo`](@ref) buys.
 """
-function correlate_tiled(pair::ImagePair, grid::PointSet{2}, p::Params,
-                         block_size::Tuple{Int,Int}; prepare_blocks::Bool = false)
+function correlate_tiled(raw::ImagePair, grid::PointSet{2}, p::Params,
+                         block_size::Tuple{Int,Int})
     sizes = _level_sizes(p)
-    layout = block_layout(grid, p, size(pair), block_size)
+    layout = block_layout(grid, p, size(raw), block_size)
     result = _empty_result(size(grid))
 
     for k in eachindex(sizes)
         cs = sizes[k]
         wanted = result.chip_size .== 0
         any(wanted) || break
-        level = _tiled_level(pair, grid, p, cs, wanted, measure_at(p, k), layout,
-                             prepare_blocks)
+        level = _tiled_level(raw, grid, p, cs, wanted, measure_at(p, k), layout)
         isnothing(level) && continue
         _merge_level!(result, level.field, level.filled, cs)
     end
@@ -437,7 +439,7 @@ end
 # One chip-size level, in blocks. The block-parallel steps are 1 and 3; everything else is global.
 function _tiled_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size::Integer,
                       wanted::AbstractMatrix{Bool}, measure::SimilarityMeasure,
-                      layout::BlockLayout, prepare_blocks::Bool)
+                      layout::BlockLayout)
     csx = Int(chip_size)
     csy = chip_size_y(p, csx)
 
@@ -463,7 +465,7 @@ function _tiled_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size::
         # pass would have run, which is what `geometry` is for.
         cgeom = pass_geometry(coarse)
         cd = _run_blocked(pair, coarse, p, layout, _coarse_block_layout(layout, setup, size(pts)),
-                          cgeom, measure, prepare_blocks; subpixel = NoRefine())
+                          cgeom, measure; subpixel = NoRefine())
 
         # Step 2, once: the decisions.
         m = _coarse_decide(cd, coarse, p, setup.filt, size(pts))
@@ -475,7 +477,7 @@ function _tiled_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size::
 
     # Step 3, per block: the fine pass.
     fgeom = pass_geometry(pts)
-    fine = _run_blocked(pair, pts, p, layout, layout.blocks, fgeom, measure, prepare_blocks)
+    fine = _run_blocked(pair, pts, p, layout, layout.blocks, fgeom, measure)
 
     # Step 4, once: reject, fill, and hand back for the merge.
     filled = _reject_and_fill!(fine, pts, p)
@@ -492,9 +494,9 @@ end
 # One task per block with `threaded = false` inside it, which is the shape `src/api.jl` already
 # documents for batch work: one unit of work per task beats threading within a unit. Plans are warmed
 # before spawning, because FFTW's planner is not thread-safe.
-function _run_blocked(pair::ImagePair, pts::PointSet{2}, p::Params, layout::BlockLayout,
+function _run_blocked(raw::ImagePair, pts::PointSet{2}, p::Params, layout::BlockLayout,
                       blocks::Vector{Block}, geometry::PassGeometry,
-                      measure::SimilarityMeasure, prepare_blocks::Bool;
+                      measure::SimilarityMeasure;
                       subpixel::SubpixelMethod = p.subpixel)
     out = displacement_field(pts)
     # Every block shares the geometry, so one warm-up serves all of them — and it must happen here,
@@ -507,30 +509,27 @@ function _run_blocked(pair::ImagePair, pts::PointSet{2}, p::Params, layout::Bloc
         # One buffer set per task, not one per block: they are written into, so sharing them across
         # concurrent blocks would race. That is the same contract a correlation workspace has.
         tasks = map(blocks) do b
-            StableTasks.@spawn _run_one_block!(out, block_buffers(pair, layout), pair, pts,
-                                              serial, b, geometry, measure, subpixel,
-                                              prepare_blocks)
+            StableTasks.@spawn _run_one_block!(out, block_buffers(raw, layout), raw, pts,
+                                              serial, b, geometry, measure, subpixel)
         end
         foreach(wait, tasks)
     else
-        buf = block_buffers(pair, layout)
+        buf = block_buffers(raw, layout)
         for b in blocks
-            _run_one_block!(out, buf, pair, pts, serial, b, geometry, measure, subpixel,
-                            prepare_blocks)
+            _run_one_block!(out, buf, raw, pts, serial, b, geometry, measure, subpixel)
         end
     end
     return out
 end
 
-function _run_one_block!(out::DisplacementField, buf::BlockBuffers, pair::ImagePair,
+function _run_one_block!(out::DisplacementField, buf::BlockBuffers, raw::ImagePair,
                          pts::PointSet{2}, p::Params, b::Block, geometry::PassGeometry,
-                         measure::SimilarityMeasure, subpixel::SubpixelMethod,
-                         prepare_blocks::Bool)
+                         measure::SimilarityMeasure, subpixel::SubpixelMethod)
     bpts = _block_points(pts, b)
     # A block all of whose points a previous level resolved, or which the coarse mask emptied.
     # Checked before reading, so an empty block costs no I/O at all.
     nsearchable(bpts) == 0 && return out
-    bpair = prepare_blocks ? _prepared_block_pair(buf, pair, b, p) : _block_pair!(buf, pair, b)
+    bpair = _prepared_block_pair(buf, raw, b, p)
     bout = displacement_field(bpts)
     track!(bout, bpair, bpts, p; subpixel, measure, geometry)
     # Assembly is a copy: the halo grew what this block read, never what it writes.

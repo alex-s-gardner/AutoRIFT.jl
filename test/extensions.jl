@@ -410,3 +410,93 @@ end
     end
     Aqua.test_ambiguities([AutoRIFT])
 end
+
+# ---------------------------------------------------------------------------
+# Windowed reads from a disk-backed array
+# ---------------------------------------------------------------------------
+#
+# Here rather than in `test/tile.jl` because it loads a package, and the core testsets deliberately
+# run with no optional dependency in the session. The property under test is that the *core* needs
+# none: a block is read with `copyto!` over a view, which any array supporting windowed reads answers
+# efficiently, so `process_block_size` bounds memory for a lazy `Raster`, Zarr, NetCDF or HDF5 input
+# without `src/` knowing any of them exist.
+
+import DiskArrays
+
+# A disk-backed array that counts what is read from it, standing in for any windowed backend —
+# Rasters over GeoTIFF, Zarr, NetCDF, HDF5. Counting reads asserts the memory property *structurally*
+# rather than by watching RSS, which measures allocator slack as much as requirement: if a
+# scene-sized read never happens, no scene-sized array can exist.
+mutable struct CountingDisk{T} <: DiskArrays.AbstractDiskArray{T,2}
+    size::Tuple{Int,Int}
+    seed::Int
+    calls::Int
+    elements::Int
+    widest::Int
+end
+CountingDisk{T}(size, seed) where {T} = CountingDisk{T}(size, seed, 0, 0, 0)
+
+Base.size(a::CountingDisk) = a.size
+DiskArrays.haschunks(::CountingDisk) = DiskArrays.Chunked()
+DiskArrays.eachchunk(a::CountingDisk) = DiskArrays.GridChunks(a.size, (256, 256))
+# Values are a deterministic function of position, so nothing is stored and the "file" is free.
+_disk_value(::Type{T}, i, j, seed) where {T} =
+    T(0.5 + 0.4 * sin(i * 0.03 + seed) * cos(j * 0.021 + seed))
+function DiskArrays.readblock!(a::CountingDisk{T}, dest, r::AbstractUnitRange...) where {T}
+    a.calls += 1
+    n = prod(length.(r))
+    a.elements += n
+    a.widest = max(a.widest, n)
+    for (jj, j) in enumerate(r[2]), (ii, i) in enumerate(r[1])
+        dest[ii, jj] = _disk_value(T, i, j, a.seed)
+    end
+    return nothing
+end
+
+@testset "a blocked run never reads the whole scene" begin
+    # The claim `process_block_size` exists to make: peak memory tracks the block, not the scene. A
+    # resident array cannot demonstrate it — the scene is already in memory — so the input here is
+    # one that only materializes what is asked for.
+    n = 512
+    p = AutoRIFT.params(; chip_size = 32, chip_size_max = 32, grid_spacing = 32,
+                        search_radius = 12)
+    a = CountingDisk{Float32}((n, n), 1)
+    b = CountingDisk{Float32}((n, n), 2)
+    grid = AutoRIFT._build_grid((n, n), p)
+    bs = (8, 8)
+    layout = AutoRIFT.block_layout(grid, p, (n, n), bs)
+
+    autorift(a, b; chip_size = 32, chip_size_max = 32, grid_spacing = 32,
+                      search_radius = 12, process_block_size = bs,
+                      reference_valid = trues(n, n), secondary_valid = trues(n, n))
+
+    # No single read is scene-sized: every read is a block's window or a chunk of one.
+    largest_window = maximum(length(blk.read_rows) * length(blk.read_cols)
+                             for blk in layout.blocks)
+    for img in (a, b)
+        @test img.calls > 1                       # windowed, not one big read
+        @test img.widest <= largest_window        # and no read exceeds a block's window
+        @test img.widest < n * n                  # so the scene is never materialized at once
+    end
+
+    # The halo is read more than once, by construction — that is the cost blocking pays. Bounded by
+    # the sum of the read windows, which is what the layout promises.
+    total_window = sum(length(blk.read_rows) * length(blk.read_cols) for blk in layout.blocks)
+    @test a.elements <= total_window
+    @test a.elements > n * n                      # strictly more than the scene: the halo overlap
+
+    # And the answer is the same one a resident array gives, so the windowed read is not a
+    # different computation.
+    resident_ref = [_disk_value(Float32, i, j, 1) for i in 1:n, j in 1:n]
+    resident_sec = [_disk_value(Float32, i, j, 2) for i in 1:n, j in 1:n]
+    lazy = autorift(CountingDisk{Float32}((n, n), 1), CountingDisk{Float32}((n, n), 2);
+                             chip_size = 32, chip_size_max = 32, grid_spacing = 32,
+                             search_radius = 12, process_block_size = bs,
+                             reference_valid = trues(n, n), secondary_valid = trues(n, n))
+    eager = autorift(resident_ref, resident_sec;
+                              chip_size = 32, chip_size_max = 32, grid_spacing = 32,
+                              search_radius = 12, process_block_size = bs)
+    for f in (:dx, :dy, :correlation, :chip_size, :interpolated)
+        @test isequal(getfield(lazy, f), getfield(eager, f))
+    end
+end

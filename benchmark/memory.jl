@@ -139,6 +139,54 @@ function series_growth(npairs::Int; n::Int = 512, threads = "auto")
 end
 
 """
+    blocked_peak(n; block, threads) -> Float64
+
+Peak RSS in MiB for one `n`-by-`n` pair correlated in `block`-by-`block` grid-point blocks, from an
+input that only materializes the window asked for.
+
+The input is a `DiskArrays`-style array whose values are a function of position, so nothing is stored
+and the scene is never resident. That is the configuration `process_block_size` exists for, and the
+only one where it can be measured: given a resident array, blocking copies out of memory that is
+already there, and `docs/plan-tiling.md` records the measurement showing no benefit below ~6000².
+
+Reported against the same no-correlation baseline as [`pair_peak`](@ref), so the two are comparable —
+and they must be compared against a *resident* untiled run. Against an untiled run that first
+materializes a windowed input, blocking flatters itself: that baseline pays for a copy the blocked
+path never makes.
+"""
+function blocked_peak(n::Int; block::Int = 64, threads = "auto")
+    common = """
+        using AutoRIFT
+        import DiskArrays
+        # Values from position, so the scene has no storage and any residency measured is the
+        # pipeline's own rather than the input's.
+        struct Synth{T} <: DiskArrays.AbstractDiskArray{T,2}
+            sz::Tuple{Int,Int}
+            seed::Int
+        end
+        Base.size(a::Synth) = a.sz
+        DiskArrays.haschunks(::Synth) = DiskArrays.Chunked()
+        DiskArrays.eachchunk(a::Synth) = DiskArrays.GridChunks(a.sz, (512, 512))
+        function DiskArrays.readblock!(a::Synth{T}, dest, r::AbstractUnitRange...) where {T}
+            for (jj, j) in enumerate(r[2]), (ii, i) in enumerate(r[1])
+                dest[ii, jj] = T(0.5 + 0.4 * sin(i * 0.03 + a.seed) * cos(j * 0.021 + a.seed))
+            end
+            return nothing
+        end
+        a = Synth{Float32}(($n, $n), 1); b = Synth{Float32}(($n, $n), 2)
+        rv = trues($n, $n); sv = trues($n, $n)
+    """
+    base = measure_rss(common * "print(Sys.maxrss()/2^20)"; threads)
+    work = measure_rss(common * """
+        autorift(a, b; chip_size = 32, chip_size_max = 32, grid_spacing = 32,
+                 search_radius = 12, process_block_size = ($block, $block),
+                 reference_valid = rv, secondary_valid = sv)
+        print(Sys.maxrss()/2^20)
+    """; threads)
+    return work - base
+end
+
+"""
     run_memory() -> Dict
 
 Every memory measurement, in the same schema `run.jl` emits for timings so `compare.jl` can
@@ -186,6 +234,26 @@ function run_memory()
             pair_peak(1024; threads = "auto", kw = ", rotation = true"))
     record!("memory/pair 1024x1024 rotation x5",
             pair_peak(1024; threads = "auto", kw = ", rotation = (-6, -3, 0, 3, 6)"))
+    # Blocked processing, from a windowed input, at two sizes and two block sizes — because the
+    # numbers say blocking *costs* memory until the scene is large, and the entries exist to pin
+    # where that turns over rather than to advertise a reduction:
+    #
+    #            untiled   blocked 32²   blocked 128²
+    #   2048²     69.5        166.5          242.5     MiB above the no-correlation baseline
+    #   4096²    156.8        222.9          719.3
+    #
+    # Two readings. Blocking is 2.4x worse at 2048² and 1.4x at 4096², so the gap closes as the scene
+    # grows and the crossover is above both — consistent with `docs/plan-tiling.md`, which measures no
+    # benefit below ~6000². And a smaller block is *cheaper*, opposite to the halo-overhead reading
+    # alone: it holds less at once, while reading a larger multiple of the scene.
+    #
+    # The comparison is only meaningful against a resident untiled run. Measured against an untiled
+    # run that first materializes a windowed input, blocking looks better than it is, because that
+    # baseline is paying for a copy the blocked path never makes.
+    for n in (2048, 4096), block in (32, 128)
+        record!("memory/blocked $(n)x$(n) block $block",
+                blocked_peak(n; block, threads = "auto"))
+    end
     g = series_growth(30)
     record!("memory/series 30 pairs 512x512 rss", g.rss)
     # The one that answers "does it leak?". Tracked separately because `rss` never falls and so

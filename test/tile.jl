@@ -273,22 +273,21 @@ end
                                              grid_spacing = 16, search_radius = 12),
                      "threaded" => params(; chip_size = 32, chip_size_max = 32, grid_spacing = 16,
                                           search_radius = 12, threaded = true))
-        pair = AutoRIFT._prepare(ImagePair(ref, sec), p)
-        grid = AutoRIFT._build_grid(size(pair), p)
+        # Each driver takes the pair it is defined on: `correlate_multichip` a filtered scene, and
+        # `correlate_tiled` the raw one, which it filters per block. That asymmetry is the feature —
+        # a blocked run never forms a filtered scene — so the comparison has to respect it.
+        raw = ImagePair(ref, sec)
+        pair = AutoRIFT._prepare(raw, p)
+        grid = AutoRIFT._build_grid(size(raw), p)
         AutoRIFT._warm_grid_plans(grid, p)
         untiled = AutoRIFT.correlate_multichip(pair, grid, p)
 
         # 31 columns puts a boundary at the feature seam; the rest do not divide the 61-point grid
         # evenly; and one block covering everything must agree with the whole-scene path trivially.
         for bs in ((61, 31), (61, 25), (20, 20), (13, 44), (61, 61))
-            assert_same_result(untiled, AutoRIFT.correlate_tiled(pair, grid, p, bs),
+            assert_same_result(untiled, AutoRIFT.correlate_tiled(raw, grid, p, bs),
                                "$tag, block $bs")
         end
-
-        # `prepare_blocks = true` is deliberately not exercised here: it filters the pair it is
-        # given, and every caller reaching this function passes one `_prepare` has already
-        # filtered, so it would filter twice. Its agreement can only be asserted once the driver
-        # takes the raw pair.
     end
 end
 
@@ -299,15 +298,16 @@ end
     n = 1024
     ref, sec = split_pair(n)
     p = params(; chip_size = 32, chip_size_max = 128, grid_spacing = 16, search_radius = 12)
-    pair = AutoRIFT._prepare(ImagePair(ref, sec), p)
+    raw = ImagePair(ref, sec)
+    pair = AutoRIFT._prepare(raw, p)
 
     # Built at the base chip size, not at `chip_size_max`: the halo must cover chip 128 anyway,
     # because that is what the coarsest level runs these points at.
-    grid = gridpoints(size(pair), 16; chip_size = 32, search_radius = 12)
+    grid = gridpoints(size(raw), 16; chip_size = 32, search_radius = 12)
     AutoRIFT._warm_grid_plans(grid, p)
     untiled = AutoRIFT.correlate_multichip(pair, grid, p)
     for bs in ((30, 15), (17, 17))
-        assert_same_result(untiled, AutoRIFT.correlate_tiled(pair, grid, p, bs),
+        assert_same_result(untiled, AutoRIFT.correlate_tiled(raw, grid, p, bs),
                            "caller grid, block $bs")
     end
 end
@@ -321,8 +321,9 @@ end
     a, b = shifted_pair((n, n), (2.0, -1.0); seed = 5)
     p = params(; chip_size = 32, chip_size_max = 32, grid_spacing = 32,
                search_radius = 12, coarse_stride = 4)
-    pair = AutoRIFT._prepare(ImagePair(a, b), p)
-    grid = AutoRIFT._build_grid(size(pair), p)
+    raw = ImagePair(a, b)
+    pair = AutoRIFT._prepare(raw, p)
+    grid = AutoRIFT._build_grid(size(raw), p)
 
     # The configuration this testset is about: the coarse grid really is too small.
     level = AutoRIFT._level_points(grid, p, 32, 32, trues(size(grid)))
@@ -331,7 +332,7 @@ end
     AutoRIFT._warm_grid_plans(grid, p)
     untiled = AutoRIFT.correlate_multichip(pair, grid, p)
     tiled = @test_logs (:warn, r"coarse grid smaller") match_mode = :any begin
-        AutoRIFT.correlate_tiled(pair, grid, p, (4, 4))
+        AutoRIFT.correlate_tiled(raw, grid, p, (4, 4))
     end
     for f in (:dx, :dy, :correlation, :chip_size, :interpolated)
         @test isequal(getfield(untiled, f), getfield(tiled, f))
