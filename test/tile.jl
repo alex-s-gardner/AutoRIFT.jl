@@ -212,6 +212,106 @@ end
     @test_throws "must be positive in both axes" AutoRIFT.block_layout(grid, p, (n, n), (8, -1))
 end
 
+"""
+    split_pair(n; shift_a, shift_b, seed) -> (reference, secondary)
+
+A pair whose left and right halves are displaced differently, so the vertical seam between them is
+a real discontinuity in the displacement field.
+
+The gate below needs a block boundary that falls *through* a feature. A boundary in uniformly
+shifted texture is satisfied by a halo of zero — every block sees the same motion its neighbours
+do — so it would pass whatever the halo were and prove nothing about it.
+"""
+function split_pair(n::Integer; shift_a = (3.0, 1.0), shift_b = (-2.0, -3.0), seed = 11)
+    a1, b1 = shifted_pair((n, n), shift_a; seed)
+    a2, b2 = shifted_pair((n, n), shift_b; seed = seed + 1)
+    ref, sec = copy(a1), copy(b1)
+    right = (n ÷ 2 + 1):n
+    ref[:, right] .= a2[:, right]
+    sec[:, right] .= b2[:, right]
+    return ref, sec
+end
+
+# Every field, so a divergence cannot hide in the one that is not compared. `isequal` rather than
+# `==` because `NaN` marks "not measured" across most of these arrays and must compare equal to
+# itself; exact rather than approximate because both runs happen in this process, sharing its FFTW
+# wisdom and plan cache — the drift that makes cross-process `correlation` comparison unreliable is
+# not in play, so an inexact match here is a bug rather than planner noise.
+function assert_same_result(untiled, tiled, tag)
+    @testset "$tag" begin
+        for f in (:dx, :dy, :correlation, :chip_size, :interpolated)
+            @test isequal(getfield(untiled, f), getfield(tiled, f))
+        end
+    end
+end
+
+@testset "a blocked run equals an untiled one" begin
+    # The gate the whole feature rests on. Blocking changes where the work happens, not what is
+    # computed, so anything short of equality on every field is a defect rather than a tolerance to
+    # widen. Everything below shares one process, so FFTW wisdom is fixed across the comparison.
+    # Large enough, at this spacing, that the coarse grid clears the outlier filter's window — so
+    # the coarse gate, its dilation and its resample are all genuinely exercised rather than
+    # short-circuited by the small-grid fallback.
+    n = 1024
+    ref, sec = split_pair(n)
+
+    # The feature seam sits at pixel 512, so a block boundary at half the grid's width falls on the
+    # discontinuity — the case an under-computed halo fails and a boundary in flat texture would not.
+    base = params(; chip_size = 32, chip_size_max = 32, grid_spacing = 16, search_radius = 12)
+    pair0 = AutoRIFT._prepare(ImagePair(ref, sec), base)
+    grid0 = AutoRIFT._build_grid(size(pair0), base)
+    @test size(grid0) == (61, 61)
+    # The coarse grid really does clear the filter's window, so the gate is exercised.
+    @test !isnothing(AutoRIFT._coarse_points(
+        AutoRIFT._level_points(grid0, base, 32, 32, trues(size(grid0))), base, 32, 32))
+
+    for (tag, p) in ("default" => base,
+                     "wallis" => params(; chip_size = 32, chip_size_max = 32, grid_spacing = 16,
+                                        search_radius = 12, preprocess = :wallis,
+                                        filter_width = 5),
+                     "multi-level" => params(; chip_size = 32, chip_size_max = 64,
+                                             grid_spacing = 16, search_radius = 12),
+                     "threaded" => params(; chip_size = 32, chip_size_max = 32, grid_spacing = 16,
+                                          search_radius = 12, threaded = true))
+        pair = AutoRIFT._prepare(ImagePair(ref, sec), p)
+        grid = AutoRIFT._build_grid(size(pair), p)
+        AutoRIFT._warm_grid_plans(grid, p)
+        untiled = AutoRIFT.correlate_multichip(pair, grid, p)
+
+        # 31 columns puts a boundary at the feature seam; the rest do not divide the 61-point grid
+        # evenly; and one block covering everything must agree with the whole-scene path trivially.
+        for bs in ((61, 31), (61, 25), (20, 20), (13, 44), (61, 61))
+            assert_same_result(untiled, AutoRIFT.correlate_tiled(pair, grid, p, bs),
+                               "$tag, block $bs")
+        end
+
+        # `prepare_blocks = true` is deliberately not exercised here: it filters the pair it is
+        # given, and every caller reaching this function passes one `_prepare` has already
+        # filtered, so it would filter twice. Its agreement can only be asserted once the driver
+        # takes the raw pair.
+    end
+end
+
+@testset "a blocked run equals an untiled one on a caller-supplied grid" begin
+    # The production path: a grid the caller built, at a chip size below `chip_size_max`. The halo
+    # has to be sized by what the levels run rather than by what this grid carries, so this is the
+    # configuration that fails when it is not — and the one the earlier verification missed.
+    n = 1024
+    ref, sec = split_pair(n)
+    p = params(; chip_size = 32, chip_size_max = 128, grid_spacing = 16, search_radius = 12)
+    pair = AutoRIFT._prepare(ImagePair(ref, sec), p)
+
+    # Built at the base chip size, not at `chip_size_max`: the halo must cover chip 128 anyway,
+    # because that is what the coarsest level runs these points at.
+    grid = gridpoints(size(pair), 16; chip_size = 32, search_radius = 12)
+    AutoRIFT._warm_grid_plans(grid, p)
+    untiled = AutoRIFT.correlate_multichip(pair, grid, p)
+    for bs in ((30, 15), (17, 17))
+        assert_same_result(untiled, AutoRIFT.correlate_tiled(pair, grid, p, bs),
+                           "caller grid, block $bs")
+    end
+end
+
 @testset "a coarse grid too small to judge falls back, and still agrees" begin
     # Below the relaxed filter's window there is no evidence to restrict the fine search with, so
     # both paths search everything. The tiled path cannot substitute a policy of its own here: it

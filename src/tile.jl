@@ -323,11 +323,17 @@ end
 # whole-scene `_prepare` leaves the filtered pair resident, and a block copied out of it then costs
 # more than it saves. Filtering the block instead means the scene is never materialized.
 #
-# Exact, and the halo is why: `filter_reach` is the neighbourhood a filter's output depends on, and
-# `halo` includes it, so a block's filtered values *and* its eroded mask agree with a whole-scene
-# filter everywhere the block writes. Verified on both, including with invalid pixels present, since
-# `_filtered` erodes the mask by the filter width and that erosion must not bite at a read edge
-# where the untiled run had data.
+# `pair` must be **raw**. This filters what it is given, so a pair `_prepare` has already filtered
+# comes back filtered twice — which is not an edge effect but a wrong image everywhere, and one that
+# still looks like imagery. `correlate_tiled`'s caller in `api.jl` passes a prepared pair, so
+# reaching here through the public API is currently that mistake; the assertion is what makes it
+# loud rather than a field of plausible numbers.
+#
+# Exact where it applies, and the halo is why: `filter_reach` is the neighbourhood a filter's output
+# depends on, and `halo` includes it, so a block's filtered values *and* its eroded mask agree with a
+# whole-scene filter everywhere the block writes. That holds for the values and for the mask, since
+# `_filtered` erodes by the filter width and that erosion must not bite at a read edge where the
+# untiled run had data.
 function _prepared_block_pair(buf::BlockBuffers, pair::ImagePair, b::Block, p::Params)
     raw = _block_pair!(buf, pair, b)
     return _prepare_block(buf, raw, p, p.preprocess, length(b.read_rows), length(b.read_cols))
