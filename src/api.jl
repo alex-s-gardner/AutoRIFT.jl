@@ -248,9 +248,14 @@ All of [`AutoRIFT.params`](@ref)'s, plus:
   these for sensors with a fill value, or to apply a cloud or shadow mask — an invalid pixel
   never contributes to a correlation.
 - `process_block_size`: `(X, Y)` grid points per block, or `nothing` (the default) for one block
-  over the whole scene. Bounds peak memory by the block rather than by the scene, which is what
-  makes a large scene fit a small instance. **Bit-identical to the untiled run** — this changes
-  where the work happens, not what it computes.
+  over the whole scene. Reads and filters the images a block at a time, so no array the size of the
+  scene is ever formed. **Bit-identical to the untiled run** — this changes where the work happens,
+  not what it computes.
+
+  For inputs that read a window cheaply, which means a lazy `Raster` or any other disk-backed
+  array. **On an array already in memory this costs more than it saves** and is measured doing so up
+  to at least 4096² (`benchmark/memory.jl`): the scene is already resident, so blocking adds the
+  halo without removing anything. Reach for it when the scene is the thing that will not fit.
 
   A tuple and only a tuple: a full-width band costs halo on two sides where a square block pays it
   on four, so which shape you want is worth saying rather than inferring from a scalar. Pass the
@@ -258,7 +263,11 @@ All of [`AutoRIFT.params`](@ref)'s, plus:
 
   Each block reads its own extent grown by a halo, so a block reads more than it writes — see
   [`AutoRIFT.halo`](@ref). A block smaller than that halo would be almost entirely overlap and is
-  rejected.
+  rejected. Smaller blocks hold less at once but read a larger multiple of the scene, since the halo
+  is a fixed width around a shrinking interior.
+
+  A preprocessing filter that estimates from the whole image cannot be reproduced block by block,
+  and is rejected rather than approximated — see [`AutoRIFT.filter_reach`](@ref).
 
 ```julia
 out = autorift(image1, image2; chip_size = 32, search_radius = 25)

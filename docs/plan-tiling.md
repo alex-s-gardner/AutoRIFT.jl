@@ -1,11 +1,15 @@
 # Tiled processing — an outer `autorift` wrapper
 
-Status: **built and bit-identical for in-RAM input; the lazy path that motivates it is not built.**
+Status: **built, gated against the untiled result, and reading windows from disk-backed input.**
 
-`autorift(a, b; process_block_size = (X, Y))` works today and gives bit-identical results to an
-untiled run. What is missing is the one configuration the feature exists for: a disk-backed input
-where a block's read *replaces* a scene that never fits, rather than copying out of one that does.
-See "Where this stands" at the end for what remains and what the measurements say.
+`autorift(a, b; process_block_size = (X, Y))` reads and filters a block at a time, so no
+scene-sized array is formed, and `test/tile.jl` asserts equality with an untiled run rather than
+leaving it to have been checked once. A lazy `Raster` — or any `DiskArrays`-backed input — works
+through the core's generic windowed read, with no dependency in `src/`.
+
+What remains is the driver duplication: `correlate_multichip` and `correlate_tiled` are still two
+implementations of one algorithm. See "Where this stands" for what the measurements say about when
+blocking is worth asking for, which is narrower than this document originally assumed.
 
 ## What is wanted
 
@@ -92,19 +96,22 @@ autorift(reference, secondary; process_block_size = (2048, 2048), kwargs...)
 
 ## Lazy input
 
-Lives in the **Rasters extension**, not the core. The core wrapper asks for a block by index
-range; the extension's method materializes it with a Rasters read. A `Raster` wrapping a disk
-array reads only the requested window, so peak memory becomes `O(block + halo)` rather than
-`O(scene)` — which is the entire point for the small-AWS-instance case that motivated
-`docs/memory.md`.
+**Needs no extension method, and no `DiskArrays` dependency.** The seam is
+`_read_block!(dest, img, rows, cols)`, and its generic implementation — `copyto!` over
+`view(img, rows, cols)` — is already a chunk-aware windowed read for any array that supports one. A
+lazy `Raster`'s `parent` is a `DiskArrays.AbstractDiskArray`, and measured through a
+`readblock!`-counting array, a window spanning four chunks issues four calls and reads exactly the
+requested elements: no over-read, no per-element degradation. The same holds for Zarr, NetCDF and
+HDF5 backends, which arrive the same way.
 
-The core must not gain a Rasters dependency to do this. The seam is `_read_block!(dest, img, rows,
-cols)` — in place, because the driver reuses one buffer across blocks rather than taking a fresh
-array per block. An allocating `_read_block` exists alongside it for callers that want one.
+In place because the driver reuses one buffer across blocks rather than taking a fresh array per
+block. An allocating `_read_block` exists alongside it for callers that want one.
 
-**This is the piece that is not built, and without it the feature has no use case:** blocking a
-resident array copies out of memory that is already there, so it only pays when the block read
-replaces a load that would not fit.
+What made `process_block_size` fail to save memory was never the read. Three whole-scene operations
+ran before any block was touched: the validity masks from `map(isfinite, ...)`, the filtered pair
+from `_prepare`, and a driver that then sliced that filtered scene. The filtering now happens per
+block from raw input, so the filtered scene is never formed — and that same change removed the
+double-filtering that made per-block preparation wrong whenever it was reachable.
 
 ## Verification
 
@@ -116,12 +123,15 @@ The gate that matters: **a tiled run must equal a non-tiled run**, not approxima
 - Include a case where a block boundary falls *through* a real displacement feature, since an
   under-computed halo shows up only there. A boundary through flat texture will pass with a
   halo of zero.
-- Compare `isequal` on `dx`/`dy` and hold FFTW wisdom fixed. Note the established caveat:
-  `correlation` drifts ~3e-7 through the planner and can flip one subpixel step at 1024²
-  (measured: 1 point of 729, `dy -4.0 → -3.984375`) — so **re-run the baseline against itself
-  first** before believing any mismatch. That has produced false alarms three times now.
-- Memory: `benchmark/memory.jl` should gain a tiled entry showing peak is bounded by block
-  size and not by scene size. That is the claim the feature exists to make.
+- Compare `isequal` on every field, `correlation` included. A **same-process** comparison shares the
+  process's FFTW wisdom and plan cache, so the ~3e-7 planner drift that flips a subpixel step
+  between processes is not in play: in-process, an inexact match is a defect. That drift is real
+  across processes, and comparing a fresh run against a capture taken earlier has produced false
+  alarms three times — so compare within one process and the caveat disappears.
+- Memory: `benchmark/memory.jl` records blocked peak RSS at two scene sizes and two block sizes,
+  against a resident untiled run. The comparison must be against a *resident* baseline; measured
+  against one that first materializes a windowed input, blocking flatters itself by the cost of a
+  copy it never makes.
 
 ## Files
 
@@ -132,9 +142,10 @@ The gate that matters: **a tiled run must equal a non-tiled run**, not approxima
 | `src/multichip.jl` | split the level loop so per-block work produces evidence and the gate, dilation and resample happen once on the assembled coarse grid | yes |
 | `src/types.jl` | `PassGeometry`; `filter_reach` | yes |
 | `src/preprocess.jl` | in-place `highpass!`, `_filtered!`, `_erode_mask!`, `_masked_boxmean!` | yes |
-| `test/tile.jl` | layout, halo and `filter_reach` coverage | partly — the equivalence gate is missing |
-| `ext/AutoRIFTRastersExt.jl` | lazy windowed `_read_block!`. The extension materializes eagerly today — `parent(reference)` at `ext/AutoRIFTRastersExt.jl:96-99` hands the whole array to the core — so this is new code rather than a change to how `Raster` inputs are unwrapped | **no** |
-| `benchmark/memory.jl` | tiled peak-memory entries | **no** |
+| `test/tile.jl` | layout, halo, `filter_reach`, and the equivalence gate | yes |
+| `test/extensions.jl` | windowed reads from a `DiskArrays` input: no read exceeds a block's window, and the result equals the resident one | yes |
+| `ext/AutoRIFTRastersExt.jl` | nothing. `_read_block!`'s generic method already reads a window from a disk-backed `parent`; an extension method would only re-implement it | n/a |
+| `benchmark/memory.jl` | blocked peak-memory entries, and the crossover they pin | yes |
 
 Validation lives in `block_layout` rather than `src/params.jl`, because the halo is what a block
 size has to be checked against and `block_layout` is what knows the halo. `process_block_size` is
@@ -177,11 +188,14 @@ trimmed binary's.
   `search_bounds` both `floor` a coordinate, and `floor(u - k) == floor(u) - k` for integer `k`, so
   a point lands on the same pixel of the block that it did on the scene.
 
-## Still to verify rather than assume
+## Verified, having been assumed
 
-- An interior block must never need `_zeropad`: it allocates full copies and shifts every
-  coordinate (`src/track.jl:146-151`). Blocks are in bounds by construction as laid out, but nothing
-  asserts it, so a caller-supplied grid could still reach that branch.
+- **A block can reach `_zeropad`, and that is a cost rather than a defect.** Measured: with
+  `chip_size_max = 128` and 8×8 grid-point blocks, some blocks' coarsest level fails `fits` and pads
+  (`src/track.jl:146-151`), allocating full copies. Results stay bit-identical — the coordinate shift
+  is integral and `okmask` pads to `false`, so padding an in-bounds point changes nothing it
+  computes. The earlier note here assumed blocks never reach that branch; they do, and what follows
+  is 1.2 ms and 10.6 MB per call, not a wrong answer.
 
 ## Where this stands
 
@@ -197,26 +211,38 @@ trimmed binary's.
 | `process_block_size` on `autorift`, `autorift_with_grid`, `init`/`autorift!` | `src/api.jl` |
 | in-place `highpass!`, `_filtered!`, `_erode_mask!`, `_masked_boxmean!` | `src/preprocess.jl` |
 
-Identity was checked against `correlate_multichip` on `dx`, `dy`, `correlation`, `chip_size` and
-`interpolated` across: plain, a decorrelated quadrant (so the coarse gate, outlier filter and hole
-fill all engage), multiple chip-size levels, threaded, `Highpass` and `Wallis`, and block sizes that
-do not divide the grid evenly. Also with `prepare_blocks = true`, i.e. filtering each block from raw
-input rather than slicing a pre-filtered scene.
+Identity is asserted by `test/tile.jl` on `dx`, `dy`, `correlation`, `chip_size` and `interpolated`
+across: a scene whose halves move differently with a block boundary on the seam between them, a
+caller-supplied grid built below `chip_size_max`, multiple chip-size levels, threaded, `Highpass` and
+`Wallis`, block sizes that do not divide the grid evenly, and the small-coarse-grid fallback.
+
+The gate is checked to have teeth rather than assumed to: shortening the halo by 20 px makes it fail
+at 252 of 3721 points, and the boundary is confirmed to straddle the discontinuity — `dx` is −3.0 on
+one side and +2.0 on the other.
 
 ### The measurements, and what they mean
 
-Peak RSS above a baseline process that allocates the inputs but does not correlate:
+Peak RSS above a baseline process that allocates the inputs but does not correlate. Blocked figures
+are from an input that materializes only the window asked for; untiled is a resident scene.
 
-| scene | pair + masks resident | untiled | blocked |
+| scene | untiled | blocked, 32² blocks | blocked, 128² blocks |
 |---|---:|---:|---:|
-| 2048² | 40 MiB | 18 MiB | 48–70 MiB |
-| 6000² (Landsat 8) | 274 MiB | 152 MiB | 142–157 MiB |
-| 20000×40000 (NISAR SLC) | **13.4 GiB** | will not fit a small instance | ~0.3 GiB at 128² grid-point blocks, 9% halo overhead |
+| 2048² | 69.5 MiB | 166.5 MiB | 242.5 MiB |
+| 4096² | 156.8 MiB | 222.9 MiB | 719.3 MiB |
 
-Two things this makes clear. **Blocking does not help a scene that already fits** — at 2048² the
-untiled path costs 18 MiB and there is nothing to save. And **the halo is only affordable at scale**:
-39.6% overhead at 32² grid-point blocks against 2.3% at 512², so large blocks are the operating
-point, not small ones.
+**Blocking costs memory at both sizes** — 2.4× at 2048², 1.4× at 4096². The gap closes as the scene
+grows, so the crossover is above 4096²; blocking is for the scene that will not fit at all, not for
+one that fits and could be smaller. What the blocked path has that the untiled one cannot is no
+scene-sized read anywhere, which is the whole property when the scene exceeds RAM.
+
+**A smaller block is cheaper**, opposite to what halo overhead alone suggests: it holds less at once
+while reading a larger multiple of the scene. Both effects are real and they point in opposite
+directions, so neither figure decides a block size on its own.
+
+**Compare against a resident untiled baseline.** Measured against an untiled run that first
+materializes a windowed input, blocking looks better than it is — that baseline pays for a copy the
+blocked path never makes. An earlier round of this work reported a 35% reduction on exactly that
+mistake.
 
 Per-block allocation, at an 888-pixel read window, before and after pooling: raw read 7.56 MiB → 0,
 prepare 15.36 MiB → 0.23 MiB.
@@ -227,21 +253,27 @@ work reported were allocator slack from per-block churn, not a requirement — a
 requirement produced a wrong conclusion ("tiling makes memory worse") that took several rounds to
 correct. `docs/memory.md` documents the same trap.
 
-### Not built, and load-bearing
+### Not built
 
-1. **Lazy windowed read.** `_read_block!` copies out of a resident array, and the Rasters extension
-   still materializes eagerly — `parent(reference)` at `ext/AutoRIFTRastersExt.jl:96-99` hands the
-   whole array to the core. For NISAR there is no resident array to copy from, so this is the
-   feature rather than an optimization. `_read_block!` is the seam; its method for a disk-backed
-   `Raster` should read only the window.
-2. **The equivalence gate as a committed test.** `test/tile.jl` covers the layout, the halo and
-   `filter_reach`, but tiled-equals-untiled was verified by throwaway scripts and is not guarded.
-   That test must include a block boundary falling *through* a displacement feature: a boundary in
-   flat texture passes with a halo of zero and proves nothing.
-3. **Benchmark entries.** `benchmark/memory.jl` should record the crossover above so a future change
-   cannot quietly move it.
+**One algorithm, two implementations.** `correlate_multichip`/`chipsize_level` and
+`correlate_tiled`/`_tiled_level` still both implement the chip-size level, and they must agree bit for
+bit. The preamble, the coarse restriction and the empty-result allocation are shared; what remains
+separate is the level body and the pass execution. They have already drifted three times — the coarse
+fallback, and the two halo deficits above — and the equivalence gate covers only the configurations it
+exercises, so the duplication is the standing risk rather than a tidiness complaint.
 
-### Two traps that cost time here
+The shape that fits: pass execution is the only thing that genuinely differs, so a `WholePass` /
+`BlockedPass` strategy behind one level function would remove the drift surface. Two constraints
+that are easy to get wrong — the strategy argument must be positional, since a keyword carrying an
+abstract type is unresolvable under `--trim` (`src/multichip.jl` records this for `measure`), and the
+coarse pass needs the strategy *restricted* to the strided subset, because it correlates
+`setup.coarse` rather than the level's own points.
+
+Unification would not make bit-identity automatic. It removes step-sequence drift; the numerical risk
+lives in the blocked executor and rests on the halo, the integral coordinate shift, `PassGeometry`,
+and per-block filtering — none of which a shared level loop establishes.
+
+### Three traps that cost time here
 
 - **FFTW wisdom persists to disk.** The first run of changed code can write wisdom that changes what
   every *later* process measures, so comparing a fresh run against a capture taken before the change
@@ -250,16 +282,28 @@ correct. `docs/memory.md` documents the same trap.
 - **`filter_width` is not a filter's reach.** `Wallis` chains two window passes and reaches twice its
   half-width; padding by `width ÷ 2` left 792 of 10201 interior points differing by up to 0.21.
   `filter_reach` exists for this and is pinned by a test that measures the true reach per filter.
+- **Which pair a driver takes is part of its contract.** Per-block filtering filters what it is given,
+  so handing it a pair `_prepare` had already filtered produced a twice-filtered image — matching a
+  twice-filtered scene exactly and the correct one only to 0.09. It reads as an edge effect (the
+  differences cluster near read edges, where a filter's output differs most) and is not one: the image
+  is wrong everywhere and still looks like imagery. Diagnosing it as a halo problem cost several
+  rounds. Bisect by substituting one stage at a time — comparing a block filtered from raw against the
+  same block sliced from a filtered scene localizes it in one step — rather than reasoning about which
+  pixels a window reaches.
 
 ### Loose ends found on the way, each worth its own change
 
-- `Sobel` and `Laplacian` are exported, documented as `PreprocessMethod`s, and have `filter_width`
-  methods — but no `preprocess` method. Calling either throws `MethodError`.
+- `Sobel`, `Laplacian`, `Decibel` and `WallisGapfill` are exported, documented as
+  `PreprocessMethod`s, resolvable from a keyword symbol, and have `filter_width` methods — but no
+  `preprocess` method for real input. All four throw `MethodError` from inside `_prepare` rather than
+  failing at the keyword boundary where every other bad value is caught.
 - `resample(grown, (nr, nc), Nearest())` is not aligned to the coarse lattice even untiled.
   `resample!(::Nearest)` uses `ys = sr/dr` with `sr = fld(nr, stride)` (`src/resample.jl:58-70`)
   while `_cell_max_radius!` uses `lo = stride÷2, hi = stride-1-lo` (`src/multichip.jl:292-294`). For
   `nr = 13, stride = 4` the radius cell for fine row 4 is rows 2..5 but the mask cell is 1..4, so
   `src/multichip.jl:36-37`'s claim that "a coarse grid point is exactly a block of fine ones" does
   not hold literally for the mask.
-- `process_block_size` on an in-RAM array is a pessimization at small scene sizes. Worth deciding
-  whether it should warn, error, or simply be documented as disk-backed-only.
+- `process_block_size` on an in-RAM array is a pessimization, measured so up to at least 4096². It is
+  documented as such rather than warned about: a caller processing a scene that genuinely does not fit
+  passes a lazy array and should not be told off for it, and the size at which blocking starts to pay
+  depends on the instance rather than on anything the package knows.
