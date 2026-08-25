@@ -69,7 +69,11 @@ Pixels a block must read beyond what it writes, in `(x, y)`.
 
 The sum of the correlation reach — `chip/2 + radius + ceil(abs(prior))`, which
 `_pass_geometry` already computes and which this does not re-derive — and the preprocessing
-filter's reach. Both apply to every point, so both are taken at the grid's maximum.
+filter's reach. Both apply to every point, so both are taken at their maximum over the run.
+
+Measured against the *coarsest level*, not against `grid` as supplied. A level overwrites the
+chip size and floors the radii, so a grid's own `chip_size_x` and `radius_x` are not what any
+pass runs — see [`AutoRIFT._worst_level_points`](@ref).
 
 The filter term comes from [`AutoRIFT.filter_reach`](@ref) rather than from `filter_width ÷ 2`,
 because the two differ: `Wallis` applies two chained window passes and so reaches twice its
@@ -92,8 +96,49 @@ function halo(grid::PointSet, p::Params, imagesize::Tuple{Int,Int})
         "for tiled processing, or run this pair untiled."))
     # `_pass_geometry`'s pad is exactly the correlation reach plus the reference's 2-pixel slack
     # for the half-pixel grid offset and index truncation.
-    _, _, _, _, pad, _ = _pass_geometry(scatter(grid), imagesize)
+    _, _, _, _, pad, _ = _pass_geometry(_worst_level_points(grid, p), imagesize)
     return (pad[1] + w, pad[2] + w)
+end
+
+"""
+    AutoRIFT._worst_level_points(grid::PointSet, p::Params) -> PointSet{1}
+
+`grid`'s points carrying the largest chip size and radius any level will run them at.
+
+The halo has to cover every level, and a level's geometry is not the grid's. `chipsize_level`
+ignores `grid.chip_size_x` and sets its own from [`AutoRIFT.chip_sizes`](@ref), so the reach is
+set by `chip_size_max` however the caller sized the grid; and `_level_points` ends in
+[`AutoRIFT.sanitize!`](@ref), which floors every non-zero radius at `p.min_search_radius`, so a
+grid whose radii sit below that floor is searched wider than it asks for.
+
+Both corrections matter only for a grid the caller built: [`AutoRIFT.autorift`](@ref)'s own grid
+takes `chip_size = p.chip_size_max` already, and its radii come from the same keywords the floor
+is compared against. A grid built at a smaller chip size is the case that breaks — at
+`chip_size = 32` against `chip_size_max = 128` the coarsest level reaches 46 px further per axis
+than the grid implies, and a block sized to the grid reads too little to reproduce it.
+
+A `PointSet{1}`, since `_pass_geometry` reduces over points and does not use the layout.
+"""
+function _worst_level_points(grid::PointSet, p::Params)
+    flat = scatter(grid)
+    csx = p.chip_size_max
+    n = size(flat.radius_x)
+    rx = similar(flat.radius_x)
+    ry = similar(flat.radius_y)
+    # `sanitize!`'s rule, read off rather than re-implemented: a point with either radius
+    # non-positive is not searched at all, and one that is searched has both radii floored.
+    @inbounds for i in eachindex(rx)
+        if flat.radius_x[i] <= 0 || flat.radius_y[i] <= 0
+            rx[i] = 0
+            ry[i] = 0
+        else
+            rx[i] = max(flat.radius_x[i], p.min_search_radius)
+            ry[i] = max(flat.radius_y[i], p.min_search_radius)
+        end
+    end
+    return rebuild(flat; radius_x = rx, radius_y = ry,
+                   chip_size_x = fill(csx, n),
+                   chip_size_y = fill(chip_size_y(p, csx), n))
 end
 
 """

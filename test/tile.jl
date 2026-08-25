@@ -57,26 +57,79 @@ end
     grid = gridpoints((n, n), 32; chip_size = 32, search_radius = 25)
 
     # `_pass_geometry`'s pad is chip/2 + radius + ceil(prior) plus the reference's 2-pixel slack.
-    pad = AutoRIFT._pass_geometry(scatter(grid), (n, n))[5]
-    @test AutoRIFT.halo(grid, params(; preprocess = :none), (n, n)) == pad
+    # Measured on the widest level's points rather than on `grid`: a level sets its own chip size,
+    # so the grid's is not what the reach is built from. Holding `chip_size_max` at the grid's own
+    # chip size is what keeps this testset about the *filter* term.
+    p0 = params(; preprocess = :none, chip_size = 32, chip_size_max = 32, search_radius = 25)
+    pad = AutoRIFT._pass_geometry(AutoRIFT._worst_level_points(grid, p0), (n, n))[5]
+    @test AutoRIFT.halo(grid, p0, (n, n)) == pad
+
+    # Same geometry throughout, varying only the filter, so each difference from `pad` is the
+    # filter's reach and nothing else.
+    filtered(m, w) = AutoRIFT.halo(grid, params(; preprocess = m, filter_width = w,
+                                                chip_size = 32, chip_size_max = 32,
+                                                search_radius = 25), (n, n))
 
     # A 5-wide highpass adds 2 in each direction; a 21-wide one adds 10.
-    @test AutoRIFT.halo(grid, params(; preprocess = :highpass, filter_width = 5), (n, n)) ==
-          (pad[1] + 2, pad[2] + 2)
-    @test AutoRIFT.halo(grid, params(; preprocess = :highpass, filter_width = 21), (n, n)) ==
-          (pad[1] + 10, pad[2] + 10)
+    @test filtered(:highpass, 5) == (pad[1] + 2, pad[2] + 2)
+    @test filtered(:highpass, 21) == (pad[1] + 10, pad[2] + 10)
 
     # And `Wallis` adds twice that, because its window is applied twice. Taking `filter_width ÷ 2`
     # here would under-halo every block by half the filter's reach.
-    @test AutoRIFT.halo(grid, params(; preprocess = :wallis, filter_width = 5), (n, n)) ==
-          (pad[1] + 4, pad[2] + 4)
-    @test AutoRIFT.halo(grid, params(; preprocess = :wallis, filter_width = 21), (n, n)) ==
-          (pad[1] + 20, pad[2] + 20)
+    @test filtered(:wallis, 5) == (pad[1] + 4, pad[2] + 4)
+    @test filtered(:wallis, 21) == (pad[1] + 20, pad[2] + 20)
 
     # A wider search radius widens the halo through the correlation term.
     wide = gridpoints((n, n), 32; chip_size = 32, search_radius = 40)
     @test all(AutoRIFT.halo(wide, params(), (n, n)) .>
               AutoRIFT.halo(grid, params(), (n, n)))
+end
+
+@testset "halo covers every level, not the grid as supplied" begin
+    # A level sets its own chip size and floors the radii, so the grid's own fields are not what
+    # any pass runs. Measured against what each level actually asks `_pass_geometry` for: a halo
+    # short of that reads too little, and the answers along a block's internal edges are wrong
+    # rather than missing.
+    n = 1024
+    imagesize = (n, n)
+
+    function widest_level_pad(grid, p)
+        worst = (0, 0)
+        for csx in AutoRIFT.chip_sizes(p)
+            lp = AutoRIFT._level_points(grid, p, csx, AutoRIFT.chip_size_y(p, csx),
+                                        trues(size(grid)))
+            pad = AutoRIFT._pass_geometry(scatter(lp), imagesize)[5]
+            worst = (max(worst[1], pad[1]), max(worst[2], pad[2]))
+        end
+        return worst
+    end
+
+    # `chip_size_max` sets the reach however the caller sized the grid. A grid built at the base
+    # chip size against a 4x larger maximum is the case that breaks: its own geometry implies a
+    # halo 46 px per axis short of what the coarsest level reaches.
+    p = params(; chip_size = 32, chip_size_max = 128, grid_spacing = 32, search_radius = 25)
+    for gridchip in (32, 64, 128)
+        grid = gridpoints(imagesize, 32; chip_size = gridchip, search_radius = 25)
+        w = AutoRIFT.filter_reach(p.preprocess)
+        need = widest_level_pad(grid, p) .+ w
+        @test all(AutoRIFT.halo(grid, p, imagesize) .>= need)
+    end
+
+    # `sanitize!` floors a searched point's radius at `min_search_radius`, so a grid whose radii
+    # sit below the floor is searched wider than it asks for.
+    tight = params(; chip_size = 32, chip_size_max = 32, grid_spacing = 32,
+                   search_radius = 3, min_search_radius = 6)
+    grid = gridpoints(imagesize, 32; chip_size = 32, search_radius = 3)
+    @test all(AutoRIFT.halo(grid, tight, imagesize) .>=
+              widest_level_pad(grid, tight) .+ AutoRIFT.filter_reach(tight.preprocess))
+
+    # The grid `autorift` builds for itself already carries the largest chip size, so nothing above
+    # widens it — the correction is for caller-supplied grids.
+    pd = params()
+    gd = AutoRIFT._build_grid(imagesize, pd)
+    @test AutoRIFT.halo(gd, pd, imagesize) ==
+          AutoRIFT._pass_geometry(scatter(gd), imagesize)[5] .+
+          AutoRIFT.filter_reach(pd.preprocess)
 end
 
 @testset "blocks partition the grid and read what they need" begin
