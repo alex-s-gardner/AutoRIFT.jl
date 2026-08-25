@@ -167,10 +167,12 @@ trimmed binary's.
   radius, *not* from image size (`src/points.jl:244`), so the grid origin is scene-independent —
   provided blocks slice the global grid with `pts[rows, cols]` (`src/points.jl:295`) and never call
   `gridpoints` themselves, which `_block_points` respects.
-- **The small-coarse-grid fallback is now an error under tiling.** `_coarse_points` returns
-  `nothing` and lets its caller decide: the whole-scene path searches everything rather than
-  rejecting on no evidence, and `_tiled_level` throws. Per block that fallback would silently skip
-  the coarse restriction, which is ~100× the work with no diagnostic.
+- **The small-coarse-grid fallback is one behaviour, warned about under tiling.** `_coarse_points`
+  returns `nothing` when the coarse grid is smaller than the outlier filter's window, and both paths
+  then search everything rather than rejecting on no evidence — a tiled run must agree with an
+  untiled one point for point, so it cannot substitute a policy of its own. The tiled path warns,
+  because the cost is what the coarse pass exists to avoid: ~100× the work, and silence reads as a
+  fast run.
 - **Block coordinates shift by an integer, and that is what makes them exact.** `chip_bounds` and
   `search_bounds` both `floor` a coordinate, and `floor(u - k) == floor(u) - k` for integer `k`, so
   a point lands on the same pixel of the block that it did on the scene.

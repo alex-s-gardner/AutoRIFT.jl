@@ -445,27 +445,31 @@ function _tiled_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size::
     nsearchable(pts) == 0 && return nothing
 
     setup = _coarse_points(pts, p, csx, csy)
-    # A coarse grid too small for the filter to judge consistency on. The untiled path searches
-    # everything here rather than rejecting on no evidence, and that is defensible for a whole
-    # scene. Under tiling it is a configuration error: it would skip the coarse restriction and
-    # search every point at full radius, which is ~100x the work with no diagnostic.
-    isnothing(setup) && throw(ArgumentError(
-        "the coarse grid for chip size $csx is smaller than the outlier filter's window, so the " *
-        "coarse pass cannot judge which points are coherent. Untiled, this falls back to " *
-        "searching everything; tiled it would do so silently and at roughly a hundred times the " *
-        "cost. Use a larger scene, a smaller `grid_spacing`, or a smaller `coarse_stride`."))
-    coarse = setup.coarse
-    nsearchable(coarse) == 0 && return nothing
+    if isnothing(setup)
+        # Too few coarse points to judge consistency against their neighbours, so there is no
+        # evidence to restrict the fine search with. Searching everything is what a whole-scene run
+        # does, and blocking must agree with it point for point rather than substitute a policy of
+        # its own. Warned because the cost is what the coarse pass exists to avoid: every point at
+        # full radius is roughly a hundred times the work, and silence here reads as a fast run.
+        @warn "coarse grid smaller than the outlier filter's window; searching every point at " *
+              "full radius, which costs roughly 100x the restricted pass. Reduce " *
+              "`coarse_stride`, reduce `grid_spacing`, or process a larger area per call." chip_size=csx
+        mask = trues(size(pts))
+    else
+        coarse = setup.coarse
+        nsearchable(coarse) == 0 && return nothing
 
-    # Step 1, per block: the coarse evidence. Every block runs the transform the whole coarse pass
-    # would have run, which is what `geometry` is for.
-    cgeom = pass_geometry(coarse)
-    cd = _run_blocked(pair, coarse, p, layout, _coarse_block_layout(layout, setup, size(pts)),
-                      cgeom, measure, prepare_blocks; subpixel = NoRefine())
+        # Step 1, per block: the coarse evidence. Every block runs the transform the whole coarse
+        # pass would have run, which is what `geometry` is for.
+        cgeom = pass_geometry(coarse)
+        cd = _run_blocked(pair, coarse, p, layout, _coarse_block_layout(layout, setup, size(pts)),
+                          cgeom, measure, prepare_blocks; subpixel = NoRefine())
 
-    # Step 2, once: the decisions.
-    mask = _coarse_decide(cd, coarse, p, setup.filt, size(pts))
-    isnothing(mask) && return nothing
+        # Step 2, once: the decisions.
+        m = _coarse_decide(cd, coarse, p, setup.filt, size(pts))
+        isnothing(m) && return nothing
+        mask = m
+    end
 
     @inbounds for i in eachindex(pts)
         if !mask[i]

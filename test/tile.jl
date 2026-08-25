@@ -212,6 +212,32 @@ end
     @test_throws "must be positive in both axes" AutoRIFT.block_layout(grid, p, (n, n), (8, -1))
 end
 
+@testset "a coarse grid too small to judge falls back, and still agrees" begin
+    # Below the relaxed filter's window there is no evidence to restrict the fine search with, so
+    # both paths search everything. The tiled path cannot substitute a policy of its own here: it
+    # has to agree with the untiled run point for point, which is what this asserts. It warns,
+    # because searching every point at full radius is what the coarse pass exists to avoid.
+    n = 320
+    a, b = shifted_pair((n, n), (2.0, -1.0); seed = 5)
+    p = params(; chip_size = 32, chip_size_max = 32, grid_spacing = 32,
+               search_radius = 12, coarse_stride = 4)
+    pair = AutoRIFT._prepare(ImagePair(a, b), p)
+    grid = AutoRIFT._build_grid(size(pair), p)
+
+    # The configuration this testset is about: the coarse grid really is too small.
+    level = AutoRIFT._level_points(grid, p, 32, 32, trues(size(grid)))
+    @test isnothing(AutoRIFT._coarse_points(level, p, 32, 32))
+
+    AutoRIFT._warm_grid_plans(grid, p)
+    untiled = AutoRIFT.correlate_multichip(pair, grid, p)
+    tiled = @test_logs (:warn, r"coarse grid smaller") match_mode = :any begin
+        AutoRIFT.correlate_tiled(pair, grid, p, (4, 4))
+    end
+    for f in (:dx, :dy, :correlation, :chip_size, :interpolated)
+        @test isequal(getfield(untiled, f), getfield(tiled, f))
+    end
+end
+
 @testset "_read_block materializes a window" begin
     a = reshape(collect(1:100), 10, 10)
     b = AutoRIFT._read_block(a, 3:6, 2:5)
