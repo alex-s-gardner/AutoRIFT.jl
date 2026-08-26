@@ -472,7 +472,7 @@ function _coarse_mask(pair::ImagePair, pts::PointSet{2}, p::Params, csx::Int, cs
                       cgeom, measure, buffers; subpixel = NoRefine())
 
     # Step 2, once: the decisions.
-    return _coarse_decide(cd, coarse, p, setup.filt, size(pts))
+    return _coarse_decide(cd, coarse, p, setup.filt, size(pts), p.coarse_stride)
 end
 
 # Correlate `pts` block by block, writing into one field.

@@ -39,6 +39,10 @@
 # `chip_size * 2^k`, which is what makes the grids nest: a coarse grid point is exactly a
 # block of fine ones.
 #
+# That correspondence is defined in exactly one place, `_cell_max_radius!`, and inverted in exactly
+# one other, `_expand_coarse_mask`. Both directions must use the same cell boundaries — a mask that
+# restricts the fine search has to sit on the evidence that produced it.
+#
 # ---------------------------------------------------------------------------
 # Why a coarse pass before each fine pass
 # ---------------------------------------------------------------------------
@@ -304,7 +308,7 @@ _coarse_evidence(pair::ImagePair, coarse::PointSet{2}, p::Params,
 # Every operation here is a neighbourhood or a whole-grid reduction, which is why this must see the
 # assembled coarse grid rather than one block of it.
 function _coarse_decide(cd::DisplacementField, coarse::PointSet{2}, p::Params,
-                        filt::OutlierMethod, gridsize::Tuple{Int,Int})
+                        filt::OutlierMethod, gridsize::Tuple{Int,Int}, stride::Int)
     measured = map(!isnan, cd.dx)
     any(measured) || return nothing
 
@@ -330,9 +334,35 @@ function _coarse_decide(cd::DisplacementField, coarse::PointSet{2}, p::Params,
     # A coherent coarse estimate is evidence about its neighbourhood, not just its own point,
     # so grow it before it restricts the fine search.
     grown = dilate_within(keep, p.coarse_buffer)
-    # Back to the full grid. Nearest-neighbour because this is a mask: an interpolated value
-    # between "search" and "do not search" would mean nothing.
-    return resample(grown, gridsize, Nearest()) .> 0.5f0
+    # Back to the full grid, on the same lattice the radii were reduced over.
+    return _expand_coarse_mask(grown, gridsize, stride)
+end
+
+# A coarse-grid mask on the full grid, inverting the cell assignment `_cell_max_radius!` makes.
+#
+# Not `resample(..., Nearest())`: that derives its own cell boundaries from the size ratio, and for
+# an even `stride` they are not the ones the radii were reduced over. At `nr = 13, stride = 4` the
+# coarse point for fine row 4 covers rows 2..5 here, where `Nearest` assigns rows 1..4 to it — so
+# the mask restricting the fine search would sit one row off the evidence that produced it. Two
+# independent derivations of one correspondence is the defect; the offset is the symptom.
+#
+# Inverting `_cell_max_radius!` instead makes the two agree by construction: it centres cell `k` on
+# fine index `k * stride` with `lo = stride ÷ 2` before and `hi = stride - 1 - lo` after, so the cell
+# containing fine index `i` is `fld(i + lo, stride)`, clamped to the ends where the coarse grid stops
+# short of the fine one. That also keeps this in integer arithmetic, where `resample` needed a
+# `Float32` round trip and a `> 0.5f0` threshold on a Boolean quantity.
+function _expand_coarse_mask(mask::AbstractMatrix{Bool}, gridsize::Tuple{Int,Int}, stride::Int)
+    nr, nc = gridsize
+    sr, sc = size(mask)
+    lo = stride ÷ 2
+    out = Matrix{Bool}(undef, nr, nc)
+    @inbounds for j in 1:nc
+        cj = clamp(fld(j + lo, stride), 1, sc)
+        for i in 1:nr
+            out[i, j] = mask[clamp(fld(i + lo, stride), 1, sr), cj]
+        end
+    end
+    return out
 end
 
 # Correlate a decimated sample of the points, filter for spatial consistency, and dilate what
@@ -354,7 +384,7 @@ function _coarse_pass(pair::ImagePair, pts::PointSet{2}, p::Params, csx::Int, cs
     nsearchable(coarse) == 0 && return nothing
 
     cd = _coarse_evidence(pair, coarse, p, measure)
-    return _coarse_decide(cd, coarse, p, setup.filt, (nr, nc))
+    return _coarse_decide(cd, coarse, p, setup.filt, (nr, nc), p.coarse_stride)
 end
 
 # Maximum radius over each coarse cell, matching the left-biased window convention the sliding
