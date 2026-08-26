@@ -158,6 +158,294 @@ preprocess(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::Highpass)
 preprocess(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::Wallis) =
     _filtered(wallis(img, mask, m.width, m.min_std), mask, m.width)
 
+preprocess(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::WallisGapfill) =
+    preprocess(img, mask, m, UInt64(0))
+
+"""
+    preprocess(img, mask, method, seed::UInt64) -> (filtered, mask)
+
+[`preprocess`](@ref) with the seed for the one filter that draws random numbers.
+
+`seed` is positional and concretely typed rather than a keyword carrying an `AbstractRNG`, which
+`--trim` cannot resolve. Only [`WallisGapfill`](@ref) reads it; every other method ignores it and
+forwards to the three-argument form, so this is what `_prepare` calls without having to know which
+filter it holds.
+"""
+preprocess(img::AbstractMatrix, mask::AbstractMatrix{Bool}, m::PreprocessMethod, ::UInt64) =
+    preprocess(img, mask, m)
+
+# A fresh `Xoshiro(seed)` per call rather than the global stream: the two images of a pair, and two
+# runs of the same pair, must fill identically, and a shared generator makes the fill depend on call
+# order. The reference draws from NumPy's unseeded global generator and so is not reproducible
+# against itself.
+preprocess(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::WallisGapfill,
+           seed::UInt64) =
+    wallis_gapfill(img, mask, m.width, m.min_std; rng = Random.Xoshiro(seed))
+
+# Pointwise, so no window and no mask erosion: `_filtered` is not used and the mask passes
+# through with only the pixels the log could not represent removed.
+preprocess(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, ::Decibel) =
+    decibel(img, mask)
+
+preprocess(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::Sobel) =
+    _filtered(sobel(img, mask, m.width), mask, m.width)
+
+preprocess(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::Laplacian) =
+    _filtered(laplacian(img, mask, m.width), mask, m.width)
+
+# ---------------------------------------------------------------------------
+# Wallis with gap filling
+# ---------------------------------------------------------------------------
+
+"""
+    wallis_gapfill(img, mask, width, std_cutoff; rng) -> (Matrix{Float32}, Matrix{Bool})
+
+[`wallis`](@ref), with interior no-data gaps and low-contrast patches replaced by white noise.
+
+For Landsat-7 after the 2003 Scan Line Corrector failure, whose imagery carries wedge-shaped
+interior gaps. Correlation cannot use a gap, but leaving one masked costs the whole
+neighbourhood of every chip that overlaps it. Filling with noise matched to the surrounding
+distribution is the cheaper trade: noise correlates with nothing, so it suppresses the peak
+where a chip is mostly gap without discarding chips that merely touch one.
+
+The noise is standard normal and **not** rescaled, which is correct because it is added after
+normalization — `wallis` has already divided by the local standard deviation, so valid pixels
+are themselves about unit variance.
+
+Three regions are distinguished, and only the middle one is filled:
+
+  * **Measured** — enough valid neighbours and enough contrast. Normalized as usual.
+  * **Filled** — an interior gap, or a patch whose local standard deviation is below
+    `std_cutoff`, that lies within reach of real data. Replaced by noise and marked *valid*,
+    since that is what stops it masking out its neighbours.
+  * **Excluded** — beyond `30` pixels from any valid pixel, so there is no nearby data for the
+    fill to be consistent with. Marked invalid, as an outer no-data border should be.
+
+`std_cutoff` is an absolute threshold on the local standard deviation, so it is scaled to the
+input's own units. Note it does *not* floor the divisor the way [`Wallis`](@ref)'s `min_std`
+does; here a low-contrast window is filled rather than clamped.
+
+Gaps are taken from `mask`, not from `img == 0`. The reference detects them as approximately
+zero, which conflates a fill value with a genuinely dark pixel — the same conflation
+[`ImagePair`](@ref) declines to make. A caller whose sensor writes zeros passes a mask that
+says so.
+"""
+function wallis_gapfill(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool},
+                        width::Integer, std_cutoff::Real;
+                        rng::Random.AbstractRNG = Random.default_rng())
+    axes(img) == axes(mask) || throw(DimensionMismatch(
+        "image and mask must share axes: $(axes(img)) vs $(axes(mask))"))
+    Base.require_one_based_indexing(img, mask)
+    w = Int(width)
+
+    buff = _gapfill_buffer(w)
+
+    # An interior gap is an invalid pixel with real data within `GAPFILL_REACH`. The outer
+    # border of a scene fails that test, which is what keeps a whole invalid margin from being
+    # filled with noise that has nothing to be consistent with.
+    near_data = dilate_within(mask, GAPFILL_REACH)
+    gaps = dilate_within(near_data .& .!mask, buff)
+
+    # Where the output means anything at all: real data, plus the grown interior gaps.
+    domain = mask .| gaps
+
+    mean = _masked_boxmean(img, mask, w)
+    sd = _masked_boxstd(img, mask, mean, w)
+
+    # `!(sd >= cutoff)` rather than `sd < cutoff` so a `NaN` standard deviation — a window with
+    # no valid neighbour — counts as low contrast rather than as passing the test.
+    cutoff = Float32(std_cutoff)
+    flat = similar(mask, Bool)
+    @inbounds for i in eachindex(flat, sd)
+        flat[i] = !(sd[i] >= cutoff)
+    end
+
+    # Fill the gaps and the flat patches, but only inside the domain.
+    fill = (gaps .| dilate_within(flat, buff)) .& domain
+
+    out = Matrix{Float32}(undef, size(img))
+    v = Matrix{Bool}(undef, size(mask))
+    @inbounds for i in eachindex(out, img, mask)
+        if !domain[i]
+            out[i] = 0.0f0
+            v[i] = false
+        elseif fill[i]
+            # Unit-variance noise, matching what the normalization leaves behind elsewhere.
+            out[i] = Float32(randn(rng))
+            v[i] = true
+        else
+            m, s = mean[i], sd[i]
+            if mask[i] && isfinite(m) && isfinite(s) && s > 0
+                out[i] = (Float32(img[i]) - m) / s
+                v[i] = true
+            else
+                # Not reachable through the branches above for a well-formed input, but a
+                # non-finite sample would land here rather than writing a NaN downstream.
+                out[i] = 0.0f0
+                v[i] = false
+            end
+        end
+    end
+    return out, v
+end
+
+# ---------------------------------------------------------------------------
+# Amplitude-in-decibels, and the derivative filters built on it
+# ---------------------------------------------------------------------------
+
+"""
+    decibel(img, mask) -> (Matrix{Float32}, Matrix{Bool})
+
+Amplitude to decibels, `20 log10(A)`, with the mask narrowed to the pixels that have one.
+
+`20 log10` and not `10 log10`: the input is amplitude, not power. Intended for radar, where
+brightness varies multiplicatively over a large range and a log turns that into an additive
+offset the windowed filters can remove.
+
+A non-positive amplitude has no decibel value. Those pixels are dropped from the mask and
+written as zero rather than left as `-Inf` or `NaN`, which is where this differs from the
+reference: it records a zero mask and then takes the log anyway, so `-Inf` reaches the
+correlator as texture.
+"""
+function decibel(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool})
+    axes(img) == axes(mask) || throw(DimensionMismatch(
+        "image and mask must share axes: $(axes(img)) vs $(axes(mask))"))
+    out = Matrix{Float32}(undef, size(img))
+    v = Matrix{Bool}(undef, size(mask))
+    @inbounds for i in eachindex(out, img, mask)
+        a = Float32(img[i])
+        # `a > 0` excludes the fill value the reference conflates with darkness, and also
+        # excludes a negative sample, which amplitude data should not contain at all.
+        if mask[i] && a > 0
+            out[i] = 20.0f0 * log10(a)
+            v[i] = true
+        else
+            out[i] = 0.0f0
+            v[i] = false
+        end
+    end
+    return out, v
+end
+
+"""
+    sobel(img, mask, width) -> Matrix{Float32}
+
+Sum of the x and y Sobel derivative kernels of side `width`, applied as one kernel.
+
+This is `Gx + Gy` — the two derivative kernels added together and convolved once — not the
+gradient magnitude `sqrt(Gx² + Gy²)` and not `|Gx| + |Gy|`. It is what the reference does, and
+it makes the filter **directional**: the response partially cancels along one diagonal and
+reinforces along the other. Worth knowing before reading the output as an edge strength.
+
+Kernels are the unnormalized separable binomial-difference pair OpenCV's `getDerivKernels`
+returns, so at `width = 5` the x kernel is `[-1,-2,0,2,1] ⊗ [1,4,6,4,1]`.
+"""
+sobel(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, width::Integer) =
+    _convolve_masked(img, mask, _summed_deriv_kernel(Int(width), 1))
+
+"""
+    laplacian(img, mask, width) -> Matrix{Float32}
+
+Laplacian of the **decibel** image: `∂²/∂x² + ∂²/∂y²` applied to `20 log10(A)`.
+
+The log comes first, and that ordering is the point. Radar brightness varies
+multiplicatively, so a second derivative of raw amplitude scales with local brightness and
+reports the same terrain twice as strongly where the scene is twice as bright. In decibels
+that variation is an additive offset, which a second derivative removes outright.
+
+Second-order kernels of side `width`, summed across the two axes, so this is one convolution
+rather than two.
+"""
+function laplacian(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, width::Integer)
+    db, dbmask = decibel(img, mask)
+    return _convolve_masked(db, dbmask, _summed_deriv_kernel(Int(width), 2))
+end
+
+# The `order`-th derivative along x plus the same along y, as one `w`-by-`w` kernel.
+#
+# Summing the two separable outer products rather than convolving twice and adding is what the
+# reference does, and it is also why one convolution suffices. For `order = 2` this is exactly
+# OpenCV's `Laplacian(ksize = w)`; for `order = 1` it is the reference's `Sobel`, which is
+# directional rather than a gradient magnitude — see [`sobel`](@ref).
+function _summed_deriv_kernel(w::Int, order::Int)
+    deriv, smooth = _deriv_kernels(w, order)
+    return _outer(deriv, smooth) .+ _outer(smooth, deriv)
+end
+
+# The separable derivative kernels OpenCV's `getDerivKernels(order, 0, w, normalize=false)`
+# returns: an `order`-th central difference widened by binomial smoothing, and the binomial
+# smoother for the perpendicular axis.
+#
+# Built from Pascal's triangle rather than tabulated, and pinned against OpenCV's own output by
+# `test/preprocess.jl`. Both factors are a binomial row: the smoother is row `w-1`, and the
+# derivative is the three-tap difference convolved with row `w-3`. That widening is why width 5
+# gives `[-1,-2,0,2,1]` rather than a bare `[-1,0,1]`.
+function _deriv_kernels(w::Int, order::Int)
+    (isodd(w) && w >= 3) || throw(ArgumentError(
+        "derivative kernel width must be odd and at least 3, got $w"))
+    order in (1, 2) || throw(ArgumentError("derivative order must be 1 or 2, got $order"))
+    smooth = _binomial_row(w)
+    base = order == 1 ? Float32[-1, 0, 1] : Float32[1, -2, 1]
+    return _conv1(base, _binomial_row(w - 2)), smooth
+end
+
+# Row `n-1` of Pascal's triangle, as a length-`n` vector: the binomial smoother of width `n`.
+_binomial_row(n::Int) = [Float32(binomial(n - 1, k)) for k in 0:(n - 1)]
+
+# Full 1-D convolution, for composing the small kernel factors above.
+function _conv1(a::AbstractVector{Float32}, b::AbstractVector{Float32})
+    out = zeros(Float32, length(a) + length(b) - 1)
+    for (i, ai) in pairs(a), (j, bj) in pairs(b)
+        out[i + j - 1] += ai * bj
+    end
+    return out
+end
+
+_outer(col::Vector{Float32}, row::Vector{Float32}) = col .* transpose(row)
+
+# Correlate `img` with `kernel`, excluding invalid pixels from every window rather than letting
+# them contribute zeros.
+#
+# That exclusion is the difference from the reference, which zero-pads: a no-data border there
+# biases every output within half a kernel of it, and the bias looks like an edge — exactly what
+# a derivative filter is meant to detect. Here a window with no valid pixel is `NaN`, which
+# `_filtered` then records in the mask.
+#
+# Renormalizing by the weight actually used would be wrong for a derivative kernel, whose
+# coefficients sum to zero: there is no mean to preserve, so the valid coefficients are applied
+# as they stand.
+function _convolve_masked(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool},
+                          kernel::AbstractMatrix{Float32})
+    axes(img) == axes(mask) || throw(DimensionMismatch(
+        "image and mask must share axes: $(axes(img)) vs $(axes(mask))"))
+    # The other filters in this file return a 1-based `Matrix{Float32}`, and `_filtered` requires
+    # one, so declare the assumption rather than appearing generic and producing an offset result.
+    Base.require_one_based_indexing(img, mask)
+    kh, kw = size(kernel)
+    # Left-biased centre, matching the window conventions in `window.jl` so an even width — which
+    # the constructors reject, but which a direct call could still reach — lands consistently.
+    ci, cj = (kh ÷ 2) + 1, (kw ÷ 2) + 1
+    rows, cols = axes(img)
+    out = Matrix{Float32}(undef, size(img))
+    @inbounds for j in cols, i in rows
+        acc = 0.0f0
+        any_valid = false
+        for kj in 1:kw
+            jj = j + (kj - cj)
+            jj in cols || continue
+            for ki in 1:kh
+                ii = i + (ki - ci)
+                ii in rows || continue
+                mask[ii, jj] || continue
+                acc += kernel[ki, kj] * Float32(img[ii, jj])
+                any_valid = true
+            end
+        end
+        out[i, j] = any_valid ? acc : NaN32
+    end
+    return out
+end
+
 # ---------------------------------------------------------------------------
 # Complex input
 # ---------------------------------------------------------------------------
@@ -272,7 +560,7 @@ end
 
 # The mask bookkeeping every windowed filter needs, written once. Doing it per filter is how
 # the reference ended up inconsistent about it.
-function _filtered(out::Matrix{Float32}, mask::AbstractMatrix{Bool}, width::Integer)
+function _filtered(out::AbstractMatrix{Float32}, mask::AbstractMatrix{Bool}, width::Integer)
     v = _erode_mask(mask, Int(width))
     return _filtered_finish!(out, v)
 end
@@ -451,11 +739,12 @@ end
 # at zero, which stops the NaNs but leaves the precision loss. Squaring the deviations
 # about the measured mean costs one more pass and avoids both.
 #
-# Note this is the *population* standard deviation of the window, not the
-# Bessel-corrected sample one. The correction would need the per-window valid count,
-# and at the window sizes used here (5 to 21, so 25 to 441 samples) the difference is
-# under 2% — well below the contrast variation the filter exists to remove, and not
-# worth a second sliding-count pass to recover.
+# Bessel-corrected by the window *area*, `sqrt(w² / (w² - 1))`, which is a constant and so
+# costs one multiply. It is deliberately not the per-window valid count: the reference scales by
+# the kernel area regardless of how many neighbours were usable, and matching it is what keeps
+# `WallisGapfill`'s `std_cutoff` — an absolute threshold on this quantity — mean the same thing
+# here as there. At width 5 the factor is 1.0206, so omitting it would shift every `Wallis`
+# output by 2% and move which pixels the gap filler treats as low-contrast.
 function _masked_boxstd(img::AbstractMatrix, mask::AbstractMatrix{Bool},
                         mean::AbstractMatrix{Float32}, w::Int)
     dev2 = Matrix{Float32}(undef, size(img))
@@ -474,10 +763,18 @@ function _masked_boxstd(img::AbstractMatrix, mask::AbstractMatrix{Bool},
     # `windowmean` ignores NaN, so this averages over valid neighbours only, and the
     # loop above already established whether there are any.
     msd = windowmean(dev2, w; hasnan = gaps)
+    bessel = _bessel_factor(w)
     @inbounds for i in eachindex(msd)
-        msd[i] = sqrt(max(msd[i], 0.0f0))
+        msd[i] = sqrt(max(msd[i], 0.0f0)) * bessel
     end
     return msd
+end
+
+# `sqrt(n / (n - 1))` for a `w`-by-`w` window. `w == 1` has no spread to correct, and the
+# expression would divide by zero, so it is 1 there.
+function _bessel_factor(w::Int)
+    n = w * w
+    return n > 1 ? Float32(sqrt(n / (n - 1))) : 1.0f0
 end
 
 # Erode a validity mask by a `w`-wide window: a pixel stays valid only if every pixel in

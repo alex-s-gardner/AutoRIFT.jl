@@ -291,7 +291,8 @@ already carries its own — that is an error rather than a silent override.
   batch processing, leaving this `false` and running one pair per worker is
   usually faster; see the documentation on throughput.
 - `progress = false`: show a progress meter.
-- `rng_seed = 0`: seed for gap filling, so results are reproducible.
+- `rng_seed = 0`: seed for the noise [`WallisGapfill`](@ref) fills gaps with, so a run is
+  reproducible. Read by that filter alone; every other `preprocess` choice ignores it.
 """
 function params(;
     similarity = :zncc,

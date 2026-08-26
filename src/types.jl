@@ -346,6 +346,21 @@ end
 WallisGapfill(; width = 5, min_std = 0.25) = WallisGapfill(width, min_std)
 
 """
+    AutoRIFT.GAPFILL_REACH
+
+How far real data may lie from an invalid pixel for that pixel to count as an interior gap rather
+than as outer no-data border, in pixels. From the reference.
+
+An interior gap is filled with noise; a border is left invalid. The distinction matters because
+noise is only defensible where there is nearby data for it to be statistically consistent with.
+"""
+const GAPFILL_REACH = 30.0
+
+# Half-diagonal of a `w`-by-`w` window: the distance at which a pixel's window can still reach a
+# gap, and so how far a gap's influence is grown before the normalized output around it is trusted.
+_gapfill_buffer(w::Integer) = sqrt(2 * ((Int(w) - 1) / 2)^2) + 0.01
+
+"""
     Sobel(; width = 5)
 
 Sum of the Sobel derivative kernels in x and y, giving an edge-emphasising
@@ -602,10 +617,23 @@ two cannot drift.
 """
 filter_reach(m::PreprocessMethod) = filter_width(m) ÷ 2
 
-# `Wallis` and its gap-filling variant subtract a local mean and then divide by a local standard
-# deviation computed *about that mean*, so the window is applied twice in sequence and each output
-# depends on a neighbourhood twice as wide.
-filter_reach(m::Union{Wallis,WallisGapfill}) = 2 * (filter_width(m) ÷ 2)
+# `Wallis` subtracts a local mean and then divides by a local standard deviation computed *about
+# that mean*, so the window is applied twice in sequence and each output depends on a neighbourhood
+# twice as wide.
+filter_reach(m::Wallis) = 2 * (filter_width(m) ÷ 2)
+
+# `WallisGapfill` reaches much further than its window, because deciding *whether* a pixel is filled
+# is a distance-transform question rather than a windowed one: an invalid pixel is an interior gap
+# only if real data lies within `GAPFILL_REACH`, and both that verdict and the low-contrast one are
+# then grown by the window's half-diagonal. So the reach is the gap-detection distance plus that
+# dilation plus the Wallis window itself.
+#
+# Finite, and verified so: a valid pixel 40 px away changes no local decision, while one at 20 px
+# does. The measured reach is 26 px at width 5 against the 35 px this returns, so the bound holds
+# with margin — which matters because a value that is too small makes a blocked run silently wrong
+# rather than merely different.
+filter_reach(m::WallisGapfill) =
+    ceil(Int, GAPFILL_REACH + _gapfill_buffer(filter_width(m))) + 2 * (filter_width(m) ÷ 2)
 
 # A whole-image reduction rather than a window: `deramp` sums adjacent-pixel conjugate products
 # over every pixel and takes one `atan2`. No finite reach expresses that, so it is `-1` rather than

@@ -90,6 +90,9 @@ function CommonSolve.init(reference::AbstractMatrix, secondary::AbstractMatrix;
               process_block_size = nothing, kwargs...)
     p = params(; kwargs...)
     raw = ImagePair(reference, secondary; reference_valid, secondary_valid)
+    # Before the grid and the plans, so a filter that cannot run on this element type is an error at
+    # the call that configured it rather than at the first correlation.
+    _check_preprocess(eltype(raw), p.preprocess)
     bs = _block_size(process_block_size)
     # A blocked run filters each block from its own read window, so the filtered scene is never
     # formed — which is what bounds peak memory by the block rather than by the scene, and is the
@@ -357,11 +360,33 @@ end
 # Whether the scene is filtered here at all depends on the block size, which is why `_prepare` sits
 # inside these methods rather than at the call: a blocked run filters per block and must never form a
 # filtered scene, since that copy is the allocation it exists to avoid.
-_run(raw::ImagePair, grid::PointSet{2}, p::Params, ::Nothing) =
-    _correlate(_prepare(raw, p), raw, grid, p, nothing)
-_run(raw::ImagePair, grid::PointSet{2}, p::Params, bs::Tuple{Int,Int}) =
-    _correlate(nothing, raw, grid, p, bs)
-_run(raw::ImagePair, pts::PointSet{1}, p::Params, ::Nothing) = track(_prepare(raw, p), pts, p)
+function _run(raw::ImagePair, grid::PointSet{2}, p::Params, ::Nothing)
+    _check_preprocess(eltype(raw), p.preprocess)
+    return _correlate(_prepare(raw, p), raw, grid, p, nothing)
+end
+function _run(raw::ImagePair, grid::PointSet{2}, p::Params, bs::Tuple{Int,Int})
+    _check_preprocess(eltype(raw), p.preprocess)
+    return _correlate(nothing, raw, grid, p, bs)
+end
+function _run(raw::ImagePair, pts::PointSet{1}, p::Params, ::Nothing)
+    _check_preprocess(eltype(raw), p.preprocess)
+    return track(_prepare(raw, p), pts, p)
+end
+
+# Whether this filter can run on this element type, checked once at the call that started the run.
+#
+# `params` cannot do this: it has no image, so it cannot know the element type, and its promise that
+# nothing below re-validates (see the note at the top of this file) therefore cannot cover the
+# filter/eltype pairing. Without this the mismatch surfaces from inside `_prepare` — mid-run, after
+# the grid is built and the plans are warmed — as an error about an array type rather than about the
+# keyword that chose it.
+#
+# Dispatch rather than a condition, so a filter added with no method for the element type it is
+# handed produces a `MethodError` here, at the boundary, instead of deep in the filter stack.
+_check_preprocess(::Type, ::PreprocessMethod) = nothing
+_check_preprocess(::Type{<:Real}, ::Deramp) = throw(ArgumentError(
+    "`preprocess = :deramp` needs complex input, but the images are real. A real image has no " *
+    "phase ramp to remove. Use `preprocess = :highpass` for real imagery, or pass complex data."))
 
 # Blocks are laid out over a *gridded* point set, since the halo is derived from where points sit
 # relative to each other. A scattered set has no such layout, so there is nothing to divide.
@@ -402,7 +427,7 @@ end
 # secondary of one pair and the reference of the next, so `reinit!` swapping one image must not
 # re-filter the other — on 1024² that is 23 ms and 23 MiB of pure waste per pair.
 _prepare(img::AbstractMatrix, mask::AbstractMatrix{Bool}, p::Params) =
-    replace_nonfinite(preprocess(img, mask, p.preprocess)...)
+    replace_nonfinite(preprocess(img, mask, p.preprocess, p.rng_seed)...)
 
 
 _prepare(pair::ImagePair, p::Params) = ImagePair(

@@ -29,6 +29,8 @@ module AutoRIFT
 # it is ours and is exported.
 using CommonSolve: CommonSolve, init
 using LinearAlgebra: LinearAlgebra
+# `WallisGapfill` fills gaps with noise, and `Params.rng_seed` is what makes that reproducible.
+using Random: Random
 using StableTasks: StableTasks
 
 """

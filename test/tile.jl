@@ -37,13 +37,73 @@ using AutoRIFT: ImagePair, gridpoints, params, scatter, issearchable,
               2 * AutoRIFT.filter_reach(Highpass(w))
     end
 
+    # The derivative filters are a single convolution, so their reach is the kernel half-width.
+    # `Laplacian` takes decibels first, but that step is pointwise and so adds nothing.
+    for w in (5, 9)
+        for m in (Sobel(; width = w), Laplacian(; width = w))
+            @test AutoRIFT.filter_reach(m) == measured_reach(m)
+        end
+    end
+
     # Windowless methods reach nothing.
     @test AutoRIFT.filter_reach(NoPreprocess()) == 0
+    @test AutoRIFT.filter_reach(Decibel()) == 0
 
     # `Deramp` estimates from the whole image, so no halo makes a block agree with the scene. A
     # negative reach says "not blockwise-reproducible" rather than naming a large number that would
     # merely be less wrong.
     @test AutoRIFT.filter_reach(Deramp()) < 0
+
+    @testset "WallisGapfill reaches far past its window, but finitely" begin
+        # Its reach is set by a *decision* rather than by a window: an invalid pixel is an interior
+        # gap only if real data lies within `GAPFILL_REACH`, so influence travels that far plus the
+        # dilation and the Wallis window. The declared reach must bound that, because a halo that is
+        # too small makes a blocked run silently wrong.
+        #
+        # The gap below is deliberately deeper than `2 * GAPFILL_REACH`, so its centre is beyond
+        # reach of data while its edges are within: the threshold then genuinely discriminates
+        # across the probe region. A benign layout measures a reach of zero and passes vacuously,
+        # which is the trap this construction avoids.
+        m = WallisGapfill(; width = 5)
+        reach = AutoRIFT.filter_reach(m)
+        @test reach > AutoRIFT.filter_reach(Wallis(; width = 5))
+        @test reach >= AutoRIFT.GAPFILL_REACH
+
+        gn = 400
+        gimg = synthetic_texture(gn; seed = 3) .* 2000.0f0 .+ 500.0f0
+        gmask = trues(gn, gn)
+        deep = 2 * ceil(Int, AutoRIFT.GAPFILL_REACH) + 20
+        gmask[100:(100 + deep), :] .= false
+
+        # Probe rows straddling the verdict boundary, which sits `GAPFILL_REACH` into the gap:
+        # nearer the edge the pixel is filled, deeper in it is excluded.
+        boundary = 100 + ceil(Int, AutoRIFT.GAPFILL_REACH)
+        prow = (boundary - 5):(boundary + 5)
+        pcol = 200:220
+        whole_out, whole_v = AutoRIFT.wallis_gapfill(gimg, gmask, 5, 0.25;
+                                                    rng = Random.Xoshiro(1))
+        # The layout has teeth only if both verdicts appear in the probe.
+        @test any(whole_v[prow, pcol])
+        @test !all(whole_v[prow, pcol])
+
+        # The validity verdict is what the halo has to reproduce; the filled values themselves are
+        # drawn from the generator and so cannot match a differently-sized block's draw.
+        function reach_of_verdict()
+            for pad in 0:(reach + 20)
+                rr = (first(prow) - pad):(last(prow) + pad)
+                cc = (first(pcol) - pad):(last(pcol) + pad)
+                (first(rr) < 1 || first(cc) < 1 || last(rr) > gn || last(cc) > gn) && return -1
+                _, bv = AutoRIFT.wallis_gapfill(gimg[rr, cc], gmask[rr, cc], 5, 0.25;
+                                                rng = Random.Xoshiro(1))
+                inner = bv[(pad + 1):(length(rr) - pad), (pad + 1):(length(cc) - pad)]
+                inner == whole_v[prow, pcol] && return pad
+            end
+            return -1
+        end
+        measured = reach_of_verdict()
+        @test measured >= 0                       # a finite reach exists at all
+        @test measured <= reach                   # and the declared value bounds it
+    end
     grid = gridpoints((n, n), 32; chip_size = 32, search_radius = 25)
     @test_throws "no halo fixes that" AutoRIFT.halo(
         grid, params(; preprocess = :deramp, similarity = :coherence), (n, n))
