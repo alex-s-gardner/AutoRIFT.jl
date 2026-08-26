@@ -34,22 +34,25 @@ mutable struct Cache{P<:Params}
     # two images, and the other must then be re-prepared from its original — preparing the
     # already-prepared one would filter it a second time.
     raw::ImagePair
-    # The pair the correlator sees: filtered, with non-finite pixels replaced. `nothing` under
-    # `block_size`, where each block is filtered from its own read window instead and a whole-scene
-    # filtered copy is exactly the allocation blocking exists to avoid.
-    prepared::Union{Nothing,ImagePair}
+    # How this cache's passes run, and over which pair: an `AutoRIFT.WholeScene` holding the
+    # filtered scene, or an `AutoRIFT.Blocked` holding the raw one and filtering per block.
+    #
+    # One field rather than a `prepared::Union{Nothing,ImagePair}` beside a
+    # `block_size::Union{Nothing,Tuple}`: those two had to agree — a filtered scene *and* a block
+    # size is a contradiction, and neither is a run with nothing to correlate — and nothing enforced
+    # it. A runner cannot express the disagreement.
+    #
+    # Blocking stays out of `Params` because it is a scheduling choice rather than an algorithm
+    # parameter: it changes peak memory and nothing else, since the two paths agree bit for bit.
+    # That also keeps `Params`'s 22 positional fields, and every construction of it including the
+    # trimmed binary's, unchanged.
+    runner::PassRunner
     grid::PointSet{2}
     result::Union{Nothing,MultichipResult}
     # Set when the images change and cleared once a run has consumed them. `reinit!`
     # accumulates dirtiness rather than overwriting it, so two swaps before one run still
     # leave the cache correctly marked.
     isfresh::Bool
-    # Grid points per block, or `nothing` for one block over the whole grid. Here rather than in
-    # `Params` because it is a scheduling choice and not an algorithm parameter: it changes peak
-    # memory and nothing else, since the tiled and untiled paths agree bit for bit. Keeping it out
-    # of `Params` also keeps that type's 22 positional fields — and every construction of it,
-    # including the trimmed binary's — unchanged.
-    block_size::Union{Nothing,Tuple{Int,Int}}
 end
 
 """
@@ -61,13 +64,13 @@ Throws for a cache built with `process_block_size`. Such a run filters each bloc
 window and never forms a filtered scene, so there is no whole-scene pair to return — and returning
 the raw one would silently answer a different question.
 """
-function imagepair(cache::Cache)
-    isnothing(cache.prepared) && throw(ArgumentError(
-        "this cache was built with `process_block_size`, so no whole-scene filtered pair exists: " *
-        "each block is filtered from its own read window, which is what bounds peak memory. Use " *
-        "`cache.raw` for the input as supplied, or build the cache without `process_block_size`."))
-    return cache.prepared
-end
+imagepair(cache::Cache) = imagepair(cache.runner)
+
+imagepair(r::WholeScene) = r.prepared
+imagepair(::Blocked) = throw(ArgumentError(
+    "this cache was built with `process_block_size`, so no whole-scene filtered pair exists: " *
+    "each block is filtered from its own read window, which is what bounds peak memory. Use " *
+    "`cache.raw` for the input as supplied, or build the cache without `process_block_size`."))
 
 """
     AutoRIFT.init(reference, secondary; kwargs...) -> Cache
@@ -98,15 +101,13 @@ function CommonSolve.init(reference::AbstractMatrix, secondary::AbstractMatrix;
     # formed — which is what bounds peak memory by the block rather than by the scene, and is the
     # reason `process_block_size` exists. Preparing here would defeat it, and would also filter
     # every block twice.
-    prepared = isnothing(bs) ? _prepare(raw, p) : nothing
     grid = _build_grid(size(raw), p)
     # Plans are created here rather than on first use so that a batch driver pays for them
     # once, on the task that builds the cache, and never inside a correlation.
     _warm_grid_plans(grid, p)
-    # Validated here rather than at the first run, so a block size that cannot work is an error at
-    # the call that set it. `block_layout` is what knows the halo, so it is what checks.
-    isnothing(bs) || block_layout(grid, p, size(raw), bs)
-    return Cache{typeof(p)}(p, raw, prepared, grid, nothing, true, bs)
+    # The layout is built here rather than at the first run, so a block size that cannot work is an
+    # error at the call that set it. `block_layout` is what knows the halo, so it is what checks.
+    return Cache{typeof(p)}(p, raw, _runner(raw, grid, p, bs), grid, nothing, true)
 end
 
 # `process_block_size` as a tuple, or `nothing` for one block.
@@ -153,7 +154,7 @@ function reinit!(cache::Cache; reference = nothing, secondary = nothing,
     isnothing(reference) && isnothing(secondary) &&
         isnothing(reference_valid) && isnothing(secondary_valid) && return cache
 
-    old, oldprep = cache.raw, cache.prepared
+    old = cache.raw
     # Defaults come from the *raw* pair, so replacing one image re-prepares the other from its
     # original rather than filtering an already-filtered array.
     ref = isnothing(reference) ? old.reference : reference
@@ -170,14 +171,7 @@ function reinit!(cache::Cache; reference = nothing, secondary = nothing,
         "cache with `init` for a different image size."))
 
     cache.raw = ImagePair(ref, sec; reference_valid = rv, secondary_valid = sv)
-    p = cache.params
-    # A blocked cache holds no filtered scene to refresh, and the reuse below has nothing to reuse:
-    # its filtering happens per block, inside the run, from whichever raw pair is current.
-    if !isnothing(oldprep)
-        newref = _reprepare(ref, cache.raw.reference_valid, old, oldprep, p)
-        newsec = _reprepare(sec, cache.raw.secondary_valid, old, oldprep, p)
-        cache.prepared = ImagePair(newref, newsec)
-    end
+    cache.runner = _reinit_runner(cache.runner, cache.raw, old, cache.params)
     # `|=` rather than `=`: two swaps before a single run must still leave the cache dirty.
     cache.isfresh |= true
     cache.result = nothing
@@ -215,23 +209,39 @@ than recomputing it.
 """
 function autorift!(cache::Cache)
     cache.isfresh || isnothing(cache.result) || return cache.result
-    cache.result = _correlate(cache.prepared, cache.raw, cache.grid, cache.params,
-                              cache.block_size)
+    cache.result = _multichip(cache.runner, cache.grid, cache.params)
     cache.isfresh = false
     return cache.result
 end
 
-# One block over the whole grid is the untiled path itself, not a tiled run that happens to have
-# one block. The two agree bit for bit, but taking the same code keeps that a property of having
-# one implementation rather than something to re-verify.
+# The runner a block size implies, and the pair it correlates.
 #
-# The two take *different pairs*, which is the whole point rather than an inconsistency: the untiled
-# path correlates a filtered scene, while a blocked run filters each block from raw and so never
-# forms one. Handing the blocked path a prepared pair would filter it twice.
-_correlate(prepared::ImagePair, ::ImagePair, grid::PointSet{2}, p::Params, ::Nothing) =
-    correlate_multichip(prepared, grid, p)
-_correlate(::Nothing, raw::ImagePair, grid::PointSet{2}, p::Params, bs::Tuple{Int,Int}) =
-    correlate_tiled(raw, grid, p, bs)
+# The two take *different pairs*, which is the point rather than an inconsistency: a whole-scene run
+# correlates a filtered scene, while a blocked run filters each block from raw and so never forms
+# one. Pairing each pair with its runner here is what makes handing the blocked path a prepared pair
+# — a twice-filtered image — impossible to write.
+_runner(raw::ImagePair, ::PointSet{2}, p::Params, ::Nothing) = WholeScene(_prepare(raw, p))
+
+function _runner(raw::ImagePair, grid::PointSet{2}, p::Params, bs::Tuple{Int,Int})
+    layout = block_layout(grid, p, size(raw), bs)
+    buffers = istrue(p.threaded) ? nothing : block_buffers(raw, layout)
+    return Blocked(raw, layout, layout.blocks, buffers)
+end
+
+# The runner for a cache whose images have just changed.
+#
+# A whole-scene runner refilters, but only what changed: `_reprepare` matches each new image against
+# both slots of the old pair, so a time series that walks each acquisition from secondary to reference
+# refilters one image per pair rather than two.
+_reinit_runner(old_runner::WholeScene, raw::ImagePair, old::ImagePair, p::Params) = WholeScene(
+    ImagePair(_reprepare(raw.reference, raw.reference_valid, old, old_runner.prepared, p),
+              _reprepare(raw.secondary, raw.secondary_valid, old, old_runner.prepared, p)))
+
+# A blocked runner has nothing to refilter — that happens per block, inside the run — so it only has
+# to point at the new pair. The layout and buffers carry over: both are sized from the grid and the
+# image size, and `reinit!` rejects a change of image size.
+_reinit_runner(old_runner::Blocked, raw::ImagePair, ::ImagePair, ::Params) =
+    Blocked(raw, old_runner.layout, old_runner.blocks, old_runner.buffers)
 
 """
     autorift(reference, secondary; kwargs...) -> MultichipResult
@@ -357,17 +367,16 @@ end
 
 # Dispatch on the point set's dimensionality: only a gridded one can run multiple chip sizes.
 #
-# Whether the scene is filtered here at all depends on the block size, which is why `_prepare` sits
-# inside these methods rather than at the call: a blocked run filters per block and must never form a
-# filtered scene, since that copy is the allocation it exists to avoid.
-function _run(raw::ImagePair, grid::PointSet{2}, p::Params, ::Nothing)
+# Whether the scene is filtered at all depends on the block size, which is what `_runner` decides: a
+# blocked run filters per block and must never form a filtered scene, since that copy is the
+# allocation it exists to avoid.
+function _run(raw::ImagePair, grid::PointSet{2}, p::Params, bs::Union{Nothing,Tuple{Int,Int}})
     _check_preprocess(eltype(raw), p.preprocess)
-    return _correlate(_prepare(raw, p), raw, grid, p, nothing)
+    return _multichip(_runner(raw, grid, p, bs), grid, p)
 end
-function _run(raw::ImagePair, grid::PointSet{2}, p::Params, bs::Tuple{Int,Int})
-    _check_preprocess(eltype(raw), p.preprocess)
-    return _correlate(nothing, raw, grid, p, bs)
-end
+
+# A scattered set runs one pass at one chip size, so there are no levels to loop over and no coarse
+# restriction to apply — `track` is the whole computation.
 function _run(raw::ImagePair, pts::PointSet{1}, p::Params, ::Nothing)
     _check_preprocess(eltype(raw), p.preprocess)
     return track(_prepare(raw, p), pts, p)

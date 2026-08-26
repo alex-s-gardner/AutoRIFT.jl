@@ -33,7 +33,7 @@ because each acts on the output of the one before it:
 | chip half-extent + search radius + prior | `chip/2 + radius + ceil(abs(prior))` per point | `_pass_geometry`, `src/track.jl:176-197` |
 | preprocessing filter | `filter_reach(m)` — `width÷2`, but **twice that** for `Wallis` | `filter_reach`, `src/types.jl` |
 | fine outlier filter + hole fill | 13 grid points, iterated | `reject_outliers`, `src/outliers.jl`; `_fill_holes!`, `src/multichip.jl` |
-| coarse filter + dilation | 14 *coarse* cells = 56 grid points | `_coarse_pass`, `src/multichip.jl:224-288` |
+| coarse filter + dilation | 14 *coarse* cells = 56 grid points | `_coarse_mask`, `src/multichip.jl` |
 
 **`_pass_geometry` already returns exactly the first one** — `(px + 2, py + 2)`, where the
 `+2` is the reference's slack for the half-pixel grid offset and index truncation. So that
@@ -253,25 +253,31 @@ work reported were allocator slack from per-block churn, not a requirement — a
 requirement produced a wrong conclusion ("tiling makes memory worse") that took several rounds to
 correct. `docs/memory.md` documents the same trap.
 
-### Not built
+### One algorithm, one implementation
 
-**One algorithm, two implementations.** `correlate_multichip`/`chipsize_level` and
-`correlate_tiled`/`_tiled_level` still both implement the chip-size level, and they must agree bit for
-bit. The preamble, the coarse restriction and the empty-result allocation are shared; what remains
-separate is the level body and the pass execution. They have already drifted three times — the coarse
-fallback, and the two halo deficits above — and the equivalence gate covers only the configurations it
-exercises, so the duplication is the standing risk rather than a tidiness complaint.
+The chip-size level and the loop over levels each exist once. `correlate_multichip` and
+`correlate_tiled` both build a [`AutoRIFT.PassRunner`](@ref) and hand it to `_multichip`, which runs
+`chipsize_level` per level; what differs is three methods on the runner:
 
-The shape that fits: pass execution is the only thing that genuinely differs, so a `WholePass` /
-`BlockedPass` strategy behind one level function would remove the drift surface. Two constraints
-that are easy to get wrong — the strategy argument must be positional, since a keyword carrying an
-abstract type is unresolvable under `--trim` (`src/multichip.jl` records this for `measure`), and the
-coarse pass needs the strategy *restricted* to the strided subset, because it correlates
-`setup.coarse` rather than the level's own points.
+| method | `WholeScene` | `Blocked` |
+|---|---|---|
+| `run_pass` | one `track` call on the filtered scene | `_run_blocked` over its blocks, at the whole set's `pass_geometry` |
+| `restrict` | itself — the subset is already the `PointSet` it is given | re-derives the partition via `_coarse_block_layout` |
+| `_warn_coarse_fallback` | silent | warns |
 
-Unification would not make bit-identity automatic. It removes step-sequence drift; the numerical risk
-lives in the blocked executor and rests on the halo, the integral coordinate shift, `PassGeometry`,
-and per-block filtering — none of which a shared level loop establishes.
+The runner carries the pair, which is what makes the prepared-versus-raw distinction unrepresentable
+rather than merely documented: `WholeScene` holds a filtered pair and `Blocked` an unfiltered one, so
+no call can supply the other kind. That was the twice-filtered-image defect.
+
+The runner is **positional**, and that is a constraint rather than a preference: a keyword carrying an
+abstract type produces `unresolved call ... Core.kwcall` under `--trim`. `_run_blocked`'s `subpixel`
+is positional for the same reason — it was a keyword annotated `SubpixelMethod`, which survived only
+because the blocked path is unreachable from the trimmed entry point.
+
+This removes step-sequence drift and the argument mismatch; it does not make bit-identity automatic.
+The numerical risk lives in `run_pass(::Blocked)` and rests on the halo, the integral coordinate
+shift, `PassGeometry` and per-block filtering. What it buys is that a failing identity test now means
+*numerics in one method* rather than "numerics or a divergent step sequence".
 
 ### Three traps that cost time here
 

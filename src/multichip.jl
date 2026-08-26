@@ -131,6 +131,37 @@ end
 # ---------------------------------------------------------------------------
 
 """
+    AutoRIFT.WholeScene(prepared)
+
+Correlate each pass in one call, over a whole filtered scene. See [`AutoRIFT.PassRunner`](@ref).
+
+`prepared` is the **filtered** pair — the pair `_prepare` produced. The blocked runner takes an
+unfiltered one instead, and holding the pair here is what keeps the two from being confused.
+"""
+struct WholeScene{P<:ImagePair} <: PassRunner
+    prepared::P
+end
+
+run_pass(r::WholeScene, pts::PointSet{2}, p::Params, measure::SimilarityMeasure,
+         subpixel::SubpixelMethod) =
+    track(r.prepared, pts, p; subpixel, measure)
+
+# A whole-scene pass sees every point of whatever set it is given, so narrowing to the coarse
+# subset needs no change: the subset is already expressed in the `PointSet` handed to `run_pass`.
+# Only a *partitioned* runner has to re-derive its partition, which is what `Blocked`'s method does.
+restrict(r::WholeScene, _setup, _gridsize::Tuple{Int,Int}) = r
+
+# Whether to warn when the coarse grid is too small to judge consistency on.
+#
+# Silent for a whole-scene run and loud for a blocked one, and the asymmetry is about what the
+# situation implies rather than about the cost, which is the same either way. A small grid is a
+# routine thing to ask a whole scene for — a modest area at a coarse spacing reaches it, and the
+# tests do. A blocked run, by contrast, is only asked for when the scene is too large to hold, so a
+# coarse grid too small to filter means the configuration is inconsistent with the reason for
+# blocking at all.
+_warn_coarse_fallback(::WholeScene, ::Int) = nothing
+
+"""
     correlate_multichip(pair, grid, p) -> MultichipResult
 
 Correlate `pair` over `grid` at every chip-size level, finest chip first.
@@ -141,8 +172,17 @@ ignored: the level sets it.
 
 Each level runs [`chipsize_level`](@ref) and contributes only where no finer level already
 succeeded, so the smallest chip that yields a coherent estimate wins at every point.
+
+`pair` is the **filtered** pair. [`AutoRIFT.correlate_tiled`](@ref) runs the same loop over an
+unfiltered one, filtering per block; both go through `_multichip` so the level sequence exists once.
 """
-function correlate_multichip(pair::ImagePair, grid::PointSet{2}, p::Params)
+correlate_multichip(pair::ImagePair, grid::PointSet{2}, p::Params) =
+    _multichip(WholeScene(pair), grid, p)
+
+# The chip-size loop, however its passes are executed. One loop, not one per driver, for the same
+# reason `chipsize_level` is one function: the two must agree bit for bit, and shared code is what
+# makes that structural rather than something to re-verify.
+function _multichip(runner::PassRunner, grid::PointSet{2}, p::Params)
     sizes = _level_sizes(p)
     result = _empty_result(size(grid))
 
@@ -156,7 +196,7 @@ function correlate_multichip(pair::ImagePair, grid::PointSet{2}, p::Params)
         # finer ones succeed.
         wanted = result.chip_size .== 0
         any(wanted) || break                     # every point resolved
-        level = chipsize_level(pair, grid, p, cs, wanted, measure_at(p, k))
+        level = chipsize_level(runner, grid, p, cs, wanted, measure_at(p, k))
         isnothing(level) && continue              # level found nothing coherent
         _merge_level!(result, level.field, level.filled, cs)
     end
@@ -182,10 +222,27 @@ resolved. Returns `nothing` if the coarse pass found too little to be worth cont
 which is what `min_coarse_valid_fraction` decides.
 
 Separately callable so a caller can run one chip size without the loop.
+
+`pair` is the **filtered** pair, which this wraps in an [`AutoRIFT.WholeScene`](@ref) runner. The
+[`AutoRIFT.PassRunner`](@ref) form below is what a blocked run uses, with the same body.
 """
-function chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params,
-                       chip_size::Integer, wanted::AbstractMatrix{Bool},
-                       measure::SimilarityMeasure = first(p.similarity))
+chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size::Integer,
+               wanted::AbstractMatrix{Bool},
+               measure::SimilarityMeasure = first(p.similarity)) =
+    chipsize_level(WholeScene(pair), grid, p, chip_size, wanted, measure)
+
+# One chip-size level, however its passes are executed.
+#
+# There is one sequence of steps here, not one per driver, and that is the point: a whole-scene run
+# and a blocked run must agree bit for bit, and the cheapest way to guarantee they take the same
+# steps is for there to be only one place the steps are written. What genuinely differs is pass
+# execution, which is `run_pass`, `restrict` and `_warn_coarse_fallback` — three methods rather than
+# a second copy of this function.
+#
+# `runner` is positional: a keyword carrying an abstract type is unresolvable under `--trim`.
+function chipsize_level(runner::PassRunner, grid::PointSet{2}, p::Params,
+                        chip_size::Integer, wanted::AbstractMatrix{Bool},
+                        measure::SimilarityMeasure)
     csx = Int(chip_size)
     csy = chip_size_y(p, csx)
 
@@ -193,11 +250,11 @@ function chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params,
     pts = _level_points(grid, p, csx, csy, wanted)
     nsearchable(pts) == 0 && return nothing
 
-    coarse_mask = _coarse_pass(pair, pts, p, csx, csy, measure)
+    coarse_mask = _coarse_mask(runner, pts, p, csx, csy, measure)
     isnothing(coarse_mask) && return nothing
     _apply_coarse_mask!(pts, coarse_mask) == 0 && return nothing
 
-    fine = track(pair, pts, p; measure)
+    fine = run_pass(runner, pts, p, measure, p.subpixel)
     filled = _reject_and_fill!(fine, pts, p)
     return (; field = fine, filled)
 end
@@ -287,21 +344,6 @@ function _coarse_points(pts::PointSet{2}, p::Params, csx::Int, csy::Int)
     return (; coarse, rows, cols, filt)
 end
 
-# The per-point half: correlate the coarse points. Nothing here looks outside a point.
-#
-# Integer peaks only: the coarse pass decides *where* to look, and sub-pixel precision would not
-# change that answer while costing most of the pass. The same measure as the fine pass, since
-# judging coherence by a different measure than the one that will be used there would gate on the
-# wrong thing.
-#
-# `geometry` is forwarded so a block can run the transform the whole coarse grid would have run —
-# see [`AutoRIFT.PassGeometry`](@ref). Absent, each pass derives its own, which is correct for a
-# whole-scene run.
-_coarse_evidence(pair::ImagePair, coarse::PointSet{2}, p::Params,
-                 measure::SimilarityMeasure;
-                 geometry::Union{Nothing,PassGeometry} = nothing) =
-    track(pair, coarse, p; subpixel = NoRefine(), measure, geometry)
-
 # The whole-grid half: from coarse displacements to a full-grid mask of where the fine pass should
 # look. `nothing` when the level is not worth continuing.
 #
@@ -369,22 +411,34 @@ end
 # survives. Returns a full-grid mask of where the fine pass should look, or `nothing` if too
 # little of the coarse grid was coherent for the level to be worth continuing.
 #
-# The whole-scene composition of the two halves above.
+# The composition of the two halves above, and the only place they are composed — a blocked run takes
+# this same path, differing only in the runner it carries.
+#
 # `measure` is positional and has no default: the one caller always knows the level's measure, and a
 # default here would be a second spelling of `chipsize_level`'s that could silently diverge from it.
-function _coarse_pass(pair::ImagePair, pts::PointSet{2}, p::Params, csx::Int, csy::Int,
+function _coarse_mask(runner::PassRunner, pts::PointSet{2}, p::Params, csx::Int, csy::Int,
                       measure::SimilarityMeasure)
-    nr, nc = size(pts)
     setup = _coarse_points(pts, p, csx, csy)
-    # Too few coarse points to judge consistency against their neighbours: search everything
-    # rather than rejecting on no evidence.
-    isnothing(setup) && return trues(nr, nc)
+    if isnothing(setup)
+        # Too few coarse points to judge consistency against their neighbours, so there is no
+        # evidence to restrict the fine search with. Searching everything is what this has to do
+        # either way — a blocked run must agree with a whole-scene one point for point rather than
+        # substitute a policy of its own — and only whether it says so differs.
+        _warn_coarse_fallback(runner, csx)
+        return trues(size(pts))
+    end
 
     coarse = setup.coarse
     nsearchable(coarse) == 0 && return nothing
 
-    cd = _coarse_evidence(pair, coarse, p, measure)
-    return _coarse_decide(cd, coarse, p, setup.filt, (nr, nc), p.coarse_stride)
+    # The per-point half, over the strided subset. Integer peaks only: the coarse pass decides
+    # *where* to look, and sub-pixel precision would not change that answer while costing most of
+    # the pass. The same measure as the fine pass, since judging coherence by a different one would
+    # gate on the wrong thing.
+    cd = run_pass(restrict(runner, setup, size(pts)), coarse, p, measure, NoRefine())
+
+    # The whole-grid half, once.
+    return _coarse_decide(cd, coarse, p, setup.filt, size(pts), p.coarse_stride)
 end
 
 # Maximum radius over each coarse cell, matching the left-biased window convention the sliding

@@ -384,6 +384,49 @@ end
 # Steps 2 and 4 work on the grid, which is ~1/1024 the scene at the default spacing and stride.
 
 """
+    AutoRIFT.Blocked(raw, layout, blocks, buffers)
+
+Correlate each pass a block at a time. See [`AutoRIFT.PassRunner`](@ref).
+
+`raw` is the **unfiltered** pair, and that is what makes blocking bound memory rather than merely
+reorganize it: each block is filtered from its own read window, so the filtered scene the whole-scene
+runner holds is never formed.
+
+`blocks` is the partition this runner correlates over — `layout.blocks` for a fine pass, and the
+strided subset [`AutoRIFT._coarse_block_layout`](@ref) derives for a coarse one. `layout` is kept
+alongside it because `block_buffers` sizes from the whole layout's largest read window, which no pass
+changes. `buffers` is `nothing` for a threaded run, where each task takes its own set.
+"""
+struct Blocked{P<:ImagePair,B<:Union{Nothing,BlockBuffers}} <: PassRunner
+    raw::P
+    layout::BlockLayout
+    blocks::Vector{Block}
+    buffers::B
+end
+
+# `pass_geometry(pts)` is computed here rather than by the caller: it is a mechanism of blocking —
+# every block must run the transform the whole set would have — and the whole-scene runner has no use
+# for it, so it does not belong in a signature the two share.
+run_pass(r::Blocked, pts::PointSet{2}, p::Params, measure::SimilarityMeasure,
+         subpixel::SubpixelMethod) =
+    _run_blocked(r.raw, pts, p, r.layout, r.blocks, pass_geometry(pts), measure, r.buffers,
+                 subpixel)
+
+# The coarse pass correlates the strided subset, so a blocked runner has to re-derive which of its
+# blocks hold which coarse points. The points themselves are already narrowed by `_coarse_points`;
+# what needs narrowing here is the *partition* of them.
+restrict(r::Blocked, setup, gridsize::Tuple{Int,Int}) =
+    Blocked(r.raw, r.layout, _coarse_block_layout(r.layout, setup, gridsize), r.buffers)
+
+# Loud, unlike the whole-scene runner: blocking is asked for when the scene will not fit, so a coarse
+# grid too small to filter means every point is searched at full radius — roughly a hundred times the
+# work the coarse pass exists to avoid — and silence there reads as a fast run.
+_warn_coarse_fallback(::Blocked, chip_size::Int) = @warn(
+    "coarse grid smaller than the outlier filter's window; searching every point at full radius, " *
+    "which costs roughly 100x the restricted pass. Reduce `coarse_stride`, reduce `grid_spacing`, " *
+    "or process a larger area per call.", chip_size)
+
+"""
     AutoRIFT.correlate_tiled(raw, grid, p, block_size) -> MultichipResult
 
 [`AutoRIFT.correlate_multichip`](@ref)'s result, computed in blocks of at most `block_size` grid
@@ -401,78 +444,12 @@ block writes, which is what the filter term in [`AutoRIFT.halo`](@ref) buys.
 """
 function correlate_tiled(raw::ImagePair, grid::PointSet{2}, p::Params,
                          block_size::Tuple{Int,Int})
-    sizes = _level_sizes(p)
     layout = block_layout(grid, p, size(raw), block_size)
-    result = _empty_result(size(grid))
     # One set for the whole run. `block_buffers` sizes from the layout's largest read window, which
     # no level changes, so allocating per pass would allocate the same nine arrays twice per level.
     # A threaded run takes its own set per task instead, since blocks then write concurrently.
     buffers = istrue(p.threaded) ? nothing : block_buffers(raw, layout)
-
-    for k in eachindex(sizes)
-        cs = sizes[k]
-        wanted = result.chip_size .== 0
-        any(wanted) || break
-        level = _tiled_level(raw, grid, p, cs, wanted, measure_at(p, k), layout, buffers)
-        isnothing(level) && continue
-        _merge_level!(result, level.field, level.filled, cs)
-    end
-    return result
-end
-
-# One chip-size level, in blocks. The block-parallel steps are 1 and 3; everything else is global.
-function _tiled_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size::Integer,
-                      wanted::AbstractMatrix{Bool}, measure::SimilarityMeasure,
-                      layout::BlockLayout, buffers::Union{Nothing,BlockBuffers})
-    csx = Int(chip_size)
-    csy = chip_size_y(p, csx)
-
-    pts = _level_points(grid, p, csx, csy, wanted)
-    nsearchable(pts) == 0 && return nothing
-
-    mask = _coarse_mask(pair, pts, p, csx, csy, measure, layout, buffers)
-    isnothing(mask) && return nothing
-    _apply_coarse_mask!(pts, mask) == 0 && return nothing
-
-    # Step 3, per block: the fine pass.
-    fgeom = pass_geometry(pts)
-    fine = _run_blocked(pair, pts, p, layout, layout.blocks, fgeom, measure, buffers)
-
-    # Step 4, once: reject, fill, and hand back for the merge.
-    filled = _reject_and_fill!(fine, pts, p)
-    return (; field = fine, filled)
-end
-
-# Steps 1 and 2: where the fine pass should look, or `nothing` if this level is not worth
-# continuing. Separated from the level so the fine pass reads as one statement rather than as the
-# tail of a two-branch block.
-function _coarse_mask(pair::ImagePair, pts::PointSet{2}, p::Params, csx::Int, csy::Int,
-                      measure::SimilarityMeasure, layout::BlockLayout,
-                      buffers::Union{Nothing,BlockBuffers})
-    setup = _coarse_points(pts, p, csx, csy)
-    if isnothing(setup)
-        # Too few coarse points to judge consistency against their neighbours, so there is no
-        # evidence to restrict the fine search with. Searching everything is what a whole-scene run
-        # does, and blocking must agree with it point for point rather than substitute a policy of
-        # its own. Warned because the cost is what the coarse pass exists to avoid: every point at
-        # full radius is roughly a hundred times the work, and silence here reads as a fast run.
-        @warn "coarse grid smaller than the outlier filter's window; searching every point at " *
-              "full radius, which costs roughly 100x the restricted pass. Reduce " *
-              "`coarse_stride`, reduce `grid_spacing`, or process a larger area per call." chip_size=csx
-        return trues(size(pts))
-    end
-
-    coarse = setup.coarse
-    nsearchable(coarse) == 0 && return nothing
-
-    # Step 1, per block: the coarse evidence. Every block runs the transform the whole coarse pass
-    # would have run, which is what `geometry` is for.
-    cgeom = pass_geometry(coarse)
-    cd = _run_blocked(pair, coarse, p, layout, _coarse_block_layout(layout, setup, size(pts)),
-                      cgeom, measure, buffers; subpixel = NoRefine())
-
-    # Step 2, once: the decisions.
-    return _coarse_decide(cd, coarse, p, setup.filt, size(pts), p.coarse_stride)
+    return _multichip(Blocked(raw, layout, layout.blocks, buffers), grid, p)
 end
 
 # Correlate `pts` block by block, writing into one field.
@@ -487,8 +464,8 @@ end
 # before spawning, because FFTW's planner is not thread-safe.
 function _run_blocked(raw::ImagePair, pts::PointSet{2}, p::Params, layout::BlockLayout,
                       blocks::Vector{Block}, geometry::PassGeometry,
-                      measure::SimilarityMeasure, buffers::Union{Nothing,BlockBuffers};
-                      subpixel::SubpixelMethod = p.subpixel)
+                      measure::SimilarityMeasure, buffers::Union{Nothing,BlockBuffers},
+                      subpixel::SubpixelMethod)
     out = displacement_field(pts)
     # Every block shares the geometry, so one warm-up serves all of them — and it must happen here,
     # on this task, rather than inside a block.

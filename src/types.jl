@@ -651,6 +651,37 @@ function _check_filter_width(width::Integer, who::Symbol)
 end
 
 # ---------------------------------------------------------------------------
+# Pass execution
+# ---------------------------------------------------------------------------
+
+"""
+    AutoRIFT.PassRunner
+
+How a correlation pass over a point set is executed: all at once, or a block at a time.
+
+One chip-size level is the same sequence of steps either way — level points, coarse evidence,
+the gate and dilation, the fine pass, rejection and hole filling — and only the *execution* of a
+pass differs. `AutoRIFT.WholeScene` correlates an already-filtered pair in one call;
+`AutoRIFT.Blocked` reads, filters and correlates one block at a time so peak memory tracks the
+block rather than the scene.
+
+Concrete subtypes carry the pair they correlate, and that is load-bearing rather than convenient:
+the whole-scene runner holds a **filtered** pair, the blocked runner holds an **unfiltered** one and
+filters each block from its own read window. Because the pair travels with the runner, there is no
+call that can hand a runner the other kind — a filtered pair filtered again is a wrong image
+everywhere, and one that still looks like imagery.
+
+The interface is three methods: `run_pass(runner, pts, p, measure, subpixel)`, which correlates a
+point set; `restrict(runner, setup, gridsize)`, which narrows a runner to the coarse pass's strided
+subset; and `_warn_coarse_fallback(runner, chip_size)`, which is where the two differ on policy.
+
+A runner is always passed **positionally**. A keyword annotated with an abstract type is
+unresolvable under `--trim` — verified: it produces `unresolved call ... Core.kwcall` — which is the
+same constraint that makes [`measure_at`](@ref)'s result positional.
+"""
+abstract type PassRunner end
+
+# ---------------------------------------------------------------------------
 # Pass geometry
 # ---------------------------------------------------------------------------
 
