@@ -108,10 +108,19 @@ In place because the driver reuses one buffer across blocks rather than taking a
 block. An allocating `_read_block` exists alongside it for callers that want one.
 
 What made `process_block_size` fail to save memory was never the read. Three whole-scene operations
-ran before any block was touched: the validity masks from `map(isfinite, ...)`, the filtered pair
-from `_prepare`, and a driver that then sliced that filtered scene. The filtering now happens per
-block from raw input, so the filtered scene is never formed — and that same change removed the
-double-filtering that made per-block preparation wrong whenever it was reachable.
+ran before any block was touched: the validity masks, the filtered pair from `_prepare`, and a driver
+that then sliced that filtered scene. All three are gone. Filtering happens per block from raw input,
+so the filtered scene is never formed — which also removed the double-filtering that made per-block
+preparation wrong wherever it was reachable — and the default mask is now an
+[`AutoRIFT.FiniteMask`](@ref), which computes `isfinite` on read.
+
+The mask mattered more than it looks. `map(isfinite, img)` read every pixel of an input that may be
+on disk and allocated a scene-sized `Matrix{Bool}` per image: 8 MiB at 2048², 32 at 4096², 68.7 at
+Landsat's 6000². Constructing an `ImagePair` now touches neither image and allocates 160 bytes.
+Materialization happens in `resident`, called from `_prepare` and nowhere else, which puts every
+whole-array reduction over a mask — `all(mask)` in `_masked_boxmean!` and `_erode_mask!` — downstream
+of a dense one. A blocked run never calls `_prepare`, so it never materializes; the untiled path pays
+a single pass and measures the same end to end (26.5 ms against 26.1 with a supplied dense mask).
 
 ## Verification
 
@@ -140,7 +149,8 @@ The gate that matters: **a tiled run must equal a non-tiled run**, not approxima
 | `src/tile.jl` | block layout, halo, the tiled driver, `BlockBuffers` | yes |
 | `src/api.jl` | `process_block_size` keyword; dispatch to the tiled path when present | yes |
 | `src/multichip.jl` | split the level loop so per-block work produces evidence and the gate, dilation and resample happen once on the assembled coarse grid | yes |
-| `src/types.jl` | `PassGeometry`; `filter_reach` | yes |
+| `src/types.jl` | `PassGeometry`; `filter_reach`; `PassRunner` | yes |
+| `src/preprocess.jl` | `FiniteMask` and `resident`, so the default mask costs nothing until something reduces over it | yes |
 | `src/preprocess.jl` | in-place `highpass!`, `_filtered!`, `_erode_mask!`, `_masked_boxmean!` | yes |
 | `test/tile.jl` | layout, halo, `filter_reach`, and the equivalence gate | yes |
 | `test/extensions.jl` | windowed reads from a `DiskArrays` input: no read exceeds a block's window, and the result equals the resident one | yes |

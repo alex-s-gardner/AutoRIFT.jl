@@ -393,3 +393,78 @@ end
         @test isequal(a, b)
     end
 end
+
+@testset "the default mask is lazy, and materializes only where it must" begin
+    # `process_block_size` promises that no array the size of the scene is formed. A default mask
+    # built with `map(isfinite, img)` broke that promise before any block was touched: it read every
+    # pixel of an input that may be on disk and allocated a scene-sized `Matrix{Bool}` per image.
+    #
+    # Counting reads asserts the property structurally rather than by watching RSS, which measures
+    # allocator slack as much as requirement.
+    mutable struct CountingRead{T} <: AbstractMatrix{T}
+        data::Matrix{T}
+        reads::Int
+    end
+    Base.size(c::CountingRead) = size(c.data)
+    Base.getindex(c::CountingRead, i::Int...) = (c.reads += 1; c.data[i...])
+
+    n = 64
+    a = CountingRead(rand(Float32, n, n) .+ 1.0f0, 0)
+    b = CountingRead(rand(Float32, n, n) .+ 1.0f0, 0)
+    pair = ImagePair(a, b)
+
+    # Construction touches neither image.
+    @test a.reads == 0
+    @test b.reads == 0
+    @test pair.reference_valid isa AutoRIFT.FiniteMask
+    # And allocates nothing of the scene's size: two wrappers, not two masks.
+    @test (@allocated ImagePair(a, b)) < 1024
+
+    # It still answers correctly, element by element.
+    withnan = copy(a.data)
+    withnan[7, 9] = NaN32
+    lazy = AutoRIFT.FiniteMask(withnan)
+    @test size(lazy) == (n, n)
+    @test !lazy[7, 9]
+    @test lazy[1, 1]
+    @test collect(lazy) == map(isfinite, withnan)
+
+    # A window read costs the window, which is what makes a blocked run bound memory: the seam is
+    # `_read_block!`'s `copyto!` over a view, and it needs no method of its own for this.
+    c = CountingRead(rand(Float32, n, n), 0)
+    dest = Matrix{Bool}(undef, 10, 10)
+    AutoRIFT._read_block!(dest, AutoRIFT.FiniteMask(c), 21:30, 31:40)
+    @test c.reads == 100
+    @test dest == map(isfinite, c.data[21:30, 31:40])
+
+    # `resident` is identity for a stored mask and one pass for a computed one, so the whole-array
+    # reductions the filters begin with never see a lazy mask.
+    dense = trues(4, 4)
+    @test AutoRIFT.resident(dense) === dense
+    made = AutoRIFT.resident(AutoRIFT.FiniteMask(rand(Float32, 4, 4)))
+    @test made isa Matrix{Bool}
+    @test all(made)
+end
+
+@testset "a pair may mix image and mask containers" begin
+    # A single shared type parameter for the two images, and another for the two masks, made these
+    # a `MethodError`. Both arise in ordinary use: a time series advances one image at a time, and a
+    # caller masking one image explicitly leaves the other to the default.
+    img = rand(Float32, 8, 8) .+ 1.0f0
+
+    # A resident reference against a view of the same data.
+    @test ImagePair(img, view(img, :, :)) isa ImagePair
+
+    # A supplied dense mask beside a defaulted lazy one.
+    mixed = ImagePair(img, img; reference_valid = trues(8, 8))
+    @test mixed.reference_valid isa AbstractMatrix{Bool}
+    @test mixed.secondary_valid isa AutoRIFT.FiniteMask
+
+    # A supplied mask is passed through rather than converted, which is what keeps a lazy `Raster`
+    # mask lazy and what lets `Cache` recognise an unchanged image by identity.
+    bits = trues(8, 8)
+    @test ImagePair(img, img; reference_valid = bits).reference_valid === bits
+
+    # Sizes are still checked across every combination.
+    @test_throws DimensionMismatch ImagePair(img, img; secondary_valid = trues(4, 4))
+end

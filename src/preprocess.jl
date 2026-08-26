@@ -24,6 +24,53 @@
 # validity mask rather than reading and writing fields of a state object.
 
 """
+    AutoRIFT.FiniteMask(parent)
+
+The validity mask "every finite pixel of `parent`", computed on read rather than stored.
+
+The default mask when a caller supplies none, and lazy for one reason: a blocked run must not form
+any array the size of the scene, and `map(isfinite, img)` is exactly that — 16 MiB per image at
+4096², plus a full read of an input that may be on disk. Reading a window of this reads only that
+window of `parent`, so `_read_block!`'s `copyto!` over a view costs the block and nothing more.
+
+Materialize with [`AutoRIFT.resident`](@ref) before reducing over the whole thing or reading it more
+than once; `_prepare` does, which is what keeps every whole-array reduction downstream of a dense
+mask.
+
+`IndexStyle` is forwarded from `parent`, so a Cartesian-indexed disk array is not pushed through
+linear index arithmetic it would have to undo.
+"""
+struct FiniteMask{T,A<:AbstractMatrix{T}} <: AbstractMatrix{Bool}
+    parent::A
+end
+
+Base.size(m::FiniteMask) = size(m.parent)
+Base.axes(m::FiniteMask) = axes(m.parent)
+Base.IndexStyle(::Type{FiniteMask{T,A}}) where {T,A} = IndexStyle(A)
+Base.@propagate_inbounds Base.getindex(m::FiniteMask, i::Int) = isfinite(m.parent[i])
+Base.@propagate_inbounds Base.getindex(m::FiniteMask, I::Int...) = isfinite(m.parent[I...])
+
+"""
+    AutoRIFT.resident(mask) -> AbstractMatrix{Bool}
+
+`mask` backed by storage: itself if it already is, one pass over it if it is computed.
+
+Call this before any whole-array reduction over a mask, and before reading one repeatedly. The
+filters do both — `_masked_boxmean!` and `_erode_mask!` each begin with `all(mask)` — so `_prepare`
+materializes at its entry, which is what puts every such reduction downstream of a dense mask
+rather than leaving each one to remember.
+
+A blocked run never calls `_prepare`; it reads windows through `_read_block!` into dense buffers
+instead. So the untiled path pays one pass and the blocked path pays nothing, without either
+branching on which it is.
+
+Only the lazy masks this package constructs are recognized. A caller supplying a computed
+`AbstractMatrix{Bool}` of their own should either materialize it first or add a method here.
+"""
+resident(m::AbstractMatrix{Bool}) = m
+resident(m::FiniteMask) = Matrix{Bool}(m)
+
+"""
     ImagePair{T}
 
 The two images to correlate, with their validity masks.
@@ -37,16 +84,24 @@ kind of mistake a name prevents and a number invites.
 arise from sensor gaps, cloud masks, and the no-data border left by reprojection, and
 they must not be allowed to contribute to a correlation — a chip full of fill values
 correlates beautifully with any other chip full of fill values.
-"""
-struct ImagePair{T<:ImageElement,A<:AbstractMatrix{T},M<:AbstractMatrix{Bool}}
-    reference::A
-    secondary::A
-    reference_valid::M
-    secondary_valid::M
 
-    function ImagePair(reference::A, secondary::A, reference_valid::M,
-                       secondary_valid::M) where {T<:ImageElement,A<:AbstractMatrix{T},
-                                                  M<:AbstractMatrix{Bool}}
+The two images and the two masks carry separate type parameters, so a pair may mix containers: a
+lazy reference against a resident secondary, a defaulted [`AutoRIFT.FiniteMask`](@ref) beside a
+supplied dense one. Both arise in ordinary use — a time series advances one image at a time, and a
+caller masking one image explicitly leaves the other to the default.
+"""
+struct ImagePair{T<:ImageElement,A<:AbstractMatrix{T},B<:AbstractMatrix{T},
+                 Mr<:AbstractMatrix{Bool},Ms<:AbstractMatrix{Bool}}
+    reference::A
+    secondary::B
+    reference_valid::Mr
+    secondary_valid::Ms
+
+    function ImagePair(reference::A, secondary::B, reference_valid::Mr,
+                       secondary_valid::Ms) where {T<:ImageElement,A<:AbstractMatrix{T},
+                                                   B<:AbstractMatrix{T},
+                                                   Mr<:AbstractMatrix{Bool},
+                                                   Ms<:AbstractMatrix{Bool}}
         size(reference) == size(secondary) || throw(DimensionMismatch(
             "reference is $(size(reference)) but secondary is $(size(secondary)); " *
             "the two images must be co-registered to a common grid before " *
@@ -57,7 +112,7 @@ struct ImagePair{T<:ImageElement,A<:AbstractMatrix{T},M<:AbstractMatrix{Bool}}
         size(secondary_valid) == size(secondary) || throw(DimensionMismatch(
             "secondary_valid is $(size(secondary_valid)) but secondary is " *
             "$(size(secondary))"))
-        return new{T,A,M}(reference, secondary, reference_valid, secondary_valid)
+        return new{T,A,B,Mr,Ms}(reference, secondary, reference_valid, secondary_valid)
     end
 end
 
@@ -70,31 +125,34 @@ A pixel is treated as invalid if it is not finite. Zero is deliberately *not* tr
 as invalid by default: it is a legitimate radiance value, and the reference's habit of
 conflating "zero" with "no data" misclassifies genuinely dark pixels. Pass an explicit
 mask when the sensor uses a fill value.
+
+The derived mask is an [`AutoRIFT.FiniteMask`](@ref), which computes `isfinite` on read. That keeps
+this constructor from touching the imagery at all, so it costs nothing for an input still on disk
+and forms no scene-sized array — the property `process_block_size` depends on.
 """
 function ImagePair(reference::AbstractMatrix, secondary::AbstractMatrix;
                    reference_valid = nothing, secondary_valid = nothing)
-    rv = isnothing(reference_valid) ? map(isfinite, reference) : _boolmask(reference_valid)
-    sv = isnothing(secondary_valid) ? map(isfinite, secondary) : _boolmask(secondary_valid)
+    rv = isnothing(reference_valid) ? FiniteMask(reference) : validmask(reference_valid)
+    sv = isnothing(secondary_valid) ? FiniteMask(secondary) : validmask(secondary_valid)
     return ImagePair(reference, secondary, rv, sv)
 end
 
-# A mask as a `Matrix{Bool}`, without copying one that already is.
+# A supplied mask, as an `AbstractMatrix{Bool}` and without copying.
 #
-# `Matrix{Bool}` rather than any `AbstractMatrix{Bool}` because a `BitMatrix` packs eight
-# entries per byte, which makes a concurrent write to one element a read-modify-write of the
-# 64-bit word holding 63 of its neighbours — the same hazard that made `DisplacementField`
-# store `searched` unpacked.
+# Passed through as given rather than converted to `Matrix{Bool}`: a lazy `Raster` mask converted
+# here would be materialized at construction, which is the scene-sized allocation blocking exists to
+# avoid. `resident` is where materialization happens instead, at the one consumer that needs it.
 #
-# Not copying when it need not is what lets a `Cache` decide by identity whether an image it
-# holds is already prepared. A defensive copy would silently turn every reuse into a re-filter.
-_boolmask(m::Matrix{Bool}) = m
-_boolmask(m::AbstractMatrix) = Matrix{Bool}(m)
+# Not copying is also what lets a `Cache` decide by identity whether an image it holds is already
+# prepared — a defensive copy would silently turn every reuse into a re-filter.
+validmask(m::AbstractMatrix{Bool}) = m
+validmask(m::AbstractMatrix) = Matrix{Bool}(m)
 
 Base.size(p::ImagePair) = size(p.reference)
 Base.eltype(::ImagePair{T}) where {T} = T
 
 """
-    valid(pair::ImagePair) -> Matrix{Bool}
+    valid(pair::ImagePair) -> AbstractMatrix{Bool}
 
 Pixels valid in **both** images.
 

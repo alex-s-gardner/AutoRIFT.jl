@@ -435,8 +435,15 @@ end
 # Per image, because that is the unit of reuse. In a time series each acquisition is the
 # secondary of one pair and the reference of the next, so `reinit!` swapping one image must not
 # re-filter the other — on 1024² that is 23 ms and 23 MiB of pure waste per pair.
+# `resident` is called here, and only here. Every whole-array reduction over a mask — `all(mask)` in
+# `_masked_boxmean!` and in `_erode_mask!` — is downstream of either this function or `_read_block!`,
+# and neither can hand one a lazy mask: this materializes at entry, and `_read_block!` copies into a
+# dense buffer. So the re-scan a computed mask would cost is unreachable rather than remembered.
+#
+# A blocked run never reaches here, which is the whole point: it filters per block from raw input, so
+# the untiled path pays one pass over the mask and the blocked path pays nothing, with no branch.
 _prepare(img::AbstractMatrix, mask::AbstractMatrix{Bool}, p::Params) =
-    replace_nonfinite(preprocess(img, mask, p.preprocess, p.rng_seed)...)
+    replace_nonfinite(preprocess(img, resident(mask), p.preprocess, p.rng_seed)...)
 
 
 _prepare(pair::ImagePair, p::Params) = ImagePair(
