@@ -135,39 +135,47 @@ end
 """
     AutoRIFT.block_layout(grid::PointSet{2}, p::Params, imagesize, block_size) -> BlockLayout
 
-Divide `grid` into blocks of at most `block_size = (X, Y)` grid points each, with the read window
-each needs.
+Divide `grid` into blocks spanning at most `block_size = (X, Y)` **pixels** of output each, with the
+read window each needs.
 
-`block_size` is in **grid points**, not pixels: it names how much output a block produces, which is
-what bounds the memory a block needs. The trailing block in each direction is short when the grid
-does not divide evenly.
+Pixels, because pixels are what blocking bounds. A block's output is negligible — 3.2 KiB against
+the 6.7 MiB of imagery it reads at a 512-pixel block, and the whole scene's output grid is smaller
+than one block's read window — so the quantity worth naming is the imagery held at once. It is also
+the unit everything here already works in: the halo, the read windows, and the buffers are all
+pixels.
+
+A block must be a whole number of grid points, so the size is a target that **snaps outward**: at
+`grid_spacing = 32` a request of 500 becomes 512. The conversion walks the grid's own coordinates
+rather than dividing by `grid_spacing`, because a caller-supplied grid need not be uniformly spaced.
+The trailing block in each direction is short when the grid does not divide evenly.
 
 Throws if a block would be smaller than the halo it reads, since such a block is all overlap.
 """
 function block_layout(grid::PointSet{2}, p::Params, imagesize::Tuple{Int,Int},
                       block_size::Tuple{Int,Int})
-    bx, by = block_size
-    (bx > 0 && by > 0) || throw(ArgumentError(
-        "`process_block_size` must be positive in both axes, got $bx by $by"))
+    px, py = block_size
+    (px > 0 && py > 0) || throw(ArgumentError(
+        "`process_block_size` must be positive in both axes, got $px by $py pixels"))
 
     hx, hy = halo(grid, p, imagesize)
-    spacing = p.grid_spacing
-    # The comparison is in pixels, because that is what the halo is in: `bx` grid points span
-    # `bx * spacing` pixels of output. A block narrower than its own halo reads more overlap than
-    # data, so it is a configuration error rather than something to silently widen.
-    (bx * spacing >= hx && by * spacing >= hy) || throw(ArgumentError(
-        "`process_block_size` of $bx by $by grid points spans " *
-        "$(bx * spacing) by $(by * spacing) pixels, which is smaller than the " *
-        "$hx by $hy pixel halo each block must read around it — so the block would be almost " *
-        "entirely overlap. Use at least $(cld(hx, spacing)) by $(cld(hy, spacing)) grid " *
-        "points, or reduce the chip size, search radius, or filter width."))
+    # A block narrower than its own halo reads more overlap than data, so it is a configuration
+    # error rather than something to silently widen. Compared directly, both being pixels.
+    (px >= hx && py >= hy) || throw(ArgumentError(
+        "`process_block_size` of $px by $py pixels is smaller than the $hx by $hy pixel halo each " *
+        "block must read around it — so the block would be almost entirely overlap. Use at least " *
+        "$hx by $hy pixels, or reduce the chip size, search radius, or filter width."))
 
     nr, nc = size(grid)
     nrows, ncols = imagesize
+    # Where each block starts, walked from the coordinates so no block spans more than the request.
+    # `grid.y` runs down rows and `grid.x` across columns, so the row starts take the y extent.
+    rowstarts = _block_starts(grid.y, py, nr, 1)
+    colstarts = _block_starts(grid.x, px, nc, 2)
+
     blocks = Block[]
-    for c0 in 1:by:nc, r0 in 1:bx:nr
-        grows = r0:min(r0 + bx - 1, nr)
-        gcols = c0:min(c0 + by - 1, nc)
+    for (ci, c0) in pairs(colstarts), (ri, r0) in pairs(rowstarts)
+        grows = r0:(ri == lastindex(rowstarts) ? nr : rowstarts[ri + 1] - 1)
+        gcols = c0:(ci == lastindex(colstarts) ? nc : colstarts[ci + 1] - 1)
         # The pixel extent this block writes, from the coordinates of its corner points. Taken from
         # the grid rather than computed from `spacing` so a caller-supplied grid with its own
         # layout still gets a correct window.
@@ -178,6 +186,36 @@ function block_layout(grid::PointSet{2}, p::Params, imagesize::Tuple{Int,Int},
                             max(clo - hx, 1):min(chi + hx, ncols)))
     end
     return BlockLayout(blocks, (hx, hy))
+end
+
+# The index each block starts at along dimension `dim`, so no block's coordinates span more than
+# `want` pixels.
+#
+# Walked rather than divided, because a caller-supplied grid need not be uniformly spaced:
+# `gridpoints(xs, ys)` takes arbitrary coordinate vectors, so no single `grid_spacing` describes the
+# axis. Accumulating per block also means a grid that is uniform apart from one large jump keeps
+# uniform-sized blocks either side of it, where a single points-per-block figure taken from the
+# largest step would shrink every block to fit the worst one.
+#
+# Each block takes as many points as fit, and always at least one — a zero-point block would divide
+# the grid into nothing. One point is therefore the only case that may exceed `want`, and it needs a
+# gap wider than a whole block to arise.
+function _block_starts(coord::AbstractMatrix, want::Int, n::Int, dim::Int)
+    starts = [1]
+    n <= 1 && return starts
+    # A gridded `PointSet` repeats the same coordinate down every row or across every column, which
+    # is what makes it gridded — so one fixed index of the other axis describes the whole axis.
+    at(i) = dim == 1 ? coord[i, 1] : coord[1, i]
+    origin = at(1)
+    @inbounds for i in 2:n
+        # Start a new block once this point would carry the current one past `want`. The comparison
+        # is on the span from the block's first point, so rounding cannot accumulate across blocks.
+        if abs(at(i) - origin) > want
+            push!(starts, i)
+            origin = at(i)
+        end
+    end
+    return starts
 end
 
 # The integer pixel span of a coordinate field over a sub-block of the grid. `floor`/`ceil` rather
@@ -429,8 +467,8 @@ _warn_coarse_fallback(::Blocked, chip_size::Int) = @warn(
 """
     AutoRIFT.correlate_tiled(raw, grid, p, block_size) -> MultichipResult
 
-[`AutoRIFT.correlate_multichip`](@ref)'s result, computed in blocks of at most `block_size` grid
-points so that peak memory tracks the block rather than the scene.
+[`AutoRIFT.correlate_multichip`](@ref)'s result, computed in blocks spanning at most `block_size`
+pixels so that peak memory tracks the block rather than the scene.
 
 `raw` is the **unfiltered** pair, and that is what makes this bound memory rather than merely
 reorganize it: each block is filtered from its own read window, so the filtered scene the untiled

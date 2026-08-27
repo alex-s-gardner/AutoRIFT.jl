@@ -463,7 +463,7 @@ end
     a = CountingDisk{Float32}((n, n), 1)
     b = CountingDisk{Float32}((n, n), 2)
     grid = AutoRIFT._build_grid((n, n), p)
-    bs = (8, 8)
+    bs = (256, 256)                      # pixels, so 8 grid points at this spacing
     layout = AutoRIFT.block_layout(grid, p, (n, n), bs)
 
     opts = (; chip_size = 32, chip_size_max = 32, grid_spacing = 32, search_radius = 12,

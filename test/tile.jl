@@ -200,8 +200,9 @@ end
     flat = scatter(grid)
     lin = LinearIndices((nr, nc))
 
-    # Sizes that divide evenly, sizes that do not, and a size covering the whole grid at once.
-    for bs in ((8, 8), (7, 5), (3, 11), (nr, nc), (2nr, 2nc))
+    # In pixels, at `grid_spacing = 32`: sizes that divide the grid evenly, sizes that do not, and
+    # sizes covering the whole grid at once.
+    for bs in ((256, 256), (224, 160), (128, 352), (32nr, 32nc), (64nr, 64nc))
         layout = AutoRIFT.block_layout(grid, p, (n, n), bs)
         @test length(layout) >= 1
 
@@ -245,7 +246,7 @@ end
     # `gridpoints` insets by a margin so no point sits at the image edge (`src/points.jl:244`).
     # The window still contains every pixel any point reads, which the loop above asserted; a
     # block that read the full scene would merely read more than it needs.
-    whole = only(AutoRIFT.block_layout(grid, p, (n, n), (nr, nc)).blocks)
+    whole = only(AutoRIFT.block_layout(grid, p, (n, n), (n, n)).blocks)
     @test whole.grid_rows == 1:nr && whole.grid_cols == 1:nc
     hx, hy = AutoRIFT.halo(grid, p, (n, n))
     r0 = max(floor(Int, minimum(grid.y)) - hy, 1)
@@ -265,8 +266,8 @@ end
     # costing something. Named as a configuration error, with the minimum stated, rather than
     # silently widened — a caller who asked for a block size to bound memory needs to know the
     # request could not be honoured.
-    @test_throws "smaller than the" AutoRIFT.block_layout(grid, p, (n, n), (1, 1))
-    @test_throws "Use at least" AutoRIFT.block_layout(grid, p, (n, n), (1, 1))
+    @test_throws "smaller than the" AutoRIFT.block_layout(grid, p, (n, n), (16, 16))
+    @test_throws "Use at least" AutoRIFT.block_layout(grid, p, (n, n), (16, 16))
 
     @test_throws "must be positive in both axes" AutoRIFT.block_layout(grid, p, (n, n), (0, 8))
     @test_throws "must be positive in both axes" AutoRIFT.block_layout(grid, p, (n, n), (8, -1))
@@ -309,11 +310,11 @@ end
         AutoRIFT._warm_grid_plans(grid, p)
         untiled = AutoRIFT.correlate_multichip(pair, grid, p)
 
-        # 31 columns puts a boundary at the feature seam; the rest do not divide the 61-point grid
-        # evenly; one block covering everything must agree with the whole-scene path trivially; and
-        # `(8, 8)` makes 64 blocks, which is many more than there are threads — the case that catches
-        # a threaded run recycling a buffer set while the `ImagePair` viewing it is still live.
-        for bs in ((61, 31), (61, 25), (20, 20), (13, 44), (61, 61), (8, 8))
+        # In pixels, at `grid_spacing = 16` over a 61-point grid. 496 columns puts a boundary at the
+        # feature seam; the next two do not divide the grid evenly; one block covering everything must
+        # agree with the whole-scene path trivially; and 128 pixels makes 64 blocks, many more than
+        # there are threads — the case that catches a threaded run sharing one buffer set across them.
+        for bs in ((976, 496), (976, 400), (320, 320), (208, 704), (976, 976), (128, 128))
             assert_same_result(untiled, AutoRIFT.correlate_tiled(raw, grid, p, bs),
                                "$tag, block $bs")
         end
@@ -335,7 +336,7 @@ end
     grid = gridpoints(size(raw), 16; chip_size = 32, search_radius = 12)
     AutoRIFT._warm_grid_plans(grid, p)
     untiled = AutoRIFT.correlate_multichip(pair, grid, p)
-    for bs in ((30, 15), (17, 17))
+    for bs in ((480, 240), (272, 272))
         assert_same_result(untiled, AutoRIFT.correlate_tiled(raw, grid, p, bs),
                            "caller grid, block $bs")
     end
@@ -361,7 +362,7 @@ end
     AutoRIFT._warm_grid_plans(grid, p)
     untiled = AutoRIFT.correlate_multichip(pair, grid, p)
     tiled = @test_logs (:warn, r"coarse grid smaller") match_mode = :any begin
-        AutoRIFT.correlate_tiled(raw, grid, p, (4, 4))
+        AutoRIFT.correlate_tiled(raw, grid, p, (128, 128))
     end
     assert_same_result(untiled, tiled, "coarse-grid fallback")
 end
@@ -400,7 +401,7 @@ end
     untiled = AutoRIFT.correlate_multichip(AutoRIFT._prepare(raw, p), grid, p)
 
     # More blocks than threads on any ordinary machine, so tasks genuinely claim repeatedly.
-    for bs in ((20, 20), (8, 8))
+    for bs in ((320, 320), (128, 128))
         first_run = AutoRIFT.correlate_tiled(raw, grid, p, bs)
         assert_same_result(untiled, first_run, "threaded determinism, block $bs")
         # Repeated: a race shows up as run-to-run variation even where one run happens to agree.
@@ -415,6 +416,52 @@ end
     # One block and one task: the degenerate end of `min(nblocks, nthreads)`, which must still
     # agree rather than taking a different path.
     nr, nc = size(grid)
-    assert_same_result(untiled, AutoRIFT.correlate_tiled(raw, grid, p, (nr, nc)),
+    assert_same_result(untiled, AutoRIFT.correlate_tiled(raw, grid, p, (16nr, 16nc)),
                        "threaded, single block")
+end
+
+@testset "block size is in pixels, and snaps outward to whole grid points" begin
+    # The unit is pixels because pixels are what blocking bounds: a block's output is a few KiB
+    # against several MiB of imagery, and the whole scene's output grid is smaller than one block's
+    # read window. Grid points would name the wrong quantity, and their meaning would depend on
+    # `grid_spacing` — the trap that made `benchmark/memory.jl` measure a single block twice.
+    n = 2048
+    p = params(; chip_size = 32, chip_size_max = 32, grid_spacing = 32, search_radius = 12)
+    grid = AutoRIFT._build_grid((n, n), p)
+
+    for px in (256, 512, 1024)
+        layout = AutoRIFT.block_layout(grid, p, (n, n), (px, px))
+        # No block writes more than the requested extent.
+        for b in layout.blocks
+            rlo, rhi = AutoRIFT._pixel_span(grid.y, b.grid_rows, b.grid_cols)
+            clo, chi = AutoRIFT._pixel_span(grid.x, b.grid_rows, b.grid_cols)
+            @test rhi - rlo <= px
+            @test chi - clo <= px
+        end
+        # Doubling the request quarters the block count, which is what makes the unit an extent
+        # rather than a count of anything.
+        bigger = AutoRIFT.block_layout(grid, p, (n, n), (2px, 2px))
+        @test length(bigger) < length(layout)
+    end
+
+    # A request at the scene's own size is one block, and a request larger than the scene still is.
+    @test length(AutoRIFT.block_layout(grid, p, (n, n), (n, n))) == 1
+    @test length(AutoRIFT.block_layout(grid, p, (n, n), (4n, 4n))) == 1
+
+    # The halo comparison is now like against like, both in pixels, and names the pixel minimum.
+    @test_throws "pixels is smaller than the" AutoRIFT.block_layout(grid, p, (n, n), (8, 8))
+
+    # A caller-supplied grid need not be uniformly spaced, so the conversion walks the coordinates
+    # rather than dividing by `grid_spacing`. Here the spacing rises from 40 to 400 pixels along the
+    # axis, and no single `grid_spacing` describes it.
+    xs = Float64[100, 140, 180, 220, 400, 600, 900, 1300]
+    uneven = gridpoints(xs, xs; chip_size = 32, search_radius = 12)
+    ulayout = AutoRIFT.block_layout(uneven, p, (2000, 2000), (512, 512))
+    for b in ulayout.blocks
+        clo, chi = AutoRIFT._pixel_span(uneven.x, b.grid_rows, b.grid_cols)
+        @test chi - clo <= 512
+    end
+    # And it packs by extent rather than shrinking every block to fit the widest gap: the closely
+    # spaced points share a block instead of each taking one.
+    @test maximum(length(b.grid_cols) for b in ulayout.blocks) > 1
 end

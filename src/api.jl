@@ -110,7 +110,7 @@ function CommonSolve.init(reference::AbstractMatrix, secondary::AbstractMatrix;
     return Cache{typeof(p)}(p, raw, _runner(raw, grid, p, bs), grid, nothing, true)
 end
 
-# `process_block_size` as a tuple, or `nothing` for one block.
+# `process_block_size` as a tuple of pixels, or `nothing` for one block.
 #
 # A tuple and only a tuple. A bare `Int` is rejected rather than read as a square block: a
 # full-width band is the cheaper shape at a given halo — halo on two sides rather than four — and
@@ -118,10 +118,9 @@ end
 _block_size(::Nothing) = nothing
 _block_size(bs::Tuple{Integer,Integer}) = (Int(bs[1]), Int(bs[2]))
 _block_size(bs) = throw(ArgumentError(
-    "`process_block_size` must be a tuple of two integers, `(X, Y)` grid points, or `nothing` " *
-    "for one block over the whole grid. Got a $(typeof(bs)). A scalar is not accepted: a " *
-    "full-width band costs less halo than a square block of the same area, so which one you " *
-    "want is worth saying."))
+    "`process_block_size` must be a tuple of two integers, `(X, Y)` pixels, or `nothing` for one " *
+    "block over the whole scene. Got a $(typeof(bs)). A scalar is not accepted: a full-width band " *
+    "costs less halo than a square block of the same area, so which one you want is worth saying."))
 
 """
     reinit!(cache; reference, secondary, reference_valid, secondary_valid) -> cache
@@ -262,27 +261,38 @@ All of [`AutoRIFT.params`](@ref)'s, plus:
 - `reference_valid`, `secondary_valid`: per-pixel validity masks. Defaults to finiteness. Pass
   these for sensors with a fill value, or to apply a cloud or shadow mask — an invalid pixel
   never contributes to a correlation.
-- `process_block_size`: `(X, Y)` grid points per block, or `nothing` (the default) for one block
-  over the whole scene. Reads and filters the images a block at a time, so no array the size of the
-  scene is ever formed. **Bit-identical to the untiled run** — this changes where the work happens,
-  not what it computes.
+- `process_block_size`: `(X, Y)` **pixels** per block, or `nothing` (the default) for one block over
+  the whole scene. Reads and filters the images a block at a time, so no array the size of the scene
+  is ever formed. **512 by 512 is a good default**; measured peak memory at 4096² and 6000² is
+  lowest there and rises with larger blocks.
 
-  For inputs that read a window cheaply, which means a lazy `Raster` or any other disk-backed
-  array. **On an array already in memory this costs more than it saves** and is measured doing so up
-  to at least 4096² (`benchmark/memory.jl`): the scene is already resident, so blocking adds the
-  halo without removing anything. Reach for it when the scene is the thing that will not fit.
+  Two things are promised under semantic versioning, and only these two: the result is
+  **bit-identical** to the untiled run, and no array the size of the scene — imagery or mask — is
+  formed. The halo formula, the number and shape of the blocks, buffer reuse and the threading shape
+  are all free to change.
 
-  A tuple and only a tuple: a full-width band costs halo on two sides where a square block pays it
-  on four, so which shape you want is worth saying rather than inferring from a scalar. Pass the
-  grid's full width as `X` for a band.
+  Worth it whenever peak memory matters, not only when the scene cannot fit. Measured total process
+  peak, threaded, against a resident untiled run:
 
-  Each block reads its own extent grown by a halo, so a block reads more than it writes — see
+  | scene | untiled | 512-pixel blocks |
+  |---|---:|---:|
+  | 4096² | 995 MiB | 593 MiB |
+  | 6000² | 1519 MiB | 603 MiB |
+
+  The gain grows with the scene — 40% and 60% here — and peak rises with the block size rather than
+  falling, since a larger block holds more imagery at once while the halo it saves is a fixed width.
+  The halo costs 1–13% extra *reading* at these sizes. Combine this with an input that reads a window
+  cheaply — a lazy `Raster`, or any disk-backed array — and the scene is never resident at all.
+
+  A block is a whole number of grid points, so the size is a target that snaps outward: at
+  `grid_spacing = 32` a request of 500 becomes 512. A tuple and only a tuple, since a full-width band
+  costs halo on two sides where a square block pays it on four — pass the scene width as `X` for a
+  band rather than leaving the shape to be inferred from a scalar.
+
+  Each block reads its own extent grown by a halo, so it reads more than it writes — see
   [`AutoRIFT.halo`](@ref). A block smaller than that halo would be almost entirely overlap and is
-  rejected. Smaller blocks hold less at once but read a larger multiple of the scene, since the halo
-  is a fixed width around a shrinking interior.
-
-  A preprocessing filter that estimates from the whole image cannot be reproduced block by block,
-  and is rejected rather than approximated — see [`AutoRIFT.filter_reach`](@ref).
+  rejected. A preprocessing filter that estimates from the whole image cannot be reproduced block by
+  block, and is rejected rather than approximated — see [`AutoRIFT.filter_reach`](@ref).
 
 ```julia
 out = autorift(image1, image2; chip_size = 32, search_radius = 25)

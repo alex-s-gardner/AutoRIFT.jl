@@ -141,20 +141,23 @@ end
 """
     blocked_peak(n; block, threads) -> Float64
 
-Peak RSS in MiB for one `n`-by-`n` pair correlated in `block`-by-`block` grid-point blocks, from an
-input that only materializes the window asked for.
+**Total** peak RSS in MiB for one `n`-by-`n` pair correlated in `block`-by-`block` **pixel** blocks,
+from an input that only materializes the window asked for.
+
+Total rather than above-a-baseline, unlike [`pair_peak`](@ref), and that is the point. An untiled
+run's baseline already contains the two resident scenes, so subtracting each configuration's own
+baseline hides exactly the cost blocking removes and makes blocking look worse than it is. The
+number a scheduler sees is the whole process.
+
+`block` is in pixels. A figure in grid points means `block / grid_spacing` blocks along an axis, so
+at the default spacing a "128" would be 4096 pixels — one block on any scene measured here, which is
+the untiled computation wearing a block label rather than a block size.
 
 The input is a `DiskArrays`-style array whose values are a function of position, so nothing is stored
-and the scene is never resident. That is the configuration `process_block_size` exists for, and the
-only one where it can be measured: given a resident array, blocking copies out of memory that is
-already there, and `docs/plan-tiling.md` records the measurement showing no benefit below ~6000².
-
-Reported against the same no-correlation baseline as [`pair_peak`](@ref), so the two are comparable —
-and they must be compared against a *resident* untiled run. Against an untiled run that first
-materializes a windowed input, blocking flatters itself: that baseline pays for a copy the blocked
-path never makes.
+and the scene is never resident. That is what `process_block_size` is for, and blocking wins at every
+size measured: see the table at [`run_memory`](@ref).
 """
-function blocked_peak(n::Int; block::Int = 64, threads = "auto")
+function blocked_peak(n::Int; block::Int = 512, threads = "auto")
     common = """
         using AutoRIFT
         import DiskArrays
@@ -176,14 +179,34 @@ function blocked_peak(n::Int; block::Int = 64, threads = "auto")
         a = Synth{Float32}(($n, $n), 1); b = Synth{Float32}(($n, $n), 2)
         rv = trues($n, $n); sv = trues($n, $n)
     """
-    base = measure_rss(common * "print(Sys.maxrss()/2^20)"; threads)
-    work = measure_rss(common * """
+    return measure_rss(common * """
         autorift(a, b; chip_size = 32, chip_size_max = 32, grid_spacing = 32,
                  search_radius = 12, process_block_size = ($block, $block),
                  reference_valid = rv, secondary_valid = sv)
         print(Sys.maxrss()/2^20)
     """; threads)
-    return work - base
+end
+
+"""
+    resident_peak(n; threads) -> Float64
+
+**Total** peak RSS in MiB for one `n`-by-`n` pair correlated untiled, from resident arrays.
+
+The baseline [`blocked_peak`](@ref) has to be compared against. Resident, because that is what an
+untiled run needs: comparing blocking against an untiled run that first materializes a windowed input
+credits blocking with a copy it never makes, and an earlier round of this work reported a 35%
+reduction on exactly that mistake.
+"""
+function resident_peak(n::Int; threads = "auto")
+    return measure_rss("""
+        using AutoRIFT
+        a = [Float32(0.5 + 0.4 * sin(i * 0.03 + 1) * cos(j * 0.021 + 1)) for i in 1:$n, j in 1:$n]
+        b = [Float32(0.5 + 0.4 * sin(i * 0.03 + 2) * cos(j * 0.021 + 2)) for i in 1:$n, j in 1:$n]
+        rv = trues($n, $n); sv = trues($n, $n)
+        autorift(a, b; chip_size = 32, chip_size_max = 32, grid_spacing = 32,
+                 search_radius = 12, reference_valid = rv, secondary_valid = sv)
+        print(Sys.maxrss()/2^20)
+    """; threads)
 end
 
 """
@@ -234,25 +257,30 @@ function run_memory()
             pair_peak(1024; threads = "auto", kw = ", rotation = true"))
     record!("memory/pair 1024x1024 rotation x5",
             pair_peak(1024; threads = "auto", kw = ", rotation = (-6, -3, 0, 3, 6)"))
-    # Blocked processing, from a windowed input, at two sizes and two block sizes — because the
-    # numbers say blocking *costs* memory until the scene is large, and the entries exist to pin
-    # where that turns over rather than to advertise a reduction:
+    # Blocked processing against a resident untiled run, as **total** process peak. Block sizes are
+    # in pixels and every one below is genuinely several blocks, which is what these entries pin:
     #
-    #            untiled   blocked 32²   blocked 128²
-    #   2048²     69.5        166.5          242.5     MiB above the no-correlation baseline
-    #   4096²    156.8        222.9          719.3
+    #             untiled   512 px   1024 px   2048 px
+    #   4096²       995.2    593.4     613.5     718.5
+    #   6000²      1519.0    602.9     612.4     742.7
     #
-    # Two readings. Blocking is 2.4x worse at 2048² and 1.4x at 4096², so the gap closes as the scene
-    # grows and the crossover is above both — consistent with `docs/plan-tiling.md`, which measures no
-    # benefit below ~6000². And a smaller block is *cheaper*, opposite to the halo-overhead reading
-    # alone: it holds less at once, while reading a larger multiple of the scene.
+    # Blocking wins at both sizes and the margin grows with the scene — 40% at 4096², 60% at 6000² —
+    # so this is not only for a scene that will not fit. 512-pixel blocks are the cheapest, and peak
+    # rises with the block size rather than falling, because a larger block holds more imagery at once
+    # while the halo it saves is a fixed width. The halo costs 1-13% extra *reading* at these sizes,
+    # not the multiples a pixel-versus-grid-point confusion once suggested.
     #
-    # The comparison is only meaningful against a resident untiled run. Measured against an untiled
-    # run that first materializes a windowed input, blocking looks better than it is, because that
-    # baseline is paying for a copy the blocked path never makes.
-    for n in (2048, 4096), block in (32, 128)
-        record!("memory/blocked $(n)x$(n) block $block",
-                blocked_peak(n; block, threads = "auto"))
+    # Two traps, both of which have produced a wrong conclusion here before. Report *total* peak, not
+    # each configuration's own above-baseline delta: an untiled baseline already holds the two
+    # resident scenes, so subtracting it hides the cost blocking removes. And compare against a
+    # *resident* untiled run, since one that first materializes a windowed input pays for a copy the
+    # blocked path never makes.
+    for n in (4096, 6000)
+        record!("memory/untiled resident $(n)x$(n)", resident_peak(n; threads = "auto"))
+        for block in (512, 1024, 2048)
+            record!("memory/blocked $(n)x$(n) block $(block)px",
+                    blocked_peak(n; block, threads = "auto"))
+        end
     end
     g = series_growth(30)
     record!("memory/series 30 pairs 512x512 rss", g.rss)

@@ -7,9 +7,9 @@ scene-sized array is formed, and `test/tile.jl` asserts equality with an untiled
 leaving it to have been checked once. A lazy `Raster` — or any `DiskArrays`-backed input — works
 through the core's generic windowed read, with no dependency in `src/`.
 
-What remains is the driver duplication: `correlate_multichip` and `correlate_tiled` are still two
-implementations of one algorithm. See "Where this stands" for what the measurements say about when
-blocking is worth asking for, which is narrower than this document originally assumed.
+`process_block_size` is in **pixels**; 512 by 512 is the measured best default. Blocking cuts total
+peak memory 40% at 4096² and 60% at 6000², and the margin grows with the scene — see "Where this
+stands", which corrects an earlier reading of these numbers that had it costing memory instead.
 
 ## What is wanted
 
@@ -57,34 +57,33 @@ suggests:
   `dilate_within(keep, coarse_buffer = 8)` (`src/multichip.jl:284`) adds 8 more — so 14
   coarse cells, which at `coarse_stride = 4` is 56 fine grid points.
 
-At `grid_spacing = 32` that totals **~1792 px**, and the dilation term alone (1024 px)
-exceeds the whole fine-path figure. Overhead depends on the block size the caller asks for:
-read-to-write is `((S + 2h)/S)²` for a square block of side `S`, so a 2048² block reads 7.6×
-its own pixels at this halo and a 8192² block 2.1×. That does not make tiling impossible; it
-makes it useless at the block sizes the feature exists to serve.
+At `grid_spacing = 32` those terms would total **~1792 px**, the dilation alone (1024 px) exceeding
+the whole fine-path figure — which at any useful block size is more overlap than data.
 
-The way out is not a bigger halo but to stop making per-block decisions: run the coarse pass
-per block as *evidence only*, then take the gate, the dilation and the resample once on the
-assembled coarse grid, which is ~1/1024 the size of the imagery. Then the halo falls back to
-the correlation-plus-filter term.
+So the outlier terms are not in the halo. The coarse pass runs per block as *evidence only*, and the
+gate, the dilation and the resample are taken once on the assembled coarse grid, which is ~1/1024 the
+size of the imagery. The halo is therefore the correlation-plus-filter term alone: **`(32, 32)` px at
+defaults**, costing 1–13% extra reading at block sizes between 512 and 2048 px. Read-to-write is
+`((S + 2h)/S)²` for a square block of side `S`, which at `h = 32` is 1.13× for `S = 512`.
 
 ## Shape
 
 ```julia
-autorift(reference, secondary; process_block_size = (2048, 2048), kwargs...)
+autorift(reference, secondary; process_block_size = (512, 512), kwargs...)
 ```
 
-- `process_block_size` absent ⇒ today's behaviour exactly, on one block. The wrapper must be
-  a no-op when not asked for, and the non-tiled result must stay bit-identical.
-- Blocks are laid out over the **output grid**, then each block's *read* window is its output
+- `process_block_size` is in **pixels**, and absent ⇒ one block over the whole scene. The wrapper
+  must be a no-op when not asked for, and the non-tiled result must stay bit-identical.
+- Blocks are laid out over the **output grid** — a block is a whole number of grid points, so a pixel
+  request snaps outward — then each block's *read* window is its output
   extent grown by the halo and clipped to the image. So the halo affects what is read, never
   what is written — which is what makes the mosaic a simple copy with no blending, no
   averaging, and no seam logic.
-- One block per task with `threaded = false` inside it — the pattern `src/api.jl:146-157` already
-  documents for batch work: "one pair per task beats threading within a pair." Do **not** nest the
-  existing intra-pass threading (`_track_threaded!`, `src/track.jl:431`) inside per-block tasks.
-  (As built this is `_serial_params` plus one `BlockBuffers` per task, not one `Cache` per block:
-  the buffers are what a block needs, and a `Cache` also carries a grid and a result.)
+- `min(nblocks, nthreads)` tasks claiming blocks from a shared counter, each with `threaded = false`
+  inside it — the pattern `src/api.jl` already documents for batch work: "one pair per task beats
+  threading within a pair." Do **not** nest the existing intra-pass threading (`_track_threaded!`)
+  inside per-block tasks. Each task holds one `BlockBuffers`, allocated in a function of its own so
+  the local cannot be hoisted into a `Core.Box` shared by every task.
 - FFTW's planner is not thread-safe (`src/api.jl:351`) — plans must be warmed before the
   block tasks spawn, exactly as `_warm_grid_plans` does now.
 - Every block must be given the **whole grid's** [`AutoRIFT.PassGeometry`](@ref) via `track!`'s
@@ -155,7 +154,7 @@ The gate that matters: **a tiled run must equal a non-tiled run**, not approxima
 | `test/tile.jl` | layout, halo, `filter_reach`, and the equivalence gate | yes |
 | `test/extensions.jl` | windowed reads from a `DiskArrays` input: no read exceeds a block's window, and the result equals the resident one | yes |
 | `ext/AutoRIFTRastersExt.jl` | nothing. `_read_block!`'s generic method already reads a window from a disk-backed `parent`; an extension method would only re-implement it | n/a |
-| `benchmark/memory.jl` | blocked peak-memory entries, and the crossover they pin | yes |
+| `benchmark/memory.jl` | blocked peak-memory entries, as total process peak against a resident untiled run | yes |
 
 Validation lives in `block_layout` rather than `src/params.jl`, because the halo is what a block
 size has to be checked against and `block_layout` is what knows the halo. `process_block_size` is
@@ -232,30 +231,39 @@ one side and +2.0 on the other.
 
 ### The measurements, and what they mean
 
-Peak RSS above a baseline process that allocates the inputs but does not correlate. Blocked figures
-are from an input that materializes only the window asked for; untiled is a resident scene.
+**Total** process peak RSS, threaded. Blocked figures are from an input that materializes only the
+window asked for; untiled is a resident scene. Block sizes are in pixels, and each is genuinely
+several blocks.
 
-| scene | untiled | blocked, 32² blocks | blocked, 128² blocks |
-|---|---:|---:|---:|
-| 2048² | 69.5 MiB | 166.5 MiB | 242.5 MiB |
-| 4096² | 156.8 MiB | 222.9 MiB | 719.3 MiB |
+| scene | untiled | 512 px | 1024 px | 2048 px |
+|---|---:|---:|---:|---:|
+| 4096² | 995.2 MiB | **593.4 MiB** | 613.5 MiB | 718.5 MiB |
+| 6000² | 1519.0 MiB | **602.9 MiB** | 612.4 MiB | 742.7 MiB |
 
-**Blocking costs memory at both sizes** — 2.4× at 2048², 1.4× at 4096². The gap closes as the scene
-grows, so the crossover is above 4096²; blocking is for the scene that will not fit at all, not for
-one that fits and could be smaller. What the blocked path has that the untiled one cannot is no
-scene-sized read anywhere, which is the whole property when the scene exceeds RAM.
+**Blocking wins at every size measured, and the margin grows with the scene** — 40% at 4096², 60% at
+6000². So it is not only for a scene that will not fit; it is worth reaching for whenever peak memory
+matters. 512-pixel blocks are the cheapest, and peak *rises* with the block size, because a larger
+block holds more imagery at once while the halo it saves is a fixed width. Halo overhead at these
+sizes is 1–13% extra reading.
 
-**A smaller block is cheaper**, opposite to what halo overhead alone suggests: it holds less at once
-while reading a larger multiple of the scene. Both effects are real and they point in opposite
-directions, so neither figure decides a block size on its own.
+**Report total peak, not each configuration's own above-baseline delta.** An untiled baseline already
+holds the two resident scenes, so subtracting it hides exactly the cost blocking removes. Measured
+that way the same runs read as 69.5 against 166.5 MiB at 2048² and support the opposite conclusion.
 
 **Compare against a resident untiled baseline.** Measured against an untiled run that first
 materializes a windowed input, blocking looks better than it is — that baseline pays for a copy the
 blocked path never makes. An earlier round of this work reported a 35% reduction on exactly that
 mistake.
 
+**A block size in grid points is not a block size.** `process_block_size` counts pixels; a figure read
+as grid points is `grid_spacing` times larger, so at the default spacing a "128" is 4096 pixels — one
+block on any scene up to 4096², which is the untiled computation wearing a block label. Two of the
+four rows in the earlier version of this table were exactly that, which is how a table with no block
+size varying in it came to be read as a block-size trend.
+
 Per-block allocation, at an 888-pixel read window, before and after pooling: raw read 7.56 MiB → 0,
-prepare 15.36 MiB → 0.23 MiB.
+prepare 15.36 MiB → 0.23 MiB. And per *task* rather than per block, at 144 blocks on 8 threads:
+992 MiB → 55 MiB of buffer sets, worth 937 → 873 MiB of peak at 6000² with 512-pixel blocks.
 
 **Read live heap, not RSS, when judging whether something is retained.** Live-heap growth is ~1 MiB
 for every configuration measured here, tiled or not. The 300–430 MiB figures an earlier round of this
