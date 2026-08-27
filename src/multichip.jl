@@ -65,6 +65,9 @@ Displacement over the full grid, assembled from all chip-size levels.
 which level produced each point — `0` where none did — and `interpolated` marks points
 filled from their neighbours rather than measured.
 
+`chip_size` holds the level's **x** extent. That identifies the level on its own, since the aspect
+is constant across levels, so the y extent is this times a fixed ratio.
+
 The chip size is worth keeping rather than discarding: it says how much spatial averaging is
 behind each estimate, so a downstream consumer can tell a sharply-resolved velocity from a
 smoothed one.
@@ -109,8 +112,10 @@ _empty_result(sz::Tuple{Int,Int}) = MultichipResult(
 # used a surplus entry.
 function _level_sizes(p::Params)
     sizes = chip_sizes(p)
-    @assert !isempty(sizes) "no chip-size levels for chip_size $(p.chip_size_base) in " *
-                            "[$(p.chip_size_min), $(p.chip_size_max)]"
+    # Interpolates the components rather than the extents: showing a `NamedTuple` reaches
+    # `Base.repeat` via `textwidth`, which `--trim` cannot resolve — see `src/track.jl`.
+    @assert !isempty(sizes) "no chip-size levels between $(p.chip_size_min.X)x$(p.chip_size_min.Y) " *
+                            "and $(p.chip_size_max.X)x$(p.chip_size_max.Y)"
     _check_measures(p, length(sizes))
     return sizes
 end
@@ -159,7 +164,7 @@ restrict(r::WholeScene, _setup, _gridsize::Tuple{Int,Int}) = r
 # tests do. A blocked run, by contrast, is only asked for when the scene is too large to hold, so a
 # coarse grid too small to filter means the configuration is inconsistent with the reason for
 # blocking at all.
-_warn_coarse_fallback(::WholeScene, ::Int) = nothing
+_warn_coarse_fallback(::WholeScene, ::Extent) = nothing
 
 """
     correlate_multichip(pair, grid, p) -> MultichipResult
@@ -223,13 +228,20 @@ which is what `min_coarse_valid_fraction` decides.
 
 Separately callable so a caller can run one chip size without the loop.
 
+`chip_size` is an [`AutoRIFT.Extent`](@ref); a scalar is accepted and means square.
+
 `pair` is the **filtered** pair, which this wraps in an [`AutoRIFT.WholeScene`](@ref) runner. The
 [`AutoRIFT.PassRunner`](@ref) form below is what a blocked run uses, with the same body.
 """
-chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size::Integer,
+chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size,
                wanted::AbstractMatrix{Bool},
                measure::SimilarityMeasure = first(p.similarity)) =
-    chipsize_level(WholeScene(pair), grid, p, chip_size, wanted, measure)
+    chipsize_level(WholeScene(pair), grid, p, extent(chip_size), wanted, measure)
+
+# A scalar or plain tuple from a caller who reached for the runner form directly.
+chipsize_level(runner::PassRunner, grid::PointSet{2}, p::Params, chip_size,
+               wanted::AbstractMatrix{Bool}, measure::SimilarityMeasure) =
+    chipsize_level(runner, grid, p, extent(chip_size), wanted, measure)
 
 # One chip-size level, however its passes are executed.
 #
@@ -241,16 +253,13 @@ chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size::Integer
 #
 # `runner` is positional: a keyword carrying an abstract type is unresolvable under `--trim`.
 function chipsize_level(runner::PassRunner, grid::PointSet{2}, p::Params,
-                        chip_size::Integer, wanted::AbstractMatrix{Bool},
+                        chip_size::Extent, wanted::AbstractMatrix{Bool},
                         measure::SimilarityMeasure)
-    csx = Int(chip_size)
-    csy = chip_size_y(p, csx)
-
     # A level's points: the requested ones, at this level's chip size.
-    pts = _level_points(grid, p, csx, csy, wanted)
+    pts = _level_points(grid, p, chip_size, wanted)
     nsearchable(pts) == 0 && return nothing
 
-    coarse_mask = _coarse_mask(runner, pts, p, csx, csy, measure)
+    coarse_mask = _coarse_mask(runner, pts, p, chip_size, measure)
     isnothing(coarse_mask) && return nothing
     _apply_coarse_mask!(pts, coarse_mask) == 0 && return nothing
 
@@ -265,7 +274,7 @@ end
 # `chip_size_min`/`chip_size_max` are not consulted per point here because `Params` carries
 # them as scalars; when they become per-point fields (from Geogrid) this is where that filter
 # belongs.
-function _level_points(grid::PointSet{2}, p::Params, csx::Int, csy::Int,
+function _level_points(grid::PointSet{2}, p::Params, chip_size::Extent,
                        wanted::AbstractMatrix{Bool})
     n = size(grid)
     rx = Matrix{Int}(undef, n)
@@ -282,7 +291,7 @@ function _level_points(grid::PointSet{2}, p::Params, csx::Int, csy::Int,
     # Coordinates and priors are shared rather than copied: nothing below writes them, and
     # only the radii (here and by the coarse mask) and the chip sizes are level-specific.
     pts = rebuild(grid; radius_x = rx, radius_y = ry,
-                  chip_size_x = fill(csx, n), chip_size_y = fill(csy, n))
+                  chip_size_x = fill(chip_size.X, n), chip_size_y = fill(chip_size.Y, n))
     sanitize!(pts, p.min_search_radius)
     return pts
 end
@@ -317,7 +326,7 @@ end
 # decides what that means, because the two callers differ: a whole-scene run falls back to searching
 # everything rather than rejecting on no evidence, while a block-at-a-time run must treat it as a
 # configuration error, since per block it would silently skip the coarse restriction entirely.
-function _coarse_points(pts::PointSet{2}, p::Params, csx::Int, csy::Int)
+function _coarse_points(pts::PointSet{2}, p::Params, chip_size::Extent)
     stride = p.coarse_stride
     nr, nc = size(pts)
     rows = stride:stride:nr
@@ -339,8 +348,8 @@ function _coarse_points(pts::PointSet{2}, p::Params, csx::Int, csy::Int)
     coarse = pts[rows, cols]
     _cell_max_radius!(coarse.radius_x, pts.radius_x, rows, cols, stride)
     _cell_max_radius!(coarse.radius_y, pts.radius_y, rows, cols, stride)
-    fill!(coarse.chip_size_x, csx)
-    fill!(coarse.chip_size_y, csy)
+    fill!(coarse.chip_size_x, chip_size.X)
+    fill!(coarse.chip_size_y, chip_size.Y)
     return (; coarse, rows, cols, filt)
 end
 
@@ -416,15 +425,15 @@ end
 #
 # `measure` is positional and has no default: the one caller always knows the level's measure, and a
 # default here would be a second spelling of `chipsize_level`'s that could silently diverge from it.
-function _coarse_mask(runner::PassRunner, pts::PointSet{2}, p::Params, csx::Int, csy::Int,
+function _coarse_mask(runner::PassRunner, pts::PointSet{2}, p::Params, chip_size::Extent,
                       measure::SimilarityMeasure)
-    setup = _coarse_points(pts, p, csx, csy)
+    setup = _coarse_points(pts, p, chip_size)
     if isnothing(setup)
         # Too few coarse points to judge consistency against their neighbours, so there is no
         # evidence to restrict the fine search with. Searching everything is what this has to do
         # either way — a blocked run must agree with a whole-scene one point for point rather than
         # substitute a policy of its own — and only whether it says so differs.
-        _warn_coarse_fallback(runner, csx)
+        _warn_coarse_fallback(runner, chip_size)
         return trues(size(pts))
     end
 
@@ -553,8 +562,11 @@ end
 # succeed at a point owns it. Since levels run finest first, that is the smallest chip that
 # could resolve the point.
 function _merge_level!(result::MultichipResult, level::DisplacementField,
-                      filled::Vector{Int}, chip_size::Integer)
-    cs = UInt16(chip_size)
+                      filled::Vector{Int}, chip_size::Extent)
+    # The x extent identifies the level on its own: the aspect is constant across levels, so
+    # `chip_size_y` is `chip_size_x` times a fixed ratio and recording both would be redundant. One
+    # `UInt16` per point rather than two also keeps the result array the size it has always been.
+    cs = UInt16(chip_size.X)
     # `filled` comes from the fill step itself rather than being inferred from a missing
     # correlation. The inference would work today, but only because of an invariant spanning
     # three files that nothing asserts — that a measured point always has all three of dx, dy

@@ -138,12 +138,12 @@ julia> pts.x[2], pts.radius_x[2], pts.chip_size_x[2]
 ```
 
 # Keywords
-- `search_radius = 25`: half-extent of the search window. A scalar sets both
-  axes; a 2-tuple sets them separately, as do `search_radius_x` and
-  `search_radius_y`. Each also accepts a per-point array.
-- `chip_size = 32`: chip extent. `chip_size_y` defaults to `chip_size_x` scaled
-  by `chip_aspect` and rounded to even.
-- `chip_aspect = 1.0`: chip height as a multiple of width.
+- `search_radius = 25`: half-extent of the search window, as an
+  [`AutoRIFT.Extent`](@ref) — a scalar means square, `(X = …, Y = …)` names the axes.
+- `chip_size = 32`: chip extent, likewise.
+- `search_radius_x`, `search_radius_y`, `chip_size_x`, `chip_size_y`: per-axis overrides that also
+  accept a **per-point array**, which an extent cannot express. That is what they are for: a
+  Geogrid-derived search radius varies across the scene.
 - `dx_prior = 0.0`, `dy_prior = 0.0`: a-priori displacement.
 """
 function pointset(
@@ -154,7 +154,6 @@ function pointset(
     chip_size = 32,
     chip_size_x = nokw,
     chip_size_y = nokw,
-    chip_aspect = 1.0,
     dx_prior = 0.0,
     dy_prior = 0.0,
 )
@@ -164,16 +163,16 @@ function pointset(
     xs = _tofield(Float64, x, x, :x)
     ys = _tofield(Float64, y, x, :y)
 
-    rx0, ry0 = search_radius isa Tuple ? search_radius : (search_radius, search_radius)
-    rx = _tofield(Int, isnokw(search_radius_x) ? rx0 : search_radius_x, x, :search_radius_x)
-    ry = _tofield(Int, isnokw(search_radius_y) ? ry0 : search_radius_y, x, :search_radius_y)
+    # `search_radius` and `chip_size` are extents, so they set both axes at once and a scalar means
+    # square. The per-axis keywords stay, and are not redundant: they accept a *per-point array*,
+    # which an extent cannot express — a Geogrid-derived radius varies across the scene.
+    rad = extent(search_radius)
+    rx = _tofield(Int, isnokw(search_radius_x) ? rad.X : search_radius_x, x, :search_radius_x)
+    ry = _tofield(Int, isnokw(search_radius_y) ? rad.Y : search_radius_y, x, :search_radius_y)
 
-    csx = _tofield(Int, isnokw(chip_size_x) ? chip_size : chip_size_x, x, :chip_size_x)
-    csy = if isnokw(chip_size_y)
-        map(c -> 2 * round(Int, c * chip_aspect / 2), csx)
-    else
-        _tofield(Int, chip_size_y, x, :chip_size_y)
-    end
+    cs = extent(chip_size)
+    csx = _tofield(Int, isnokw(chip_size_x) ? cs.X : chip_size_x, x, :chip_size_x)
+    csy = _tofield(Int, isnokw(chip_size_y) ? cs.Y : chip_size_y, x, :chip_size_y)
 
     dx = _tofield(Float64, dx_prior, x, :dx_prior)
     dy = _tofield(Float64, dy_prior, x, :dy_prior)
@@ -228,32 +227,36 @@ julia> ndims(pts), size(pts)
 
 Accepts the same geometry keywords as [`pointset`](@ref).
 """
-function gridpoints(imagesize::Tuple{Integer,Integer}, spacing::Integer;
-                    chip_size = 32, chip_aspect = 1.0, search_radius = 25,
+function gridpoints(imagesize::Tuple{Integer,Integer}, spacing;
+                    chip_size = 32, search_radius = 25,
                     search_radius_x = nokw, search_radius_y = nokw, kw...)
-    spacing > 0 || throw(ArgumentError("`spacing` must be positive, got $spacing"))
+    sp = extent(spacing)
+    (sp.X > 0 && sp.Y > 0) || throw(ArgumentError(
+        "`spacing` must be positive, got $(sp.X) by $(sp.Y)"))
 
     # Inset so that the widest chip plus its search window lies inside the
     # image. Points that would read outside would either need padding or produce
     # a truncated correlation surface; excluding them keeps the geometry exact.
-    rx0, ry0 = search_radius isa Tuple ? search_radius : (search_radius, search_radius)
-    rx = isnokw(search_radius_x) ? rx0 : search_radius_x
-    ry = isnokw(search_radius_y) ? ry0 : search_radius_y
-    csx = maximum(chip_size)
-    csy = 2 * round(Int, csx * chip_aspect / 2)
-    margin_x = cld(csx, 2) + maximum(rx) + 1
-    margin_y = cld(csy, 2) + maximum(ry) + 1
+    #
+    # `maximum` on each, because a per-point array is allowed here: the inset has to clear the
+    # widest chip and radius anywhere on the grid, not the first one.
+    rad = extent(search_radius)
+    rx = isnokw(search_radius_x) ? rad.X : search_radius_x
+    ry = isnokw(search_radius_y) ? rad.Y : search_radius_y
+    cs = extent(chip_size)
+    margin_x = cld(cs.X, 2) + maximum(rx) + 1
+    margin_y = cld(cs.Y, 2) + maximum(ry) + 1
 
     nrows, ncols = imagesize
-    xs = (margin_x + 1):spacing:(ncols - margin_x)
-    ys = (margin_y + 1):spacing:(nrows - margin_y)
+    xs = (margin_x + 1):sp.X:(ncols - margin_x)
+    ys = (margin_y + 1):sp.Y:(nrows - margin_y)
     (isempty(xs) || isempty(ys)) && throw(ArgumentError(
         "no search center fits in a $(nrows)x$(ncols) image with chip " *
-        "$(csx)x$(csy) and search radius $(rx)x$(ry): a margin of " *
+        "$(cs.X)x$(cs.Y) and search radius $(maximum(rx))x$(maximum(ry)): a margin of " *
         "$(margin_y)x$(margin_x) pixels is needed on each side. Use a smaller " *
         "chip size or search radius."))
 
-    return gridpoints(xs, ys; chip_size, chip_aspect, search_radius,
+    return gridpoints(xs, ys; chip_size, search_radius,
                       search_radius_x, search_radius_y, kw...)
 end
 

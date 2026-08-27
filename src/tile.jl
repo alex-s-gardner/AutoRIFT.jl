@@ -121,12 +121,12 @@ A `PointSet{1}`, since `_pass_geometry` reduces over points and does not use the
 """
 function _worst_level_points(grid::PointSet, p::Params)
     flat = scatter(grid)
-    csx = p.chip_size_max
+    cs = p.chip_size_max
     n = size(flat.radius_x)
     # Copies, because `sanitize!` writes in place and `scatter` shares the grid's own arrays.
     pts = rebuild(flat; radius_x = copy(flat.radius_x), radius_y = copy(flat.radius_y),
-                  chip_size_x = fill(csx, n),
-                  chip_size_y = fill(chip_size_y(p, csx), n))
+                  chip_size_x = fill(cs.X, n),
+                  chip_size_y = fill(cs.Y, n))
     # The same floor a level applies, applied by the same function, so the two cannot drift.
     sanitize!(pts, p.min_search_radius)
     return pts
@@ -458,10 +458,14 @@ restrict(r::Blocked, setup, gridsize::Tuple{Int,Int}) =
 # Loud, unlike the whole-scene runner: blocking is asked for when the scene will not fit, so a coarse
 # grid too small to filter means every point is searched at full radius — roughly a hundred times the
 # work the coarse pass exists to avoid — and silence there reads as a fast run.
-_warn_coarse_fallback(::Blocked, chip_size::Int) = @warn(
+#
+# The chip size is logged as two integers rather than as the extent itself: showing a `NamedTuple`
+# reaches `Base.repeat` via `textwidth`, which `--trim` cannot resolve — the same constraint
+# `src/track.jl` records for error messages.
+_warn_coarse_fallback(::Blocked, chip_size::Extent) = @warn(
     "coarse grid smaller than the outlier filter's window; searching every point at full radius, " *
     "which costs roughly 100x the restricted pass. Reduce `coarse_stride`, reduce `grid_spacing`, " *
-    "or process a larger area per call.", chip_size)
+    "or process a larger area per call.", chip_size_x = chip_size.X, chip_size_y = chip_size.Y)
 
 """
     AutoRIFT.correlate_tiled(raw, grid, p, block_size) -> MultichipResult

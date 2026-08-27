@@ -34,24 +34,19 @@ end
 @testset "search radius, both axes" begin
     # The x and y radii are independent: Geogrid projects the a-priori velocity
     # onto each image axis separately, so a glacier flowing along x gets a wide
-    # x-radius and a narrow y-radius. Three spellings, increasing specificity.
-    p = AutoRIFT.params(; search_radius = 25)
-    @test (p.search_radius_x, p.search_radius_y) == (25, 25)
+    # x-radius and a narrow y-radius. Three spellings of one extent.
+    @test AutoRIFT.params(; search_radius = 25).search_radius == (X = 25, Y = 25)
+    @test AutoRIFT.params(; search_radius = (25, 10)).search_radius == (X = 25, Y = 10)
+    @test AutoRIFT.params(; search_radius = (X = 25, Y = 10)).search_radius == (X = 25, Y = 10)
 
-    p = AutoRIFT.params(; search_radius = (25, 10))
-    @test (p.search_radius_x, p.search_radius_y) == (25, 10)
-
-    p = AutoRIFT.params(; search_radius_x = 25, search_radius_y = 10)
-    @test (p.search_radius_x, p.search_radius_y) == (25, 10)
-
-    # A per-axis keyword overrides the shared one for that axis only.
-    p = AutoRIFT.params(; search_radius = 25, search_radius_y = 10)
-    @test (p.search_radius_x, p.search_radius_y) == (25, 10)
-
-    # Zero in one axis is legal as a scalar default (per-pixel fields routinely
-    # hold zeros); zero in both means nothing can be searched.
-    @test AutoRIFT.params(; search_radius = (25, 0)).search_radius_y == 0
+    # Zero in one axis searches along the other only, which a per-pixel radius field routinely
+    # asks for; zero in both means nothing can be searched.
+    @test AutoRIFT.params(; search_radius = (25, 0)).search_radius.Y == 0
     @test_throws "zero in both axes" AutoRIFT.params(; search_radius = 0)
+    @test_throws "must be >= 0" AutoRIFT.params(; search_radius = (-1, 10))
+
+    # A named tuple with the wrong field names is a mistake worth naming, not a silent reorder.
+    @test_throws "must be `X` and `Y`" AutoRIFT.params(; search_radius = (x = 25, y = 10))
 end
 
 # Search-radius normalisation is tested in test/points.jl, alongside the
@@ -61,22 +56,45 @@ end
     # Levels are chip_size * 2^k within [min, max], ascending. Ascending order
     # is load-bearing downstream: each level only writes where no finer level
     # succeeded, so the smallest chip that works wins.
-    @test AutoRIFT.chip_sizes(AutoRIFT.params(; chip_size = 32)) == [32, 64, 128]
-    @test AutoRIFT.chip_sizes(AutoRIFT.params(;
-        chip_size = 32, chip_size_max = 32)) == [32]
-    @test AutoRIFT.chip_sizes(AutoRIFT.params(;
-        chip_size = 16, chip_size_max = 128)) == [16, 32, 64, 128]
-    # chip_size_min skips the finest levels without changing the level grid.
-    @test AutoRIFT.chip_sizes(AutoRIFT.params(;
-        chip_size = 16, chip_size_min = 64, chip_size_max = 128)) == [64, 128]
+    xs(p) = [c.X for c in AutoRIFT.chip_sizes(p)]
+    @test xs(AutoRIFT.params(; chip_size = 32)) == [32, 64, 128]
+    @test xs(AutoRIFT.params(; chip_size = 32, chip_size_max = 32)) == [32]
+    @test xs(AutoRIFT.params(; chip_size = 16, chip_size_max = 128)) == [16, 32, 64, 128]
 
-    # Chip height derives from width and is forced even.
-    p = AutoRIFT.params(; chip_aspect = 1.0)
-    @test AutoRIFT.chip_size_y(p, 32) == 32
-    p = AutoRIFT.params(; chip_aspect = 0.5)
-    @test AutoRIFT.chip_size_y(p, 32) == 16
-    p = AutoRIFT.params(; chip_aspect = 0.7)
-    @test iseven(AutoRIFT.chip_size_y(p, 32))
+    # Both axes double together, so a non-square chip keeps its aspect at every level. That is what
+    # lets `MultichipResult.chip_size` record the x extent alone and still name the level.
+    lv = AutoRIFT.chip_sizes(AutoRIFT.params(; chip_size = (X = 16, Y = 32),
+                                            chip_size_max = (X = 64, Y = 128)))
+    @test lv == [(X = 16, Y = 32), (X = 32, Y = 64), (X = 64, Y = 128)]
+    @test all(c -> c.Y == 2c.X, lv)
+
+    # A scalar means square.
+    @test AutoRIFT.params(; chip_size = 32).chip_size_min == (X = 32, Y = 32)
+    @test AutoRIFT.extent(32) == (X = 32, Y = 32)
+    @test AutoRIFT.extent((16, 32)) == (X = 16, Y = 32)
+    @test AutoRIFT.extent((X = 16, Y = 32)) == (X = 16, Y = 32)
+end
+
+@testset "chip-size levels must keep one aspect ratio" begin
+    # Levels are `chip_size .* 2^k` in both axes at once, so `chip_size_max` has to be the same
+    # multiple of `chip_size` in each. Otherwise x would reach its maximum after a different number
+    # of doublings than y, and the chip's aspect would drift across levels -- which would break the
+    # nesting `src/multichip.jl` depends on, where a coarse grid point is exactly a block of fine
+    # ones.
+    #
+    # Non-square is fine; a *changing* aspect is not. These two cases are the distinction.
+    @test AutoRIFT.params(; chip_size = (X = 16, Y = 32),
+                          chip_size_max = (X = 32, Y = 64)) isa AutoRIFT.Params
+    @test_throws "same multiple" AutoRIFT.params(; chip_size = (X = 16, Y = 16),
+                                                 chip_size_max = (X = 128, Y = 64))
+
+    # Applying the per-axis checks alone does not catch that: both cases pass them individually.
+    @test_throws "power-of-two multiple" AutoRIFT.params(; chip_size = 16, chip_size_max = 48)
+    @test_throws "must not exceed" AutoRIFT.params(; chip_size = 64, chip_size_max = 32)
+
+    # Multiple of 4 per axis, so a chip centre lands on a pixel boundary.
+    @test_throws "multiple of 4" AutoRIFT.params(; chip_size = (X = 16, Y = 18))
+    @test_throws "multiple of 4" AutoRIFT.params(; chip_size = 18)
 end
 
 @testset "validation" begin
@@ -90,11 +108,10 @@ end
     @test_throws "must be a Symbol" AutoRIFT.params(; similarity = 1.0)
 
     @test_throws "multiple of 4" AutoRIFT.params(; chip_size = 30)
-    @test_throws "multiple of 4" AutoRIFT.params(; chip_size_min = 18)
     @test_throws "power-of-two multiple" AutoRIFT.params(;
         chip_size = 32, chip_size_max = 96)
-    @test_throws "must be <=" AutoRIFT.params(;
-        chip_size = 32, chip_size_min = 128, chip_size_max = 64)
+    @test_throws "must not exceed" AutoRIFT.params(;
+        chip_size = 128, chip_size_max = 64)
 
     @test_throws "power of 2" PyramidRefine(; upsampling = 48)
     @test_throws "must be > 1" PyramidRefine(; upsampling = 1)
@@ -104,7 +121,7 @@ end
     @test_throws "must be odd" Wallis(; width = 6)
     @test_throws "must be >= 3" Highpass(; width = 1)
 
-    @test_throws "must be >= 0" AutoRIFT.params(; search_radius_x = -5)
+    @test_throws "must be >= 0" AutoRIFT.params(; search_radius = (-5, 10))
     @test_throws "in [0, 1]" AutoRIFT.params(; agree_tolerance = 1.5)
     @test_throws "in [0, 1]" AutoRIFT.params(; min_agree_fraction = -0.1)
     @test_throws "must be positive" AutoRIFT.params(; mad_scale = 0)
@@ -151,4 +168,22 @@ end
     @test AutoRIFT.isnokwornothing(nothing)
     @test AutoRIFT.isnokwornothing(AutoRIFT.nokw)
     @test !AutoRIFT.isnokwornothing(5)
+end
+
+@testset "an extent is C-layout compatible" begin
+    # A C binary API is a requirement, and `Extent` is what the geometry fields are made of — so its
+    # layout is part of the contract, not an implementation detail. A `NamedTuple` was chosen over a
+    # struct precisely because it keeps this property.
+    E = AutoRIFT.Extent
+    @test isbitstype(E)
+    @test sizeof(E) == 2 * sizeof(Int)
+    # No padding, and x before y: the layout a `struct { int64_t x, y; }` has.
+    @test fieldoffset(E, 1) == 0
+    @test fieldoffset(E, 2) == sizeof(Int)
+    # The names live in the type, not the data, which is why they are free.
+    @test reinterpret(Tuple{Int,Int}, [AutoRIFT.extent((16, 32))])[1] === (16, 32)
+
+    # And `Params` stays `isbitstype`, which `src/types.jl` records as load-bearing for the
+    # trimmed binary: it is what lets the struct store inline with no dispatch.
+    @test isbitstype(typeof(AutoRIFT.params()))
 end

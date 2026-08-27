@@ -210,7 +210,11 @@ end
     ref, sec = shifted_pair(512, (6, -4); T = Float32)
     p = Params((ZNCC(),), Highpass(), PyramidRefine(), GardnerFilter(),
                AutoRIFT.False(), AutoRIFT.NoRotationSearch(),
-               32, 32, 128, 1.0, 32, 25, 25, 6, 4, 8, 0.01, 0.0, 0.0, 3, UInt64(0), false)
+               (X = 32, Y = 32),      # chip_size_min
+               (X = 128, Y = 128),    # chip_size_max
+               (X = 32, Y = 32),      # grid_spacing
+               (X = 25, Y = 25),      # search_radius
+               6, 4, 8, 0.01, 0.0, 0.0, 3, UInt64(0), false)
 
     # First: the hand-built `Params` is the one `params()` produces for these keywords. If a
     # default drifts, this fails here rather than as a silent behaviour difference in the binary.
@@ -232,4 +236,38 @@ end
     # keyword path cannot be trimmed however concrete the arguments are.
     @test !isconcretetype(inferred_type(params, ()))
     @test isconcretetype(typeof(p))
+end
+
+@testset "a non-square chip runs end to end" begin
+    # The capability extents add: a chip that is not square, stated rather than derived from an
+    # aspect ratio and a rounding rule. Recovering a known shift through the whole pipeline is what
+    # shows the two axes stay attached to the right dimension all the way down — a transposition
+    # somewhere would put the x displacement in y.
+    ref, sec = shifted_pair(512, (6, -4); T = Float32)
+    for cs in ((X = 32, Y = 16), (X = 16, Y = 32))
+        r = autorift(ref, sec; chip_size = cs, chip_size_max = cs,
+                     grid_spacing = 16, search_radius = 12)
+        @test AutoRIFT.nmeasured(r) > 0
+        mx, my = motion(r)
+        @test mx ≈ 6 atol = 0.1
+        @test my ≈ -4 atol = 0.1
+        # The level is recorded by its x extent, which names it uniquely because the aspect is
+        # constant across levels.
+        @test all(c -> c == 0 || c == cs.X, r.chip_size)
+    end
+
+    # A non-square *grid spacing* too, which changes the output shape rather than the correlation:
+    # points sit further apart in one axis than the other.
+    r = autorift(ref, sec; chip_size = 32, chip_size_max = 32,
+                 grid_spacing = (X = 32, Y = 16), search_radius = 12)
+    @test size(r.dx, 1) > size(r.dx, 2)          # more rows than columns, since Y spacing is finer
+    @test AutoRIFT.nmeasured(r) > 0
+
+    # And a non-square search radius, which the old API expressed with two keywords.
+    r = autorift(ref, sec; chip_size = 32, chip_size_max = 32, grid_spacing = 16,
+                 search_radius = (X = 20, Y = 8))
+    @test AutoRIFT.nmeasured(r) > 0
+    mx, my = motion(r)
+    @test mx ≈ 6 atol = 0.1
+    @test my ≈ -4 atol = 0.1
 end

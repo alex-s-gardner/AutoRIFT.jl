@@ -184,8 +184,8 @@ end
     # Chip and radius are independent per axis all the way through.
     ref, sec = shifted_pair(400, (5, -3); T = Float32)
     pair = ImagePair(ref, sec)
-    pts = gridpoints((400, 400), 32; chip_size = 32, chip_aspect = 0.5,
-                     search_radius_x = 25, search_radius_y = 10)
+    pts = gridpoints((400, 400), 32; chip_size = (X = 32, Y = 16),
+                     search_radius = (X = 25, Y = 10))
     d = track(pair, pts, params())
     mx, my = motion(d)
     @test median_of(filter(!isnan, mx)) ≈ 5 atol = 0.05

@@ -333,7 +333,11 @@ the better tool for that, since it also reuses buffers.
 
 ```julia
 p = AutoRIFT.Params((ZNCC(),), Highpass(), PyramidRefine(), GardnerFilter(),
-                    AutoRIFT.False(), AutoRIFT.NoRotationSearch(), 32, 32, 128, 1.0, 32, 25, 25,
+                    AutoRIFT.False(), AutoRIFT.NoRotationSearch(),
+                    (X = 32, Y = 32),    # chip_size_min
+                    (X = 128, Y = 128),  # chip_size_max
+                    (X = 32, Y = 32),    # grid_spacing
+                    (X = 25, Y = 25),    # search_radius
                     6, 4, 8, 0.01, 0.0, 0.0, 3, UInt64(0), false)
 out = autorift(image1, image2, p)
 ```
@@ -489,9 +493,7 @@ end
 function _build_grid(imagesize::Tuple{Int,Int}, p::Params)
     return gridpoints(imagesize, p.grid_spacing;
                       chip_size = p.chip_size_max,
-                      chip_aspect = p.chip_aspect,
-                      search_radius_x = p.search_radius_x,
-                      search_radius_y = p.search_radius_y,
+                      search_radius = p.search_radius,
                       dx_prior = p.dx_prior,
                       dy_prior = p.dy_prior)
 end
@@ -512,8 +514,7 @@ function _warm_grid_plans(grid::PointSet{2}, p::Params)
     csizes = chip_sizes(p)
     for k in eachindex(csizes)
         cs = csizes[k]
-        csy = chip_size_y(p, cs)
-        sz = (next_fft_size(csy + 2ry - 1), next_fft_size(cs + 2rx - 1))
+        sz = (next_fft_size(cs.Y + 2ry - 1), next_fft_size(cs.X + 2rx - 1))
         if _wants_complex_plans(measure_at(p, k))
             warm_plans!((sz,); complex = true)
         else

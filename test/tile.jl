@@ -163,9 +163,8 @@ end
 
     function widest_level_pad(grid, p)
         worst = (0, 0)
-        for csx in AutoRIFT.chip_sizes(p)
-            lp = AutoRIFT._level_points(grid, p, csx, AutoRIFT.chip_size_y(p, csx),
-                                        trues(size(grid)))
+        for cs in AutoRIFT.chip_sizes(p)
+            lp = AutoRIFT._level_points(grid, p, cs, trues(size(grid)))
             pad = AutoRIFT._pass_geometry(scatter(lp), imagesize)[5]
             worst = (max(worst[1], pad[1]), max(worst[2], pad[2]))
         end
@@ -299,7 +298,8 @@ end
     @test size(grid0) == (61, 61)
     # The coarse grid really does clear the filter's window, so the gate is exercised.
     @test !isnothing(AutoRIFT._coarse_points(
-        AutoRIFT._level_points(grid0, base, 32, 32, trues(size(grid0))), base, 32, 32))
+        AutoRIFT._level_points(grid0, base, AutoRIFT.extent(32), trues(size(grid0))),
+        base, AutoRIFT.extent(32)))
 
     for (tag, p) in ("default" => base,
                      "wallis" => params(; chip_size = 32, chip_size_max = 32, grid_spacing = 16,
@@ -364,8 +364,8 @@ end
     grid = AutoRIFT._build_grid(size(raw), p)
 
     # The configuration this testset is about: the coarse grid really is too small.
-    level = AutoRIFT._level_points(grid, p, 32, 32, trues(size(grid)))
-    @test isnothing(AutoRIFT._coarse_points(level, p, 32, 32))
+    level = AutoRIFT._level_points(grid, p, AutoRIFT.extent(32), trues(size(grid)))
+    @test isnothing(AutoRIFT._coarse_points(level, p, AutoRIFT.extent(32)))
 
     AutoRIFT._warm_grid_plans(grid, p)
     untiled = AutoRIFT.correlate_multichip(pair, grid, p)

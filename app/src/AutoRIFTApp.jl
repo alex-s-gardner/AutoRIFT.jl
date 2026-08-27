@@ -110,12 +110,15 @@ end
 # measures pair-level parallelism at 2.7x intra-pair threading anyway — so the shape this binary
 # wants is many single-threaded processes, which is exactly what it is.
 function app_params(chip_size::Int, search_radius::Int)
+    # The geometry fields are extents — `(X = …, Y = …)` named tuples. Written as literals rather
+    # than through `AutoRIFT.extent`, because a positional `Params` call is the trimmable entry point
+    # and every value here is already known to be square.
     return Params(
         (ZNCC(),), Highpass(), PyramidRefine(), GardnerFilter(), False(),
         NoRotationSearch(),
-        chip_size, chip_size, 4chip_size, 1.0,
-        chip_size,
-        search_radius, search_radius, 6,
+        (X = chip_size, Y = chip_size), (X = 4chip_size, Y = 4chip_size),
+        (X = chip_size, Y = chip_size),
+        (X = search_radius, Y = search_radius), 6,
         4, 8, 0.01,
         0.0, 0.0,
         3,
