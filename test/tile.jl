@@ -376,3 +376,41 @@ end
     b[1, 1] = -1
     @test a[3, 2] != -1
 end
+
+@testset "a threaded blocked run is deterministic and bounded" begin
+    # Two properties, and the second is the one that has broken twice.
+    #
+    # `_run_blocked` spawns `min(nblocks, nthreads)` tasks that claim blocks from a shared counter,
+    # so the task count is bounded rather than equal to the block count. Whether a task may *reuse*
+    # one buffer set across the blocks it claims is a separate question, and the answer is currently
+    # no: it is exact serially and at one thread, and wrong at eight, only ever in the blocks a task
+    # claims second or later. So a fresh set per block is what the code does, and this asserts the
+    # result that reuse breaks rather than the allocation strategy itself.
+    n = 1024
+    ref, sec = split_pair(n)
+    p = params(; chip_size = 32, chip_size_max = 32, grid_spacing = 16, search_radius = 12,
+               threaded = true)
+    raw = ImagePair(ref, sec)
+    grid = AutoRIFT._build_grid(size(raw), p)
+    AutoRIFT._warm_grid_plans(grid, p)
+    untiled = AutoRIFT.correlate_multichip(AutoRIFT._prepare(raw, p), grid, p)
+
+    # More blocks than threads on any ordinary machine, so tasks genuinely claim repeatedly.
+    for bs in ((20, 20), (8, 8))
+        first_run = AutoRIFT.correlate_tiled(raw, grid, p, bs)
+        assert_same_result(untiled, first_run, "threaded determinism, block $bs")
+        # Repeated: a race shows up as run-to-run variation even where one run happens to agree.
+        for _ in 1:2
+            again = AutoRIFT.correlate_tiled(raw, grid, p, bs)
+            @test isequal(again.dx, first_run.dx)
+            @test isequal(again.dy, first_run.dy)
+            @test isequal(again.correlation, first_run.correlation)
+        end
+    end
+
+    # One block and one task: the degenerate end of `min(nblocks, nthreads)`, which must still
+    # agree rather than taking a different path.
+    nr, nc = size(grid)
+    assert_same_result(untiled, AutoRIFT.correlate_tiled(raw, grid, p, (nr, nc)),
+                       "threaded, single block")
+end

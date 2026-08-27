@@ -474,19 +474,34 @@ function _run_blocked(raw::ImagePair, pts::PointSet{2}, p::Params, layout::Block
 
     serial = _serial_params(p)
     if istrue(p.threaded)
-        # One buffer set per task, not one per block: they are written into, so sharing them across
-        # concurrent blocks would race. That is the same contract a correlation workspace has, and it
-        # is why a threaded run cannot take the caller's single set.
+        # As many tasks as there are threads, capped by the block count, each claiming the next
+        # unclaimed block until they run out. Bounding the task count is what lets a later change
+        # bound the buffer count too; claiming dynamically is what keeps the tasks busy, since
+        # per-block cost varies by orders of magnitude — a block whose points a finer level already
+        # resolved returns before any I/O, so a static split would leave tasks idle.
         #
-        # Pooling these — borrowing `nthreads` sets rather than allocating one per block — saves real
-        # memory (48 of 105 MiB at 64 blocks on 8 threads) and is *not* correct as written: a
-        # `Channel` of sets made a threaded run disagree with an untiled one at 1330 of 3721 points.
-        # The buffers alias into `ImagePair` views that outlive `_run_one_block!`'s frame, so a set
-        # returned to the pool is still referenced by the pair a later block reads. Fixing that means
-        # making the borrow span the whole read-filter-correlate sequence, not just the call.
-        tasks = map(blocks) do b
-            StableTasks.@spawn _run_one_block!(out, block_buffers(raw, layout), raw, pts,
-                                              serial, b, geometry, measure, subpixel)
+        # Dynamic claiming cannot change the result: each block writes a disjoint slice of `out`, so
+        # the field is assembled rather than reduced and block order is not an input.
+        #
+        # A **fresh** buffer set per block, not one per task. Reusing a set across the blocks of one
+        # task is correct in isolation — verified exact both serially and at `-t1`, where a single
+        # task reuses one set across every block — but not when several such tasks run concurrently:
+        # at `-t8` it disagrees with an untiled run at 300-900 of 3721 points, varying run to run,
+        # and only ever in the blocks a task claims *second or later*. Something reachable from a
+        # block's `ImagePair` therefore outlives `_run_one_block!` and is read across tasks; until
+        # that is found, per-block allocation is the honest cost. `benchmark/memory.jl` records what
+        # it is: 441 MiB at 64 blocks against 55 for one set per task.
+        next = Threads.Atomic{Int}(1)
+        ntasks = min(length(blocks), Threads.nthreads())
+        tasks = map(1:ntasks) do _
+            StableTasks.@spawn begin
+                while true
+                    k = Threads.atomic_add!(next, 1)
+                    k <= length(blocks) || break
+                    _run_one_block!(out, block_buffers(raw, layout), raw, pts, serial,
+                                    blocks[k], geometry, measure, subpixel)
+                end
+            end
         end
         foreach(wait, tasks)
     else
