@@ -164,6 +164,10 @@ docstring. A name absent here is internal and may change in a patch release.
 const PUBLIC_NAMES = (
     # Configuration.
     :params, :Params, :chip_sizes, :chip_measures, :measure_at, :filter_width, :filter_reach,
+    # Geometry is two-dimensional throughout, and `Extent` is how it is spelled. Public because it
+    # appears in `Params`' fields and in every geometry keyword, so a caller building one by hand
+    # needs the name — and because a C caller's struct layout is derived from it.
+    :Extent, :extent,
     # The grid, which is how per-point fields reach the correlator.
     :PointSet, :pointset, :gridpoints, :scatter, :rebuild, :sanitize!,
     :npoints, :nsearchable, :issearchable, :chip_bounds, :search_bounds,

@@ -178,22 +178,64 @@ _badtype(kw::Symbol, x, expected) =
 # Numeric validation
 # ---------------------------------------------------------------------------
 
-# Chip sizes must be multiples of 4. Two independent reasons: the chip needs an
-# even half-extent in each direction, and the chip size halves at each
-# level, so an odd multiple would break the finest level's grid alignment.
-function _check_chip_size(name::Symbol, cs::Integer)
-    cs > 0 || throw(ArgumentError("`$name` must be positive, got $cs"))
-    cs % 4 == 0 ||
-        throw(ArgumentError("`$name` must be a multiple of 4, got $cs. Chip " *
-                            "sizes are halved at each chip-size level and need " *
-                            "an even half-extent in both directions."))
-    return Int(cs)
+# Chip sizes must be multiples of 4 in each axis. A chip's centre has to land on a pixel boundary
+# for its displacement to be reported at one, which needs an even extent; and a chip halved once
+# still needs an even half-extent, which is the second factor of two.
+function _check_chip_size(name::Symbol, cs)
+    e = extent(cs)
+    for (ax, v) in ((:X, e.X), (:Y, e.Y))
+        v > 0 || throw(ArgumentError("`$name` must be positive, got $v in $ax"))
+        v % 4 == 0 || throw(ArgumentError(
+            "`$name` must be a multiple of 4, got $v in $ax. A chip's centre lands on a pixel " *
+            "boundary only for an even extent, and a chip halved once needs an even half-extent."))
+    end
+    return e
 end
 
-_pair(x::Integer) = (Int(x), Int(x))
-_pair(x::Tuple{Integer,Integer}) = (Int(x[1]), Int(x[2]))
-_pair(x::AbstractVector) = length(x) == 2 ? (Int(x[1]), Int(x[2])) :
-    throw(ArgumentError("expected 1 or 2 values, got $(length(x))"))
+# Grid spacing: positive in each axis. Nothing divides by it in `src/`, so there is no further
+# constraint — `block_layout` walks the grid's own coordinates rather than assuming a spacing.
+function _check_spacing(sp)
+    e = extent(sp)
+    for (ax, v) in ((:X, e.X), (:Y, e.Y))
+        v > 0 || throw(ArgumentError("`grid_spacing` must be positive, got $v in $ax"))
+    end
+    return e
+end
+
+# Search radius: zero is allowed per axis — that is how a caller searches along one axis only — but
+# not in both, which would leave no pixel searchable.
+function _check_radius(r)
+    e = extent(r)
+    for (ax, v) in ((:X, e.X), (:Y, e.Y))
+        v >= 0 || throw(ArgumentError("`search_radius` must be >= 0, got $v in $ax"))
+    end
+    (e.X > 0 || e.Y > 0) || throw(ArgumentError(
+        "`search_radius` is zero in both axes, so no pixel can be searched."))
+    return e
+end
+
+# The levels `chip_size .* 2^k` must reach `chip_size_max` in both axes at the same k, so the aspect
+# a caller asked for holds at every level rather than drifting across them. That is what makes a
+# coarse grid point exactly a block of fine ones — see `src/multichip.jl`.
+#
+# So `(X=16, Y=32)` to `(X=32, Y=64)` is fine, both ratios being 2, while `(X=16, Y=16)` to
+# `(X=128, Y=64)` is not: x would reach its maximum after three doublings and y after two.
+function _check_levels(cmin::Extent, cmax::Extent)
+    (cmin.X <= cmax.X && cmin.Y <= cmax.Y) || throw(ArgumentError(
+        "`chip_size` ($(cmin.X) by $(cmin.Y)) must not exceed `chip_size_max` " *
+        "($(cmax.X) by $(cmax.Y)) in either axis."))
+    rx, ry = cmax.X ÷ cmin.X, cmax.Y ÷ cmin.Y
+    (cmax.X % cmin.X == 0 && cmax.Y % cmin.Y == 0 && ispow2(rx) && ispow2(ry)) ||
+        throw(ArgumentError(
+            "`chip_size_max` must be a power-of-two multiple of `chip_size` in each axis, " *
+            "because chip-size levels double at each step. Got $(cmin.X) to $(cmax.X) in X and " *
+            "$(cmin.Y) to $(cmax.Y) in Y."))
+    rx == ry || throw(ArgumentError(
+        "`chip_size_max` must be the same multiple of `chip_size` in both axes, so the chip's " *
+        "aspect ratio is the same at every level. Got $rx in X and $ry in Y — x would reach its " *
+        "maximum after a different number of doublings than y."))
+    return nothing
+end
 
 function _check_fraction(name::Symbol, v::Real)
     0 <= v <= 1 ||
@@ -244,16 +286,27 @@ choice is a known defect — see the package documentation for the list.
 - `subpixel = :pyramid`: peak refinement; see [`SubpixelMethod`](@ref).
 
 ## Chip and grid geometry, in pixels
-- `chip_size = 32`: finest chip size. Must be a multiple of 4.
-- `chip_size_min = chip_size`, `chip_size_max = 4 * chip_size`: range of chip sizes tried.
-  Levels are `chip_size * 2^k` within these bounds.
-- `chip_aspect = 1.0`: chip height as a multiple of width.
+
+Each of these is an **extent** — a quantity with an x and a y component. A scalar means square, and
+`(X = …, Y = …)` names the axes:
+
+```julia
+chip_size = 32                 # 32 by 32
+chip_size = (X = 16, Y = 32)   # taller than wide
+```
+
+- `chip_size = 32`: the finest chip-size level. Each axis must be a multiple of 4, so a chip's
+  centre lands on a pixel boundary and a chip halved once still has an even half-extent.
+- `chip_size_max = 4 * chip_size`: the coarsest level. Levels are `chip_size .* 2^k` up to this, so
+  `chip_size_max` must be the **same** power-of-two multiple of `chip_size` in both axes — the chip's
+  aspect ratio is therefore the same at every level, which is what makes a coarse grid point exactly
+  a block of fine ones.
 - `grid_spacing = chip_size`: spacing of output grid points.
 
 ## Search geometry, in pixels
-- `search_radius = 25`: half-extent of the search window. An `Int` sets both
-  axes; a `Tuple` sets them separately, as do `search_radius_x` and
-  `search_radius_y`. The window spans `2 * radius` in each direction.
+- `search_radius = 25`: half-extent of the search window, as an extent. The window spans
+  `2 * radius` in each direction. Zero in one axis searches along the other only; zero in both is an
+  error, since no pixel could be searched.
 - `min_search_radius = 6`: floor applied to non-zero radii, per axis.
 - `dx_prior = 0.0`, `dy_prior = 0.0`: a-priori displacement the search window is
   centred on.
@@ -301,13 +354,9 @@ function params(;
     filter_width = nokw,
     upsampling = nokw,
     chip_size = 32,
-    chip_size_min = nokw,
     chip_size_max = nokw,
-    chip_aspect = 1.0,
     grid_spacing = nokw,
     search_radius = 25,
-    search_radius_x = nokw,
-    search_radius_y = nokw,
     min_search_radius = 6,
     dx_prior = 0.0,
     dy_prior = 0.0,
@@ -336,40 +385,17 @@ function params(;
                                min_agree_fraction, agree_tolerance, mad_scale))
     rot = _rotation(rotation)
 
-    base = _check_chip_size(:chip_size, chip_size)
-    cmin = isnokw(chip_size_min) ? base : _check_chip_size(:chip_size_min, chip_size_min)
-    cmax = isnokw(chip_size_max) ? 4base : _check_chip_size(:chip_size_max, chip_size_max)
+    cmin = _check_chip_size(:chip_size, chip_size)
+    cmax = isnokw(chip_size_max) ? (X = 4cmin.X, Y = 4cmin.Y) :
+        _check_chip_size(:chip_size_max, chip_size_max)
+    _check_levels(cmin, cmax)
 
-    cmin <= cmax || throw(ArgumentError(
-        "`chip_size_min` ($cmin) must be <= `chip_size_max` ($cmax)"))
-    base <= cmin || throw(ArgumentError(
-        "`chip_size` ($base) must be <= `chip_size_min` ($cmin). `chip_size` " *
-        "is the finest chip-size level; coarser levels are its powers-of-two " *
-        "multiples."))
-    cmax % base == 0 || throw(ArgumentError(
-        "`chip_size_max` ($cmax) must be a power-of-two multiple of " *
-        "`chip_size` ($base), because chip-size levels double at each step."))
-    ispow2(cmax ÷ base) || throw(ArgumentError(
-        "`chip_size_max` ($cmax) must be a power-of-two multiple of " *
-        "`chip_size` ($base), got a ratio of $(cmax ÷ base)."))
-
-    spacing = isnokw(grid_spacing) ? base :
-        Int(_check_positive(:grid_spacing, grid_spacing))
-
-    # `search_radius` sets both axes; the per-axis keywords override it.
-    rx0, ry0 = _pair(search_radius)
-    rx = isnokw(search_radius_x) ? rx0 : Int(search_radius_x)
-    ry = isnokw(search_radius_y) ? ry0 : Int(search_radius_y)
-    rx >= 0 || throw(ArgumentError("`search_radius_x` must be >= 0, got $rx"))
-    ry >= 0 || throw(ArgumentError("`search_radius_y` must be >= 0, got $ry"))
-    (rx > 0 || ry > 0) || throw(ArgumentError(
-        "`search_radius` is zero in both axes, so no pixel can be searched."))
+    spacing = isnokw(grid_spacing) ? cmin : _check_spacing(grid_spacing)
+    rad = _check_radius(search_radius)
 
     return Params(
         sim, pre, sub, out, booltype(threaded), rot,
-        base, cmin, cmax, Float64(_check_positive(:chip_aspect, chip_aspect)),
-        spacing,
-        rx, ry, Int(min_search_radius),
+        cmin, cmax, spacing, rad, Int(min_search_radius),
         Int(_check_positive(:coarse_stride, coarse_stride)),
         Int(coarse_buffer),
         _check_fraction(:min_coarse_valid_fraction, min_coarse_valid_fraction),

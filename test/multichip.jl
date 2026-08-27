@@ -209,14 +209,12 @@ end
     @test r.interpolated isa BitMatrix
 
     # Every valid parameter set selects at least one level, because `params` requires
-    # `chip_size <= chip_size_min <= chip_size_max` with power-of-two ratios. Checked here so
-    # the invariant the pyramid relies on is pinned at the boundary that establishes it.
-    for (b, mn, mx) in ((32, 32, 32), (32, 64, 64), (16, 64, 128), (32, 32, 128))
-        @test !isempty(AutoRIFT.chip_sizes(params(; chip_size = b, chip_size_min = mn,
-                                                  chip_size_max = mx)))
+    # `chip_size <= chip_size_max` with the same power-of-two ratio in both axes. Checked here so
+    # the invariant the level loop relies on is pinned at the boundary that establishes it.
+    for (mn, mx) in ((32, 32), (64, 64), (16, 128), (32, 128))
+        @test !isempty(AutoRIFT.chip_sizes(params(; chip_size = mn, chip_size_max = mx)))
     end
-    @test_throws ArgumentError params(; chip_size = 32, chip_size_min = 96,
-                                      chip_size_max = 96)
+    @test_throws ArgumentError params(; chip_size = 32, chip_size_max = 96)
 end
 
 @testset "the coarse mask sits on the lattice the radii were reduced over" begin

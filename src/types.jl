@@ -57,6 +57,26 @@ supports instead of merely more than it supports.
 """
 const ImageElement = Union{Real,Complex}
 
+"""
+    AutoRIFT.Extent
+
+A quantity with an x and a y component, in pixels: `(X = 16, Y = 32)`.
+
+Chip size, search radius and grid spacing are all two-dimensional, and naming the axes is what
+makes a transposition visible. `chip.X` reads as itself where `chip[1]` needs the convention looked
+up — and a transposed extent is the error this package has already made twice, once in a point set
+and once in an FFT size that "for a symmetric test size looks like it works".
+
+A `NamedTuple` rather than a struct, and that is load-bearing three ways. It stays `isbitstype`, so
+`Params` does and the trimmed binary keeps its inline layout. It is byte-identical to
+`Tuple{Int,Int}` — 16 bytes, offsets 0 and 8 — so it maps to `struct { int64_t x, y; }` with no
+padding for a C caller, since the names live in the type rather than the data. And it is writable as
+a literal, where a struct would need a constructor call at every site.
+
+Build one from a scalar or a tuple with [`AutoRIFT.extent`](@ref); a scalar means square.
+"""
+const Extent = NamedTuple{(:X, :Y),Tuple{Int,Int}}
+
 abstract type BoolAsType end
 struct True <: BoolAsType end
 struct False <: BoolAsType end
@@ -883,15 +903,14 @@ struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:Preproces
     threaded::T
     rotation::W
 
-    # Chip geometry (pixels). `chip_size_base` is the finest chip-size level and
-    # the reference for grid spacing; levels are base * 2^k.
-    chip_size_base::Int
-    chip_size_min::Int
-    chip_size_max::Int
-    chip_aspect::Float64
+    # Chip geometry (pixels). Levels are `chip_size_min .* 2^k` up to `chip_size_max`, and
+    # `chip_size_max ./ chip_size_min` is the same power of two in both axes — so the aspect is
+    # constant across levels, which is what makes a coarse grid point exactly a block of fine ones.
+    chip_size_min::Extent
+    chip_size_max::Extent
 
-    # Grid geometry (pixels).
-    grid_spacing::Int
+    # Grid geometry (pixels). Also the default reference for how far apart output points sit.
+    grid_spacing::Extent
 
     # Search geometry (pixels). Radius, not width: the search window spans
     # 2*radius. Naming this "limit" as the reference does is what produced its
@@ -900,10 +919,9 @@ struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:Preproces
     # x and y are independent, not a convenience split of one number. Geogrid
     # projects the a-priori velocity onto each image axis separately, so an ice
     # stream flowing along x legitimately gets a wide x-radius and a narrow
-    # y-radius. These scalars are the fallback when no per-pixel radius field is
-    # supplied; the per-pixel case carries two separate arrays in lockstep.
-    search_radius_x::Int
-    search_radius_y::Int
+    # y-radius. This is the fallback when no per-pixel radius field is supplied;
+    # the per-pixel case carries two separate arrays in lockstep.
+    search_radius::Extent
     min_search_radius::Int
     coarse_stride::Int
     coarse_buffer::Int
@@ -923,25 +941,54 @@ struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:Preproces
 end
 
 """
-    chip_sizes(p::Params) -> Vector{Int}
+    chip_sizes(p::Params) -> Vector{Extent}
 
-The chip-size levels actually used, ascending. Levels are
-`chip_size_base * 2^k` for `k = 0, 1, ...`, restricted to
-`[chip_size_min, chip_size_max]`.
+The chip-size levels actually used, ascending. Levels are `chip_size_min .* 2^k` up to
+`chip_size_max`.
+
+Both axes double together, which is well-defined because `params` requires
+`chip_size_max ./ chip_size_min` to be the same power of two in each — so the aspect a caller asked
+for holds at every level rather than drifting across them.
 
 Ascending order is load-bearing: every level only writes where no finer level
 already produced a value, so the *smallest* chip that yields a valid estimate
 wins. Small chips resolve detail; large chips succeed in low-texture areas.
 """
 function chip_sizes(p::Params)
-    sizes = Int[]
-    cs = p.chip_size_base
-    while cs <= p.chip_size_max
-        cs >= p.chip_size_min && push!(sizes, cs)
-        cs *= 2
+    sizes = Extent[]
+    cs = p.chip_size_min
+    while cs.X <= p.chip_size_max.X
+        push!(sizes, cs)
+        cs = (X = 2cs.X, Y = 2cs.Y)
     end
     return sizes
 end
+
+"""
+    AutoRIFT.extent(x) -> Extent
+
+An [`AutoRIFT.Extent`](@ref) from a scalar, a tuple, or a named tuple.
+
+A scalar means square — `32` is `(X = 32, Y = 32)` — which is what nearly every call wants and what
+keeps the common spelling short. `(X = 16, Y = 32)` names the axes; a bare `(16, 32)` is accepted as
+x-then-y, matching the order every other pair in this package uses.
+"""
+extent(x::Integer) = Extent((Int(x), Int(x)))
+extent(x::Extent) = x
+extent(x::NamedTuple{(:X, :Y)}) = Extent((Int(x.X), Int(x.Y)))
+extent(x::Tuple{Integer,Integer}) = Extent((Int(x[1]), Int(x[2])))
+extent(x::AbstractVector) = length(x) == 2 ? Extent((Int(x[1]), Int(x[2]))) :
+    throw(ArgumentError("an extent needs 1 or 2 values, got $(length(x))"))
+extent(x::NamedTuple) = throw(ArgumentError(
+    "an extent's fields must be `X` and `Y`, got a named tuple with $(length(x)) other field(s)"))
+
+# A fractional value is a caller mistake rather than a rounding request, and anything else is the
+# wrong kind entirely. Named here rather than left to a `MethodError`, which would report a method
+# table instead of the constraint.
+extent(x::Real) = throw(ArgumentError(
+    "an extent must be a whole number of pixels: expected an integer value, got $x"))
+extent(x) = throw(ArgumentError(
+    "an extent must be a number or a pair of numbers, got a $(typeof(x))"))
 
 """
     chip_measures(p::Params, nlevels::Integer) -> Tuple
@@ -998,15 +1045,6 @@ function _check_measures(p::Params, nlevels::Integer)
         "applies to every remaining level."))
     return nothing
 end
-
-"""
-    chip_size_y(p::Params, chip_size_x::Integer) -> Int
-
-Chip height for a given width, forced even so that the chip has a well-defined
-half-extent in both directions.
-"""
-chip_size_y(p::Params, chip_size_x::Integer) =
-    2 * round(Int, chip_size_x * p.chip_aspect / 2)
 
 # Search-radius normalisation lives with the point set it operates on; see
 # `sanitize!` in points.jl.

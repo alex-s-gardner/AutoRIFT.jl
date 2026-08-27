@@ -43,7 +43,8 @@ let g = addgroup!(SUITE, "multichip")
         # a handful of points — microseconds, dominated by setup, and it would report the
         # measurement floor rather than the cost.
         if n == 1024
-            pts = AutoRIFT._level_points(grid, p, 32, 32, wanted)
+            cs = AutoRIFT.extent(32)
+            pts = AutoRIFT._level_points(grid, p, cs, wanted)
             # A `WholeScene` runner, because that is how a whole-scene pass is executed — the same
             # `_coarse_mask` serves a blocked run through a `Blocked` runner instead.
             #
@@ -52,7 +53,7 @@ let g = addgroup!(SUITE, "multichip")
             # level it is. Kept in step with `chipsize_level`'s call rather than relying on a default.
             runner = AutoRIFT.WholeScene(prepared)
             g["coarse pass c32 $(n)x$(n)"] = @benchmarkable AutoRIFT._coarse_mask(
-                $runner, $pts, $p, 32, 32, AutoRIFT.measure_at($p, 1))
+                $runner, $pts, $p, $cs, AutoRIFT.measure_at($p, 1))
         end
     end
 

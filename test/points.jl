@@ -56,11 +56,16 @@ end
     @test pts.chip_size_x == [16, 32, 64]
     @test pts.dx_prior == [0.0, 2.5, -3.0]
 
-    # chip_size_y derives from chip_size_x via the aspect, forced even.
-    pts = pointset([1.0], [1.0]; chip_size = 32, chip_aspect = 0.5)
+    # A non-square chip is stated, not derived: an extent names both axes.
+    pts = pointset([1.0], [1.0]; chip_size = (X = 32, Y = 16))
+    @test pts.chip_size_x == [32]
     @test pts.chip_size_y == [16]
-    pts = pointset([1.0], [1.0]; chip_size = 32, chip_aspect = 0.7)
-    @test iseven(pts.chip_size_y[1])
+    # A scalar means square.
+    pts = pointset([1.0], [1.0]; chip_size = 32)
+    @test pts.chip_size_x == pts.chip_size_y == [32]
+    # And the per-axis keyword still takes a per-point array, which an extent cannot express.
+    pts = pointset([1.0, 2.0], [1.0, 2.0]; chip_size = 32, chip_size_y = [16, 48])
+    @test pts.chip_size_y == [16, 48]
 
     # An integer field must not silently swallow a fractional value: a chip size
     # of 32.5 is a caller mistake, not a rounding request.
@@ -70,8 +75,7 @@ end
     @test_throws DimensionMismatch pointset([1.0, 2.0], [1.0])
     @test_throws DimensionMismatch pointset([1.0, 2.0], [1.0, 2.0];
                                             search_radius_x = [1, 2, 3])
-    @test_throws "must be a number or an array" pointset([1.0], [1.0];
-                                                         chip_size = :big)
+    @test_throws "must be a number or a pair" pointset([1.0], [1.0]; chip_size = :big)
 end
 
 @testset "gridded points" begin
