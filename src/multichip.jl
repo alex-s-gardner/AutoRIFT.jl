@@ -238,11 +238,6 @@ chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size,
                measure::SimilarityMeasure = first(p.similarity)) =
     chipsize_level(WholeScene(pair), grid, p, extent(chip_size), wanted, measure)
 
-# A scalar or plain tuple from a caller who reached for the runner form directly.
-chipsize_level(runner::PassRunner, grid::PointSet{2}, p::Params, chip_size,
-               wanted::AbstractMatrix{Bool}, measure::SimilarityMeasure) =
-    chipsize_level(runner, grid, p, extent(chip_size), wanted, measure)
-
 # One chip-size level, however its passes are executed.
 #
 # There is one sequence of steps here, not one per driver, and that is the point: a whole-scene run
@@ -252,6 +247,9 @@ chipsize_level(runner::PassRunner, grid::PointSet{2}, p::Params, chip_size,
 # a second copy of this function.
 #
 # `runner` is positional: a keyword carrying an abstract type is unresolvable under `--trim`.
+#
+# `chip_size` is an `Extent` and not a scalar here, because the only caller is the level loop, which
+# already has one from `chip_sizes`. The public `ImagePair` form above is where a scalar is accepted.
 function chipsize_level(runner::PassRunner, grid::PointSet{2}, p::Params,
                         chip_size::Extent, wanted::AbstractMatrix{Bool},
                         measure::SimilarityMeasure)
