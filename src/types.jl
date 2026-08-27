@@ -605,12 +605,22 @@ filter_width(m::Union{Highpass,Wallis,WallisGapfill,Sobel,Laplacian}) = m.width
 How many pixels beyond a region must be supplied for the filter's output *inside* that region to
 equal what filtering the whole image would give.
 
+**Negative means no finite reach**, so check the sign before using the result as a width. A filter
+that estimates from the whole image — [`Deramp`](@ref) — cannot be reproduced from a window of any
+size, and returns `-1` rather than a large number that would merely be less wrong. Adding a negative reach
+to a correlation extent yields a halo *shorter* than the correlation alone, which is exactly the
+silent under-read this trait exists to prevent; [`AutoRIFT.halo`](@ref) throws instead.
+
 Separate from [`filter_width`](@ref) because the two differ, and the difference is not a detail: a
 filter that applies two chained window passes reaches twice its half-width, since the second pass
 consumes the first's output over its own window. Tiled processing sizes its halo from this, so a
 value that is too small produces a filter output that is quietly wrong near every block edge rather
 than merely different — measured at 792 of 10201 points differing by up to 0.21 for `Wallis(5)` when
 padded by `width ÷ 2` instead of twice that.
+
+A reach may also be far larger than the window suggests when the filter's *decisions* are not
+windowed: [`WallisGapfill`](@ref) reaches `GAPFILL_REACH` plus its dilation plus its window, because
+whether a pixel is filled depends on how far the nearest real data lies.
 
 Pinned per method by a test that measures the true reach and compares it against this trait, so the
 two cannot drift.

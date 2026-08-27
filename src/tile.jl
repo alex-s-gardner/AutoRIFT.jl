@@ -168,9 +168,10 @@ function block_layout(grid::PointSet{2}, p::Params, imagesize::Tuple{Int,Int},
     nr, nc = size(grid)
     nrows, ncols = imagesize
     # Where each block starts, walked from the coordinates so no block spans more than the request.
-    # `grid.y` runs down rows and `grid.x` across columns, so the row starts take the y extent.
-    rowstarts = _block_starts(grid.y, py, nr, 1)
-    colstarts = _block_starts(grid.x, px, nc, 2)
+    # `grid.y` runs down rows and `grid.x` across columns, so the row starts take the y extent. The
+    # views are free and make the axis explicit at the call rather than a parameter to be got wrong.
+    rowstarts = _block_starts(view(grid.y, :, 1), py)
+    colstarts = _block_starts(view(grid.x, 1, :), px)
 
     blocks = Block[]
     for (ci, c0) in pairs(colstarts), (ri, r0) in pairs(rowstarts)
@@ -188,8 +189,9 @@ function block_layout(grid::PointSet{2}, p::Params, imagesize::Tuple{Int,Int},
     return BlockLayout(blocks, (hx, hy))
 end
 
-# The index each block starts at along dimension `dim`, so no block's coordinates span more than
-# `want` pixels.
+# The index each block starts at along one axis, so no block's coordinates span more than `want`
+# pixels. `coord` is that axis's coordinates — a gridded `PointSet` repeats the same coordinate down
+# every row and across every column, so one row or column describes the whole axis.
 #
 # Walked rather than divided, because a caller-supplied grid need not be uniformly spaced:
 # `gridpoints(xs, ys)` takes arbitrary coordinate vectors, so no single `grid_spacing` describes the
@@ -200,19 +202,16 @@ end
 # Each block takes as many points as fit, and always at least one — a zero-point block would divide
 # the grid into nothing. One point is therefore the only case that may exceed `want`, and it needs a
 # gap wider than a whole block to arise.
-function _block_starts(coord::AbstractMatrix, want::Int, n::Int, dim::Int)
-    starts = [1]
-    n <= 1 && return starts
-    # A gridded `PointSet` repeats the same coordinate down every row or across every column, which
-    # is what makes it gridded — so one fixed index of the other axis describes the whole axis.
-    at(i) = dim == 1 ? coord[i, 1] : coord[1, i]
-    origin = at(1)
-    @inbounds for i in 2:n
+function _block_starts(coord::AbstractVector, want::Int)
+    starts = [firstindex(coord)]
+    length(coord) <= 1 && return starts
+    origin = first(coord)
+    @inbounds for i in (firstindex(coord) + 1):lastindex(coord)
         # Start a new block once this point would carry the current one past `want`. The comparison
         # is on the span from the block's first point, so rounding cannot accumulate across blocks.
-        if abs(at(i) - origin) > want
+        if abs(coord[i] - origin) > want
             push!(starts, i)
-            origin = at(i)
+            origin = coord[i]
         end
     end
     return starts

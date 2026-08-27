@@ -53,6 +53,14 @@ using AutoRIFT: ImagePair, gridpoints, params, scatter, issearchable,
     # negative reach says "not blockwise-reproducible" rather than naming a large number that would
     # merely be less wrong.
     @test AutoRIFT.filter_reach(Deramp()) < 0
+    # And every other method returns something usable as a width, so a caller checking the sign has
+    # a complete answer. Asserted across the whole set rather than for `Deramp` alone: the negative
+    # value is a second kind of answer from one function, and the guard below is what stops it being
+    # added to a correlation extent to give a halo *shorter* than the correlation itself.
+    for m in (NoPreprocess(), Decibel(), Highpass(5), Wallis(; width = 5),
+              WallisGapfill(; width = 5), Sobel(; width = 5), Laplacian(; width = 5))
+        @test AutoRIFT.filter_reach(m) >= 0
+    end
 
     @testset "WallisGapfill reaches far past its window, but finitely" begin
         # Its reach is set by a *decision* rather than by a window: an invalid pixel is an interior

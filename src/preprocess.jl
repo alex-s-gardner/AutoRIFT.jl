@@ -70,6 +70,21 @@ Only the lazy masks this package constructs are recognized. A caller supplying a
 resident(m::AbstractMatrix{Bool}) = m
 resident(m::FiniteMask) = Matrix{Bool}(m)
 
+# The windowed filters read their mask many times over and begin with a whole-array `all`, so a
+# computed mask is the wrong representation for them: `all` on a `FiniteMask` costs 425 us at 1024²
+# against 4.6 for a dense one, and the per-window reads then repeat that work.
+#
+# Materializing here rather than trusting every caller to is what makes the invariant structural.
+# `_prepare` already calls `resident`, so these methods are unreachable from the untiled path, and
+# `_read_block!` copies into dense buffers, so they are unreachable from the blocked one. They exist
+# for the third caller — a future one — that would otherwise be correct but quietly slow.
+_masked_boxmean!(out::AbstractMatrix{Float32}, img::AbstractMatrix, mask::FiniteMask, w::Int,
+                 scratch::Union{Nothing,AbstractMatrix{Float32}}) =
+    _masked_boxmean!(out, img, resident(mask), w, scratch)
+
+_erode_mask!(out::AbstractMatrix{Bool}, mask::FiniteMask, w::Int) =
+    _erode_mask!(out, resident(mask), w)
+
 """
     ImagePair{T}
 
@@ -332,13 +347,14 @@ function wallis_gapfill(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool},
             out[i] = Float32(randn(rng))
             v[i] = true
         else
+            # `mask[i]` holds here without testing it: this branch needs `domain[i] && !fill[i]`,
+            # and `gaps ⊆ fill ⊆ domain`, so `!fill` implies `!gaps`, and `(mask | gaps) && !gaps`
+            # is `mask`. A non-finite local statistic is still possible, though, and lands below.
             m, s = mean[i], sd[i]
-            if mask[i] && isfinite(m) && isfinite(s) && s > 0
+            if isfinite(m) && isfinite(s) && s > 0
                 out[i] = (Float32(img[i]) - m) / s
                 v[i] = true
             else
-                # Not reachable through the branches above for a well-formed input, but a
-                # non-finite sample would land here rather than writing a NaN downstream.
                 out[i] = 0.0f0
                 v[i] = false
             end
@@ -483,20 +499,55 @@ function _convolve_masked(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool
     # Left-biased centre, matching the window conventions in `window.jl` so an even width — which
     # the constructors reject, but which a direct call could still reach — lands consistently.
     ci, cj = (kh ÷ 2) + 1, (kw ÷ 2) + 1
-    rows, cols = axes(img)
-    out = Matrix{Float32}(undef, size(img))
-    @inbounds for j in cols, i in rows
+    nr, nc = size(img)
+    out = Matrix{Float32}(undef, nr, nc)
+
+    # The interior, where every tap of the window is in bounds, so the per-tap range test the edge
+    # loop needs cannot fail. Splitting it out is worth a measurement rather than assumed: the taps
+    # are cheap enough that the two range checks per tap dominated, and hoisting them out of the
+    # interior — which is all but a `kh`-wide frame of the image — cut the filter by a third.
+    #
+    # `all(mask)` decides the mask test the same way, and for the same reason `_masked_boxmean!` and
+    # `_erode_mask!` both check it: a gap-free image is the common case, and on one the test is pure
+    # overhead. Both loops are otherwise identical, which is why the body is a macro-free function
+    # of the mask predicate rather than two hand-copied loops.
+    dense = all(mask)
+    ilo, ihi = ci, nr - (kh - ci)
+    jlo, jhi = cj, nc - (kw - cj)
+    @inbounds for j in 1:nc, i in 1:nr
+        interior = ilo <= i <= ihi && jlo <= j <= jhi
         acc = 0.0f0
         any_valid = false
-        for kj in 1:kw
-            jj = j + (kj - cj)
-            jj in cols || continue
-            for ki in 1:kh
-                ii = i + (ki - ci)
-                ii in rows || continue
-                mask[ii, jj] || continue
-                acc += kernel[ki, kj] * Float32(img[ii, jj])
-                any_valid = true
+        if interior && dense
+            # Nothing to test: every tap is in bounds and every pixel is valid.
+            for kj in 1:kw
+                jj = j + (kj - cj)
+                for ki in 1:kh
+                    acc += kernel[ki, kj] * Float32(img[i + (ki - ci), jj])
+                end
+            end
+            any_valid = true
+        elseif interior
+            for kj in 1:kw
+                jj = j + (kj - cj)
+                for ki in 1:kh
+                    ii = i + (ki - ci)
+                    mask[ii, jj] || continue
+                    acc += kernel[ki, kj] * Float32(img[ii, jj])
+                    any_valid = true
+                end
+            end
+        else
+            for kj in 1:kw
+                jj = j + (kj - cj)
+                1 <= jj <= nc || continue
+                for ki in 1:kh
+                    ii = i + (ki - ci)
+                    1 <= ii <= nr || continue
+                    mask[ii, jj] || continue
+                    acc += kernel[ki, kj] * Float32(img[ii, jj])
+                    any_valid = true
+                end
             end
         end
         out[i, j] = any_valid ? acc : NaN32
