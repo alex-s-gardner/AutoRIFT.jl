@@ -335,3 +335,36 @@ function inferred_type(f, argtypes::Tuple)
     length(ts) == 1 || error("expected one method for $f$(argtypes), inference gave $(length(ts))")
     return only(ts)
 end
+
+"""
+    split_pair(n; shift_a, shift_b, seed) -> (reference, secondary)
+
+A pair whose left and right halves are displaced differently, so the vertical seam between them is
+a real discontinuity in the displacement field.
+
+A blocked-vs-untiled comparison needs a block boundary that falls *through* a feature. A boundary in uniformly
+shifted texture is satisfied by a halo of zero — every block sees the same motion its neighbours
+do — so it would pass whatever the halo were and prove nothing about it.
+"""
+function split_pair(n::Integer; shift_a = (3.0, 1.0), shift_b = (-2.0, -3.0), seed = 11)
+    a1, b1 = shifted_pair((n, n), shift_a; seed)
+    a2, b2 = shifted_pair((n, n), shift_b; seed = seed + 1)
+    ref, sec = copy(a1), copy(b1)
+    right = (n ÷ 2 + 1):n
+    ref[:, right] .= a2[:, right]
+    sec[:, right] .= b2[:, right]
+    return ref, sec
+end
+
+# Every field, so a divergence cannot hide in the one that is not compared. `isequal` rather than
+# `==` because `NaN` marks "not measured" across most of these arrays and must compare equal to
+# itself; exact rather than approximate because both runs happen in this process, sharing its FFTW
+# wisdom and plan cache — the drift that makes cross-process `correlation` comparison unreliable is
+# not in play, so an inexact match here is a bug rather than planner noise.
+function assert_same_result(untiled, tiled, tag)
+    @testset "$tag" begin
+        for f in (:dx, :dy, :correlation, :chip_size, :interpolated)
+            @test isequal(getfield(untiled, f), getfield(tiled, f))
+        end
+    end
+end

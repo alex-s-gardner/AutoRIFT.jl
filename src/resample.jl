@@ -19,12 +19,30 @@
 # is NaN wherever there was no measurement.
 
 """
-    Nearest, Area, Bicubic
+    Nearest()
 
-Resampling methods. See [`resample`](@ref) for which is appropriate where.
+Nearest-neighbour resampling: each destination sample takes the value of the source sample containing
+its centre. The right choice for a mask, where an interpolated value between two categories would mean
+nothing. See [`resample`](@ref).
 """
 struct Nearest end
+
+"""
+    Area()
+
+Area-averaging resampling: each destination sample is the mean of the source samples its footprint
+covers, weighted by overlap and ignoring `NaN`. The right choice for decimating a measured field,
+where a point sample would discard most of the data. See [`resample`](@ref).
+"""
 struct Area end
+
+"""
+    Bicubic()
+
+Bicubic resampling: a smooth interpolant over the surrounding 4-by-4 neighbourhood. The right choice
+for upsampling a displacement field into a prior, where nearest-neighbour would put visible seams in
+the output. See [`resample`](@ref).
+"""
 struct Bicubic end
 
 """

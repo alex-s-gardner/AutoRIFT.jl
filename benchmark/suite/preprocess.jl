@@ -1,4 +1,4 @@
-# Pre-correlation filters and quantization. Populated at M3.
+# Pre-correlation filters. Populated at M3.
 #
 # Reported as Mpixel/sec against the corresponding cv2 call, since these run over
 # the full image rather than the grid and so scale with scene size rather than
@@ -22,9 +22,9 @@ let g = addgroup!(SUITE, "preprocess")
         g["wallis w5 $(n)x$(n)"] = @benchmarkable AutoRIFT.wallis($img, $mask, 5)
 
         # The full path a caller actually takes: filter both images, shrink the masks,
-        # then convert to the correlation element type.
+        # then replace whatever came out non-finite.
         pair = AutoRIFT.ImagePair(img, bench_texture((n, n); seed = 2))
-        g["preprocess+quantize $(n)x$(n)"] = @benchmarkable AutoRIFT.quantize(
-            AutoRIFT.preprocess($pair, AutoRIFT.Highpass(; width = 5)), :uint8)
+        g["preprocess+prepare $(n)x$(n)"] = @benchmarkable AutoRIFT.replace_nonfinite(
+            AutoRIFT.preprocess($pair, AutoRIFT.Highpass(; width = 5)))
     end
 end

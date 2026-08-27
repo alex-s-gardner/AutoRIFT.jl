@@ -317,7 +317,7 @@ end
     a = synthetic_texture(n)
     b = rotate_bilinear(a, 3.0)
 
-    kw = (; chip_size = 32, chip_size_max = 32, search_radius = 8, quantize = :none,
+    kw = (; chip_size = 32, chip_size_max = 32, search_radius = 8,
           outliers = :none)
     plain = autorift(a, b; kw...)
     rotated = autorift(a, b; kw..., rotation = RotationSearch((-3.0, 0.0, 3.0)))

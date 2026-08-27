@@ -218,3 +218,66 @@ end
     @test_throws ArgumentError params(; chip_size = 32, chip_size_min = 96,
                                       chip_size_max = 96)
 end
+
+@testset "the coarse mask sits on the lattice the radii were reduced over" begin
+    # `_cell_max_radius!` takes the maximum radius over the cell *centred* on each coarse point,
+    # and `_expand_coarse_mask` inverts that assignment. The two have to agree for every fine
+    # index, because the mask restricts the fine search and the radii are the evidence behind it.
+    #
+    # `resample(..., Nearest())` does not: it derives cell boundaries from the size ratio, which
+    # for an even stride are left-aligned rather than centred. At `nr = 13, stride = 4` it puts
+    # fine row 5 in coarse cell 2 while the radius for that row came from cell 1.
+    for stride in (2, 3, 4, 5, 8), n in (7, 13, 20, 33, 64)
+        rows = stride:stride:n
+        isempty(rows) && continue
+        ncoarse = length(rows)
+        lo = stride ÷ 2
+        hi = stride - 1 - lo
+
+        # Which coarse cell each fine index draws its radius from, read straight off
+        # `_cell_max_radius!`'s window: a one-hot radius field at coarse point `k` must reduce to
+        # a nonzero maximum exactly for the fine indices that cell covers.
+        radius_cell = zeros(Int, n)
+        for (k, r) in enumerate(rows), i in max(r - lo, 1):min(r + hi, n)
+            radius_cell[i] = k
+        end
+
+        mask_cell = zeros(Int, n)
+        for k in 1:ncoarse
+            onehot = falses(ncoarse, 1)
+            onehot[k, 1] = true
+            expanded = AutoRIFT._expand_coarse_mask(onehot, (n, 1), stride)
+            for i in 1:n
+                expanded[i, 1] && (mask_cell[i] = k)
+            end
+        end
+
+        # Every fine index belongs to exactly one coarse cell, and it is the same one in both
+        # directions wherever the radius reduction defines it.
+        @test all(mask_cell[i] > 0 for i in 1:n)
+        for i in 1:n
+            radius_cell[i] == 0 && continue
+            @test mask_cell[i] == radius_cell[i]
+        end
+    end
+
+    # And the case that exposed the defect, asserted concretely rather than only as a property.
+    onehot = falses(3, 1)
+    onehot[1, 1] = true
+    @test vec(AutoRIFT._expand_coarse_mask(onehot, (13, 1), 4)) ==
+          [true, true, true, true, true, false, false, false, false, false, false, false, false]
+    # `resample` disagrees here, which is why it is not used for this.
+    viaresample = vec(resample(Float32.(onehot), (13, 1), Nearest())) .> 0.5f0
+    @test viaresample != vec(AutoRIFT._expand_coarse_mask(onehot, (13, 1), 4))
+
+    # A coarse point's own fine index always lands in its own cell, at any stride.
+    for stride in (2, 3, 4, 7)
+        n = 40
+        rows = stride:stride:n
+        for (k, r) in enumerate(rows)
+            onehot = falses(length(rows), 1)
+            onehot[k, 1] = true
+            @test AutoRIFT._expand_coarse_mask(onehot, (n, 1), stride)[r, 1]
+        end
+    end
+end

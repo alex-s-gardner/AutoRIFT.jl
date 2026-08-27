@@ -51,9 +51,9 @@ The element types the correlator accepts: `Real` for optical and amplitude image
 single-look-complex radar under [`Coherence`](@ref).
 
 `Union{Real,Complex}` rather than `Number`, which is what the type walls first said. `Number` admits
-types no path here handles — `Rational` reaches `quantize` and dies as a bare `MethodError` five
-layers down, with no mention of the actual constraint. Naming the real bound once makes the
-signatures state what the pipeline supports instead of merely more than it supports.
+types no path here handles, which die as a bare `MethodError` several layers down with no mention of
+the actual constraint. Naming the real bound once makes the signatures state what the pipeline
+supports instead of merely more than it supports.
 """
 const ImageElement = Union{Real,Complex}
 
@@ -346,6 +346,21 @@ end
 WallisGapfill(; width = 5, min_std = 0.25) = WallisGapfill(width, min_std)
 
 """
+    AutoRIFT.GAPFILL_REACH
+
+How far real data may lie from an invalid pixel for that pixel to count as an interior gap rather
+than as outer no-data border, in pixels. From the reference.
+
+An interior gap is filled with noise; a border is left invalid. The distinction matters because
+noise is only defensible where there is nearby data for it to be statistically consistent with.
+"""
+const GAPFILL_REACH = 30.0
+
+# Half-diagonal of a `w`-by-`w` window: the distance at which a pixel's window can still reach a
+# gap, and so how far a gap's influence is grown before the normalized output around it is trusted.
+_gapfill_buffer(w::Integer) = sqrt(2 * ((Int(w) - 1) / 2)^2) + 0.01
+
+"""
     Sobel(; width = 5)
 
 Sum of the Sobel derivative kernels in x and y, giving an edge-emphasising
@@ -584,6 +599,58 @@ Side length of the filter window, or `0` for methods that take no window.
 filter_width(::Union{NoPreprocess,Decibel,Deramp}) = 0
 filter_width(m::Union{Highpass,Wallis,WallisGapfill,Sobel,Laplacian}) = m.width
 
+"""
+    AutoRIFT.filter_reach(method::PreprocessMethod) -> Int
+
+How many pixels beyond a region must be supplied for the filter's output *inside* that region to
+equal what filtering the whole image would give.
+
+**Negative means no finite reach**, so check the sign before using the result as a width. A filter
+that estimates from the whole image — [`Deramp`](@ref) — cannot be reproduced from a window of any
+size, and returns `-1` rather than a large number that would merely be less wrong. Adding a negative reach
+to a correlation extent yields a halo *shorter* than the correlation alone, which is exactly the
+silent under-read this trait exists to prevent; [`AutoRIFT.halo`](@ref) throws instead.
+
+Separate from [`filter_width`](@ref) because the two differ, and the difference is not a detail: a
+filter that applies two chained window passes reaches twice its half-width, since the second pass
+consumes the first's output over its own window. Tiled processing sizes its halo from this, so a
+value that is too small produces a filter output that is quietly wrong near every block edge rather
+than merely different — measured at 792 of 10201 points differing by up to 0.21 for `Wallis(5)` when
+padded by `width ÷ 2` instead of twice that.
+
+A reach may also be far larger than the window suggests when the filter's *decisions* are not
+windowed: [`WallisGapfill`](@ref) reaches `GAPFILL_REACH` plus its dilation plus its window, because
+whether a pixel is filled depends on how far the nearest real data lies.
+
+Pinned per method by a test that measures the true reach and compares it against this trait, so the
+two cannot drift.
+"""
+filter_reach(m::PreprocessMethod) = filter_width(m) ÷ 2
+
+# `Wallis` subtracts a local mean and then divides by a local standard deviation computed *about
+# that mean*, so the window is applied twice in sequence and each output depends on a neighbourhood
+# twice as wide.
+filter_reach(m::Wallis) = 2 * (filter_width(m) ÷ 2)
+
+# `WallisGapfill` reaches much further than its window, because deciding *whether* a pixel is filled
+# is a distance-transform question rather than a windowed one: an invalid pixel is an interior gap
+# only if real data lies within `GAPFILL_REACH`, and both that verdict and the low-contrast one are
+# then grown by the window's half-diagonal. So the reach is the gap-detection distance plus that
+# dilation plus the Wallis window itself.
+#
+# Finite, and verified so: a valid pixel 40 px away changes no local decision, while one at 20 px
+# does. The measured reach is 26 px at width 5 against the 35 px this returns, so the bound holds
+# with margin — which matters because a value that is too small makes a blocked run silently wrong
+# rather than merely different.
+filter_reach(m::WallisGapfill) =
+    ceil(Int, GAPFILL_REACH + _gapfill_buffer(filter_width(m))) + 2 * (filter_width(m) ÷ 2)
+
+# A whole-image reduction rather than a window: `deramp` sums adjacent-pixel conjugate products
+# over every pixel and takes one `atan2`. No finite reach expresses that, so it is `-1` rather than
+# a large number — a caller dividing work into blocks has to be told this cannot be done blockwise
+# from local data, not handed a halo that would merely be less wrong.
+filter_reach(::Deramp) = -1
+
 function _check_filter_width(width::Integer, who::Symbol)
     width >= 3 ||
         throw(ArgumentError("$who `width` must be >= 3, got $width"))
@@ -594,36 +661,65 @@ function _check_filter_width(width::Integer, who::Symbol)
 end
 
 # ---------------------------------------------------------------------------
-# Quantization
+# Pass execution
 # ---------------------------------------------------------------------------
 
 """
-    QuantizeMethod
+    AutoRIFT.PassRunner
 
-Abstract supertype for how filtered images are converted to the element type
-used for correlation. Concrete subtypes: [`QuantizeUInt8`](@ref),
-[`NoQuantize`](@ref).
+How a correlation pass over a point set is executed: all at once, or a block at a time.
+
+One chip-size level is the same sequence of steps either way — level points, coarse evidence,
+the gate and dilation, the fine pass, rejection and hole filling — and only the *execution* of a
+pass differs. `AutoRIFT.WholeScene` correlates an already-filtered pair in one call;
+`AutoRIFT.Blocked` reads, filters and correlates one block at a time so peak memory tracks the
+block rather than the scene.
+
+Concrete subtypes carry the pair they correlate, and that is load-bearing rather than convenient:
+the whole-scene runner holds a **filtered** pair, the blocked runner holds an **unfiltered** one and
+filters each block from its own read window. Because the pair travels with the runner, there is no
+call that can hand a runner the other kind — a filtered pair filtered again is a wrong image
+everywhere, and one that still looks like imagery.
+
+The interface is three methods: `run_pass(runner, pts, p, measure, subpixel)`, which correlates a
+point set; `restrict(runner, setup, gridsize)`, which narrows a runner to the coarse pass's strided
+subset; and `_warn_coarse_fallback(runner, chip_size)`, which is where the two differ on policy.
+
+A runner is always passed **positionally**. A keyword annotated with an abstract type is
+unresolvable under `--trim` — verified: it produces `unresolved call ... Core.kwcall` — which is the
+same constraint that makes [`measure_at`](@ref)'s result positional.
 """
-abstract type QuantizeMethod end
+abstract type PassRunner end
+
+# ---------------------------------------------------------------------------
+# Pass geometry
+# ---------------------------------------------------------------------------
 
 """
-    QuantizeUInt8()
+    AutoRIFT.PassGeometry
 
-Rescale each image so that `[mean - 3 std, mean + 3 std]` maps onto the `UInt8`
-range, then round and clamp. Correlating in `UInt8` allows exact integer
-accumulation of the correlation numerator, which is both faster and more
-accurate than accumulating in `Float32`.
-"""
-struct QuantizeUInt8 <: QuantizeMethod end
+The largest chip and search radius any point in a pass uses.
 
-"""
-    NoQuantize()
+These size the correlation workspace, and a workspace sizes its own FFT buffers from its extents
+— so they set the **transform length** every point in the pass executes, not merely how much
+memory it takes. A pass whose maxima are `(32, 32, 25, 25)` runs an 84-point transform where one
+with `(32, 32, 10, 10)` runs a 56-point one, and the two agree only to about 4e-7. Pooling depends
+on the same property; see `take_workspace!`.
 
-Keep the filtered images in floating point, replacing non-finite values with
-zero. Preserves full radiometric precision at the cost of a slower correlation
-inner loop.
+That is why this is a value a caller can supply rather than only something derived per pass. A
+subset of a point set has its own, generally smaller, maxima — so correlating a subset computes a
+different transform than correlating the whole and reading those points out of it. Passing the
+whole set's geometry to the subset is what makes the two agree. Measured: without it, `correlation`
+differs on 46% of the points of a sub-block, and `dx`/`dy` can flip a subpixel step.
+
+Build one with [`AutoRIFT.pass_geometry`](@ref).
 """
-struct NoQuantize <: QuantizeMethod end
+struct PassGeometry
+    chip_x::Int
+    chip_y::Int
+    radius_x::Int
+    radius_y::Int
+end
 
 # ---------------------------------------------------------------------------
 # Outlier rejection
@@ -779,11 +875,9 @@ between them — coherence at the finest chip, amplitude above it. A scalar keyw
 of one measure everywhere is the 1-tuple and costs nothing. See [`chip_measures`](@ref).
 """
 struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:PreprocessMethod,
-              Q<:QuantizeMethod,R<:SubpixelMethod,O<:OutlierMethod,T<:BoolAsType,
-              W<:RotationMethod}
+              R<:SubpixelMethod,O<:OutlierMethod,T<:BoolAsType,W<:RotationMethod}
     similarity::S
     preprocess::P
-    quantize::Q
     subpixel::R
     outliers::O
     threaded::T

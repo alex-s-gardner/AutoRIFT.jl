@@ -94,6 +94,11 @@ chip-size level, so a single level cannot read it without knowing which level it
 chip-size loop passes the right one. The default is the first, which is correct for a caller
 running `track!` directly on a single scale.
 
+`geometry` overrides the largest chip and radius this pass would derive from `pts`, and it is what
+makes correlating a *subset* of a point set give the same answer as correlating the whole and
+reading those points out — see [`AutoRIFT.PassGeometry`](@ref), which explains why those are
+otherwise different computations. It may only widen the pass, never narrow it.
+
 A point is skipped, leaving `NaN`, if its search radius is zero in either axis, if its
 chip lies wholly outside the image, or if its chip contains no valid pixel. The last is
 what keeps zero-padding out of the result: the images are padded so the inner loop needs
@@ -102,7 +107,8 @@ other such chip. See `valid` on [`ImagePair`](@ref).
 """
 function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Params;
                 subpixel::SubpixelMethod = p.subpixel,
-                measure::SimilarityMeasure = first(p.similarity))
+                measure::SimilarityMeasure = first(p.similarity),
+                geometry::Union{Nothing,PassGeometry} = nothing)
     # Interpolating the `Tuple`s directly would be the natural spelling, but showing a `Tuple`
     # reaches `textwidth` and `Base.repeat`, which `--trim` cannot resolve — so this one message
     # would make the whole package untrimmable. Element counts say the same thing here: `out`
@@ -112,11 +118,18 @@ function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Param
         "output has $(length(out)) points but the point set has $(length(pts))"))
 
     flat = scatter(pts)          # free: shares memory, discards only the layout
-    chipx, chipy, rx, ry, pad, fits = _pass_geometry(flat, size(pair))
+    ownx, owny, ownrx, ownry, pad, fits = _pass_geometry(flat, size(pair))
     # Nothing searchable: skip the padding, the planning, and the task spawning entirely.
     # Later chip-size levels hit this, since their coarse pass zeroes most radii.
-    chipx == 0 && return out
+    ownx == 0 && return out
 
+    # A supplied geometry replaces this pass's own maxima, so a subset executes the transform the
+    # whole set would have. It may only ever *widen* them: a workspace narrower than a point needs
+    # cannot hold its surface, and `correlate!` would throw deep in the loop rather than here.
+    chipx, chipy, rx, ry = _resolve_geometry(geometry, ownx, owny, ownrx, ownry)
+
+    # `pad` stays this pass's own, and deliberately so: it is what makes *these* points' windows
+    # in bounds, which depends on where they sit rather than on how large the transform is.
     # Padding only when a point actually needs it. `gridpoints` insets by the chip half-extent
     # plus the search radius, so a gridded pass never does — and padding it anyway costs 1.2 ms
     # and 10.6 MB per call, which is 2.5% of a dense coarse pass but ~10% of the sparse ones the
@@ -152,7 +165,7 @@ function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Param
 end
 
 """
-    track(pair, pts, p; subpixel = p.subpixel) -> DisplacementField
+    track(pair, pts, p; subpixel = p.subpixel, measure, geometry) -> DisplacementField
 
 Allocating form of [`track!`](@ref).
 """
@@ -162,6 +175,42 @@ track(pair::ImagePair, pts::PointSet, p::Params; kw...) =
 # ---------------------------------------------------------------------------
 # Geometry
 # ---------------------------------------------------------------------------
+
+"""
+    AutoRIFT.pass_geometry(pts::PointSet) -> PassGeometry
+
+The pass geometry `pts` implies: the largest chip and radius over its searchable points.
+
+Pass the result to [`track!`](@ref) to correlate a *subset* of `pts` as the whole set would have
+been correlated. See [`AutoRIFT.PassGeometry`](@ref) for why that is not the same computation.
+"""
+function pass_geometry(pts::PointSet)
+    cx = cy = rx = ry = 0
+    @inbounds for i in eachindex(pts)
+        issearchable(pts, i) || continue
+        cx = max(cx, pts.chip_size_x[i])
+        cy = max(cy, pts.chip_size_y[i])
+        rx = max(rx, pts.radius_x[i])
+        ry = max(ry, pts.radius_y[i])
+    end
+    return PassGeometry(cx, cy, rx, ry)
+end
+
+# A supplied geometry wins, after checking it covers what this pass actually needs. Rejecting a
+# too-narrow one here names the mistake; letting it through produces a `DimensionMismatch` from
+# `correlate!` about workspace extents, which does not mention the argument that caused it.
+_resolve_geometry(::Nothing, cx::Int, cy::Int, rx::Int, ry::Int) = (cx, cy, rx, ry)
+
+function _resolve_geometry(g::PassGeometry, cx::Int, cy::Int, rx::Int, ry::Int)
+    (g.chip_x >= cx && g.chip_y >= cy && g.radius_x >= rx && g.radius_y >= ry) ||
+        throw(ArgumentError(
+            "the supplied `geometry` is smaller than this point set needs: chip " *
+            "$(g.chip_x)x$(g.chip_y) and radius $(g.radius_x)x$(g.radius_y) against a " *
+            "required chip $(cx)x$(cy) and radius $(rx)x$(ry). A pass geometry may widen a " *
+            "pass but never narrow it, since the workspace must hold every point's surface. " *
+            "Build it from the whole point set with `pass_geometry`."))
+    return (g.chip_x, g.chip_y, g.radius_x, g.radius_y)
+end
 
 # Everything about a pass that is a summary over its points: the largest chip and radius
 # any point uses, and how much padding makes every window in bounds.

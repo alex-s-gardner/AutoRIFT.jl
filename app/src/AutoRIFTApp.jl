@@ -24,7 +24,7 @@
 
 module AutoRIFTApp
 
-using AutoRIFT: AutoRIFT, ZNCC, Highpass, QuantizeUInt8, PyramidRefine, GardnerFilter,
+using AutoRIFT: AutoRIFT, ZNCC, Highpass, PyramidRefine, GardnerFilter,
                 Params, False, NoRotationSearch, autorift
 
 # ---------------------------------------------------------------------------
@@ -111,7 +111,7 @@ end
 # wants is many single-threaded processes, which is exactly what it is.
 function app_params(chip_size::Int, search_radius::Int)
     return Params(
-        (ZNCC(),), Highpass(), QuantizeUInt8(), PyramidRefine(), GardnerFilter(), False(),
+        (ZNCC(),), Highpass(), PyramidRefine(), GardnerFilter(), False(),
         NoRotationSearch(),
         chip_size, chip_size, 4chip_size, 1.0,
         chip_size,

@@ -46,6 +46,9 @@ include("utils.jl")
     @testset "multichip" begin
         include("multichip.jl")
     end
+    @testset "tile" begin
+        include("tile.jl")
+    end
     @testset "api" begin
         include("api.jl")
     end

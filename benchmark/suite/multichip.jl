@@ -19,8 +19,8 @@ let g = addgroup!(SUITE, "multichip")
         # work. An uncorrelated pair measures the early-exit path instead.
         sec = circshift(ref, (-4, 6))
         pair = AutoRIFT.ImagePair(ref, sec)
-        prepared = AutoRIFT.quantize(
-            AutoRIFT.preprocess(pair, AutoRIFT.Highpass(; width = 5)), :uint8)
+        prepared = AutoRIFT.replace_nonfinite(
+            AutoRIFT.preprocess(pair, AutoRIFT.Highpass(; width = 5)))
         p = AutoRIFT.params(; chip_size = 32, search_radius = 25, threaded = false)
         grid = AutoRIFT.gridpoints((n, n), 32; chip_size = 128, search_radius = 25)
 
@@ -44,11 +44,15 @@ let g = addgroup!(SUITE, "multichip")
         # measurement floor rather than the cost.
         if n == 1024
             pts = AutoRIFT._level_points(grid, p, 32, 32, wanted)
+            # A `WholeScene` runner, because that is how a whole-scene pass is executed — the same
+            # `_coarse_mask` serves a blocked run through a `Blocked` runner instead.
+            #
             # `measure` is positional and has no default — the level's measure is passed explicitly,
             # since `p.similarity` is a tuple and a single level cannot read it without knowing which
             # level it is. Kept in step with `chipsize_level`'s call rather than relying on a default.
-            g["coarse pass c32 $(n)x$(n)"] = @benchmarkable AutoRIFT._coarse_pass(
-                $prepared, $pts, $p, 32, 32, AutoRIFT.measure_at($p, 1))
+            runner = AutoRIFT.WholeScene(prepared)
+            g["coarse pass c32 $(n)x$(n)"] = @benchmarkable AutoRIFT._coarse_mask(
+                $runner, $pts, $p, 32, 32, AutoRIFT.measure_at($p, 1))
         end
     end
 

@@ -1,4 +1,4 @@
-# Pre-correlation filtering, and conversion to the correlation element type.
+# Pre-correlation filtering.
 #
 # Layer 2: depends on nothing else in the package.
 #
@@ -24,6 +24,68 @@
 # validity mask rather than reading and writing fields of a state object.
 
 """
+    AutoRIFT.FiniteMask(parent)
+
+The validity mask "every finite pixel of `parent`", computed on read rather than stored.
+
+The default mask when a caller supplies none, and lazy for one reason: a blocked run must not form
+any array the size of the scene, and `map(isfinite, img)` is exactly that — 16 MiB per image at
+4096², plus a full read of an input that may be on disk. Reading a window of this reads only that
+window of `parent`, so `_read_block!`'s `copyto!` over a view costs the block and nothing more.
+
+Materialize with [`AutoRIFT.resident`](@ref) before reducing over the whole thing or reading it more
+than once; `_prepare` does, which is what keeps every whole-array reduction downstream of a dense
+mask.
+
+`IndexStyle` is forwarded from `parent`, so a Cartesian-indexed disk array is not pushed through
+linear index arithmetic it would have to undo.
+"""
+struct FiniteMask{T,A<:AbstractMatrix{T}} <: AbstractMatrix{Bool}
+    parent::A
+end
+
+Base.size(m::FiniteMask) = size(m.parent)
+Base.axes(m::FiniteMask) = axes(m.parent)
+Base.IndexStyle(::Type{FiniteMask{T,A}}) where {T,A} = IndexStyle(A)
+Base.@propagate_inbounds Base.getindex(m::FiniteMask, i::Int) = isfinite(m.parent[i])
+Base.@propagate_inbounds Base.getindex(m::FiniteMask, I::Int...) = isfinite(m.parent[I...])
+
+"""
+    AutoRIFT.resident(mask) -> AbstractMatrix{Bool}
+
+`mask` backed by storage: itself if it already is, one pass over it if it is computed.
+
+Call this before any whole-array reduction over a mask, and before reading one repeatedly. The
+filters do both — `_masked_boxmean!` and `_erode_mask!` each begin with `all(mask)` — so `_prepare`
+materializes at its entry, which is what puts every such reduction downstream of a dense mask
+rather than leaving each one to remember.
+
+A blocked run never calls `_prepare`; it reads windows through `_read_block!` into dense buffers
+instead. So the untiled path pays one pass and the blocked path pays nothing, without either
+branching on which it is.
+
+Only the lazy masks this package constructs are recognized. A caller supplying a computed
+`AbstractMatrix{Bool}` of their own should either materialize it first or add a method here.
+"""
+resident(m::AbstractMatrix{Bool}) = m
+resident(m::FiniteMask) = Matrix{Bool}(m)
+
+# The windowed filters read their mask many times over and begin with a whole-array `all`, so a
+# computed mask is the wrong representation for them: `all` on a `FiniteMask` costs 425 us at 1024²
+# against 4.6 for a dense one, and the per-window reads then repeat that work.
+#
+# Materializing here rather than trusting every caller to is what makes the invariant structural.
+# `_prepare` already calls `resident`, so these methods are unreachable from the untiled path, and
+# `_read_block!` copies into dense buffers, so they are unreachable from the blocked one. They exist
+# for the third caller — a future one — that would otherwise be correct but quietly slow.
+_masked_boxmean!(out::AbstractMatrix{Float32}, img::AbstractMatrix, mask::FiniteMask, w::Int,
+                 scratch::Union{Nothing,AbstractMatrix{Float32}}) =
+    _masked_boxmean!(out, img, resident(mask), w, scratch)
+
+_erode_mask!(out::AbstractMatrix{Bool}, mask::FiniteMask, w::Int) =
+    _erode_mask!(out, resident(mask), w)
+
+"""
     ImagePair{T}
 
 The two images to correlate, with their validity masks.
@@ -37,16 +99,24 @@ kind of mistake a name prevents and a number invites.
 arise from sensor gaps, cloud masks, and the no-data border left by reprojection, and
 they must not be allowed to contribute to a correlation — a chip full of fill values
 correlates beautifully with any other chip full of fill values.
-"""
-struct ImagePair{T<:ImageElement,A<:AbstractMatrix{T},M<:AbstractMatrix{Bool}}
-    reference::A
-    secondary::A
-    reference_valid::M
-    secondary_valid::M
 
-    function ImagePair(reference::A, secondary::A, reference_valid::M,
-                       secondary_valid::M) where {T<:ImageElement,A<:AbstractMatrix{T},
-                                                  M<:AbstractMatrix{Bool}}
+The two images and the two masks carry separate type parameters, so a pair may mix containers: a
+lazy reference against a resident secondary, a defaulted [`AutoRIFT.FiniteMask`](@ref) beside a
+supplied dense one. Both arise in ordinary use — a time series advances one image at a time, and a
+caller masking one image explicitly leaves the other to the default.
+"""
+struct ImagePair{T<:ImageElement,A<:AbstractMatrix{T},B<:AbstractMatrix{T},
+                 Mr<:AbstractMatrix{Bool},Ms<:AbstractMatrix{Bool}}
+    reference::A
+    secondary::B
+    reference_valid::Mr
+    secondary_valid::Ms
+
+    function ImagePair(reference::A, secondary::B, reference_valid::Mr,
+                       secondary_valid::Ms) where {T<:ImageElement,A<:AbstractMatrix{T},
+                                                   B<:AbstractMatrix{T},
+                                                   Mr<:AbstractMatrix{Bool},
+                                                   Ms<:AbstractMatrix{Bool}}
         size(reference) == size(secondary) || throw(DimensionMismatch(
             "reference is $(size(reference)) but secondary is $(size(secondary)); " *
             "the two images must be co-registered to a common grid before " *
@@ -57,7 +127,7 @@ struct ImagePair{T<:ImageElement,A<:AbstractMatrix{T},M<:AbstractMatrix{Bool}}
         size(secondary_valid) == size(secondary) || throw(DimensionMismatch(
             "secondary_valid is $(size(secondary_valid)) but secondary is " *
             "$(size(secondary))"))
-        return new{T,A,M}(reference, secondary, reference_valid, secondary_valid)
+        return new{T,A,B,Mr,Ms}(reference, secondary, reference_valid, secondary_valid)
     end
 end
 
@@ -70,31 +140,34 @@ A pixel is treated as invalid if it is not finite. Zero is deliberately *not* tr
 as invalid by default: it is a legitimate radiance value, and the reference's habit of
 conflating "zero" with "no data" misclassifies genuinely dark pixels. Pass an explicit
 mask when the sensor uses a fill value.
+
+The derived mask is an [`AutoRIFT.FiniteMask`](@ref), which computes `isfinite` on read. That keeps
+this constructor from touching the imagery at all, so it costs nothing for an input still on disk
+and forms no scene-sized array — the property `process_block_size` depends on.
 """
 function ImagePair(reference::AbstractMatrix, secondary::AbstractMatrix;
                    reference_valid = nothing, secondary_valid = nothing)
-    rv = isnothing(reference_valid) ? map(isfinite, reference) : _boolmask(reference_valid)
-    sv = isnothing(secondary_valid) ? map(isfinite, secondary) : _boolmask(secondary_valid)
+    rv = isnothing(reference_valid) ? FiniteMask(reference) : validmask(reference_valid)
+    sv = isnothing(secondary_valid) ? FiniteMask(secondary) : validmask(secondary_valid)
     return ImagePair(reference, secondary, rv, sv)
 end
 
-# A mask as a `Matrix{Bool}`, without copying one that already is.
+# A supplied mask, as an `AbstractMatrix{Bool}` and without copying.
 #
-# `Matrix{Bool}` rather than any `AbstractMatrix{Bool}` because a `BitMatrix` packs eight
-# entries per byte, which makes a concurrent write to one element a read-modify-write of the
-# 64-bit word holding 63 of its neighbours — the same hazard that made `DisplacementField`
-# store `searched` unpacked.
+# Passed through as given rather than converted to `Matrix{Bool}`: a lazy `Raster` mask converted
+# here would be materialized at construction, which is the scene-sized allocation blocking exists to
+# avoid. `resident` is where materialization happens instead, at the one consumer that needs it.
 #
-# Not copying when it need not is what lets a `Cache` decide by identity whether an image it
-# holds is already prepared. A defensive copy would silently turn every reuse into a re-filter.
-_boolmask(m::Matrix{Bool}) = m
-_boolmask(m::AbstractMatrix) = Matrix{Bool}(m)
+# Not copying is also what lets a `Cache` decide by identity whether an image it holds is already
+# prepared — a defensive copy would silently turn every reuse into a re-filter.
+validmask(m::AbstractMatrix{Bool}) = m
+validmask(m::AbstractMatrix) = Matrix{Bool}(m)
 
 Base.size(p::ImagePair) = size(p.reference)
 Base.eltype(::ImagePair{T}) where {T} = T
 
 """
-    valid(pair::ImagePair) -> Matrix{Bool}
+    valid(pair::ImagePair) -> AbstractMatrix{Bool}
 
 Pixels valid in **both** images.
 
@@ -157,6 +230,330 @@ preprocess(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::Highpass)
 
 preprocess(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::Wallis) =
     _filtered(wallis(img, mask, m.width, m.min_std), mask, m.width)
+
+preprocess(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::WallisGapfill) =
+    preprocess(img, mask, m, UInt64(0))
+
+"""
+    preprocess(img, mask, method, seed::UInt64) -> (filtered, mask)
+
+[`preprocess`](@ref) with the seed for the one filter that draws random numbers.
+
+`seed` is positional and concretely typed rather than a keyword carrying an `AbstractRNG`, which
+`--trim` cannot resolve. Only [`WallisGapfill`](@ref) reads it; every other method ignores it and
+forwards to the three-argument form, so this is what `_prepare` calls without having to know which
+filter it holds.
+"""
+preprocess(img::AbstractMatrix, mask::AbstractMatrix{Bool}, m::PreprocessMethod, ::UInt64) =
+    preprocess(img, mask, m)
+
+# A fresh `Xoshiro(seed)` per call rather than the global stream: the two images of a pair, and two
+# runs of the same pair, must fill identically, and a shared generator makes the fill depend on call
+# order. The reference draws from NumPy's unseeded global generator and so is not reproducible
+# against itself.
+preprocess(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::WallisGapfill,
+           seed::UInt64) =
+    wallis_gapfill(img, mask, m.width, m.min_std; rng = Random.Xoshiro(seed))
+
+# Pointwise, so no window and no mask erosion: `_filtered` is not used and the mask passes
+# through with only the pixels the log could not represent removed.
+preprocess(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, ::Decibel) =
+    decibel(img, mask)
+
+preprocess(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::Sobel) =
+    _filtered(sobel(img, mask, m.width), mask, m.width)
+
+preprocess(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::Laplacian) =
+    _filtered(laplacian(img, mask, m.width), mask, m.width)
+
+# ---------------------------------------------------------------------------
+# Wallis with gap filling
+# ---------------------------------------------------------------------------
+
+"""
+    wallis_gapfill(img, mask, width, std_cutoff; rng) -> (Matrix{Float32}, Matrix{Bool})
+
+[`wallis`](@ref), with interior no-data gaps and low-contrast patches replaced by white noise.
+
+For Landsat-7 after the 2003 Scan Line Corrector failure, whose imagery carries wedge-shaped
+interior gaps. Correlation cannot use a gap, but leaving one masked costs the whole
+neighbourhood of every chip that overlaps it. Filling with noise matched to the surrounding
+distribution is the cheaper trade: noise correlates with nothing, so it suppresses the peak
+where a chip is mostly gap without discarding chips that merely touch one.
+
+The noise is standard normal and **not** rescaled, which is correct because it is added after
+normalization — `wallis` has already divided by the local standard deviation, so valid pixels
+are themselves about unit variance.
+
+Three regions are distinguished, and only the middle one is filled:
+
+  * **Measured** — enough valid neighbours and enough contrast. Normalized as usual.
+  * **Filled** — an interior gap, or a patch whose local standard deviation is below
+    `std_cutoff`, that lies within reach of real data. Replaced by noise and marked *valid*,
+    since that is what stops it masking out its neighbours.
+  * **Excluded** — beyond `30` pixels from any valid pixel, so there is no nearby data for the
+    fill to be consistent with. Marked invalid, as an outer no-data border should be.
+
+`std_cutoff` is an absolute threshold on the local standard deviation, so it is scaled to the
+input's own units. Note it does *not* floor the divisor the way [`Wallis`](@ref)'s `min_std`
+does; here a low-contrast window is filled rather than clamped.
+
+Gaps are taken from `mask`, not from `img == 0`. The reference detects them as approximately
+zero, which conflates a fill value with a genuinely dark pixel — the same conflation
+[`ImagePair`](@ref) declines to make. A caller whose sensor writes zeros passes a mask that
+says so.
+"""
+function wallis_gapfill(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool},
+                        width::Integer, std_cutoff::Real;
+                        rng::Random.AbstractRNG = Random.default_rng())
+    axes(img) == axes(mask) || throw(DimensionMismatch(
+        "image and mask must share axes: $(axes(img)) vs $(axes(mask))"))
+    Base.require_one_based_indexing(img, mask)
+    w = Int(width)
+
+    buff = _gapfill_buffer(w)
+
+    # An interior gap is an invalid pixel with real data within `GAPFILL_REACH`. The outer
+    # border of a scene fails that test, which is what keeps a whole invalid margin from being
+    # filled with noise that has nothing to be consistent with.
+    near_data = dilate_within(mask, GAPFILL_REACH)
+    gaps = dilate_within(near_data .& .!mask, buff)
+
+    # Where the output means anything at all: real data, plus the grown interior gaps.
+    domain = mask .| gaps
+
+    mean = _masked_boxmean(img, mask, w)
+    sd = _masked_boxstd(img, mask, mean, w)
+
+    # `!(sd >= cutoff)` rather than `sd < cutoff` so a `NaN` standard deviation — a window with
+    # no valid neighbour — counts as low contrast rather than as passing the test.
+    cutoff = Float32(std_cutoff)
+    flat = similar(mask, Bool)
+    @inbounds for i in eachindex(flat, sd)
+        flat[i] = !(sd[i] >= cutoff)
+    end
+
+    # Fill the gaps and the flat patches, but only inside the domain.
+    fill = (gaps .| dilate_within(flat, buff)) .& domain
+
+    out = Matrix{Float32}(undef, size(img))
+    v = Matrix{Bool}(undef, size(mask))
+    @inbounds for i in eachindex(out, img, mask)
+        if !domain[i]
+            out[i] = 0.0f0
+            v[i] = false
+        elseif fill[i]
+            # Unit-variance noise, matching what the normalization leaves behind elsewhere.
+            out[i] = Float32(randn(rng))
+            v[i] = true
+        else
+            # `mask[i]` holds here without testing it: this branch needs `domain[i] && !fill[i]`,
+            # and `gaps ⊆ fill ⊆ domain`, so `!fill` implies `!gaps`, and `(mask | gaps) && !gaps`
+            # is `mask`. A non-finite local statistic is still possible, though, and lands below.
+            m, s = mean[i], sd[i]
+            if isfinite(m) && isfinite(s) && s > 0
+                out[i] = (Float32(img[i]) - m) / s
+                v[i] = true
+            else
+                out[i] = 0.0f0
+                v[i] = false
+            end
+        end
+    end
+    return out, v
+end
+
+# ---------------------------------------------------------------------------
+# Amplitude-in-decibels, and the derivative filters built on it
+# ---------------------------------------------------------------------------
+
+"""
+    decibel(img, mask) -> (Matrix{Float32}, Matrix{Bool})
+
+Amplitude to decibels, `20 log10(A)`, with the mask narrowed to the pixels that have one.
+
+`20 log10` and not `10 log10`: the input is amplitude, not power. Intended for radar, where
+brightness varies multiplicatively over a large range and a log turns that into an additive
+offset the windowed filters can remove.
+
+A non-positive amplitude has no decibel value. Those pixels are dropped from the mask and
+written as zero rather than left as `-Inf` or `NaN`, which is where this differs from the
+reference: it records a zero mask and then takes the log anyway, so `-Inf` reaches the
+correlator as texture.
+"""
+function decibel(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool})
+    axes(img) == axes(mask) || throw(DimensionMismatch(
+        "image and mask must share axes: $(axes(img)) vs $(axes(mask))"))
+    out = Matrix{Float32}(undef, size(img))
+    v = Matrix{Bool}(undef, size(mask))
+    @inbounds for i in eachindex(out, img, mask)
+        a = Float32(img[i])
+        # `a > 0` excludes the fill value the reference conflates with darkness, and also
+        # excludes a negative sample, which amplitude data should not contain at all.
+        if mask[i] && a > 0
+            out[i] = 20.0f0 * log10(a)
+            v[i] = true
+        else
+            out[i] = 0.0f0
+            v[i] = false
+        end
+    end
+    return out, v
+end
+
+"""
+    sobel(img, mask, width) -> Matrix{Float32}
+
+Sum of the x and y Sobel derivative kernels of side `width`, applied as one kernel.
+
+This is `Gx + Gy` — the two derivative kernels added together and convolved once — not the
+gradient magnitude `sqrt(Gx² + Gy²)` and not `|Gx| + |Gy|`. It is what the reference does, and
+it makes the filter **directional**: the response partially cancels along one diagonal and
+reinforces along the other. Worth knowing before reading the output as an edge strength.
+
+Kernels are the unnormalized separable binomial-difference pair OpenCV's `getDerivKernels`
+returns, so at `width = 5` the x kernel is `[-1,-2,0,2,1] ⊗ [1,4,6,4,1]`.
+"""
+sobel(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, width::Integer) =
+    _convolve_masked(img, mask, _summed_deriv_kernel(Int(width), 1))
+
+"""
+    laplacian(img, mask, width) -> Matrix{Float32}
+
+Laplacian of the **decibel** image: `∂²/∂x² + ∂²/∂y²` applied to `20 log10(A)`.
+
+The log comes first, and that ordering is the point. Radar brightness varies
+multiplicatively, so a second derivative of raw amplitude scales with local brightness and
+reports the same terrain twice as strongly where the scene is twice as bright. In decibels
+that variation is an additive offset, which a second derivative removes outright.
+
+Second-order kernels of side `width`, summed across the two axes, so this is one convolution
+rather than two.
+"""
+function laplacian(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, width::Integer)
+    db, dbmask = decibel(img, mask)
+    return _convolve_masked(db, dbmask, _summed_deriv_kernel(Int(width), 2))
+end
+
+# The `order`-th derivative along x plus the same along y, as one `w`-by-`w` kernel.
+#
+# Summing the two separable outer products rather than convolving twice and adding is what the
+# reference does, and it is also why one convolution suffices. For `order = 2` this is exactly
+# OpenCV's `Laplacian(ksize = w)`; for `order = 1` it is the reference's `Sobel`, which is
+# directional rather than a gradient magnitude — see [`sobel`](@ref).
+function _summed_deriv_kernel(w::Int, order::Int)
+    deriv, smooth = _deriv_kernels(w, order)
+    return _outer(deriv, smooth) .+ _outer(smooth, deriv)
+end
+
+# The separable derivative kernels OpenCV's `getDerivKernels(order, 0, w, normalize=false)`
+# returns: an `order`-th central difference widened by binomial smoothing, and the binomial
+# smoother for the perpendicular axis.
+#
+# Built from Pascal's triangle rather than tabulated, and pinned against OpenCV's own output by
+# `test/preprocess.jl`. Both factors are a binomial row: the smoother is row `w-1`, and the
+# derivative is the three-tap difference convolved with row `w-3`. That widening is why width 5
+# gives `[-1,-2,0,2,1]` rather than a bare `[-1,0,1]`.
+function _deriv_kernels(w::Int, order::Int)
+    (isodd(w) && w >= 3) || throw(ArgumentError(
+        "derivative kernel width must be odd and at least 3, got $w"))
+    order in (1, 2) || throw(ArgumentError("derivative order must be 1 or 2, got $order"))
+    smooth = _binomial_row(w)
+    base = order == 1 ? Float32[-1, 0, 1] : Float32[1, -2, 1]
+    return _conv1(base, _binomial_row(w - 2)), smooth
+end
+
+# Row `n-1` of Pascal's triangle, as a length-`n` vector: the binomial smoother of width `n`.
+_binomial_row(n::Int) = [Float32(binomial(n - 1, k)) for k in 0:(n - 1)]
+
+# Full 1-D convolution, for composing the small kernel factors above.
+function _conv1(a::AbstractVector{Float32}, b::AbstractVector{Float32})
+    out = zeros(Float32, length(a) + length(b) - 1)
+    for (i, ai) in pairs(a), (j, bj) in pairs(b)
+        out[i + j - 1] += ai * bj
+    end
+    return out
+end
+
+_outer(col::Vector{Float32}, row::Vector{Float32}) = col .* transpose(row)
+
+# Correlate `img` with `kernel`, excluding invalid pixels from every window rather than letting
+# them contribute zeros.
+#
+# That exclusion is the difference from the reference, which zero-pads: a no-data border there
+# biases every output within half a kernel of it, and the bias looks like an edge — exactly what
+# a derivative filter is meant to detect. Here a window with no valid pixel is `NaN`, which
+# `_filtered` then records in the mask.
+#
+# Renormalizing by the weight actually used would be wrong for a derivative kernel, whose
+# coefficients sum to zero: there is no mean to preserve, so the valid coefficients are applied
+# as they stand.
+function _convolve_masked(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool},
+                          kernel::AbstractMatrix{Float32})
+    axes(img) == axes(mask) || throw(DimensionMismatch(
+        "image and mask must share axes: $(axes(img)) vs $(axes(mask))"))
+    # The other filters in this file return a 1-based `Matrix{Float32}`, and `_filtered` requires
+    # one, so declare the assumption rather than appearing generic and producing an offset result.
+    Base.require_one_based_indexing(img, mask)
+    kh, kw = size(kernel)
+    # Left-biased centre, matching the window conventions in `window.jl` so an even width — which
+    # the constructors reject, but which a direct call could still reach — lands consistently.
+    ci, cj = (kh ÷ 2) + 1, (kw ÷ 2) + 1
+    nr, nc = size(img)
+    out = Matrix{Float32}(undef, nr, nc)
+
+    # The interior, where every tap of the window is in bounds, so the per-tap range test the edge
+    # loop needs cannot fail. Splitting it out is worth a measurement rather than assumed: the taps
+    # are cheap enough that the two range checks per tap dominated, and hoisting them out of the
+    # interior — which is all but a `kh`-wide frame of the image — cut the filter by a third.
+    #
+    # `all(mask)` decides the mask test the same way, and for the same reason `_masked_boxmean!` and
+    # `_erode_mask!` both check it: a gap-free image is the common case, and on one the test is pure
+    # overhead. Both loops are otherwise identical, which is why the body is a macro-free function
+    # of the mask predicate rather than two hand-copied loops.
+    dense = all(mask)
+    ilo, ihi = ci, nr - (kh - ci)
+    jlo, jhi = cj, nc - (kw - cj)
+    @inbounds for j in 1:nc, i in 1:nr
+        interior = ilo <= i <= ihi && jlo <= j <= jhi
+        acc = 0.0f0
+        any_valid = false
+        if interior && dense
+            # Nothing to test: every tap is in bounds and every pixel is valid.
+            for kj in 1:kw
+                jj = j + (kj - cj)
+                for ki in 1:kh
+                    acc += kernel[ki, kj] * Float32(img[i + (ki - ci), jj])
+                end
+            end
+            any_valid = true
+        elseif interior
+            for kj in 1:kw
+                jj = j + (kj - cj)
+                for ki in 1:kh
+                    ii = i + (ki - ci)
+                    mask[ii, jj] || continue
+                    acc += kernel[ki, kj] * Float32(img[ii, jj])
+                    any_valid = true
+                end
+            end
+        else
+            for kj in 1:kw
+                jj = j + (kj - cj)
+                1 <= jj <= nc || continue
+                for ki in 1:kh
+                    ii = i + (ki - ci)
+                    1 <= ii <= nr || continue
+                    mask[ii, jj] || continue
+                    acc += kernel[ki, kj] * Float32(img[ii, jj])
+                    any_valid = true
+                end
+            end
+        end
+        out[i, j] = any_valid ? acc : NaN32
+    end
+    return out
+end
 
 # ---------------------------------------------------------------------------
 # Complex input
@@ -272,13 +669,31 @@ end
 
 # The mask bookkeeping every windowed filter needs, written once. Doing it per filter is how
 # the reference ended up inconsistent about it.
-function _filtered(out::Matrix{Float32}, mask::AbstractMatrix{Bool}, width::Integer)
+function _filtered(out::AbstractMatrix{Float32}, mask::AbstractMatrix{Bool}, width::Integer)
     v = _erode_mask(mask, Int(width))
+    return _filtered_finish!(out, v)
+end
+
+"""
+    _filtered!(out, v, mask, width) -> (out, v)
+
+[`_filtered`](@ref)'s work, writing the eroded mask into `v` rather than allocating it.
+
+For tiled processing, where a fresh mask per block is churn `Sys.maxrss` reports as a requirement.
+`out` is modified in place, as in the allocating form.
+"""
+function _filtered!(out::AbstractMatrix{Float32}, v::AbstractMatrix{Bool},
+                    mask::AbstractMatrix{Bool}, width::Integer)
+    _erode_mask!(v, mask, Int(width))
+    return _filtered_finish!(out, v)
+end
+
+# Shared tail: a filter can produce a non-finite value from finite input, so finiteness of the
+# output is part of validity too.
+function _filtered_finish!(out::AbstractMatrix{Float32}, v::AbstractMatrix{Bool})
     @inbounds for i in eachindex(out)
-        # A filter can produce a non-finite value from finite input (a zero divisor in the
-        # Wallis case), so finiteness of the output is part of validity too. The value itself
-        # becomes zero to keep downstream arithmetic finite; the mask is what records that it
-        # carries no information.
+        # The value becomes zero to keep downstream arithmetic finite; the mask is what records
+        # that it carries no information.
         if !isfinite(out[i])
             out[i] = 0.0f0
             v[i] = false
@@ -301,10 +716,27 @@ driver applies inside the correlator. Invalid pixels are excluded from the local
 rather than contributing zeros to it, which is where this differs from the reference —
 its zero-padded convolution lets a no-data border bias the mean of every pixel near it.
 """
-function highpass(img::AbstractMatrix, mask::AbstractMatrix{Bool}, width::Integer)
+highpass(img::AbstractMatrix, mask::AbstractMatrix{Bool}, width::Integer) =
+    highpass!(Matrix{Float32}(undef, size(img)), img, mask, width)
+
+"""
+    highpass!(out, img, mask, width; scratch = nothing) -> out
+
+[`highpass`](@ref) writing into `out`, which must have `img`'s shape.
+
+Exists for tiled processing, where the alternative is a fresh output and scratch array per block —
+churn that `Sys.maxrss` records as a requirement even though the collector frees it. `scratch` is a
+second `Float32` array of the same shape, needed only when `mask` excludes something; pass one to
+make the call allocation-free in that case too.
+"""
+function highpass!(out::AbstractMatrix{Float32}, img::AbstractMatrix,
+                   mask::AbstractMatrix{Bool}, width::Integer;
+                   scratch::Union{Nothing,AbstractMatrix{Float32}} = nothing)
+    axes(out) == axes(img) == axes(mask) || throw(DimensionMismatch(
+        "out, img and mask must share axes"))
     # In place over the local mean: each output reads only the mean at its own index, and the
     # mean is not wanted afterwards. Saves a full-size temporary on an image-sized array.
-    out = _masked_boxmean(img, mask, Int(width))
+    _masked_boxmean!(out, img, mask, Int(width), scratch)
     @inbounds for i in eachindex(out)
         out[i] = mask[i] && isfinite(out[i]) ? Float32(img[i]) - out[i] : NaN32
     end
@@ -368,8 +800,14 @@ end
 # A bandwidth estimate puts the floor at 0.4 ms, so what remains is per-element scalar
 # work that cv2 vectorises. Closing it means cache tiling, an M8 item. Filtering runs
 # once per image rather than once per grid point, so this is not on the hot path.
-function _masked_boxmean(img::AbstractMatrix, mask::AbstractMatrix{Bool}, w::Int)
-    out = Matrix{Float32}(undef, size(img))
+_masked_boxmean(img::AbstractMatrix, mask::AbstractMatrix{Bool}, w::Int) =
+    _masked_boxmean!(Matrix{Float32}(undef, size(img)), img, mask, w, nothing)
+
+# `scratch`, when given, is the NaN-encoded copy this would otherwise allocate. Supplying it is what
+# makes a per-block call allocation-free; `nothing` allocates as before.
+function _masked_boxmean!(out::AbstractMatrix{Float32}, img::AbstractMatrix,
+                          mask::AbstractMatrix{Bool}, w::Int,
+                          scratch::Union{Nothing,AbstractMatrix{Float32}})
     # The copy exists only to encode invalidity as NaN, which is what makes the running sum
     # skip those pixels. With nothing masked there is nothing to encode, so read `img`
     # directly — `windowmean!` is generic in its input. On a gap-free image, which is the
@@ -380,7 +818,9 @@ function _masked_boxmean(img::AbstractMatrix, mask::AbstractMatrix{Bool}, w::Int
     # otherwise would silently take the dense path over an image that needs the masked one.
     all(mask) && return windowmean!(out, img, w)
 
-    masked = Matrix{Float32}(undef, size(img))
+    masked = isnothing(scratch) ? Matrix{Float32}(undef, size(img)) : scratch
+    axes(masked) == axes(img) || throw(DimensionMismatch(
+        "scratch must share axes with the image"))
     gaps = false
     @inbounds for i in eachindex(masked)
         if mask[i]
@@ -408,11 +848,12 @@ end
 # at zero, which stops the NaNs but leaves the precision loss. Squaring the deviations
 # about the measured mean costs one more pass and avoids both.
 #
-# Note this is the *population* standard deviation of the window, not the
-# Bessel-corrected sample one. The correction would need the per-window valid count,
-# and at the window sizes used here (5 to 21, so 25 to 441 samples) the difference is
-# under 2% — well below the contrast variation the filter exists to remove, and not
-# worth a second sliding-count pass to recover.
+# Bessel-corrected by the window *area*, `sqrt(w² / (w² - 1))`, which is a constant and so
+# costs one multiply. It is deliberately not the per-window valid count: the reference scales by
+# the kernel area regardless of how many neighbours were usable, and matching it is what keeps
+# `WallisGapfill`'s `std_cutoff` — an absolute threshold on this quantity — mean the same thing
+# here as there. At width 5 the factor is 1.0206, so omitting it would shift every `Wallis`
+# output by 2% and move which pixels the gap filler treats as low-contrast.
 function _masked_boxstd(img::AbstractMatrix, mask::AbstractMatrix{Bool},
                         mean::AbstractMatrix{Float32}, w::Int)
     dev2 = Matrix{Float32}(undef, size(img))
@@ -431,10 +872,18 @@ function _masked_boxstd(img::AbstractMatrix, mask::AbstractMatrix{Bool},
     # `windowmean` ignores NaN, so this averages over valid neighbours only, and the
     # loop above already established whether there are any.
     msd = windowmean(dev2, w; hasnan = gaps)
+    bessel = _bessel_factor(w)
     @inbounds for i in eachindex(msd)
-        msd[i] = sqrt(max(msd[i], 0.0f0))
+        msd[i] = sqrt(max(msd[i], 0.0f0)) * bessel
     end
     return msd
+end
+
+# `sqrt(n / (n - 1))` for a `w`-by-`w` window. `w == 1` has no spread to correct, and the
+# expression would divide by zero, so it is 1 there.
+function _bessel_factor(w::Int)
+    n = w * w
+    return n > 1 ? Float32(sqrt(n / (n - 1))) : 1.0f0
 end
 
 # Erode a validity mask by a `w`-wide window: a pixel stays valid only if every pixel in
@@ -444,15 +893,20 @@ end
 # A whole-array shortcut first, because it is the common case and it is free to check: if
 # nothing is masked, eroding changes nothing. That skips three full-size temporaries and
 # two passes on every gap-free image, which is most of them.
-function _erode_mask(mask::AbstractMatrix{Bool}, w::Int)
-    all(mask) && return copy(mask)
+_erode_mask(mask::AbstractMatrix{Bool}, w::Int) =
+    _erode_mask!(Matrix{Bool}(undef, size(mask)), mask, w)
+
+function _erode_mask!(out::AbstractMatrix{Bool}, mask::AbstractMatrix{Bool}, w::Int)
+    if all(mask)
+        copyto!(out, mask)
+        return out
+    end
     f = Matrix{Float32}(undef, size(mask))
     @inbounds for i in eachindex(f)
         f[i] = mask[i] ? 1.0f0 : 0.0f0
     end
     # No NaN by construction, so the sliding minimum takes its cheap path directly.
     lo = windowmin(f, w)
-    out = Matrix{Bool}(undef, size(mask))
     @inbounds for i in eachindex(out)
         out[i] = lo[i] > 0.5f0
     end
@@ -460,133 +914,43 @@ function _erode_mask(mask::AbstractMatrix{Bool}, w::Int)
 end
 
 # ---------------------------------------------------------------------------
-# Conversion to the correlation element type
+# Non-finite replacement
 # ---------------------------------------------------------------------------
 
 """
-    quantize(pair::ImagePair, method) -> ImagePair
+    replace_nonfinite(pair::ImagePair) -> ImagePair
 
-Convert filtered images to the element type used for correlation.
+Replace non-finite pixels with zero, leaving the element type alone.
 
-`method` is a [`QuantizeMethod`](@ref) or the `Symbol` naming one.
+The images reach the correlator in the caller's own type, so `Int16` sensor data is
+correlated as `Int16`. The correlator is generic over its element type and widens per
+element where it must — the chip to `Float32` because it is stored mean-removed, the sums
+to `Float64` — so converting a whole image here would double its memory traffic and change
+no result.
 """
-quantize(pair::ImagePair, method::Symbol) = quantize(pair, _quantize(method))
-
-# Per image, for the same reason as `preprocess`: the UInt8 scaling is computed from one
-# image's own statistics and nothing crosses between the two.
-quantize(pair::ImagePair, m::QuantizeMethod) = ImagePair(
-    quantize(pair.reference, pair.reference_valid, m),
-    quantize(pair.secondary, pair.secondary_valid, m))
+replace_nonfinite(pair::ImagePair) = ImagePair(
+    replace_nonfinite(pair.reference, pair.reference_valid),
+    replace_nonfinite(pair.secondary, pair.secondary_valid))
 
 """
-    quantize(img, mask, method) -> (converted, mask)
+    replace_nonfinite(img, mask) -> (replaced, mask)
 
-Convert a single filtered image to the correlation element type, with its mask.
-
-See [`preprocess`](@ref) for why the per-image form exists.
+Per-image form, for the same reason [`preprocess`](@ref) has one.
 """
-# No quantization means the element type is the caller's, so `Int16` sensor data reaches the
-# correlator as `Int16`. The correlator is generic over `T<:Real` and converts per element where
-# it must — the chip to `Float32` because it is stored mean-removed, the sums to `Float64` — so
-# widening the whole image here would double its memory traffic and change no result.
-quantize(img::AbstractMatrix{<:Integer}, mask::AbstractMatrix{Bool}, ::NoQuantize) =
+# An integer image cannot hold a non-finite value, so there is nothing to replace and the
+# copy is the whole operation.
+replace_nonfinite(img::AbstractMatrix{<:Integer}, mask::AbstractMatrix{Bool}) =
     (copy(img), copy(mask))
 
-function quantize(img::AbstractMatrix{<:AbstractFloat}, mask::AbstractMatrix{Bool},
-                  ::NoQuantize)
-    # Only a float type can hold a non-finite value, so only this method needs to replace one.
-    # They become zero so downstream arithmetic stays finite, and the mask records that they
-    # carry no information. An integer image cannot be in that state, which is why the method
-    # above can be a plain copy rather than this loop with a test that is always false.
+# Float and complex share one method: `isfinite` of a complex number is false if either
+# component is, so the same test and the same replacement serve both. Zero keeps downstream
+# arithmetic finite, and the mask is what records that those pixels carry no information.
+function replace_nonfinite(img::AbstractMatrix{<:Union{AbstractFloat,Complex}},
+                           mask::AbstractMatrix{Bool})
     out = similar(img)
     @inbounds for i in eachindex(out)
         v = img[i]
         out[i] = isfinite(v) ? v : zero(v)
     end
     return out, copy(mask)
-end
-
-# Complex input under `NoQuantize`: the same non-finite replacement as the float method, since a
-# complex value is non-finite if either component is.
-function quantize(img::AbstractMatrix{<:Complex}, mask::AbstractMatrix{Bool}, ::NoQuantize)
-    out = similar(img)
-    @inbounds for i in eachindex(out)
-        v = img[i]
-        out[i] = isfinite(v) ? v : zero(v)
-    end
-    return out, copy(mask)
-end
-
-quantize(img::AbstractMatrix, mask::AbstractMatrix{Bool}, ::QuantizeUInt8) =
-    (_to_uint8(img, mask), copy(mask))
-
-# Quantizing complex data to UInt8 would have to discard the phase, which is the only reason to
-# hold complex data in the first place. An error rather than a silent `abs`: a caller who wants
-# amplitude matching should say so, and then the whole real pipeline applies unchanged.
-quantize(::AbstractMatrix{<:Complex}, ::AbstractMatrix{Bool}, ::QuantizeUInt8) =
-    throw(ArgumentError(
-        "`quantize = :uint8` cannot represent complex input — scaling to 8-bit integers would " *
-        "discard the phase, which is the only thing `Coherence` measures. Use " *
-        "`quantize = :none` for complex data, or take `abs` of the images to correlate " *
-        "amplitudes with the full real pipeline."))
-
-"""
-    _to_uint8(img, mask) -> Matrix{UInt8}
-
-Rescale so that `mean ± 3 std` of the valid pixels spans the `UInt8` range.
-
-Three standard deviations captures essentially all of a roughly normal distribution
-while keeping the quantization step small; the tails are clipped, which costs nothing
-because correlation depends on texture rather than on extremes.
-
-Statistics are computed over valid pixels only, in `Float64`. Including fill values
-would drag the mean and inflate the spread, compressing the real data into a fraction
-of the available range and throwing away precision exactly where it is needed.
-"""
-function _to_uint8(img::AbstractMatrix, mask::AbstractMatrix{Bool})
-    n = 0
-    s = 0.0
-    @inbounds for i in eachindex(img)
-        v = Float64(img[i])
-        if mask[i] && isfinite(v)
-            n += 1
-            s += v
-        end
-    end
-    out = zeros(UInt8, size(img))
-    n == 0 && return out            # nothing valid; all zero
-
-    mean = s / n
-    ss = 0.0
-    @inbounds for i in eachindex(img)
-        v = Float64(img[i])
-        if mask[i] && isfinite(v)
-            d = v - mean
-            ss += d * d
-        end
-    end
-    # Sample standard deviation (Bessel-corrected), matching the reference. Here the
-    # correction is worth applying because the statistics are global rather than
-    # per-window, so it costs nothing.
-    sd = n > 1 ? sqrt(ss / (n - 1)) : 0.0
-    if sd == 0
-        # A uniform image has no texture to preserve; mid-grey keeps it neutral rather
-        # than pinning it to an endpoint.
-        @inbounds for i in eachindex(out)
-            out[i] = mask[i] ? 0x80 : 0x00
-        end
-        return out
-    end
-
-    lo = mean - 3sd
-    scale = 255.0 / (6sd)
-    @inbounds for i in eachindex(out)
-        v = Float64(img[i])
-        if !mask[i] || !isfinite(v)
-            out[i] = 0x00
-            continue
-        end
-        out[i] = round(UInt8, clamp((v - lo) * scale, 0.0, 255.0))
-    end
-    return out
 end

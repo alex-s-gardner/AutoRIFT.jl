@@ -29,6 +29,8 @@ module AutoRIFT
 # it is ours and is exported.
 using CommonSolve: CommonSolve, init
 using LinearAlgebra: LinearAlgebra
+# `WallisGapfill` fills gaps with noise, and `Params.rng_seed` is what makes that reproducible.
+using Random: Random
 using StableTasks: StableTasks
 
 """
@@ -104,6 +106,7 @@ include("preprocess.jl")
 include("firstguess.jl")
 include("track.jl")
 include("multichip.jl")
+include("tile.jl")
 include("api.jl")
 
 # Import this machine's saved FFTW wisdom, so a fresh process does not re-measure plans it has
@@ -140,11 +143,56 @@ export SimilarityMeasure, ZNCC, NCC, Coherence
 export PreprocessMethod, Highpass, Wallis, WallisGapfill, Sobel, Laplacian,
        Decibel, Deramp, NoPreprocess
 export SubpixelMethod, PyramidRefine, NoRefine
-export QuantizeMethod, QuantizeUInt8, NoQuantize
 export OutlierMethod, GardnerFilter, NoOutlierFilter
 export ImagePair
 export FirstGuess, ORBGuess, AKAZEGuess, first_guess, scene_rotation
 export RotationMethod, RotationSearch, NoRotationSearch
+
+"""
+    AutoRIFT.PUBLIC_NAMES
+
+Names that are API but not exported: callable as `AutoRIFT.name`, and covered by semantic versioning.
+
+Exports are the names a user needs in scope. These are the ones they may reach for deliberately —
+the production input path, the pipeline steps `src/multichip.jl` promises are separately callable, and
+the preprocessing functions `src/preprocess.jl` says must be usable ahead of reprojection.
+
+One list rather than a `public` declaration scattered through the files, because three things have to
+agree about it: this declaration, the documentation, and the test that every public name has a
+docstring. A name absent here is internal and may change in a patch release.
+"""
+const PUBLIC_NAMES = (
+    # Configuration.
+    :params, :Params, :chip_sizes, :chip_measures, :measure_at, :filter_width, :filter_reach,
+    # The grid, which is how per-point fields reach the correlator.
+    :PointSet, :pointset, :gridpoints, :scatter, :rebuild, :sanitize!,
+    :npoints, :nsearchable, :issearchable, :chip_bounds, :search_bounds,
+    # Running it, and the results.
+    :init, :autorift_with_grid, :Cache, :imagepair, :MultichipResult, :nmeasured,
+    :DisplacementField, :displacement_field, :track, :track!,
+    :correlate_multichip, :chipsize_level, :PassGeometry, :pass_geometry,
+    # Preprocessing, standalone as well as inside a run.
+    :ImageElement, :preprocess, :valid, :replace_nonfinite, :highpass, :highpass!, :wallis,
+    :wallis_gapfill, :decibel, :sobel, :laplacian, :deramp, :ramp_phase,
+    :FiniteMask, :resident,
+    # Post-processing steps a caller may want on their own.
+    :reject_outliers, :outlier_filter, :dilate_within, :resample, :resample!,
+    :Nearest, :Area, :Bicubic, :window, :relax,
+    # Blocked processing: `halo` says how much overlap a block size costs. The layout types are
+    # deliberately absent — they are the part free to change.
+    :halo,
+    # FFT plan warming, for a driver that wants it off the hot path.
+    :warm_plans!,
+    # First-guess plumbing the extensions build on.
+    :consistent_matches, :required_package,
+)
+
+# `public` exists from Julia 1.11 and this package supports 1.10, so the declaration is guarded.
+# `Expr(:public, ...)` rather than the surface syntax because that would be a parse error on 1.10 —
+# and it is a lowering-level declaration with no runtime component, so it stays trim-inert.
+@static if VERSION >= v"1.11"
+    eval(Expr(:public, PUBLIC_NAMES...))
+end
 
 # ---------------------------------------------------------------------------
 # Precompilation
@@ -159,9 +207,8 @@ export RotationMethod, RotationSearch, NoRotationSearch
 # for each element type the correlator can see, not running it on large inputs. So this uses the
 # smallest images that produce a grid at all and covers the type axes that matter —
 #
-#   * `UInt8`, the reference's default and what `quantize = :uint8` produces;
-#   * `Float32`, what `quantize = :none` produces after filtering;
-#   * `Int16`, a raw sensor type that reaches the correlator unwidened.
+#   * `Float32`, what a filter produces from real input;
+#   * `UInt8` and `Int16`, raw sensor types that reach the correlator unwidened.
 #
 # and the two entry points, since `autorift` and the `init`/`autorift!` cache path compile
 # separately. The extensions precompile their own workloads: a package cannot precompile code

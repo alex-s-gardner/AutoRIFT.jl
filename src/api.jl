@@ -11,9 +11,10 @@
 #
 # Every keyword is resolved to a concrete `Params` here, at the boundary, and nothing below
 # this file sees a `Symbol` or re-validates a number. That is also why the work is handed to
-# `_run` rather than done inline: the images may be `UInt8` or `Float32` depending on
-# `quantize`, so the call crosses a type boundary, and putting a function barrier there keeps
-# everything downstream monomorphic instead of leaving the whole pipeline inferring a union.
+# `_run` rather than done inline: the filter may change the element type — an integer image
+# filtered by `Highpass` comes back `Float32` — so the call crosses a type boundary, and putting
+# a function barrier there keeps everything downstream monomorphic instead of leaving the whole
+# pipeline inferring a union.
 
 """
     Cache
@@ -29,12 +30,23 @@ concurrently, which is the intended shape for batch processing — see [`autorif
 """
 mutable struct Cache{P<:Params}
     params::P
-    # The pair as supplied, before filtering or quantization. Kept because `reinit!` may replace
-    # only one of the two images, and the other must then be re-prepared from its original —
-    # preparing the already-prepared one would filter and quantize it a second time.
+    # The pair as supplied, before filtering. Kept because `reinit!` may replace only one of the
+    # two images, and the other must then be re-prepared from its original — preparing the
+    # already-prepared one would filter it a second time.
     raw::ImagePair
-    # The pair the correlator sees: filtered and converted to the correlation element type.
-    prepared::ImagePair
+    # How this cache's passes run, and over which pair: an `AutoRIFT.WholeScene` holding the
+    # filtered scene, or an `AutoRIFT.Blocked` holding the raw one and filtering per block.
+    #
+    # One field rather than a `prepared::Union{Nothing,ImagePair}` beside a
+    # `block_size::Union{Nothing,Tuple}`: those two had to agree — a filtered scene *and* a block
+    # size is a contradiction, and neither is a run with nothing to correlate — and nothing enforced
+    # it. A runner cannot express the disagreement.
+    #
+    # Blocking stays out of `Params` because it is a scheduling choice rather than an algorithm
+    # parameter: it changes peak memory and nothing else, since the two paths agree bit for bit.
+    # That also keeps `Params`'s 22 positional fields, and every construction of it including the
+    # trimmed binary's, unchanged.
+    runner::PassRunner
     grid::PointSet{2}
     result::Union{Nothing,MultichipResult}
     # Set when the images change and cleared once a run has consumed them. `reinit!`
@@ -46,9 +58,19 @@ end
 """
     AutoRIFT.imagepair(cache) -> ImagePair
 
-The pair the correlator will see: filtered and converted to the correlation element type.
+The filtered pair the correlator will see.
+
+Throws for a cache built with `process_block_size`. Such a run filters each block from its own read
+window and never forms a filtered scene, so there is no whole-scene pair to return — and returning
+the raw one would silently answer a different question.
 """
-imagepair(cache::Cache) = cache.prepared
+imagepair(cache::Cache) = imagepair(cache.runner)
+
+imagepair(r::WholeScene) = r.prepared
+imagepair(::Blocked) = throw(ArgumentError(
+    "this cache was built with `process_block_size`, so no whole-scene filtered pair exists: " *
+    "each block is filtered from its own read window, which is what bounds peak memory. Use " *
+    "`cache.raw` for the input as supplied, or build the cache without `process_block_size`."))
 
 """
     AutoRIFT.init(reference, secondary; kwargs...) -> Cache
@@ -56,24 +78,49 @@ imagepair(cache::Cache) = cache.prepared
 Prepare to correlate `reference` against `secondary`, allocating buffers and planning
 transforms once.
 
-Accepts the same keywords as [`autorift`](@ref). The images are preprocessed and quantized
-immediately, since that is configuration-dependent work that does not need repeating per run.
+Accepts the same keywords as [`autorift`](@ref). The images are preprocessed immediately, since
+that is configuration-dependent work that does not need repeating per run — except under
+`process_block_size`, where each block is filtered from its own read window during the run and no
+whole-scene filtered copy is ever formed. [`AutoRIFT.imagepair`](@ref) therefore has nothing to
+return for such a cache and says so.
 
 Use this with [`reinit!`](@ref) when processing many pairs: the grid, the output arrays, and
 the FFT plans are then built once rather than per pair. For a single pair, call
 [`autorift`](@ref) instead.
 """
 function CommonSolve.init(reference::AbstractMatrix, secondary::AbstractMatrix;
-              reference_valid = nothing, secondary_valid = nothing, kwargs...)
+              reference_valid = nothing, secondary_valid = nothing,
+              process_block_size = nothing, kwargs...)
     p = params(; kwargs...)
     raw = ImagePair(reference, secondary; reference_valid, secondary_valid)
-    prepared = _prepare(raw, p)
-    grid = _build_grid(size(prepared), p)
+    # Before the grid and the plans, so a filter that cannot run on this element type is an error at
+    # the call that configured it rather than at the first correlation.
+    _check_preprocess(eltype(raw), p.preprocess)
+    bs = _block_size(process_block_size)
+    # A blocked run filters each block from its own read window, so the filtered scene is never
+    # formed — which is what bounds peak memory by the block rather than by the scene, and is the
+    # reason `process_block_size` exists. Preparing here would defeat it, and would also filter
+    # every block twice.
+    grid = _build_grid(size(raw), p)
     # Plans are created here rather than on first use so that a batch driver pays for them
     # once, on the task that builds the cache, and never inside a correlation.
     _warm_grid_plans(grid, p)
-    return Cache{typeof(p)}(p, raw, prepared, grid, nothing, true)
+    # The layout is built here rather than at the first run, so a block size that cannot work is an
+    # error at the call that set it. `block_layout` is what knows the halo, so it is what checks.
+    return Cache{typeof(p)}(p, raw, _runner(raw, grid, p, bs), grid, nothing, true)
 end
+
+# `process_block_size` as a tuple of pixels, or `nothing` for one block.
+#
+# A tuple and only a tuple. A bare `Int` is rejected rather than read as a square block: a
+# full-width band is the cheaper shape at a given halo — halo on two sides rather than four — and
+# inferring "square" from a scalar would quietly pick the more expensive one on the caller's behalf.
+_block_size(::Nothing) = nothing
+_block_size(bs::Tuple{Integer,Integer}) = (Int(bs[1]), Int(bs[2]))
+_block_size(bs) = throw(ArgumentError(
+    "`process_block_size` must be a tuple of two integers, `(X, Y)` pixels, or `nothing` for one " *
+    "block over the whole scene. Got a $(typeof(bs)). A scalar is not accepted: a full-width band " *
+    "costs less halo than a square block of the same area, so which one you want is worth saying."))
 
 """
     reinit!(cache; reference, secondary, reference_valid, secondary_valid) -> cache
@@ -106,7 +153,7 @@ function reinit!(cache::Cache; reference = nothing, secondary = nothing,
     isnothing(reference) && isnothing(secondary) &&
         isnothing(reference_valid) && isnothing(secondary_valid) && return cache
 
-    old, oldprep = cache.raw, cache.prepared
+    old = cache.raw
     # Defaults come from the *raw* pair, so replacing one image re-prepares the other from its
     # original rather than filtering an already-filtered array.
     ref = isnothing(reference) ? old.reference : reference
@@ -123,10 +170,7 @@ function reinit!(cache::Cache; reference = nothing, secondary = nothing,
         "cache with `init` for a different image size."))
 
     cache.raw = ImagePair(ref, sec; reference_valid = rv, secondary_valid = sv)
-    p = cache.params
-    newref = _reprepare(ref, cache.raw.reference_valid, old, oldprep, p)
-    newsec = _reprepare(sec, cache.raw.secondary_valid, old, oldprep, p)
-    cache.prepared = ImagePair(newref, newsec)
+    cache.runner = _reinit_runner(cache.runner, cache.raw, old, cache.params)
     # `|=` rather than `=`: two swaps before a single run must still leave the cache dirty.
     cache.isfresh |= true
     cache.result = nothing
@@ -164,10 +208,39 @@ than recomputing it.
 """
 function autorift!(cache::Cache)
     cache.isfresh || isnothing(cache.result) || return cache.result
-    cache.result = correlate_multichip(cache.prepared, cache.grid, cache.params)
+    cache.result = _multichip(cache.runner, cache.grid, cache.params)
     cache.isfresh = false
     return cache.result
 end
+
+# The runner a block size implies, and the pair it correlates.
+#
+# The two take *different pairs*, which is the point rather than an inconsistency: a whole-scene run
+# correlates a filtered scene, while a blocked run filters each block from raw and so never forms
+# one. Pairing each pair with its runner here is what makes handing the blocked path a prepared pair
+# — a twice-filtered image — impossible to write.
+_runner(raw::ImagePair, ::PointSet{2}, p::Params, ::Nothing) = WholeScene(_prepare(raw, p))
+
+function _runner(raw::ImagePair, grid::PointSet{2}, p::Params, bs::Tuple{Int,Int})
+    layout = block_layout(grid, p, size(raw), bs)
+    buffers = istrue(p.threaded) ? nothing : block_buffers(raw, layout)
+    return Blocked(raw, layout, layout.blocks, buffers)
+end
+
+# The runner for a cache whose images have just changed.
+#
+# A whole-scene runner refilters, but only what changed: `_reprepare` matches each new image against
+# both slots of the old pair, so a time series that walks each acquisition from secondary to reference
+# refilters one image per pair rather than two.
+_reinit_runner(old_runner::WholeScene, raw::ImagePair, old::ImagePair, p::Params) = WholeScene(
+    ImagePair(_reprepare(raw.reference, raw.reference_valid, old, old_runner.prepared, p),
+              _reprepare(raw.secondary, raw.secondary_valid, old, old_runner.prepared, p)))
+
+# A blocked runner has nothing to refilter — that happens per block, inside the run — so it only has
+# to point at the new pair. The layout and buffers carry over: both are sized from the grid and the
+# image size, and `reinit!` rejects a change of image size.
+_reinit_runner(old_runner::Blocked, raw::ImagePair, ::ImagePair, ::Params) =
+    Blocked(raw, old_runner.layout, old_runner.blocks, old_runner.buffers)
 
 """
     autorift(reference, secondary; kwargs...) -> MultichipResult
@@ -188,6 +261,38 @@ All of [`AutoRIFT.params`](@ref)'s, plus:
 - `reference_valid`, `secondary_valid`: per-pixel validity masks. Defaults to finiteness. Pass
   these for sensors with a fill value, or to apply a cloud or shadow mask — an invalid pixel
   never contributes to a correlation.
+- `process_block_size`: `(X, Y)` **pixels** per block, or `nothing` (the default) for one block over
+  the whole scene. Reads and filters the images a block at a time, so no array the size of the scene
+  is ever formed. **512 by 512 is a good default**; measured peak memory at 4096² and 6000² is
+  lowest there and rises with larger blocks.
+
+  Two things are promised under semantic versioning, and only these two: the result is
+  **bit-identical** to the untiled run, and no array the size of the scene — imagery or mask — is
+  formed. The halo formula, the number and shape of the blocks, buffer reuse and the threading shape
+  are all free to change.
+
+  Worth it whenever peak memory matters, not only when the scene cannot fit. Measured total process
+  peak, threaded, against a resident untiled run:
+
+  | scene | untiled | 512-pixel blocks |
+  |---|---:|---:|
+  | 4096² | 995 MiB | 593 MiB |
+  | 6000² | 1519 MiB | 603 MiB |
+
+  The gain grows with the scene — 40% and 60% here — and peak rises with the block size rather than
+  falling, since a larger block holds more imagery at once while the halo it saves is a fixed width.
+  The halo costs 1–13% extra *reading* at these sizes. Combine this with an input that reads a window
+  cheaply — a lazy `Raster`, or any disk-backed array — and the scene is never resident at all.
+
+  A block is a whole number of grid points, so the size is a target that snaps outward: at
+  `grid_spacing = 32` a request of 500 becomes 512. A tuple and only a tuple, since a full-width band
+  costs halo on two sides where a square block pays it on four — pass the scene width as `X` for a
+  band rather than leaving the shape to be inferred from a scalar.
+
+  Each block reads its own extent grown by a halo, so it reads more than it writes — see
+  [`AutoRIFT.halo`](@ref). A block smaller than that halo would be almost entirely overlap and is
+  rejected. A preprocessing filter that estimates from the whole image cannot be reproduced block by
+  block, and is rejected rather than approximated — see [`AutoRIFT.filter_reach`](@ref).
 
 ```julia
 out = autorift(image1, image2; chip_size = 32, search_radius = 25)
@@ -227,7 +332,7 @@ once reuse it across pairs without re-validating keywords — though [`AutoRIFT.
 the better tool for that, since it also reuses buffers.
 
 ```julia
-p = AutoRIFT.Params((ZNCC(),), Highpass(), QuantizeUInt8(), PyramidRefine(), GardnerFilter(),
+p = AutoRIFT.Params((ZNCC(),), Highpass(), PyramidRefine(), GardnerFilter(),
                     AutoRIFT.False(), AutoRIFT.NoRotationSearch(), 32, 32, 128, 1.0, 32, 25, 25,
                     6, 4, 8, 0.01, 0.0, 0.0, 3, UInt64(0), false)
 out = autorift(image1, image2, p)
@@ -263,15 +368,51 @@ single scale via [`track`](@ref), since the chip-size loop's coarse pass and mer
 operations that need a layout.
 """
 function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, grid::PointSet;
-                  reference_valid = nothing, secondary_valid = nothing, kwargs...)
+                  reference_valid = nothing, secondary_valid = nothing,
+                  process_block_size = nothing, kwargs...)
     p = params(; kwargs...)
-    pair = _prepare(ImagePair(reference, secondary; reference_valid, secondary_valid), p)
-    return _run(pair, grid, p)
+    raw = ImagePair(reference, secondary; reference_valid, secondary_valid)
+    return _run(raw, grid, p, _block_size(process_block_size))
 end
 
 # Dispatch on the point set's dimensionality: only a gridded one can run multiple chip sizes.
-_run(pair::ImagePair, grid::PointSet{2}, p::Params) = correlate_multichip(pair, grid, p)
-_run(pair::ImagePair, pts::PointSet{1}, p::Params) = track(pair, pts, p)
+#
+# Whether the scene is filtered at all depends on the block size, which is what `_runner` decides: a
+# blocked run filters per block and must never form a filtered scene, since that copy is the
+# allocation it exists to avoid.
+function _run(raw::ImagePair, grid::PointSet{2}, p::Params, bs::Union{Nothing,Tuple{Int,Int}})
+    _check_preprocess(eltype(raw), p.preprocess)
+    return _multichip(_runner(raw, grid, p, bs), grid, p)
+end
+
+# A scattered set runs one pass at one chip size, so there are no levels to loop over and no coarse
+# restriction to apply — `track` is the whole computation.
+function _run(raw::ImagePair, pts::PointSet{1}, p::Params, ::Nothing)
+    _check_preprocess(eltype(raw), p.preprocess)
+    return track(_prepare(raw, p), pts, p)
+end
+
+# Whether this filter can run on this element type, checked once at the call that started the run.
+#
+# `params` cannot do this: it has no image, so it cannot know the element type, and its promise that
+# nothing below re-validates (see the note at the top of this file) therefore cannot cover the
+# filter/eltype pairing. Without this the mismatch surfaces from inside `_prepare` — mid-run, after
+# the grid is built and the plans are warmed — as an error about an array type rather than about the
+# keyword that chose it.
+#
+# Dispatch rather than a condition, so a filter added with no method for the element type it is
+# handed produces a `MethodError` here, at the boundary, instead of deep in the filter stack.
+_check_preprocess(::Type, ::PreprocessMethod) = nothing
+_check_preprocess(::Type{<:Real}, ::Deramp) = throw(ArgumentError(
+    "`preprocess = :deramp` needs complex input, but the images are real. A real image has no " *
+    "phase ramp to remove. Use `preprocess = :highpass` for real imagery, or pass complex data."))
+
+# Blocks are laid out over a *gridded* point set, since the halo is derived from where points sit
+# relative to each other. A scattered set has no such layout, so there is nothing to divide.
+_run(::ImagePair, ::PointSet{1}, ::Params, ::Tuple{Int,Int}) = throw(ArgumentError(
+    "`process_block_size` needs a gridded `PointSet`, but this one is scattered. Blocks are " *
+    "rectangles of the output grid, and a scattered point set has no grid to cut. Drop the " *
+    "keyword, or pass a gridded point set."))
 
 """
     AutoRIFT.autorift_with_grid(reference, secondary; kwargs...) -> (result, grid)
@@ -286,24 +427,33 @@ Exists so the DimensionalData and Rasters extensions share one path into the cor
 each rebuilding the grid and hoping it matches. Not exported: the array API has no use for it.
 """
 function autorift_with_grid(reference::AbstractMatrix, secondary::AbstractMatrix;
-                            reference_valid = nothing, secondary_valid = nothing, kwargs...)
+                            reference_valid = nothing, secondary_valid = nothing,
+                            process_block_size = nothing, kwargs...)
     p = params(; kwargs...)
-    pair = _prepare(ImagePair(reference, secondary; reference_valid, secondary_valid), p)
-    grid = _build_grid(size(pair), p)
+    raw = ImagePair(reference, secondary; reference_valid, secondary_valid)
+    # From the raw pair's size, which the filters preserve.
+    grid = _build_grid(size(raw), p)
     _warm_grid_plans(grid, p)
-    return _run(pair, grid, p), grid
+    return _run(raw, grid, p, _block_size(process_block_size)), grid
 end
 
 # ---------------------------------------------------------------------------
 
-# Filter and quantize, in that order. Both are configuration-dependent and neither depends on
-# the grid, so a cache does this once per image pair rather than once per run.
+# Filter, then replace non-finite pixels. The filter is configuration-dependent and neither step
+# depends on the grid, so a cache does this once per image pair rather than once per run.
 #
 # Per image, because that is the unit of reuse. In a time series each acquisition is the
 # secondary of one pair and the reference of the next, so `reinit!` swapping one image must not
 # re-filter the other — on 1024² that is 23 ms and 23 MiB of pure waste per pair.
+# `resident` is called here, and only here. Every whole-array reduction over a mask — `all(mask)` in
+# `_masked_boxmean!` and in `_erode_mask!` — is downstream of either this function or `_read_block!`,
+# and neither can hand one a lazy mask: this materializes at entry, and `_read_block!` copies into a
+# dense buffer. So the re-scan a computed mask would cost is unreachable rather than remembered.
+#
+# A blocked run never reaches here, which is the whole point: it filters per block from raw input, so
+# the untiled path pays one pass over the mask and the blocked path pays nothing, with no branch.
 _prepare(img::AbstractMatrix, mask::AbstractMatrix{Bool}, p::Params) =
-    quantize(preprocess(img, mask, p.preprocess)..., p.quantize)
+    replace_nonfinite(preprocess(img, resident(mask), p.preprocess, p.rng_seed)...)
 
 
 _prepare(pair::ImagePair, p::Params) = ImagePair(
@@ -314,7 +464,7 @@ _prepare(pair::ImagePair, p::Params) = ImagePair(
 #
 # Matched against *both* slots of the old pair, not just the corresponding one. In a time series
 # the pairs are consecutive acquisitions, so the new reference is the old secondary: the array
-# the caller passes has already been filtered and quantized, just into the other slot. Checking
+# the caller passes has already been filtered, just into the other slot. Checking
 # only like-for-like would miss that and re-filter every image twice over its lifetime.
 #
 # Identity (`===`), not equality: comparing 4 MiB of pixels to decide whether to spend 12 ms

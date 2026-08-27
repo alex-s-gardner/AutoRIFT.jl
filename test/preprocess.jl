@@ -1,4 +1,4 @@
-using AutoRIFT: ImagePair, preprocess, quantize, highpass, wallis, valid,
+using AutoRIFT: ImagePair, preprocess, replace_nonfinite, highpass, wallis, valid,
                 workspace, correlate!, peak_offset
 
 @testset "ImagePair construction" begin
@@ -140,51 +140,33 @@ end
     @test_throws "not recognised" preprocess(p, :sharpen)
 end
 
-@testset "quantize to UInt8" begin
-    n = 40
-    tex = synthetic_texture(n; seed = 7)
-    p = ImagePair(tex, tex)
-    q = quantize(preprocess(p, :highpass), :uint8)
-    @test eltype(q) === UInt8
-    # The ±3σ window should use most of the range without saturating everything.
-    @test maximum(q.reference) > 200
-    @test minimum(q.reference) < 60
-    @test count(==(0x00), q.reference) < length(q.reference) ÷ 10
-    @test count(==(0xff), q.reference) < length(q.reference) ÷ 10
-end
+@testset "non-finite pixels become zero, and the type is preserved" begin
+    # The images reach the correlator in the caller's own type: nothing here converts, so an
+    # integer image stays 2 bytes per pixel rather than becoming 4.
+    for T in (Float32, Float64, Int16, UInt8)
+        img = synthetic_texture(20; seed = 7, T)
+        out, _ = replace_nonfinite(img, trues(20, 20))
+        @test eltype(out) === T
+        @test out == img
+        # A copy, not an alias: the pipeline must not write through to the caller's array.
+        @test out !== img
+    end
 
-@testset "quantize excludes invalid pixels from its statistics" begin
-    # A large fill-valued region would otherwise drag the mean and inflate the spread,
-    # compressing the real data into a fraction of the available range.
-    n = 40
-    tex = synthetic_texture(n; seed = 7)
-    img = copy(tex)
-    mask = trues(n, n)
-    img[1:20, :] .= -999.0f0      # a fill value far outside the data range
-    mask[1:20, :] .= false
+    # NaN and Inf become zero so downstream arithmetic stays finite. The mask is what records
+    # that those pixels carry no information, which is why the value itself can be anything.
+    img = Float32[1 NaN32; Inf32 -Inf32]
+    out, mask = replace_nonfinite(img, trues(2, 2))
+    @test out == Float32[1 0; 0 0]
+    @test all(mask)
 
-    p = ImagePair(img, img; reference_valid = mask, secondary_valid = mask)
-    q = quantize(p, :uint8)
-    # The valid half still spans the range, which it would not if -999 were included.
-    live = q.reference[21:n, :]
-    @test maximum(live) > 200
-    @test minimum(live) < 60
-    # Invalid pixels are zeroed rather than mapped somewhere meaningful.
-    @test all(==(0x00), q.reference[1:20, :])
-end
+    # Complex is non-finite if either component is, and the same replacement applies.
+    z = ComplexF32[1+2im NaN32+0im; 0+NaN32*im 3-1im]
+    zout, _ = replace_nonfinite(z, trues(2, 2))
+    @test zout == ComplexF32[1+2im 0; 0 3-1im]
 
-@testset "quantize handles a uniform image" begin
-    # No texture to preserve, so mid-grey is the neutral answer; pinning it to an
-    # endpoint would be arbitrary.
-    p = ImagePair(fill(5.0f0, 10, 10), fill(5.0f0, 10, 10))
-    q = quantize(p, :uint8)
-    @test all(==(0x80), q.reference)
-
-    # Nothing valid at all: all zero rather than an error, since the grid will have no
-    # searchable points anyway.
-    p = ImagePair(fill(5.0f0, 10, 10), fill(5.0f0, 10, 10);
-                  reference_valid = falses(10, 10), secondary_valid = falses(10, 10))
-    @test all(==(0x00), quantize(p, :uint8).reference)
+    # An integer image cannot hold a non-finite value, so nothing is replaced.
+    iout, _ = replace_nonfinite(Int16[1 -2; 3 -4], trues(2, 2))
+    @test iout == Int16[1 -2; 3 -4]
 end
 
 @testset "filtering improves correlation across a brightness change" begin
@@ -218,4 +200,271 @@ end
     # filter and any downstream weighting depend on.
     @test c_f > c_raw
     @test c_f > 0.95
+end
+
+# ---------------------------------------------------------------------------
+# The decibel filters and the derivative kernels built on them
+# ---------------------------------------------------------------------------
+
+@testset "derivative kernels match OpenCV's getDerivKernels" begin
+    # Pinned against `cv2.getDerivKernels(order, 0, w, normalize=false)`, which is what the
+    # reference builds `Sobel` and `Laplacian` from. Deriving these independently is a second
+    # chance to get the scale wrong -- for widths above 3 they are binomial-difference kernels
+    # whose magnitude grows with width, and Julia's `Kernel.sobel` uses a different, normalized,
+    # 3x3-only convention.
+    expected = Dict(
+        (3, 1) => ([-1, 0, 1], [1, 2, 1]),
+        (3, 2) => ([1, -2, 1], [1, 2, 1]),
+        (5, 1) => ([-1, -2, 0, 2, 1], [1, 4, 6, 4, 1]),
+        (5, 2) => ([1, 0, -2, 0, 1], [1, 4, 6, 4, 1]),
+        (7, 1) => ([-1, -4, -5, 0, 5, 4, 1], [1, 6, 15, 20, 15, 6, 1]),
+        (7, 2) => ([1, 2, -1, -4, -1, 2, 1], [1, 6, 15, 20, 15, 6, 1]),
+    )
+    for ((w, order), (deriv, smooth)) in expected
+        d, s = AutoRIFT._deriv_kernels(w, order)
+        @test Int.(d) == deriv
+        @test Int.(s) == smooth
+    end
+
+    # A derivative kernel sums to zero, which is what makes it blind to a constant offset. This
+    # is the property `Laplacian` relies on to remove multiplicative brightness in decibels.
+    for w in (3, 5, 7), order in (1, 2)
+        d, s = AutoRIFT._deriv_kernels(w, order)
+        @test sum(d) == 0
+        @test sum(s) > 0
+    end
+
+    @test_throws "must be odd and at least 3" AutoRIFT._deriv_kernels(4, 1)
+    @test_throws "order must be 1 or 2" AutoRIFT._deriv_kernels(5, 3)
+end
+
+@testset "decibel converts amplitude and drops what has no logarithm" begin
+    img = Float32[1 10 100; 1000 0 -5; 0.1 0.01 2]
+    mask = trues(3, 3)
+    out, v = AutoRIFT.decibel(img, mask)
+
+    @test out[1, 1] ≈ 0.0f0                      # 20*log10(1) == 0
+    @test out[1, 2] ≈ 20.0f0                     # 20*log10(10)
+    @test out[1, 3] ≈ 40.0f0
+    @test out[2, 1] ≈ 60.0f0
+    # `20 log10` and not `10 log10`: the input is amplitude, so a factor of ten is 20 dB.
+    @test out[1, 2] - out[1, 1] ≈ 20.0f0
+
+    # Zero and negative amplitudes have no decibel value. They leave the mask rather than
+    # becoming -Inf or NaN, which is where this departs from the reference.
+    @test !v[2, 2]
+    @test !v[2, 3]
+    @test isfinite(out[2, 2])
+    @test all(isfinite, out)
+    @test count(v) == 7
+
+    # An already-invalid pixel stays invalid whatever its value.
+    m2 = trues(3, 3)
+    m2[1, 1] = false
+    _, v2 = AutoRIFT.decibel(img, m2)
+    @test !v2[1, 1]
+end
+
+@testset "sobel is the summed kernel, not a gradient magnitude" begin
+    # The reference adds the x and y derivative kernels and convolves once, so the filter is
+    # directional: `Gx + Gy`. A gradient magnitude would be non-negative everywhere and
+    # symmetric under transposition; this is neither, and a future edit that "fixes" it into a
+    # magnitude would change every result.
+    img = synthetic_texture(48; seed = 4) .+ 1.0f0
+    mask = trues(48, 48)
+    out = AutoRIFT.sobel(img, mask, 5)
+
+    @test any(<(0), out)                          # signed, so not a magnitude
+    inner = 5:44
+    @test !all(isapprox.(out[inner, inner], permutedims(AutoRIFT.sobel(permutedims(img),
+                                                                      mask, 5))[inner, inner]))
+
+    # Blind to a constant offset, because the kernel sums to zero.
+    shifted = AutoRIFT.sobel(img .+ 100.0f0, mask, 5)
+    @test out[inner, inner] ≈ shifted[inner, inner] rtol=1e-4
+end
+
+@testset "laplacian works in decibels, so it is blind to a brightness scale" begin
+    # The log comes first, and that ordering is the whole point: radar brightness varies
+    # multiplicatively, so scaling the scene is an additive offset in decibels, which a
+    # zero-sum second-derivative kernel removes. On raw amplitude the same scaling would
+    # multiply the output.
+    img = synthetic_texture(48; seed = 6) .+ 1.0f0
+    mask = trues(48, 48)
+    inner = 5:44
+
+    plain = AutoRIFT.laplacian(img, mask, 5)
+    scaled = AutoRIFT.laplacian(img .* 8.0f0, mask, 5)
+    @test plain[inner, inner] ≈ scaled[inner, inner] rtol=1e-3
+
+    # Not the same as a Laplacian of the raw amplitude, which is what makes the ordering
+    # observable rather than a stylistic note.
+    raw = AutoRIFT._convolve_masked(img, mask, AutoRIFT._summed_deriv_kernel(5, 2))
+    @test !isapprox(plain[inner, inner], raw[inner, inner]; rtol = 1e-2)
+end
+
+@testset "wallis_gapfill fills interior gaps and excludes the border" begin
+    n = 120
+    # Landsat-like digital numbers: `std_cutoff` is an absolute threshold on the local standard
+    # deviation, so it only means "low contrast" against imagery of a realistic scale.
+    img = synthetic_texture(n; seed = 8) .* 2000.0f0 .+ 500.0f0
+    mask = trues(n, n)
+    # An interior gap, as a post-2003 Landsat-7 scan-line gap would appear.
+    mask[40:60, 30:36] .= false
+    # And an outer no-data margin deep enough that its far side is beyond `GAPFILL_REACH` from
+    # any real pixel. Depth is what distinguishes the two cases: a thin margin is within reach of
+    # data and so is filled like any interior gap, which is correct -- only a pixel with no nearby
+    # data to be statistically consistent with is excluded.
+    margin = 2 * ceil(Int, AutoRIFT.GAPFILL_REACH)
+    mask[1:margin, :] .= false
+
+    out, v = AutoRIFT.wallis_gapfill(img, mask, 5, 0.25; rng = Random.Xoshiro(1))
+
+    @test size(out) == (n, n)
+    @test all(isfinite, out)
+    # The interior gap becomes valid -- that is what stops it masking out its neighbourhood.
+    @test all(v[45:55, 31:35])
+    # The top of a deep margin is beyond reach of any data, so it stays invalid.
+    @test !v[1, 60]
+    # Its inner edge is within reach, so it is filled rather than excluded.
+    @test v[margin, 60]
+    # Real data away from either stays measured, and normalized rather than replaced.
+    @test v[80, 80]
+
+    # Reproducible from the seed, which the reference is not: it draws from NumPy's unseeded
+    # global generator, so two runs of the same scene disagree.
+    again, _ = AutoRIFT.wallis_gapfill(img, mask, 5, 0.25; rng = Random.Xoshiro(1))
+    @test isequal(out, again)
+    other, _ = AutoRIFT.wallis_gapfill(img, mask, 5, 0.25; rng = Random.Xoshiro(2))
+    @test !isequal(out, other)
+end
+
+@testset "the local standard deviation carries the Bessel correction" begin
+    # The reference scales by `sqrt(n / (n - 1))` with `n` the kernel *area*, not the per-window
+    # valid count -- which is what makes it a single multiply. Matching it exactly is what keeps
+    # `WallisGapfill`'s `std_cutoff`, an absolute threshold on this quantity, mean the same thing
+    # here as there.
+    for w in (3, 5, 21)
+        n = w * w
+        @test AutoRIFT._bessel_factor(w) ≈ Float32(sqrt(n / (n - 1)))
+    end
+    # A single-pixel window has no spread to correct and must not divide by zero.
+    @test AutoRIFT._bessel_factor(1) == 1.0f0
+
+    # The correction is a constant factor on the whole field, so `wallis` scales by exactly its
+    # reciprocal. Asserted against a hand-computed window rather than against itself.
+    img = Float32[0 0 0 0 0; 0 1 2 3 0; 0 4 5 6 0; 0 7 8 9 0; 0 0 0 0 0]
+    mask = trues(5, 5)
+    out = AutoRIFT.wallis(img, mask, 3, 0.0)
+    centre = img[2:4, 2:4]
+    mu = sum(centre) / 9
+    sigma = sqrt(sum((centre .- mu) .^ 2) / 9) * sqrt(9 / 8)
+    @test out[3, 3] ≈ (img[3, 3] - mu) / sigma rtol=1e-5
+end
+
+@testset "every PreprocessMethod runs on the input it documents" begin
+    # The gap this closes: `Sobel`, `Laplacian`, `Decibel` and `WallisGapfill` were exported,
+    # documented, resolvable from a keyword symbol, and had `filter_width`/`filter_reach`
+    # methods -- but no `preprocess` method, so each threw a `MethodError` from inside the run.
+    img = synthetic_texture(40; seed = 9) .* 1000.0f0 .+ 500.0f0
+    mask = trues(40, 40)
+    for m in (NoPreprocess(), Highpass(; width = 5), Wallis(), WallisGapfill(),
+              Sobel(), Laplacian(), Decibel())
+        out, v = preprocess(img, mask, m)
+        @test size(out) == size(img)
+        @test size(v) == size(mask)
+        @test all(isfinite, out)
+        @test any(v)
+    end
+
+    # Complex input is still refused for every amplitude filter, naming the two things a caller
+    # probably wants instead.
+    cimg = rand(ComplexF32, 16, 16)
+    cmask = trues(16, 16)
+    for m in (Highpass(), Wallis(), WallisGapfill(), Sobel(), Laplacian(), Decibel())
+        @test_throws "amplitude filter and the image is complex" preprocess(cimg, cmask, m)
+    end
+
+    # And the seed-carrying form forwards to the three-argument one for every filter that
+    # ignores it, so `_prepare` need not know which filter it holds.
+    for m in (NoPreprocess(), Highpass(; width = 5), Wallis(), Sobel(), Laplacian(), Decibel())
+        a, _ = preprocess(img, mask, m)
+        b, _ = preprocess(img, mask, m, UInt64(12345))
+        @test isequal(a, b)
+    end
+end
+
+@testset "the default mask is lazy, and materializes only where it must" begin
+    # `process_block_size` promises that no array the size of the scene is formed. A default mask
+    # built with `map(isfinite, img)` broke that promise before any block was touched: it read every
+    # pixel of an input that may be on disk and allocated a scene-sized `Matrix{Bool}` per image.
+    #
+    # Counting reads asserts the property structurally rather than by watching RSS, which measures
+    # allocator slack as much as requirement.
+    mutable struct CountingRead{T} <: AbstractMatrix{T}
+        data::Matrix{T}
+        reads::Int
+    end
+    Base.size(c::CountingRead) = size(c.data)
+    Base.getindex(c::CountingRead, i::Int...) = (c.reads += 1; c.data[i...])
+
+    n = 64
+    a = CountingRead(rand(Float32, n, n) .+ 1.0f0, 0)
+    b = CountingRead(rand(Float32, n, n) .+ 1.0f0, 0)
+    pair = ImagePair(a, b)
+
+    # Construction touches neither image.
+    @test a.reads == 0
+    @test b.reads == 0
+    @test pair.reference_valid isa AutoRIFT.FiniteMask
+    # And allocates nothing of the scene's size: two wrappers, not two masks.
+    @test (@allocated ImagePair(a, b)) < 1024
+
+    # It still answers correctly, element by element.
+    withnan = copy(a.data)
+    withnan[7, 9] = NaN32
+    lazy = AutoRIFT.FiniteMask(withnan)
+    @test size(lazy) == (n, n)
+    @test !lazy[7, 9]
+    @test lazy[1, 1]
+    @test collect(lazy) == map(isfinite, withnan)
+
+    # A window read costs the window, which is what makes a blocked run bound memory: the seam is
+    # `_read_block!`'s `copyto!` over a view, and it needs no method of its own for this.
+    c = CountingRead(rand(Float32, n, n), 0)
+    dest = Matrix{Bool}(undef, 10, 10)
+    AutoRIFT._read_block!(dest, AutoRIFT.FiniteMask(c), 21:30, 31:40)
+    @test c.reads == 100
+    @test dest == map(isfinite, c.data[21:30, 31:40])
+
+    # `resident` is identity for a stored mask and one pass for a computed one, so the whole-array
+    # reductions the filters begin with never see a lazy mask.
+    dense = trues(4, 4)
+    @test AutoRIFT.resident(dense) === dense
+    made = AutoRIFT.resident(AutoRIFT.FiniteMask(rand(Float32, 4, 4)))
+    @test made isa Matrix{Bool}
+    @test all(made)
+end
+
+@testset "a pair may mix image and mask containers" begin
+    # A single shared type parameter for the two images, and another for the two masks, made these
+    # a `MethodError`. Both arise in ordinary use: a time series advances one image at a time, and a
+    # caller masking one image explicitly leaves the other to the default.
+    img = rand(Float32, 8, 8) .+ 1.0f0
+
+    # A resident reference against a view of the same data.
+    @test ImagePair(img, view(img, :, :)) isa ImagePair
+
+    # A supplied dense mask beside a defaulted lazy one.
+    mixed = ImagePair(img, img; reference_valid = trues(8, 8))
+    @test mixed.reference_valid isa AbstractMatrix{Bool}
+    @test mixed.secondary_valid isa AutoRIFT.FiniteMask
+
+    # A supplied mask is passed through rather than converted, which is what keeps a lazy `Raster`
+    # mask lazy and what lets `Cache` recognise an unchanged image by identity.
+    bits = trues(8, 8)
+    @test ImagePair(img, img; reference_valid = bits).reference_valid === bits
+
+    # Sizes are still checked across every combination.
+    @test_throws DimensionMismatch ImagePair(img, img; secondary_valid = trues(4, 4))
 end
