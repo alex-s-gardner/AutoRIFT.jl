@@ -378,14 +378,18 @@ end
 end
 
 @testset "a threaded blocked run is deterministic and bounded" begin
-    # Two properties, and the second is the one that has broken twice.
+    # `_run_blocked` spawns `min(nblocks, nthreads)` tasks, each holding one buffer set and claiming
+    # blocks from a shared counter until they run out. Two things can break that, and both are
+    # invisible in a single run:
     #
-    # `_run_blocked` spawns `min(nblocks, nthreads)` tasks that claim blocks from a shared counter,
-    # so the task count is bounded rather than equal to the block count. Whether a task may *reuse*
-    # one buffer set across the blocks it claims is a separate question, and the answer is currently
-    # no: it is exact serially and at one thread, and wrong at eight, only ever in the blocks a task
-    # claims second or later. So a fresh set per block is what the code does, and this asserts the
-    # result that reuse breaks rather than the allocation strategy itself.
+    #   * a buffer set shared between tasks rather than per task, which corrupts whichever blocks a
+    #     task claims after its first — the failure a `Core.Box` produces when the set is assigned
+    #     inside the spawned closure instead of in a function of its own;
+    #   * dynamic claiming changing the answer, which it cannot, since each block writes a disjoint
+    #     slice of the output.
+    #
+    # Asserted as a result rather than as an allocation strategy, and repeated, because a race shows
+    # up as run-to-run variation even where one run happens to agree.
     n = 1024
     ref, sec = split_pair(n)
     p = params(; chip_size = 32, chip_size_max = 32, grid_spacing = 16, search_radius = 12,

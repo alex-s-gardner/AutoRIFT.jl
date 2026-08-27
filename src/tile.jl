@@ -483,33 +483,55 @@ function _run_blocked(raw::ImagePair, pts::PointSet{2}, p::Params, layout::Block
         # Dynamic claiming cannot change the result: each block writes a disjoint slice of `out`, so
         # the field is assembled rather than reduced and block order is not an input.
         #
-        # A **fresh** buffer set per block, not one per task. Reusing a set across the blocks of one
-        # task is correct in isolation — verified exact both serially and at `-t1`, where a single
-        # task reuses one set across every block — but not when several such tasks run concurrently:
-        # at `-t8` it disagrees with an untiled run at 300-900 of 3721 points, varying run to run,
-        # and only ever in the blocks a task claims *second or later*. Something reachable from a
-        # block's `ImagePair` therefore outlives `_run_one_block!` and is read across tasks; until
-        # that is found, per-block allocation is the honest cost. `benchmark/memory.jl` records what
-        # it is: 441 MiB at 64 blocks against 55 for one set per task.
+        # One buffer set per *task*, reused across every block that task claims — so a run holds
+        # `min(nblocks, nthreads)` sets rather than one per block. At 144 blocks on 8 threads that is
+        # 55 MiB against 992.
+        #
+        # The set is allocated inside `_run_task_blocks!` rather than here, and that is load-bearing
+        # rather than tidiness. A variable assigned inside a closure *and* in an enclosing scope is
+        # hoisted into a single `Core.Box` shared by every closure built from that frame — so writing
+        # `buf = block_buffers(...)` inline here, next to the serial branch's own `buf`, gives all
+        # tasks one box and therefore one buffer set. That corrupts 300-900 of 3721 points, varying
+        # run to run and concentrated in the blocks claimed second or later. A separate function has
+        # its own frame, so the local cannot be captured or shared.
         next = Threads.Atomic{Int}(1)
         ntasks = min(length(blocks), Threads.nthreads())
         tasks = map(1:ntasks) do _
-            StableTasks.@spawn begin
-                while true
-                    k = Threads.atomic_add!(next, 1)
-                    k <= length(blocks) || break
-                    _run_one_block!(out, block_buffers(raw, layout), raw, pts, serial,
-                                    blocks[k], geometry, measure, subpixel)
-                end
-            end
+            StableTasks.@spawn _run_task_blocks!(out, next, raw, pts, serial, blocks, layout,
+                                                 geometry, measure, subpixel)
         end
         foreach(wait, tasks)
     else
         # Serial: one set serves every block, and the caller's serves every pass.
-        buf = isnothing(buffers) ? block_buffers(raw, layout) : buffers
+        serialbuf = isnothing(buffers) ? block_buffers(raw, layout) : buffers
         for b in blocks
-            _run_one_block!(out, buf, raw, pts, serial, b, geometry, measure, subpixel)
+            _run_one_block!(out, serialbuf, raw, pts, serial, b, geometry, measure, subpixel)
         end
+    end
+    return out
+end
+
+# One task's share of the blocks: take a buffer set, then claim blocks until they run out.
+#
+# A function rather than a `begin` block inside the spawn, so its buffer set is a genuine local of
+# this frame. Julia boxes a captured variable that is also assigned in the enclosing scope, and a box
+# built once in the caller is shared by every task spawned from it — one buffer set for all of them,
+# and a corrupted result.
+#
+# Claiming from a shared counter rather than taking a pre-assigned slice, because per-block cost
+# varies by orders of magnitude: a block whose points a finer level already resolved returns before
+# any I/O, so a static split would leave tasks idle. It cannot change the result — each block writes a
+# disjoint slice of `out`, so the field is assembled rather than reduced and block order is not an
+# input.
+function _run_task_blocks!(out::DisplacementField, next::Threads.Atomic{Int}, raw::ImagePair,
+                           pts::PointSet{2}, p::Params, blocks::Vector{Block},
+                           layout::BlockLayout, geometry::PassGeometry,
+                           measure::SimilarityMeasure, subpixel::SubpixelMethod)
+    buf = block_buffers(raw, layout)
+    while true
+        k = Threads.atomic_add!(next, 1)
+        k <= length(blocks) || break
+        _run_one_block!(out, buf, raw, pts, p, blocks[k], geometry, measure, subpixel)
     end
     return out
 end
