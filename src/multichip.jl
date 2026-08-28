@@ -269,16 +269,24 @@ end
 # Points for one level: the caller's grid with this level's chip size, and the radius zeroed
 # wherever the level should not attempt a point.
 #
-# `chip_size_min`/`chip_size_max` are not consulted per point here because `Params` carries
-# them as scalars; when they become per-point fields (from Geogrid) this is where that filter
-# belongs.
+# A point is attempted only when the level's chip size lies within that point's own
+# `chip_size_min_x`/`chip_size_max_x`, matching the reference's per-level mask
+# (`autoRIFT.py:534`). Zero in either means unbounded, which is the default, so a grid that
+# carries no bounds admits every level exactly as it did before the fields existed.
+#
+# The bound earns its place on real data. ITS_LIVE's parameter rasters permit a 960 m chip at
+# 1.7% of points over Jakobshavn, and running it everywhere instead produces estimates from a
+# chip far larger than the ice structure it covers — measured at a 0.73 correlation against the
+# reference where the finest level reaches 0.99.
 function _level_points(grid::PointSet{2}, p::Params, chip_size::Extent,
                        wanted::AbstractMatrix{Bool})
     n = size(grid)
     rx = Matrix{Int}(undef, n)
     ry = Matrix{Int}(undef, n)
     @inbounds for i in eachindex(grid)
-        if wanted[i]
+        lo, hi = grid.chip_size_min_x[i], grid.chip_size_max_x[i]
+        permitted = (lo == 0 || chip_size.X >= lo) && (hi == 0 || chip_size.X <= hi)
+        if wanted[i] && permitted
             rx[i] = grid.radius_x[i]
             ry[i] = grid.radius_y[i]
         else

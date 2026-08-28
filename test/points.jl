@@ -1,6 +1,6 @@
 using AutoRIFT: PointSet, pointset, gridpoints, scatter, npoints, nsearchable,
                 issearchable, sanitize!, chip_bounds, search_bounds,
-                surface_size, inbounds
+                surface_size, inbounds, rebuild, params
 
 @testset "scattered points" begin
     # The correlator works on a list of search centers. Arbitrary, unsorted,
@@ -250,4 +250,62 @@ end
     @test_throws DimensionMismatch PointSet(
         zeros(3), zeros(3), zeros(Int, 3), zeros(Int, 2),
         zeros(3), zeros(3), zeros(Int, 3), zeros(Int, 3))
+end
+
+@testset "per-point chip-size bounds" begin
+    # The bounds restrict which multi-chip-size *levels* may run at a point, unlike `chip_size_x`,
+    # which is the extent a single pass uses. Zero means unbounded in either.
+    pts = pointset([1.0, 2.0], [3.0, 4.0];
+                   chip_size_min_x = [16, 32], chip_size_max_x = [32, 64])
+    @test pts.chip_size_min_x == [16, 32]
+    @test pts.chip_size_max_x == [32, 64]
+
+    # Absent, they are zero, which is what makes this addition invisible to every existing caller.
+    plain = pointset([1.0], [2.0])
+    @test plain.chip_size_min_x == [0]
+    @test plain.chip_size_max_x == [0]
+    @test gridpoints((256, 256), 32; chip_size = 16, search_radius = 10).chip_size_min_x ==
+          zeros(Int, size(gridpoints((256, 256), 32; chip_size = 16, search_radius = 10)))
+
+    # They travel with every derivation, which is the property a missed field would break: a
+    # bound dropped by `scatter` or `getindex` silently re-admits a level the caller excluded.
+    g = gridpoints((512, 512), 32; chip_size = 16, search_radius = 10)
+    n = size(g)
+    bounded = rebuild(g; chip_size_min_x = fill(16, n), chip_size_max_x = fill(32, n))
+    @test all(==(16), scatter(bounded).chip_size_min_x)
+    @test all(==(32), scatter(bounded).chip_size_max_x)
+    @test all(==(16), bounded[1:3, 1:3].chip_size_min_x)
+    @test size(bounded[1:3, 1:3].chip_size_max_x) == (3, 3)
+
+    @test_throws DimensionMismatch PointSet(
+        zeros(3), zeros(3), zeros(Int, 3), zeros(Int, 3),
+        zeros(3), zeros(3), zeros(Int, 3), zeros(Int, 3),
+        zeros(Int, 2), zeros(Int, 3))
+end
+
+@testset "a level runs only where its chip size is permitted" begin
+    # The reference gates each level on the point's own bounds (`autoRIFT.py:534`). Asserted
+    # through `_level_points`, which is where the gate lives: a point outside the bounds gets a
+    # zero radius, which is how this package spells "do not search".
+    g = gridpoints((512, 512), 32; chip_size = 16, search_radius = 10)
+    n = size(g)
+    # Left half admits fine chips only, right half coarse chips only.
+    lo = [j <= n[2] ÷ 2 ? 16 : 64 for _ in 1:n[1], j in 1:n[2]]
+    hi = [j <= n[2] ÷ 2 ? 32 : 64 for _ in 1:n[1], j in 1:n[2]]
+    bounded = rebuild(g; chip_size_min_x = lo, chip_size_max_x = hi)
+    want = trues(n)
+
+    fine = AutoRIFT._level_points(bounded, params(), AutoRIFT.extent(16), want)
+    @test all(>(0), fine.radius_x[:, 1:(n[2] ÷ 2)])       # inside [16, 32]
+    @test all(iszero, fine.radius_x[:, (n[2] ÷ 2 + 1):end])   # below the right half's minimum
+
+    coarse = AutoRIFT._level_points(bounded, params(), AutoRIFT.extent(64), want)
+    @test all(iszero, coarse.radius_x[:, 1:(n[2] ÷ 2)])   # above the left half's maximum
+    @test all(>(0), coarse.radius_x[:, (n[2] ÷ 2 + 1):end])
+
+    # Unbounded admits every level, so the gate cannot narrow a grid that asked for nothing.
+    for cs in (16, 32, 64, 128)
+        pts = AutoRIFT._level_points(g, params(), AutoRIFT.extent(cs), want)
+        @test all(>(0), pts.radius_x)
+    end
 end
