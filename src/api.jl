@@ -110,17 +110,20 @@ function CommonSolve.init(reference::AbstractMatrix, secondary::AbstractMatrix;
     return Cache{typeof(p)}(p, raw, _runner(raw, grid, p, bs), grid, nothing, true)
 end
 
-# `process_block_size` as a tuple of pixels, or `nothing` for one block.
+# `process_block_size` as an `Extent` of pixels, or `nothing` for one block.
 #
-# A tuple and only a tuple. A bare `Int` is rejected rather than read as a square block: a
-# full-width band is the cheaper shape at a given halo — halo on two sides rather than four — and
-# inferring "square" from a scalar would quietly pick the more expensive one on the caller's behalf.
+# A pair and only a pair. A bare `Int` is rejected rather than read as a square block, unlike every
+# other geometry keyword: a full-width band is the cheaper shape at a given halo — halo on two sides
+# rather than four — so inferring "square" from a scalar would quietly pick the more expensive one on
+# the caller's behalf.
 _block_size(::Nothing) = nothing
-_block_size(bs::Tuple{Integer,Integer}) = (Int(bs[1]), Int(bs[2]))
+_block_size(bs::Tuple{Integer,Integer}) = extent(bs)
+_block_size(bs::Extent) = bs
 _block_size(bs) = throw(ArgumentError(
-    "`process_block_size` must be a tuple of two integers, `(X, Y)` pixels, or `nothing` for one " *
-    "block over the whole scene. Got a $(typeof(bs)). A scalar is not accepted: a full-width band " *
-    "costs less halo than a square block of the same area, so which one you want is worth saying."))
+    "`process_block_size` must be two integers — `(X, Y)` or `(X = …, Y = …)` pixels — or " *
+    "`nothing` for one block over the whole scene. Got a $(typeof(bs)). A scalar is not accepted: " *
+    "a full-width band costs less halo than a square block of the same area, so which one you " *
+    "want is worth saying."))
 
 """
     reinit!(cache; reference, secondary, reference_valid, secondary_valid) -> cache
@@ -221,7 +224,7 @@ end
 # — a twice-filtered image — impossible to write.
 _runner(raw::ImagePair, ::PointSet{2}, p::Params, ::Nothing) = WholeScene(_prepare(raw, p))
 
-function _runner(raw::ImagePair, grid::PointSet{2}, p::Params, bs::Tuple{Int,Int})
+function _runner(raw::ImagePair, grid::PointSet{2}, p::Params, bs::Extent)
     layout = block_layout(grid, p, size(raw), bs)
     buffers = istrue(p.threaded) ? nothing : block_buffers(raw, layout)
     return Blocked(raw, layout, layout.blocks, buffers)
@@ -384,7 +387,7 @@ end
 # Whether the scene is filtered at all depends on the block size, which is what `_runner` decides: a
 # blocked run filters per block and must never form a filtered scene, since that copy is the
 # allocation it exists to avoid.
-function _run(raw::ImagePair, grid::PointSet{2}, p::Params, bs::Union{Nothing,Tuple{Int,Int}})
+function _run(raw::ImagePair, grid::PointSet{2}, p::Params, bs::Union{Nothing,Extent})
     _check_preprocess(eltype(raw), p.preprocess)
     return _multichip(_runner(raw, grid, p, bs), grid, p)
 end
@@ -413,7 +416,7 @@ _check_preprocess(::Type{<:Real}, ::Deramp) = throw(ArgumentError(
 
 # Blocks are laid out over a *gridded* point set, since the halo is derived from where points sit
 # relative to each other. A scattered set has no such layout, so there is nothing to divide.
-_run(::ImagePair, ::PointSet{1}, ::Params, ::Tuple{Int,Int}) = throw(ArgumentError(
+_run(::ImagePair, ::PointSet{1}, ::Params, ::Extent) = throw(ArgumentError(
     "`process_block_size` needs a gridded `PointSet`, but this one is scattered. Blocks are " *
     "rectangles of the output grid, and a scattered point set has no grid to cut. Drop the " *
     "keyword, or pass a gridded point set."))
