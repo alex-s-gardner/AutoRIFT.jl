@@ -266,6 +266,18 @@ function chipsize_level(runner::PassRunner, grid::PointSet{2}, p::Params,
     return (; field = fine, filled)
 end
 
+# How many grid points span one chip of the finest level, per axis, taken as the smaller of the
+# two so a non-square configuration does not over-widen either axis of the filter window.
+#
+# Only a grid at least as fine as its chips has overlapping neighbourhoods, so a spacing coarser
+# than the chip gives one and the filter is left alone. Integer division matches the reference,
+# which rejects a non-dividing pair outright (`autoRIFT.py:474-482`) rather than rounding.
+function _oversample(p::Params)
+    ox = p.chip_size_min.X ÷ max(p.grid_spacing.X, 1)
+    oy = p.chip_size_min.Y ÷ max(p.grid_spacing.Y, 1)
+    return max(min(ox, oy), 1)
+end
+
 # Points for one level: the caller's grid with this level's chip size, and the radius zeroed
 # wherever the level should not attempt a point.
 #
@@ -337,10 +349,11 @@ function _coarse_points(pts::PointSet{2}, p::Params, chip_size::Extent)
     nr, nc = size(pts)
     rows = stride:stride:nr
     cols = stride:stride:nc
-    # Loosened for the decimated grid: its neighbourhoods span `stride` times more ground, so a
-    # coarse point's neighbours are genuinely further away and less like it. `relax` is where
-    # each method says what that means for it.
-    filt = relax(p.outliers)
+    # Two adjustments, both the reference's (`autoRIFT.py:484-496`). `relax` loosens for the
+    # decimation: a coarse point's neighbours span `stride` times more ground and are genuinely
+    # less like it. `rescale` matches the neighbourhood to a grid finer than its chips, and takes
+    # `stride` because decimated neighbours overlap less than adjacent ones do.
+    filt = rescale(relax(p.outliers), _oversample(p), stride)
     w = window(filt)
     (length(rows) < w || length(cols) < w) && return nothing
 
@@ -487,7 +500,8 @@ end
 function _reject_and_fill!(d::DisplacementField, pts::PointSet, p::Params)
     measured = map(!isnan, d.dx)
     keep = reject_outliers(d.dx, d.dy, pts.radius_x, pts.radius_y,
-                           measured, upsampling(p.subpixel), p.outliers)
+                           measured, upsampling(p.subpixel),
+                           rescale(p.outliers, _oversample(p)))
     @inbounds for i in eachindex(keep)
         if !keep[i]
             d.dx[i] = NaN32

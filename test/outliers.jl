@@ -1,4 +1,4 @@
-using AutoRIFT: GardnerFilter, NoOutlierFilter, outlier_filter, reject_outliers
+using AutoRIFT: GardnerFilter, NoOutlierFilter, outlier_filter, reject_outliers, params
 
 # A coherent field with planted outliers, which is the situation the filter exists for:
 # real motion is spatially smooth, false correlation peaks are arbitrary vectors that
@@ -284,4 +284,45 @@ end
     @test_throws DimensionMismatch reject_outliers(
         zeros(Float32, 5, 5), zeros(Float32, 5, 5), fill(25, 5, 5), fill(25, 5, 5),
         trues(4, 5), 64, outlier_filter())
+end
+
+@testset "rescale matches the reference's grid scaling" begin
+    # `autoRIFT.py:484-505` derives the filter's neighbourhood from the chip-size-to-grid-spacing
+    # ratio rather than using the configured values directly. The arithmetic is asserted against
+    # the reference's own expressions: window `(w-1)*ratio+1`, fraction `frac*(1-ov)+ov^2` for
+    # `ov = 1 - stride/ratio`.
+    f = outlier_filter()                      # window 5, min_agree_fraction 8/25
+    @test AutoRIFT.rescale(f, 1) === f        # a grid no finer than its chips is untouched
+    @test AutoRIFT.rescale(f, 1, 4) === f
+
+    r2 = AutoRIFT.rescale(f, 2)
+    @test r2.window == 9                      # (5-1)*2+1
+    @test r2.min_agree_fraction ≈ 8 / 25 * 0.5 + 0.25    # overlap 1 - 1/2
+    r4 = AutoRIFT.rescale(f, 4)
+    @test r4.window == 17
+    @test r4.min_agree_fraction ≈ 8 / 25 * 0.25 + 0.5625  # overlap 1 - 1/4
+
+    # A stride at least the oversample ratio leaves no overlap, so the fraction is unchanged
+    # while the window still widens — decimated neighbours are far apart but each still stands
+    # for a chip's worth of ground.
+    rc = AutoRIFT.rescale(f, 2, 4)
+    @test rc.window == 9
+    @test rc.min_agree_fraction ≈ 8 / 25
+
+    # Untouched parameters stay untouched, and the method's own contract is preserved.
+    @test r2.iterations == f.iterations
+    @test r2.agree_tolerance == f.agree_tolerance
+    @test r2.mad_scale == f.mad_scale
+    @test AutoRIFT.rescale(NoOutlierFilter(), 4) === NoOutlierFilter()
+    @test_throws "must be at least 1" AutoRIFT.rescale(f, 0)
+
+    # `_oversample` is what feeds it, and reads the *finest* chip against the spacing.
+    @test AutoRIFT._oversample(params(; chip_size = 32, grid_spacing = 32)) == 1
+    @test AutoRIFT._oversample(params(; chip_size = 32, grid_spacing = 16)) == 2
+    @test AutoRIFT._oversample(params(; chip_size = 32, grid_spacing = 8)) == 4
+    # A spacing coarser than the chip has no overlap to correct for.
+    @test AutoRIFT._oversample(params(; chip_size = 16, grid_spacing = 32)) == 1
+    # Non-square: the smaller ratio wins, so neither axis is over-widened.
+    @test AutoRIFT._oversample(params(; chip_size = (X = 32, Y = 32),
+                                      grid_spacing = (X = 8, Y = 32))) == 1
 end
