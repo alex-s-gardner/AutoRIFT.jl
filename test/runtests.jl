@@ -68,6 +68,13 @@ include("utils.jl")
         include("firstguess.jl")
     end
 
+    # Real Landsat imagery against ITS_LIVE. Skipped unless the cache is built, and after the
+    # synthetic testsets so a failure here reads as "the package disagrees with production" rather
+    # than as a broken correlator.
+    @testset "real data" begin
+        include("realdata.jl")
+    end
+
     @testset "code quality" begin
         include("aqua.jl")
     end
