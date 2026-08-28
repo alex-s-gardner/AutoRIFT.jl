@@ -557,10 +557,10 @@ function _fill_holes!(d::DisplacementField, p::Params)
                 end
             end
             n >= needed || continue
-            _insertion_sort!(bufx, n)
-            _insertion_sort!(bufy, n)
+            # `_select_median!` rather than a sort here: it picks the cheaper selection for `n`,
+            # which at the default 3-wide window is the insertion sort this used to call directly.
             push!(pending, (LinearIndices(d.dx)[i, j],
-                            _sorted_median(bufx, n), _sorted_median(bufy, n)))
+                            _select_median!(bufx, n), _select_median!(bufy, n)))
         end
         isempty(pending) && break        # nothing left that qualifies
         @inbounds for (idx, mx, my) in pending
