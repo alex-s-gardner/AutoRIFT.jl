@@ -29,3 +29,17 @@
 # bundle is ~71 MiB. Built on demand; see app/README.md.
 /app/build/
 /app/Manifest.toml
+
+# A/B run artifacts: the shared input arrays and each side's output, ~95 MiB per run, regenerated
+# from the real-data cache by the stage scripts. The scripts and the plots they produce are kept.
+/tools/ab/stage1/
+/tools/ab/stage2/
+/tools/ab/Manifest.toml
+__pycache__/
+
+# Benchmark timings from tools/ab: absolute wall-clock is machine-specific, and the measured
+# ratios are recorded in tools/ab/README.md.
+/tools/ab/bench_julia.txt
+/tools/ab/bench_python.txt
+/tools/ab/bench_pair_*.bin
+/tools/ab/bench_scene.bin
