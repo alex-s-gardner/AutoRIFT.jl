@@ -1,5 +1,6 @@
 [deps]
 ArchGDAL = "c9ce4bd3-c3d5-55b8-8973-c0e20141b8c3"
+DiskArrays = "3c3547ce-8d99-4f5e-a174-61eb10b00ae3"
 Extents = "411431e0-e8b7-467b-b5e0-f676ba4f2910"
 NCDatasets = "85f8d34a-cbdd-5861-8df4-14fed0d494ab"
 NetworkOptions = "ca575930-c2e3-43a9-ace4-1e988b2c1908"
