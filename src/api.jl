@@ -358,6 +358,27 @@ function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, p::Param
 end
 
 """
+    autorift(reference, secondary, p::Params, block_size::Tuple{Int,Int}) -> MultichipResult
+
+Correlate a block at a time, with an already-resolved [`Params`](@ref).
+
+`block_size` is `(X, Y)` pixels per block, as the `process_block_size` keyword takes — see
+[`autorift`](@ref)'s keyword form for what blocking promises and costs. The result is bit-identical
+to the unblocked run.
+
+Positional throughout, for the same reason the three-argument form is: nothing between the call and
+the correlation is a runtime value, so a `--trim`ed binary can reach it. The keyword form resolves
+`process_block_size` through keyword machinery that `--trim` cannot follow.
+"""
+function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, p::Params,
+                  block_size::Tuple{Int,Int})
+    raw = ImagePair(reference, secondary)
+    grid = _build_grid(size(raw), p)
+    _warm_grid_plans(grid, p)
+    return _run(raw, grid, p, block_size)
+end
+
+"""
     autorift(reference, secondary, grid::PointSet; kwargs...) -> MultichipResult
 
 Correlate at a caller-supplied set of search points rather than a grid synthesized from

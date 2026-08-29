@@ -138,18 +138,31 @@ function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Param
     # The half-pixel offset applies either way: it is what makes an even-sized chip's reported
     # position refer to its true centre rather than to a position the chip is not symmetric
     # about.
+    # Each branch hands its own concrete array types to `_dispatch_pass!`, rather than assigning them
+    # to variables the two branches share. Sharing them makes each a `Union` of the padded and
+    # unpadded types, and the call below then dispatches on that union — which is a runtime choice
+    # `--trim=safe` cannot resolve, and which the blocked path reaches with `SubArray`s where the
+    # whole-scene path has `Matrix`. The barrier also lets the loop specialize on the concrete pair
+    # rather than on the union, which is the ordinary reason for one.
     if fits
-        ref, sec = pair.reference, pair.secondary
-        okmask = valid(pair)
-        shifted = _shift_points(flat, (0, 0))
+        _dispatch_pass!(out, pair.reference, pair.secondary, valid(pair),
+                        _shift_points(flat, (0, 0)), chipx, chipy, rx, ry, p, measure, subpixel)
     else
-        ref = _zeropad(pair.reference, pad)
-        sec = _zeropad(pair.secondary, pad)
         # The mask pads to `false`, which is what distinguishes "outside the image" from "dark".
-        okmask = _zeropad(valid(pair), pad)
-        shifted = _shift_points(flat, pad)
+        _dispatch_pass!(out, _zeropad(pair.reference, pad), _zeropad(pair.secondary, pad),
+                        _zeropad(valid(pair), pad), _shift_points(flat, pad),
+                        chipx, chipy, rx, ry, p, measure, subpixel)
     end
+    return out
+end
 
+# One pass over `pts`, threaded or not, on whatever concrete array types the caller resolved.
+#
+# Split from `track!` so the padded and unpadded paths each arrive here monomorphic — see the note at
+# the call sites.
+function _dispatch_pass!(out::DisplacementField, ref, sec, okmask, pts::PointSet{1},
+                        chipx::Int, chipy::Int, rx::Int, ry::Int, p::Params,
+                        measure::SimilarityMeasure, subpixel::SubpixelMethod)
     up = upsampling(subpixel)
     # Plans are built here, on this task, before any spawning. FFTW's planner is not
     # thread-safe, so leaving this to the workers would have every one of them contend on
@@ -157,10 +170,10 @@ function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Param
     # its most serial.
     _warm_pass_plans(chipx, chipy, rx, ry, measure)
 
-    istrue(p.threaded) ? _track_threaded!(out, ref, sec, okmask, shifted, chipx, chipy,
+    istrue(p.threaded) ? _track_threaded!(out, ref, sec, okmask, pts, chipx, chipy,
                                           rx, ry, up, p, measure) :
-                         _track_chunk!(out, ref, sec, okmask, shifted, chipx, chipy,
-                                       rx, ry, up, p, measure, eachindex(shifted))
+                         _track_chunk!(out, ref, sec, okmask, pts, chipx, chipy,
+                                       rx, ry, up, p, measure, eachindex(pts))
     return out
 end
 
