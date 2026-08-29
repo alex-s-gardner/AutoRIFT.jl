@@ -433,6 +433,17 @@ runner holds is never formed.
 strided subset [`AutoRIFT._coarse_block_layout`](@ref) derives for a coarse one. `layout` is kept
 alongside it because `block_buffers` sizes from the whole layout's largest read window, which no pass
 changes. `buffers` is `nothing` for a threaded run, where each task takes its own set.
+
+!!! warning "`blocks` indexes one grid, and only that grid"
+    A `Block` holds *grid index ranges*, so this runner is bound to the grid shape its partition was
+    built from. Passing [`AutoRIFT.run_pass`](@ref) a point set of any other shape indexes those
+    ranges into the wrong array and throws `BoundsError` from `_block_points` — it does not silently
+    correlate the wrong points, but nor is it caught at the call.
+
+    Anything that changes the grid shape — the coarse stride, or a per-level decimation — must
+    therefore go through [`AutoRIFT.restrict`](@ref) to re-derive the partition first. That is what
+    `restrict` is for, and it is the whole reason it exists as a method on the runner rather than as
+    a step inside the coarse pass.
 """
 struct Blocked{P<:ImagePair,B<:Union{Nothing,BlockBuffers}} <: PassRunner
     raw::P
@@ -449,11 +460,15 @@ run_pass(r::Blocked, pts::PointSet{2}, p::Params, measure::SimilarityMeasure,
     _run_blocked(r.raw, pts, p, r.layout, r.blocks, pass_geometry(pts), measure, r.buffers,
                  subpixel)
 
-# The coarse pass correlates the strided subset, so a blocked runner has to re-derive which of its
-# blocks hold which coarse points. The points themselves are already narrowed by `_coarse_points`;
-# what needs narrowing here is the *partition* of them.
-restrict(r::Blocked, setup, gridsize::Tuple{Int,Int}) =
-    Blocked(r.raw, r.layout, _coarse_block_layout(r.layout, setup, gridsize), r.buffers)
+# A pass over a strided subset — the coarse pass, or a decimated chip-size level — so a blocked
+# runner has to re-derive which of its blocks hold which of the surviving points. The points
+# themselves are already narrowed by the caller; what needs narrowing here is the *partition* of them.
+#
+# Derived from `r.blocks` rather than `r.layout.blocks`, so restricting twice composes: a decimated
+# level restricts, and its coarse pass restricts that result again. `r.layout` is carried through
+# untouched because it sizes the buffers from the largest read window, which no striding changes.
+restrict(r::Blocked, setup, _gridsize::Tuple{Int,Int}) =
+    Blocked(r.raw, r.layout, _coarse_block_layout(r.blocks, setup), r.buffers)
 
 # Loud, unlike the whole-scene runner: blocking is asked for when the scene will not fit, so a coarse
 # grid too small to filter means every point is searched at full radius — roughly a hundred times the
@@ -611,19 +626,24 @@ end
 
 _serial_params(p::Params) = istrue(p.threaded) ? _params_serial(p) : p
 
-# Blocks over the *coarse* grid, derived from the fine-grid layout.
+# Blocks over a *strided subset* of the grid the blocks currently index, derived from them.
 #
-# The coarse grid is the fine grid strided by `coarse_stride`, so a fine-grid block maps to whichever
-# coarse points fall inside it. Deriving them rather than laying out afresh is what guarantees the
-# two partitions agree: every coarse point belongs to exactly one block, and to the same block its
-# fine neighbours do.
+# Deriving rather than laying out afresh is what guarantees the two partitions agree: every selected
+# point belongs to exactly one block, and to the same block its neighbours do.
 #
-# `rows`/`cols` are the strided indices `_coarse_points` selected, so `searchsortedfirst` finds where
-# each fine-grid range begins in them.
-function _coarse_block_layout(layout::BlockLayout, setup, fine_size::Tuple{Int,Int})
+# `blocks` is the partition to map, **not** `layout.blocks`, and that is what makes the operation
+# composable. A level may be decimated before its coarse pass strides it again, so this runs twice in
+# sequence; taking the full layout each time would silently discard the first striding and map the
+# second against the wrong index space. Both stridings are relative to the grid handed to the pass,
+# so each must start from the previous result.
+#
+# `rows`/`cols` are the indices selected *from that same grid*, so `searchsortedfirst` finds where
+# each block's range begins in them. The read windows are pixel ranges and carry over unchanged:
+# striding the grid changes which points a block writes, never which imagery it must read.
+function _coarse_block_layout(blocks::Vector{Block}, setup)
     rows, cols = setup.rows, setup.cols
     out = Block[]
-    for b in layout.blocks
+    for b in blocks
         r0 = searchsortedfirst(rows, first(b.grid_rows))
         r1 = searchsortedlast(rows, last(b.grid_rows))
         c0 = searchsortedfirst(cols, first(b.grid_cols))

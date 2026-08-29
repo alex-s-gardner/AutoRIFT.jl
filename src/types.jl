@@ -702,8 +702,16 @@ call that can hand a runner the other kind — a filtered pair filtered again is
 everywhere, and one that still looks like imagery.
 
 The interface is three methods: `run_pass(runner, pts, p, measure, subpixel)`, which correlates a
-point set; `restrict(runner, setup, gridsize)`, which narrows a runner to the coarse pass's strided
-subset; and `_warn_coarse_fallback(runner, chip_size)`, which is where the two differ on policy.
+point set; `restrict(runner, setup, gridsize)`, which rebuilds a runner for a **differently shaped**
+grid; and `_warn_coarse_fallback(runner, chip_size)`, which is where the two differ on policy.
+
+`restrict` is a precondition of `run_pass`, not an optimization. A runner may hold state indexed by
+grid shape — `AutoRIFT.Blocked` holds a partition of grid index ranges — so a point set whose shape
+differs from the one the runner was built for is a bounds error, not a smaller pass. Every caller
+that decimates, strides, or otherwise reshapes the grid must `restrict` first; the coarse pass is
+the most visible such caller but it is not the only possible one. `AutoRIFT.WholeScene` holds no
+per-shape state and so returns itself, which is why omitting the call is invisible until a blocked
+run reaches it.
 
 A runner is always passed **positionally**. A keyword annotated with an abstract type is
 unresolvable under `--trim` — verified: it produces `unresolved call ... Core.kwcall` — which is the

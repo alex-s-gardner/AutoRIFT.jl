@@ -104,7 +104,7 @@ end
 
 @testset "coarser levels recover what finer ones cannot" begin
     # The reason the pyramid exists, and the only test that exercises more than one level.
-    # Coverage must rise monotonically as coarser chips are permitted.
+    # Coverage must not fall as coarser chips are permitted.
     n = 512
     pair = banded_pair(n, (6, -4), 200:290)
     grid = gridpoints((n, n), 32; chip_size = 32, search_radius = 25)
@@ -119,7 +119,14 @@ end
         @test 32 in used
         cmax >= 64 && @test 64 in used
     end
-    @test counts[1] < counts[2] < counts[3]
+    # Non-decreasing rather than strictly increasing. A level coarser than the finest runs on a
+    # proportionally coarser grid — `_level_decimation` — so it posts one estimate per chip
+    # footprint rather than one per fine grid point, and its estimates are spread back over that
+    # footprint. Two successive levels can therefore cover the same points, which is the intended
+    # behaviour: permitting a coarser chip may add nothing where the level below already answered.
+    @test counts[1] <= counts[2] <= counts[3]
+    # Permitting coarser chips must still buy something overall, or the pyramid is pointless.
+    @test counts[1] < counts[3]
     # And the featureless band is not fully resolvable at any scale, so some points remain
     # honestly unmeasured rather than invented.
     @test counts[3] < length(gridpoints((n, n), 32; chip_size = 32, search_radius = 25))

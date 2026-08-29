@@ -151,9 +151,12 @@ run_pass(r::WholeScene, pts::PointSet{2}, p::Params, measure::SimilarityMeasure,
          subpixel::SubpixelMethod) =
     track(r.prepared, pts, p; subpixel, measure)
 
-# A whole-scene pass sees every point of whatever set it is given, so narrowing to the coarse
-# subset needs no change: the subset is already expressed in the `PointSet` handed to `run_pass`.
-# Only a *partitioned* runner has to re-derive its partition, which is what `Blocked`'s method does.
+# A whole-scene pass sees every point of whatever set it is given, so a reshaped grid needs no
+# change here: the subset is already expressed in the `PointSet` handed to `run_pass`. Only a
+# *partitioned* runner has to re-derive its partition, which is what `Blocked`'s method does.
+#
+# Returning `r` unchanged is why a missing `restrict` is invisible in a whole-scene run and a
+# `BoundsError` in a blocked one — see `AutoRIFT.PassRunner`.
 restrict(r::WholeScene, _setup, _gridsize::Tuple{Int,Int}) = r
 
 # Whether to warn when the coarse grid is too small to judge consistency on.
@@ -253,6 +256,35 @@ chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size,
 function chipsize_level(runner::PassRunner, grid::PointSet{2}, p::Params,
                         chip_size::Extent, wanted::AbstractMatrix{Bool},
                         measure::SimilarityMeasure)
+    # The grid this level runs on. A chip wider than the finest one gets a proportionally coarser
+    # grid, so every level posts one estimate per chip rather than several per chip.
+    decim = _level_decimation(p, chip_size)
+    decim == 1 && return _level_on_grid(runner, grid, p, chip_size, wanted, measure)
+
+    sub = _decimate_level(grid, wanted, decim)
+    isnothing(sub) && return nothing
+    # `restrict` before the pass: `sub.grid` is a different shape from `grid`, and a `PassRunner` may
+    # hold state indexed by grid shape — `Blocked` holds a partition of grid index ranges, which
+    # indexed into the decimated grid would be a `BoundsError`. See `AutoRIFT.PassRunner`.
+    #
+    # `sub.rows`/`sub.cols` are indices into `grid`, which is the space this runner's blocks are in,
+    # so the restriction lands in the right place. The level's own coarse pass then restricts the
+    # result again, in the decimated space — which composes because `restrict` derives from the
+    # runner's current blocks rather than from the full layout.
+    got = _level_on_grid(restrict(runner, sub, size(grid)), sub.grid, p, chip_size,
+                         sub.wanted, measure)
+    isnothing(got) && return nothing
+    return _undecimate_level(got, size(grid), sub.rows, sub.cols)
+end
+
+# One level on the grid it was handed, without regard to whether that grid was decimated. Split out
+# so the decimated and undecimated paths run identically — the two must not drift.
+#
+# `runner` must already match `grid`'s shape: this does not `restrict`, because it cannot tell
+# whether its caller decimated. The caller owns that.
+function _level_on_grid(runner::PassRunner, grid::PointSet{2}, p::Params,
+                        chip_size::Extent, wanted::AbstractMatrix{Bool},
+                        measure::SimilarityMeasure)
     # A level's points: the requested ones, at this level's chip size.
     pts = _level_points(grid, p, chip_size, wanted)
     nsearchable(pts) == 0 && return nothing
@@ -266,6 +298,138 @@ function chipsize_level(runner::PassRunner, grid::PointSet{2}, p::Params,
     return (; field = fine, filled)
 end
 
+# How much coarser this level's grid is than the caller's, as an integer stride.
+#
+# The reference resizes its grid by `ChipSize0X / ChipSizeUniX[i]` at every level
+# (`autoRIFT.py:507-524`) and resizes the results back afterwards (`820-878`), so a level's grid
+# spacing grows with its chip and the chip-to-spacing ratio is the same at every level. That is what
+# makes one filter width correct throughout, and what keeps a level from posting sixteen estimates
+# per chip footprint — sixteen views of mostly the same pixels, which no coherence filter can tell
+# apart.
+#
+# A stride rather than a resize: the levels are powers of two of the base chip, so the coarse grid is
+# exactly every `n`-th point of the fine one, and taking a subset keeps the coordinates the caller
+# supplied instead of interpolating new ones.
+#
+# Derived from the *grid spacing*, not from `chip_size_min`. The invariant to hold is that every
+# level sees the same chip-to-spacing ratio, so the stride is whatever makes this level's effective
+# spacing proportional to its chip: `chip / (ratio * spacing)`, where the ratio is the finest
+# level's. Defining it against `chip_size_min` instead gives a stride of 1 whenever a single coarse
+# level runs alone — `chip_size_min` is then that same coarse size — and the ratio jumps to 8, where
+# the filter demands 877 of 1089 neighbours agree and nothing survives.
+function _level_decimation(p::Params, chip_size::Extent)
+    ratio = _oversample(p)
+    sx = chip_size.X ÷ max(ratio * p.grid_spacing.X, 1)
+    sy = chip_size.Y ÷ max(ratio * p.grid_spacing.Y, 1)
+    return max(min(sx, sy), 1)
+end
+
+# Every `stride`-th point of `grid`, and `wanted` reduced to match.
+#
+# `wanted` is reduced by a maximum over each coarse cell rather than sampled at its centre, which is
+# what the reference's `colfilt(..., 0)` does (`autoRIFT.py:534-539`). Sampling would let one fine
+# point's state decide for every point in its cell, dropping a region whose sampled node happens to
+# be resolved.
+#
+# `nothing` when the result is too small to filter, the same condition `_coarse_points` applies.
+function _decimate_level(grid::PointSet{2}, wanted::AbstractMatrix{Bool}, stride::Int)
+    nr, nc = size(grid)
+    rows = 1:stride:nr
+    cols = 1:stride:nc
+    (length(rows) < 3 || length(cols) < 3) && return nothing
+    # A coarse point is attempted where any fine point within six coarse cells still wants one,
+    # which is the reference's `colfilt(M0, (6/Scale, 6/Scale), 0)` — a maximum, so a dilation of the
+    # wanted mask, over six of this level's own cells (`autoRIFT.py:534-539`). Six and not one: the
+    # reference's `colfilt(..., 0)` is a maximum, i.e. a dilation of the wanted mask, and taking it
+    # over the cell is what stops a sampled node's own state from deciding for its fifteen
+    # neighbours. Dilating the *resolved* mask instead — the `logical_not` reading — skips a coarse
+    # point whenever anything within `6 * stride` is resolved, which after a successful finest level
+    # is everywhere: measured as 259 of 3922 searchable points surviving, and no coarse level
+    # reaching the merge at all.
+    want = windowmax(map(w -> w ? 1.0f0 : 0.0f0, wanted), 6 * stride)
+    keep = [want[i, j] > 0.5f0 for i in rows, j in cols]
+    return (; grid = grid[rows, cols], wanted = keep, rows, cols)
+end
+
+# `A` with every `NaN` replaced by its nearest finite neighbour, so an interpolant reading a
+# neighbourhood never sees one. Only the values are affected; which points are valid is decided by a
+# mask the caller keeps, so filling here cannot invent a measurement.
+#
+# Nearest rather than a smooth extrapolation: this exists to keep a hole from poisoning its
+# neighbours, not to estimate anything, and the filled values survive only where the mask allows.
+function _fill_nan_nearest(A::AbstractMatrix{Float32})
+    out = copy(A)
+    any(isnan, out) || return out
+    nr, nc = size(out)
+    # Expanding-ring search from each hole. Rings rather than a full scan: a hole in this field is
+    # within a few cells of data, and the whole-field alternative is quadratic in the hole count.
+    @inbounds for j in 1:nc, i in 1:nr
+        isnan(out[i, j]) || continue
+        found = false
+        for ring in 1:max(nr, nc)
+            for dj in -ring:ring, di in -ring:ring
+                max(abs(di), abs(dj)) == ring || continue
+                ii, jj = i + di, j + dj
+                (1 <= ii <= nr && 1 <= jj <= nc) || continue
+                isnan(A[ii, jj]) && continue
+                out[i, j] = A[ii, jj]
+                found = true
+                break
+            end
+            found && break
+        end
+    end
+    return out
+end
+
+# A decimated level's result, back on the full grid.
+#
+# `dx`/`dy` interpolate bicubically, matching the reference's `INTER_CUBIC`: they are continuous
+# fields, and nearest-neighbour would post a coarse estimate as a blocky plateau that the merge then
+# treats as measured everywhere inside it. `correlation` interpolates the same way, since it
+# describes the same estimate. `searched` and the filled indices do not interpolate — they are
+# categorical, and a fractional "partly searched" has no meaning.
+function _undecimate_level(got, fullsize::Tuple{Int,Int}, rows, cols)
+    field = got.field
+    out = DisplacementField(fill(NaN32, fullsize), fill(NaN32, fullsize),
+                            fill(NaN32, fullsize), fill(false, fullsize))
+    # Bicubic interpolation reads a 4x4 neighbourhood, so a single `NaN` in it poisons every
+    # destination it touches — enough to erase all but the interior of a sparse field. The values
+    # are interpolated over a hole-free copy, and validity is carried separately by the mask: a
+    # destination is kept only where the mask says a measurement stands behind it. Interpolating
+    # the raw field instead loses everything within two coarse cells of any hole, which measured as
+    # 11,679 coarse values reaching exactly 11,679 fine points where a stride-2 level covers four
+    # times that area.
+    # Filled only so the interpolant never reads a `NaN`; the mask below decides what survives.
+    resample!(out.dx, _fill_nan_nearest(field.dx), Bicubic())
+    resample!(out.dy, _fill_nan_nearest(field.dy), Bicubic())
+    resample!(out.correlation, _fill_nan_nearest(field.correlation), Bicubic())
+    # Keyed on `dx` being finite rather than on `searched`: a point can be searched and yield
+    # nothing, and only a real measurement may be spread over its cell. `searched` would post a
+    # coarse estimate across every hole the level attempted and failed at — measured as 13,118
+    # searched nodes claiming 52,033 fine points and the correlation against the control collapsing
+    # from 0.996 to 0.841.
+    valid = resample(map(v -> isnan(v) ? 0.0f0 : 1.0f0, field.dx), fullsize, Nearest())
+    filled = Int[]
+    wasfilled = falses(size(field.dx))
+    @inbounds for idx in got.filled
+        wasfilled[idx] = true
+    end
+    up = resample(map(f -> f ? 1.0f0 : 0.0f0, wasfilled), fullsize, Nearest())
+    @inbounds for i in eachindex(out.dx)
+        if valid[i] > 0.5f0 && isfinite(out.dx[i]) && isfinite(out.dy[i])
+            out.searched[i] = true
+            up[i] > 0.5f0 && push!(filled, i)
+        else
+            out.dx[i] = NaN32
+            out.dy[i] = NaN32
+            out.correlation[i] = NaN32
+            out.searched[i] = false
+        end
+    end
+    return (; field = out, filled)
+end
+
 # How many grid points span one chip of the finest level, per axis, taken as the smaller of the
 # two so a non-square configuration does not over-widen either axis of the filter window.
 #
@@ -275,7 +439,14 @@ end
 function _oversample(p::Params)
     ox = p.chip_size_min.X ÷ max(p.grid_spacing.X, 1)
     oy = p.chip_size_min.Y ÷ max(p.grid_spacing.Y, 1)
-    return max(min(ox, oy), 1)
+    # Capped at 2. The ratio is how many grid points span one chip, and the filter's window and
+    # agreement fraction both grow with it: at 4 the threshold is 186 of 289 neighbours and at 8 it
+    # is 877 of 1089, which no real velocity field clears — measured as zero coverage for a 64 px
+    # chip on a grid spaced 8. The reference never exceeds 2 because it decimates every level to
+    # keep the ratio fixed, so the formula it uses (`autoRIFT.py:498-502`) was only ever exercised
+    # there. A caller who posts a grid four times finer than its chips gets the same neighbourhood
+    # in ground units that the reference would use, and `_level_decimation` does the rest.
+    return clamp(min(ox, oy), 1, 2)
 end
 
 # Points for one level: the caller's grid with this level's chip size, and the radius zeroed

@@ -319,7 +319,14 @@ end
     # `_oversample` is what feeds it, and reads the *finest* chip against the spacing.
     @test AutoRIFT._oversample(params(; chip_size = 32, grid_spacing = 32)) == 1
     @test AutoRIFT._oversample(params(; chip_size = 32, grid_spacing = 16)) == 2
-    @test AutoRIFT._oversample(params(; chip_size = 32, grid_spacing = 8)) == 4
+    # Capped at 2, however much finer the grid is than the chip. The window and the agreement
+    # fraction both grow with the ratio, and past 2 the fraction is what no real velocity field
+    # clears: 186 of 289 neighbours at 4, 877 of 1089 at 8. The reference never exceeds 2 because it
+    # decimates every level to hold the ratio fixed, so its formula was only ever exercised there —
+    # `chipsize_level` decimates for the same reason, and the cap is what keeps a caller-supplied
+    # fine grid from being filtered against a threshold nothing passes.
+    @test AutoRIFT._oversample(params(; chip_size = 32, grid_spacing = 8)) == 2
+    @test AutoRIFT._oversample(params(; chip_size = 64, grid_spacing = 8)) == 2
     # A spacing coarser than the chip has no overlap to correct for.
     @test AutoRIFT._oversample(params(; chip_size = 16, grid_spacing = 32)) == 1
     # Non-square: the smaller ratio wins, so neither axis is over-widened.
