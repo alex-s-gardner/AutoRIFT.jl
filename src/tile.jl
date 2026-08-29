@@ -330,7 +330,17 @@ window from disk.
 function _read_block!(dest::AbstractMatrix, img::AbstractMatrix, rows, cols)
     size(dest) == (length(rows), length(cols)) || throw(DimensionMismatch(
         "destination is $(size(dest)) but the window is $((length(rows), length(cols)))"))
-    copyto!(dest, view(img, rows, cols))
+    # `img[rows, cols]`, not `copyto!(dest, view(img, rows, cols))`. A view defers the read, so
+    # `copyto!` then walks it element by element — and for a lazy array that is one read per pixel
+    # rather than one read per window. Measured on a lazy GeoTIFF: 99.7% of a blocked run's time was a
+    # scalar `getindex` reached from here, and a 512² region with one block took 444 s against 0.6 s
+    # from memory. Indexing asks the array for the whole window, which is the operation a chunked
+    # backend is built to serve — `DiskArrays` turns it into one aligned read per touched chunk.
+    #
+    # The extra allocation is a block-sized temporary, which is the trade: `BlockBuffers` exists to
+    # keep a run's storage at one block's worth, and this adds one more of the same order while
+    # removing a per-pixel I/O call. For an in-memory input the two forms cost the same.
+    copyto!(dest, img[rows, cols])
     return dest
 end
 

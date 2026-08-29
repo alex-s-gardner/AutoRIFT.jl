@@ -50,6 +50,22 @@ Base.IndexStyle(::Type{FiniteMask{T,A}}) where {T,A} = IndexStyle(A)
 Base.@propagate_inbounds Base.getindex(m::FiniteMask, i::Int) = isfinite(m.parent[i])
 Base.@propagate_inbounds Base.getindex(m::FiniteMask, I::Int...) = isfinite(m.parent[I...])
 
+# A windowed read as **one** read of `parent`, then `isfinite` over the result.
+#
+# Without this, `mask[rows, cols]` reaches `Base`'s generic `getindex`, which fills the destination by
+# calling the scalar method above once per element. For an in-memory parent that is merely a slow loop.
+# For a disk-backed one it is a separate read per pixel, and the cost is not subtle: measured on a
+# lazy GeoTIFF window of 369x369, 1.5 ms to read the imagery against 37.3 s through the mask — 25,000x,
+# or 274 us per element. `_read_block!` reads a mask window per block, so a blocked run over a lazy
+# raster spent essentially all of its time here.
+#
+# Indexed with ranges only, which is what a block read uses. A scalar index still takes the methods
+# above, and anything more exotic falls back to `Base` — correct, just not accelerated.
+Base.@propagate_inbounds function Base.getindex(m::FiniteMask, rows::AbstractUnitRange,
+                                                cols::AbstractUnitRange)
+    return map(isfinite, m.parent[rows, cols])
+end
+
 """
     AutoRIFT.resident(mask) -> AbstractMatrix{Bool}
 
