@@ -688,6 +688,26 @@ function _filtered!(out::AbstractMatrix{Float32}, v::AbstractMatrix{Bool},
     return _filtered_finish!(out, v)
 end
 
+"""
+    AutoRIFT._finishes_nonfinite(method) -> Bool
+
+Whether `method`'s own `preprocess` already zeroed every non-finite output and cleared those pixels
+in the mask.
+
+Every filter that ends in [`AutoRIFT._filtered`](@ref) does, because
+[`AutoRIFT._filtered_finish!`](@ref) is exactly that pass — so running
+[`replace_nonfinite`](@ref) over the result afterwards would allocate two full-size arrays to
+recompute a result it already has. On a 17121×16961 scene that is 1.6 GiB per image.
+
+Declared per method rather than inferred, and defaulting to `false`: a new filter that forgets to
+declare it pays one redundant pass, where a default of `true` would silently pass non-finite values
+into the correlator. [`WallisGapfill`](@ref) is the method that genuinely needs the pass — its random
+fill can leave non-finite values behind — and [`Decibel`](@ref) does its own mask bookkeeping without
+`_filtered`, so neither declares it.
+"""
+_finishes_nonfinite(::PreprocessMethod) = false
+_finishes_nonfinite(::Union{Highpass,Wallis,Sobel,Laplacian}) = true
+
 # Shared tail: a filter can produce a non-finite value from finite input, so finiteness of the
 # output is part of validity too.
 function _filtered_finish!(out::AbstractMatrix{Float32}, v::AbstractMatrix{Bool})

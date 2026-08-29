@@ -456,8 +456,18 @@ end
 #
 # A blocked run never reaches here, which is the whole point: it filters per block from raw input, so
 # the untiled path pays one pass over the mask and the blocked path pays nothing, with no branch.
-_prepare(img::AbstractMatrix, mask::AbstractMatrix{Bool}, p::Params) =
-    replace_nonfinite(preprocess(img, resident(mask), p.preprocess, p.rng_seed)...)
+# The `replace_nonfinite` pass is skipped for the filters that already did it. Most of them do —
+# anything ending in `_filtered` finishes with exactly that pass — and repeating it allocates a fresh
+# image and a fresh mask per image to arrive at the arrays already in hand: 1.6 GiB per image on a
+# 17121x16961 scene, against 2.7 GiB of genuinely required filtered output for the pair.
+#
+# By dispatch on `_finishes_nonfinite` rather than a branch here, so a filter answers for itself and a
+# new one that forgets pays a redundant pass rather than leaking non-finite values into the correlator.
+# `WallisGapfill` is the method that still needs it: its random fill can leave them behind.
+function _prepare(img::AbstractMatrix, mask::AbstractMatrix{Bool}, p::Params)
+    out, v = preprocess(img, resident(mask), p.preprocess, p.rng_seed)
+    return _finishes_nonfinite(p.preprocess) ? (out, v) : replace_nonfinite(out, v)
+end
 
 
 _prepare(pair::ImagePair, p::Params) = ImagePair(
