@@ -26,6 +26,7 @@ module AutoRIFTApp
 
 using AutoRIFT: AutoRIFT, ZNCC, Highpass, PyramidRefine, GardnerFilter,
                 Params, False, NoRotationSearch, autorift
+using Mmap: Mmap
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -39,7 +40,7 @@ const USAGE = """
 autorift — dense normalized cross-correlation feature tracking
 
   autorift <reference> <secondary> <ny> <nx> <output> [chip_size] [search_radius]
-           [grid_spacing] [block_size] [upsampling]
+           [grid_spacing] [block_size] [upsampling] [mmap]
 
   <reference>, <secondary>  headerless raw Float32, column-major, ny*nx*4 bytes
   <ny> <nx>                 image shape in pixels
@@ -49,6 +50,7 @@ autorift — dense normalized cross-correlation feature tracking
   [grid_spacing]            pixels between search points (default chip_size)
   [block_size]              pixels per block, 0 for one block over the scene (default 0)
   [upsampling]              subpixel refinement factor, power of 2 (default 64)
+  [mmap]                    1 to memory-map the inputs instead of reading them (default 0)
 """
 
 # `write(Core.stdout, …)` rather than `print`/`println`. `print(x)` forwards to
@@ -70,6 +72,21 @@ function read_image(path::String, ny::Int, nx::Int)
         close(io)
     end
     return a
+end
+
+# The same image, memory-mapped rather than read: the OS demand-loads pages, so a blocked run touches
+# only the pages its block windows cover and the scene is never fully resident.
+#
+# `Mmap` and not a raster reader, which is the difference between lazy input costing nothing and
+# costing the GDAL stack. It is stdlib, it trims with no verifier errors, and the array it returns is
+# an ordinary `Matrix{Float32}` — so every method below it specializes exactly as for a read image, and
+# nothing in the package needs a lazy-array path.
+#
+# The file is deliberately left open. Closing it invalidates the mapping, and the process exits when
+# the run is done, which is when the mapping should go.
+function map_image(path::String, ny::Int, nx::Int)
+    io = open(path, "r")
+    return Mmap.mmap(io, Matrix{Float32}, (ny, nx))
 end
 
 function write_planes(path::String, dx::Matrix{Float32}, dy::Matrix{Float32},
@@ -132,7 +149,7 @@ function app_params(chip_size::Int, search_radius::Int, grid_spacing::Int, upsam
 end
 
 function (@main)(args::Vector{String})::Cint
-    if length(args) < 5 || length(args) > 10
+    if length(args) < 5 || length(args) > 11
         say(USAGE)
         return Cint(2)
     end
@@ -201,8 +218,20 @@ function (@main)(args::Vector{String})::Cint
         upsampling = u
     end
 
-    reference = read_image(args[1], ny, nx)
-    secondary = read_image(args[2], ny, nx)
+    # Memory-mapped or read. Mapping matters only with a block size: an unblocked run correlates the
+    # whole scene, so every page is touched and the mapping saves nothing but the read.
+    domap = false
+    if length(args) >= 11
+        m = tryparse(Int, args[11])
+        if m === nothing || (m != 0 && m != 1)
+            say("error: [mmap] must be 0 or 1\n")
+            return Cint(2)
+        end
+        domap = m == 1
+    end
+
+    reference = domap ? map_image(args[1], ny, nx) : read_image(args[1], ny, nx)
+    secondary = domap ? map_image(args[2], ny, nx) : read_image(args[2], ny, nx)
 
     p = app_params(chip_size, search_radius, grid_spacing, upsampling)
     # Two calls rather than one with a `Union` argument, for the trimming reason above.
