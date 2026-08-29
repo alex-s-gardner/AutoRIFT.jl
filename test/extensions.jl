@@ -6,10 +6,18 @@
 # silently because a later test had loaded them.
 
 using Rasters
+using ArchGDAL          # triggers RastersArchGDALExt, and so AutoRIFTRastersExt: see below
 using DimensionalData
 using DimensionalData.Lookups
 using Dates
 using AutoRIFT: autorift
+
+# `AutoRIFTRastersExt` needs ArchGDAL as well as Rasters, because reading a raster from a file goes
+# through `RastersArchGDALExt` and that is what carries GDAL. Asserted rather than assumed: without
+# ArchGDAL the extension does not load, `autorift` on a projected raster falls through to the
+# DimensionalData method, and every test below would pass while checking the wrong path -- returning a
+# `DimStack` of `dx`/`dy` where a `RasterStack` of `vx`/`vy` is expected.
+@test Base.get_extension(AutoRIFT, :AutoRIFTRastersExt) !== nothing
 
 # A north-up projected pair with a known shift. North-up means y *decreasing*, which is what a
 # GeoTIFF normally stores and what makes the y-flip question real.
@@ -453,6 +461,22 @@ function DiskArrays.readblock!(a::CountingDisk{T}, dest, r::AbstractUnitRange...
     return nothing
 end
 
+# A *striped* disk array: chunks one row tall, which is what `Rasters.write` produces by default and
+# what makes `approx_chunksize` report a block far too small to correlate in.
+mutable struct CountingStripe{T} <: DiskArrays.AbstractDiskArray{T,2}
+    size::Tuple{Int,Int}
+    seed::Int
+end
+Base.size(a::CountingStripe) = a.size
+DiskArrays.haschunks(::CountingStripe) = DiskArrays.Chunked()
+DiskArrays.eachchunk(a::CountingStripe) = DiskArrays.GridChunks(a.size, (a.size[1], 1))
+function DiskArrays.readblock!(a::CountingStripe{T}, dest, r::AbstractUnitRange...) where {T}
+    for (jj, j) in enumerate(r[2]), (ii, i) in enumerate(r[1])
+        dest[ii, jj] = _disk_value(T, i, j, a.seed)
+    end
+    return nothing
+end
+
 @testset "a blocked run never reads the whole scene" begin
     # The claim `process_block_size` exists to make: peak memory tracks the block, not the scene. A
     # resident array cannot demonstrate it — the scene is already in memory — so the input here is
@@ -491,4 +515,122 @@ end
     resident_ref = [_disk_value(Float32, i, j, 1) for i in 1:n, j in 1:n]
     resident_sec = [_disk_value(Float32, i, j, 2) for i in 1:n, j in 1:n]
     assert_same_result(autorift(resident_ref, resident_sec; opts...), lazy, "lazy equals resident")
+end
+
+# ---------------------------------------------------------------------------
+# A raster still on disk
+# ---------------------------------------------------------------------------
+#
+# Every other raster test above is in-memory, and that is why three separate lazy-read defects
+# survived to be found by hand on a real scene: `FiniteMask` had no bulk `getindex`, `_read_block!`
+# wrapped its input in a view, and `resident` converted elementwise. Each turned one windowed read
+# into one read per *pixel* — invisible in memory, where the two cost the same.
+
+# `assert_same_result` compares `MultichipResult` fields; a `RasterStack` has `vx`/`vy` layers instead,
+# so stack comparison gets its own helper rather than bending that one.
+function assert_same_stack(a, b, tag)
+    @testset "$tag" begin
+        for l in (:vx, :vy, :correlation, :chip_size, :interpolated)
+            @test isequal(parent(a[l]), parent(b[l]))
+        end
+    end
+end
+
+@testset "a file-backed raster correlates where it lies" begin
+    # A real GeoTIFF, written and read back, so the whole GDAL path is exercised rather than a mock:
+    # tiling, compression, nodata, and the eltype `Union{Missing,T}` that comes with it.
+    n = 384
+    a = synthetic_texture(n; seed = 3)
+    b = circshift(a, (4, -3))
+    res = 10.0
+    x = X(Projected(0.0:res:(res * (n - 1)); order = ForwardOrdered(), span = Regular(res),
+                    sampling = Intervals(Start()), crs = EPSG(3031)))
+    y = Y(Projected((res * (n - 1)):(-res):0.0; order = ReverseOrdered(),
+                    span = Regular(-res), sampling = Intervals(Start()), crs = EPSG(3031)))
+
+    mktempdir() do dir
+        pa, pb = joinpath(dir, "a.tif"), joinpath(dir, "b.tif")
+        Rasters.write(pa, Raster(a, (y, x)); force = true)
+        Rasters.write(pb, Raster(b, (y, x)); force = true)
+
+        lazy_a = Raster(pa; lazy = true)
+        lazy_b = Raster(pb; lazy = true)
+        @test parent(lazy_a) isa DiskArrays.AbstractDiskArray
+
+        opts = (; chip_size = 16, chip_size_max = 16, grid_spacing = 16, search_radius = 8)
+        lazy = autorift(lazy_a, lazy_b; opts...)
+        # `read` materializes but keeps `missingval` and the `Union{Missing,T}` eltype, so this also
+        # checks that nodata handling does not depend on where the data lives.
+        eager = autorift(read(lazy_a), read(lazy_b); opts...)
+
+        @test count(!isnan, parent(lazy.vx)) > 0.5 * length(parent(lazy.vx))
+        assert_same_stack(eager, lazy, "lazy raster equals materialized raster")
+
+        # An explicit block size must give the same answer as the chunk-derived default, at sizes
+        # either side of the file's own 256-pixel tiling — a partition bug shows up here and not in a
+        # single-block run.
+        for bs in (128, 512)
+            blocked = autorift(lazy_a, lazy_b; opts..., process_block_size = (bs, bs))
+            assert_same_stack(eager, blocked, "lazy raster, $(bs)px blocks")
+        end
+    end
+end
+
+@testset "nodata is excluded rather than correlated" begin
+    # A sentinel fill value, which is what most sensors write, rather than `missing`. The pixels it
+    # marks must produce no measurement: reading a fill value as a number would correlate -9999
+    # against -9999 and report a confident zero displacement over the gap.
+    n = 384
+    fill = -9999.0f0
+    a = synthetic_texture(n; seed = 5)
+    b = circshift(a, (3, -2))
+    gap = 150:250
+    a[gap, gap] .= fill
+    b[gap, gap] .= fill
+    dims2 = (Y(1:n), X(1:n))
+    opts = (; chip_size = 16, chip_size_max = 16, grid_spacing = 16, search_radius = 8)
+    out = autorift(Raster(a, dims2; missingval = fill),
+                   Raster(b, dims2; missingval = fill); opts...)
+
+    grid = AutoRIFT._build_grid((n, n), AutoRIFT.params(; opts...))
+    interior = findall(eachindex(IndexCartesian(), parent(out.vx))) do k
+        # Well inside the gap, so the whole chip is fill rather than straddling the edge.
+        170 <= round(Int, grid.y[k]) <= 230 && 170 <= round(Int, grid.x[k]) <= 230
+    end
+    @test !isempty(interior)
+    @test all(isnan, parent(out.vx)[interior])
+    # And the rest of the scene is unaffected: this excludes the gap, it does not poison the run.
+    @test count(!isnan, parent(out.vx)) > 0.8 * length(parent(out.vx))
+end
+
+@testset "a lazy raster is blocked by default" begin
+    # The chunk-derived default is what keeps a file-backed run off the unblocked path, where the
+    # whole scene is one window. Asserted through the read counter rather than by timing.
+    n = 1024
+    ext = Base.get_extension(AutoRIFT, :AutoRIFTRastersExt)
+    @test ext !== nothing
+    a = CountingDisk{Float32}((n, n), 1)
+    b = CountingDisk{Float32}((n, n), 2)
+    dims2 = (Y(1:n), X(1:n))
+    ra, rb = Raster(a, dims2), Raster(b, dims2)
+    @test ext._ondisk(ra)
+    # `CountingDisk` declares 256² chunks, so that is the block size the default derives.
+    @test ext._blocks(nothing, ra, rb) == (256, 256)
+    # A chunk too small to be a sensible block is raised to `MIN_BLOCK`. `Rasters.write` produces
+    # *striped* GeoTIFFs, whose chunks are one row tall, and a 5-pixel block is below the halo — which
+    # `block_layout` rejects outright. Bounded above by the scene, so a small image stays one block.
+    tiny = Raster(CountingStripe{Float32}((512, 512), 3), (Y(1:512), X(1:512)))
+    @test ext._blocks(nothing, tiny, tiny) == (512, ext.MIN_BLOCK)
+    small = Raster(CountingStripe{Float32}((64, 64), 4), (Y(1:64), X(1:64)))
+    @test ext._blocks(nothing, small, small) == (64, 64)
+    # An explicit choice always wins, and an in-memory pair stays unblocked.
+    @test ext._blocks((64, 64), ra, rb) == (64, 64)
+    mem = Raster(zeros(Float32, 8, 8), (Y(1:8), X(1:8)))
+    @test ext._blocks(nothing, mem, mem) === nothing
+    @test !ext._ondisk(mem)
+
+    autorift(ra, rb; chip_size = 16, chip_size_max = 16, grid_spacing = 16, search_radius = 8)
+    # Windowed, not one read of the scene: the whole point of the default.
+    @test a.calls > 1
+    @test a.widest < n * n
 end

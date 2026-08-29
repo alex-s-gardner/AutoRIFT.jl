@@ -84,7 +84,10 @@ Only the lazy masks this package constructs are recognized. A caller supplying a
 `AbstractMatrix{Bool}` of their own should either materialize it first or add a method here.
 """
 resident(m::AbstractMatrix{Bool}) = m
-resident(m::FiniteMask) = Matrix{Bool}(m)
+# `map` over the parent, not `Matrix{Bool}(m)`. The conversion indexes `m` element by element, which
+# for a disk-backed parent is one read per pixel: the same defect `FiniteMask`'s windowed `getindex`
+# had, on the whole-array path this time. `map` reads the parent once. Same result, same allocation.
+resident(m::FiniteMask) = map(isfinite, m.parent)
 
 # The windowed filters read their mask many times over and begin with a whole-array `all`, so a
 # computed mask is the wrong representation for them: `all` on a `FiniteMask` costs 425 us at 1024²

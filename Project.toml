@@ -16,7 +16,9 @@ StableTasks = "91464d47-22a1-43fe-8b7f-2d57ee82463f"
 
 [weakdeps]
 AkazeFeatures = "23406c00-28fe-5193-aec2-b0bcaddf547d"
+ArchGDAL = "c9ce4bd3-c3d5-55b8-8973-c0e20141b8c3"
 DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
+DiskArrays = "3c3547ce-8d99-4f5e-a174-61eb10b00ae3"
 ImageCore = "a09fc81d-aa75-5fe9-8630-4744c3626534"
 ImageFeatures = "92ff4b2b-8094-53d3-b29d-97f740f06cef"
 NearestNeighbors = "b8a86587-4115-5ab1-83bc-aa920d37bbce"
@@ -28,11 +30,12 @@ AutoRIFTAkazeFeaturesExt = "AkazeFeatures"
 AutoRIFTDimensionalDataExt = "DimensionalData"
 AutoRIFTImageFeaturesExt = ["ImageFeatures", "ImageCore"]
 AutoRIFTNearestNeighborsExt = "NearestNeighbors"
-AutoRIFTRastersExt = ["Rasters", "DimensionalData"]
+AutoRIFTRastersExt = ["Rasters", "DimensionalData", "ArchGDAL", "DiskArrays"]
 
 [compat]
 AkazeFeatures = "0.1"
 Aqua = "0.8"
+ArchGDAL = "0.10"
 CommonSolve = "0.2"
 Dates = "1"
 DimensionalData = "0.29, 0.30"
@@ -58,6 +61,7 @@ julia = "1.10"
 
 [extras]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
+ArchGDAL = "c9ce4bd3-c3d5-55b8-8973-c0e20141b8c3"
 DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
 DiskArrays = "3c3547ce-8d99-4f5e-a174-61eb10b00ae3"
 ImageCore = "a09fc81d-aa75-5fe9-8630-4744c3626534"
@@ -73,6 +77,6 @@ Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test", "Aqua", "JET", "JSON3", "Random", "Statistics", "Rasters", "DimensionalData",
+test = ["Test", "Aqua", "ArchGDAL", "JET", "JSON3", "Random", "Statistics", "Rasters", "DimensionalData",
         "DiskArrays", "ImageFeatures", "ImageCore", "NearestNeighbors", "NCDatasets",
         "Serialization"]

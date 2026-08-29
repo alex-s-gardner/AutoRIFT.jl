@@ -36,6 +36,7 @@ ITS_LIVE's published naming. A caller who wants the unconverted offsets can corr
 module AutoRIFTRastersExt
 
 import AutoRIFT
+import DiskArrays
 import Rasters
 
 using Dates: Dates, Day, Millisecond, Month, Period, Year
@@ -68,12 +69,39 @@ All of [`AutoRIFT.params`](@ref)'s, plus:
   `Dates.Period` such as `Day(16)`, or a `Real` count of years, converts them to **CRS units per
   year** — metres per year for a projected raster.
 - `reference_valid`, `secondary_valid`: per-pixel validity masks, as arrays or rasters.
+- `process_block_size`: `(X, Y)` pixels per block. Defaults to the rasters' own chunking for
+  file-backed input and to `nothing` — one block — for input already in memory.
 
 ```julia
-using AutoRIFT, Rasters, Dates
+using AutoRIFT, Rasters, ArchGDAL, Dates
 out = autorift(Raster("early.tif"), Raster("late.tif"); grid_spacing = 32, dt = Day(16))
 out.vx, out.vy, out.correlation
 ```
+
+`ArchGDAL` has to be loaded to open a file: it is what carries GDAL, through `RastersArchGDALExt`,
+and this extension requires it for that reason.
+
+# Reading a raster that is still on disk
+
+`lazy = true` correlates from the file, and this is the case the defaults are tuned for:
+
+```julia
+a = Raster("early.tif"; lazy = true)
+b = Raster("late.tif"; lazy = true)
+out = autorift(a, b; grid_spacing = 8, threaded = true)
+```
+
+Two things happen automatically, and both matter on a scene large enough to care about. The run is
+**blocked at the file's own chunk size**, so no array the size of the scene is formed — a block reads
+its own window and nothing else. And **nodata becomes mask rather than number**: a GDAL raster's
+`missingval` marks pixels that are excluded from correlation instead of being read as a dark
+measurement, which is what reading a `-9999` fill would amount to.
+
+The answer is **bit-identical** to the same pair materialized, at any block size; the tests assert
+that on all five layers, since a windowed read that computed something subtly different would be
+worse than one that was merely slow. Measured on a Landsat 8/9 pair over Jakobshavn — 17121x16961,
+4.48 M grid points — reading from the two GeoTIFFs peaks at **2.2 GiB against 7.0 GiB** for the same
+run from memory.
 
 !!! note "Sign convention"
     `vx` and `vy` are **feature motion in map orientation**: `+vx` points east, `+vy` north. Both
@@ -89,14 +117,21 @@ out.vx, out.vy, out.correlation
 """
 function AutoRIFT.autorift(reference::AbstractRaster, secondary::AbstractRaster;
                            dt = nothing, reference_valid = nothing, secondary_valid = nothing,
-                           kwargs...)
+                           process_block_size = nothing, kwargs...)
     DDExt.check_aligned(reference, secondary)
     _check_crs(reference, secondary)
 
+    # A file-backed raster is correlated where it lies: nodata becomes mask rather than number, and the
+    # run is blocked so no array the size of the scene is formed. Both are no-ops for a raster already
+    # in memory, so this path is the same computation either way — see `_ondisk` and `_blocks`.
+    rimg, rvalid = _lazy_input(reference, DDExt.unwrap(reference_valid))
+    simg, svalid = _lazy_input(secondary, DDExt.unwrap(secondary_valid))
+    blocks = _blocks(process_block_size, reference, secondary)
+
     result, grid = AutoRIFT.autorift_with_grid(
-        parent(reference), parent(secondary);
-        reference_valid = DDExt.unwrap(reference_valid),
-        secondary_valid = DDExt.unwrap(secondary_valid), kwargs...)
+        rimg, simg;
+        reference_valid = rvalid, secondary_valid = svalid,
+        process_block_size = blocks, kwargs...)
 
     outdims = DDExt.grid_dims(reference, grid)
     vx, vy = _to_velocity(result, reference, dt)
@@ -110,6 +145,123 @@ function AutoRIFT.autorift(reference::AbstractRaster, secondary::AbstractRaster;
     return RasterStack(layers, outdims;
                        missingval = (vx = NaN32, vy = NaN32, correlation = NaN32,
                                      chip_size = UInt16(0), interpolated = false))
+end
+
+# ---------------------------------------------------------------------------
+# Reading a raster where it lies
+# ---------------------------------------------------------------------------
+
+# Whether `r`'s data is still on disk.
+#
+# Asked of the chunking rather than of the type: `lazy = true` gives a `FileArray`, indexing it gives a
+# `SubDiskArray`, and a future backend may give something else again — but all of them report
+# `Chunked`, and an in-memory `Array` reports `Unchunked`. So this follows the property that matters
+# (does a read cost I/O) rather than a list of types to keep up to date.
+_ondisk(r::AbstractRaster) = DiskArrays.haschunks(parent(r)) isa DiskArrays.Chunked
+
+# The array and validity mask to hand the core.
+#
+# Two things happen for a file-backed raster, and neither touches the imagery:
+#
+#   * **Nodata becomes mask.** A GDAL raster's eltype is `Union{Missing,T}`, which `ImagePair` rejects
+#     — rightly, since `missing` in an FFT poisons the whole surface. `Rasters.replace_missing` swaps
+#     the fill for `zero(T)` *lazily*, and the pixels it swapped are recorded in the mask, so they are
+#     excluded from correlation rather than read as a dark measurement.
+#   * **A caller's own mask is combined**, not overridden. Nodata is a property of the file; a cloud or
+#     shadow mask is a property of the scene, and a caller passing one should not lose the other.
+#
+# The masks stay lazy: `AutoRIFT.ImagePair` passes a supplied mask through without materializing, and
+# `_read_block!` reads windows of it into dense buffers. Materializing here would form exactly the
+# scene-sized array that blocking exists to avoid.
+function _lazy_input(r::AbstractRaster, supplied)
+    # Keyed on whether the raster *declares* nodata, not on where its data lives. A raster read into
+    # memory keeps both its `missingval` and its `Union{Missing,T}` eltype, so gating this on
+    # disk-backedness would leave the in-memory case unable to correlate at all — and would make the
+    # lazy and eager paths answer differently, which is the one thing this must not do.
+    mv = Rasters.missingval(r)
+    isnothing(mv) && return parent(r), supplied
+    filled = parent(Rasters.replace_missing(r, zero(nonmissingtype(eltype(r)))))
+    valid = _nodata_mask(r, mv)
+    return filled, isnothing(supplied) ? valid : _both(valid, supplied)
+end
+
+# "Not the fill value", as a lazy `Bool` array over the raster's own storage.
+#
+# `missing` and a sentinel number are the two forms GDAL reports and they need different tests, so this
+# dispatches on which one the file declared rather than comparing against a value that may be `missing`
+# — `x == missing` is `missing`, not `false`, which would make every pixel indeterminate.
+_nodata_mask(r::AbstractRaster, ::Missing) = _NotMissing(parent(r))
+_nodata_mask(r::AbstractRaster, mv) = _NotEqual(parent(r), convert(eltype(r), mv))
+
+# Lazy mask types rather than `map`: a `map` over a disk array is itself lazy, but its element type and
+# indexing behaviour depend on the backend, where these are `AbstractMatrix{Bool}` by construction and
+# forward a windowed read straight to the parent — which is what makes a block read one window rather
+# than one pixel at a time. The same shape as `AutoRIFT.FiniteMask`, for the same reason.
+struct _NotMissing{A} <: AbstractMatrix{Bool}
+    parent::A
+end
+struct _NotEqual{A,T} <: AbstractMatrix{Bool}
+    parent::A
+    value::T
+end
+struct _Both{A,B} <: AbstractMatrix{Bool}
+    a::A
+    b::B
+end
+_both(a, b) = _Both(a, b)
+
+for M in (:_NotMissing, :_NotEqual)
+    @eval begin
+        Base.size(m::$M) = size(m.parent)
+        Base.axes(m::$M) = axes(m.parent)
+    end
+end
+Base.size(m::_Both) = size(m.a)
+Base.axes(m::_Both) = axes(m.a)
+
+Base.@propagate_inbounds Base.getindex(m::_NotMissing, I::Int...) = !ismissing(m.parent[I...])
+Base.@propagate_inbounds Base.getindex(m::_NotEqual, I::Int...) =
+    !ismissing(m.parent[I...]) && m.parent[I...] != m.value
+Base.@propagate_inbounds Base.getindex(m::_Both, I::Int...) = m.a[I...] && m.b[I...]
+
+# Windowed reads, one read of the parent each. Without these a block read walks the mask element by
+# element, which for a disk-backed parent is one I/O call per pixel — measured at 274 us per element
+# against 1.5 ms for the whole window.
+Base.@propagate_inbounds Base.getindex(m::_NotMissing, r::AbstractUnitRange, c::AbstractUnitRange) =
+    map(!ismissing, m.parent[r, c])
+Base.@propagate_inbounds Base.getindex(m::_NotEqual, r::AbstractUnitRange, c::AbstractUnitRange) =
+    map(x -> !ismissing(x) && x != m.value, m.parent[r, c])
+Base.@propagate_inbounds Base.getindex(m::_Both, r::AbstractUnitRange, c::AbstractUnitRange) =
+    m.a[r, c] .& m.b[r, c]
+
+# The block size to correlate at.
+#
+# A caller's choice always wins. Otherwise a file-backed pair is blocked at its own chunking — 256² for
+# a tiled GeoTIFF — so a block read is a whole number of chunks and no chunk is decoded twice for the
+# same block. An in-memory pair keeps `nothing`, the untiled path, so nothing changes for callers who
+# were already passing arrays.
+#
+# The larger of the two rasters' chunk sizes, since one block size serves both: taking the smaller
+# would read a partial chunk of the coarser file for every block.
+#
+# Rounded up to `MIN_BLOCK` per axis, because a file's chunking is not always a sensible block. A
+# *striped* GeoTIFF — what `Rasters.write` produces by default — reports chunks one row tall, so a
+# 384x384 file gives `(384, 5)`: below the halo, which `block_layout` rejects outright, and which would
+# be nearly all overlap even if it did not. Chunk-aligned reads are the aim, but only where the chunk
+# is large enough to be worth aligning to; below that the halo dominates and a larger block is
+# strictly better. A block that is a whole multiple of the chunk stays chunk-aligned regardless.
+const MIN_BLOCK = 256
+
+function _blocks(supplied, reference::AbstractRaster, secondary::AbstractRaster)
+    isnothing(supplied) || return supplied
+    (_ondisk(reference) && _ondisk(secondary)) || return nothing
+    cr = DiskArrays.approx_chunksize(DiskArrays.eachchunk(parent(reference)))
+    cs = DiskArrays.approx_chunksize(DiskArrays.eachchunk(parent(secondary)))
+    # `approx_chunksize` reports one entry per dimension; a `Raster` here is 2-D by `check_aligned`.
+    # Never larger than the scene: a block wider than the image is one block, which is the untiled
+    # path wearing a block label, and it makes the trailing-block arithmetic do nothing useful.
+    return (min(max(cr[1], cs[1], MIN_BLOCK), size(reference, 1)),
+            min(max(cr[2], cs[2], MIN_BLOCK), size(reference, 2)))
 end
 
 # ---------------------------------------------------------------------------
