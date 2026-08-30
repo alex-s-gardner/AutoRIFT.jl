@@ -61,9 +61,15 @@
 
 Displacement over the full grid, assembled from all chip-size levels.
 
-`dx`, `dy`, and `correlation` are as in [`DisplacementField`](@ref). `chip_size` records
+`dx`, `dy`, `correlation`, and `peak_snr` are as in [`DisplacementField`](@ref). `chip_size` records
 which level produced each point — `0` where none did — and `interpolated` marks points
 filled from their neighbours rather than measured.
+
+`peak_snr` answers a different question from `correlation`: whether the surface *determined* the
+displacement, rather than how high its peak was. See [`AutoRIFT.peak_quality`](@ref) for the
+measurements behind that distinction. At an `interpolated` point it is the median of the
+neighbourhood the displacement itself was taken from, since that is what stands behind the value;
+`correlation` is `NaN` there instead, having no surface of its own to report.
 
 `chip_size` holds the level's **x** extent. That identifies the level on its own, since the aspect
 is constant across levels, so the y extent is this times a fixed ratio.
@@ -82,6 +88,7 @@ struct MultichipResult
     dx::Matrix{Float32}
     dy::Matrix{Float32}
     correlation::Matrix{Float32}
+    peak_snr::Matrix{Float32}
     chip_size::Matrix{UInt16}
     interpolated::BitMatrix
 end
@@ -99,7 +106,8 @@ nmeasured(r::MultichipResult) = count(!isnan, r.dx)
 # A result with nothing resolved: `NaN` where no displacement was measured, and a zero chip size
 # marking every point as still wanted by the level loop.
 _empty_result(sz::Tuple{Int,Int}) = MultichipResult(
-    fill(NaN32, sz), fill(NaN32, sz), fill(NaN32, sz), zeros(UInt16, sz), falses(sz))
+    fill(NaN32, sz), fill(NaN32, sz), fill(NaN32, sz), fill(NaN32, sz),
+    zeros(UInt16, sz), falses(sz))
 
 # The chip sizes a run will step through, checked against the measures it was given.
 #
@@ -417,7 +425,8 @@ end
 function _undecimate_level(got, fullsize::Tuple{Int,Int}, rows, cols)
     field = got.field
     out = DisplacementField(fill(NaN32, fullsize), fill(NaN32, fullsize),
-                            fill(NaN32, fullsize), fill(false, fullsize))
+                            fill(NaN32, fullsize), fill(NaN32, fullsize),
+                            fill(false, fullsize))
     # Bicubic interpolation reads a 4x4 neighbourhood, so a single `NaN` in it poisons every
     # destination it touches — enough to erase all but the interior of a sparse field. The values
     # are interpolated over a hole-free copy, and validity is carried separately by the mask: a
@@ -429,6 +438,12 @@ function _undecimate_level(got, fullsize::Tuple{Int,Int}, rows, cols)
     resample!(out.dx, _fill_nan_nearest(field.dx), Bicubic())
     resample!(out.dy, _fill_nan_nearest(field.dy), Bicubic())
     resample!(out.correlation, _fill_nan_nearest(field.correlation), Bicubic())
+    # `Nearest` for the peak quality, where the displacement gets `Bicubic`. Interpolating it would
+    # invent a quality between two coarse cells, and a quality is a statement about one specific
+    # correlation surface — there is no surface between them to make the interpolated value a
+    # statement about. Every fine point in a coarse cell therefore reports that cell's value
+    # verbatim, the same treatment `chip_size` receives for the same reason.
+    resample!(out.peak_snr, _fill_nan_nearest(field.peak_snr), Nearest())
     # Keyed on `dx` being finite rather than on `searched`: a point can be searched and yield
     # nothing, and only a real measurement may be spread over its cell. `searched` would post a
     # coarse estimate across every hole the level attempted and failed at — measured as 13,118
@@ -449,6 +464,7 @@ function _undecimate_level(got, fullsize::Tuple{Int,Int}, rows, cols)
             out.dx[i] = NaN32
             out.dy[i] = NaN32
             out.correlation[i] = NaN32
+            out.peak_snr[i] = NaN32
             out.searched[i] = false
         end
     end
@@ -703,6 +719,7 @@ function _reject_and_fill!(d::DisplacementField, pts::PointSet, p::Params)
             d.dx[i] = NaN32
             d.dy[i] = NaN32
             d.correlation[i] = NaN32
+            d.peak_snr[i] = NaN32
         end
     end
     return _fill_holes!(d, p)
@@ -733,16 +750,27 @@ function _fill_holes!(d::DisplacementField, p::Params)
     nr, nc = size(d.dx)
     bufx = Vector{Float32}(undef, w * w)
     bufy = Vector{Float32}(undef, w * w)
+    # `peak_snr` is filled alongside the displacement, so a point carrying a value always carries a
+    # quality for it — the same rule `chip_size` follows. The filled quality is the neighbourhood's,
+    # which is the honest description: the displacement came from those neighbours, so their peak
+    # quality is what stands behind it. `interpolated` marks the point either way, so a caller
+    # wanting only directly measured peaks can exclude them.
+    #
+    # `correlation` is deliberately *not* filled, and stays `NaN` at a filled point. It is the peak
+    # value of a surface this point has none of, where the median of neighbouring qualities is a
+    # summary that still means something.
+    bufs = Vector{Float32}(undef, w * w)
     filled = Int[]
 
     for _ in 1:3
         # Two-phase: collect this pass's fills before applying any, so every point in a pass
         # sees the same field. Filling in place would let one fill seed the next within a
         # single pass, which is what the three-pass structure exists to control.
-        pending = Tuple{Int,Float32,Float32}[]
+        pending = Tuple{Int,Float32,Float32,Float32}[]
         @inbounds for j in 1:nc, i in 1:nr
             isnan(d.dx[i, j]) || continue
             n = 0
+            ns = 0
             for jj in max(j - lo, 1):min(j + hi, nc)
                 for ii in max(i - lo, 1):min(i + hi, nr)
                     v = d.dx[ii, jj]
@@ -750,18 +778,29 @@ function _fill_holes!(d::DisplacementField, p::Params)
                     n += 1
                     bufx[n] = v
                     bufy[n] = d.dy[ii, jj]
+                    # Counted separately: a neighbour can carry a displacement with no quality —
+                    # it may itself have been filled by an earlier pass, or its surface may have
+                    # been too small to characterize — and mixing `NaN` into the selection would
+                    # poison the median rather than skip the neighbour.
+                    s = d.peak_snr[ii, jj]
+                    if !isnan(s)
+                        ns += 1
+                        bufs[ns] = s
+                    end
                 end
             end
             n >= needed || continue
             # `_select_median!` rather than a sort here: it picks the cheaper selection for `n`,
-            # which at the default 3-wide window is the insertion sort this used to call directly.
+            # which at the default 3-wide window is an insertion sort.
             push!(pending, (LinearIndices(d.dx)[i, j],
-                            _select_median!(bufx, n), _select_median!(bufy, n)))
+                            _select_median!(bufx, n), _select_median!(bufy, n),
+                            ns > 0 ? _select_median!(bufs, ns) : NaN32))
         end
         isempty(pending) && break        # nothing left that qualifies
-        @inbounds for (idx, mx, my) in pending
+        @inbounds for (idx, mx, my, ms) in pending
             d.dx[idx] = mx
             d.dy[idx] = my
+            d.peak_snr[idx] = ms
             push!(filled, idx)
         end
     end
@@ -797,6 +836,7 @@ function _merge_level!(result::MultichipResult, level::DisplacementField,
         result.dx[i] = level.dx[i]
         result.dy[i] = level.dy[i]
         result.correlation[i] = level.correlation[i]
+        result.peak_snr[i] = level.peak_snr[i]
         result.chip_size[i] = cs
         result.interpolated[i] = wasfilled[i]
     end

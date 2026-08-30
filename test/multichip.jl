@@ -146,6 +146,51 @@ end
     @test !isempty(filter(cs -> cs > 32, vec(r.chip_size)))
 end
 
+@testset "peak_snr accompanies every measured point" begin
+    n = 512
+    pair = banded_pair(n, (6, -4), 200:290)
+    grid = gridpoints((n, n), 32; chip_size = 32, search_radius = 25)
+    r = correlate_multichip(pair, grid, params(; chip_size = 32, chip_size_max = 128))
+
+    # A point carrying a displacement carries a quality for it, and a point carrying neither carries
+    # neither. `chip_size` follows the same rule, and a caller reading `peak_snr` to gate on quality
+    # needs it: a measured point with no quality would silently fail any threshold.
+    @test all(i -> isnan(r.dx[i]) == isnan(r.peak_snr[i]), eachindex(r.dx))
+    # A real match stands above its background, so the finite values are positive.
+    @test all(>(0), filter(isfinite, r.peak_snr))
+end
+
+@testset "peak_snr is not interpolated across a coarse cell" begin
+    # A decimated level posts one estimate per chip footprint. `dx`/`dy` are spread over the cell
+    # bicubically, but a quality describes one specific correlation surface and there is no surface
+    # between two cells for an interpolated value to be about — so it is resampled `Nearest` and
+    # every fine point in a cell must report that cell's value exactly.
+    n = 512
+    pair = banded_pair(n, (6, -4), 200:290)
+    grid = gridpoints((n, n), 8; chip_size = 16, search_radius = 20)
+    r = correlate_multichip(pair, grid, params(; chip_size = 16, chip_size_max = 64,
+                                               grid_spacing = 8, search_radius = 20))
+    nr, nc = size(r.peak_snr)
+    coarse = filter(c -> c > 16, unique(r.chip_size))
+    if !isempty(coarse)
+        for c in coarse
+            stride = Int(c) ÷ 16
+            # The source index `resample!(…, Nearest())` maps each destination to, so the grouping
+            # follows the resampler's own arithmetic rather than an assumed cell origin.
+            srows = length(1:stride:nr)
+            scols = length(1:stride:nc)
+            src(i, ns, nd) = clamp(floor(Int, (i - 0.5) * ns / nd) + 1, 1, ns)
+            seen = Dict{Tuple{Int,Int},Float32}()
+            for j in 1:nc, i in 1:nr
+                (r.chip_size[i, j] == c && isfinite(r.peak_snr[i, j])) || continue
+                key = (src(i, srows, nr), src(j, scols, nc))
+                v = get!(seen, key, r.peak_snr[i, j])
+                @test v == r.peak_snr[i, j]
+            end
+        end
+    end
+end
+
 @testset "chipsize_level in isolation" begin
     # Callable on its own, which is what lets a caller run one scale without the pyramid.
     ref, sec = shifted_pair(512, (5, -3); T = Float32)

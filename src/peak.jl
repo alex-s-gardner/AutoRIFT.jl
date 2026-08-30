@@ -105,6 +105,76 @@ places as it does in the reference.
     return Float64(j - rx - 1), Float64(i - ry - 1), v
 end
 
+# How far around the peak is excluded from the background, in surface samples.
+#
+# 3 is not delicate: 2 and 5 measure within 0.005 of the same discriminating power, so this is a
+# constant rather than a `Params` field that would imply a tuning decision a caller has to make.
+const PEAK_EXCLUSION = 3
+
+"""
+    peak_quality(surface[, exclusion = $PEAK_EXCLUSION]) -> Float32
+
+How far the correlation peak stands above the background, in background standard deviations.
+
+`NaN32` when the surface is too small to have a background outside the exclusion box, or when the
+background is perfectly flat — both meaning "no quality could be assessed" rather than a low quality.
+
+A high value means the surface *determined* the displacement; a low one means the sub-pixel estimate
+was drawn from a peak that barely rose above the noise, so it is closer to a guess. This is not the
+same question as `correlation`, the peak value alone: a peak of 0.6 over quiet background is
+unambiguous where the same 0.6 over noisy background is not, which is why this discriminates better
+than the peak value does.
+
+# Why this quantity
+
+Measured against two independent labels — disagreement with the Python reference on the same input,
+and each field's inconsistency with its own neighbours — over 52,866 correlation surfaces from a
+Landsat pair:
+
+| quantity | AUC vs disagreement | AUC vs self-inconsistency |
+|---|---:|---:|
+| this | 0.736 | 0.730 |
+| runner-up / peak | 0.734 | 0.745 |
+| peak value (`correlation`) | 0.699 | 0.723 |
+| Gaussian half width of the peak | 0.596 | 0.648 |
+| peak / background | 0.517 | 0.514 |
+
+Peak *width* discriminates poorly because it measures curvature at the winning peak — set by chip
+size and texture scale — and is blind to a rival peak elsewhere, where ambiguity is a global property
+of the surface. `peak / background` is near-useless because the ZNCC background sits near zero, so
+the ratio is dominated by its denominator rather than by peak quality.
+
+The background **mean** rather than its median: measured identical to four decimal places (0.7365
+against 0.7364), and a mean accumulates in the same pass with no allocation where a median needs
+selection over every background sample, per point, per level.
+"""
+@inline function peak_quality(surface::AbstractMatrix, exclusion::Int = PEAK_EXCLUSION)
+    i, j = peak_index(surface)
+    nr, nc = size(surface)
+    h = Float64(@inbounds surface[i, j])
+    # Sum and sum of squares in one traversal, column-major for the reason `peak_index` documents.
+    # Two passes would read the surface twice for a variance that one pass gives.
+    s1 = 0.0
+    s2 = 0.0
+    n = 0
+    @inbounds for c in 1:nc, r in 1:nr
+        (abs(r - i) <= exclusion && abs(c - j) <= exclusion) && continue
+        v = Float64(surface[r, c])
+        s1 += v
+        s2 += v * v
+        n += 1
+    end
+    # Too little background to characterize. Eight samples is a floor, not a threshold with a
+    # meaning: below it the standard deviation is dominated by whichever few samples remain.
+    n < 8 && return NaN32
+    mean = s1 / n
+    # `max(…, 0)` because the sum-of-squares form of the variance can go slightly negative through
+    # cancellation when the background is nearly constant — the same guard `_correlate_surface!`
+    # applies for the same reason.
+    sd = sqrt(max(s2 / n - mean * mean, 0.0))
+    return sd > 0 ? Float32((h - mean) / sd) : NaN32
+end
+
 # ---------------------------------------------------------------------------
 # Sub-pixel refinement
 # ---------------------------------------------------------------------------

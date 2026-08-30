@@ -96,9 +96,11 @@ else
         # anything short of equality is a defect.
         blocked = AutoRIFT.correlate_tiled(ImagePair(w.reference, w.secondary), grid, p,
                                            (768, 768))
-        @test all(isequal.(blocked.dx, out.dx))
-        @test all(isequal.(blocked.dy, out.dy))
-        @test all(isequal.(blocked.correlation, out.correlation))
-        @test all(isequal.(blocked.chip_size, out.chip_size))
+        # Every field, by `fieldnames`, rather than a list to keep in step: a new output added to
+        # `MultichipResult` and missed in the block write-back would otherwise pass this test while
+        # being `NaN` everywhere for every blocked run.
+        for f in fieldnames(AutoRIFT.MultichipResult)
+            @test all(isequal.(getfield(blocked, f), getfield(out, f)))
+        end
     end
 end

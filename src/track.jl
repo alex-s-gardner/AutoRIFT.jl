@@ -29,10 +29,15 @@
 
 Per-point results of a correlation pass.
 
-`dx` and `dy` are displacements in pixels, `correlation` the peak similarity, and
-`searched` marks the points that were actually correlated. Non-searched and failed points
-are `NaN` in `dx`/`dy` and `false` in `searched` — distinguishing "no measurement" from a
-measurement of zero, which the reference conflates.
+`dx` and `dy` are displacements in pixels, `correlation` the peak similarity, `peak_snr` how far that
+peak stood above the surface's background (see [`AutoRIFT.peak_quality`](@ref)), and `searched` marks
+the points that were actually correlated. Non-searched and failed points are `NaN` in `dx`/`dy` and
+`false` in `searched` — distinguishing "no measurement" from a measurement of zero, which the
+reference conflates.
+
+`correlation` and `peak_snr` are both quality measures and they are not interchangeable: the first is
+how strong the match was, the second whether it was *unambiguous*. A peak of 0.6 over quiet
+background locates a displacement; the same 0.6 over noisy background does not.
 
 `searched` is a `Matrix{Bool}` rather than a `BitMatrix` deliberately. `BitArray` packs 64
 elements per word, so writing one element is a read-modify-write of that word — and the
@@ -47,6 +52,7 @@ struct DisplacementField{N,A<:AbstractArray{Float32,N},B<:AbstractArray{Bool,N}}
     dx::A
     dy::A
     correlation::A
+    peak_snr::A
     searched::B
 end
 
@@ -58,7 +64,7 @@ Allocate results for `pts`, initialised to "no measurement".
 function displacement_field(pts::PointSet)
     sz = size(pts.x)
     return DisplacementField(fill(NaN32, sz), fill(NaN32, sz), fill(NaN32, sz),
-                             fill(false, sz))
+                             fill(NaN32, sz), fill(false, sz))
 end
 
 Base.size(d::DisplacementField) = size(d.dx)
@@ -355,6 +361,9 @@ function _track_chunk!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
             out.dx[i] = Float32(dx + pts.dx_prior[i])
             out.dy[i] = Float32(dy + pts.dy_prior[i])
             out.correlation[i] = c
+            # One more traversal of a surface already in cache, so the quality is measured where the
+            # surface exists rather than reconstructed later from the displacement field.
+            out.peak_snr[i] = peak_quality(surface)
         end
         return out
     finally

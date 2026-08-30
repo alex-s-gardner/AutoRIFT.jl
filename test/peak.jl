@@ -1,4 +1,4 @@
-using AutoRIFT: peak_index, peak, peak_offset, pyrup!, reflect101,
+using AutoRIFT: peak_index, peak, peak_offset, peak_quality, pyrup!, reflect101,
                 refinement_workspace, subpixel_peak, workspace, correlate!
 
 @testset "peak_index scan order" begin
@@ -75,6 +75,45 @@ end
     a = zeros(Float32, 2ry, 2rx)
     a[ry + 1, rx + 1] = 1.0f0
     @test peak_offset(a, (rx, ry))[1:2] == (0.0, 0.0)
+end
+
+@testset "peak_quality" begin
+    # A sharp peak over noise scores high; the same peak over noise of its own amplitude does not.
+    # That contrast is the whole point of the quantity — it is what `correlation`, the peak value
+    # alone, cannot express.
+    sharp = 0.05f0 .* ones(Float32, 40, 40)
+    sharp[20, 20] = 1.0f0
+    sharp[1, 1] = 0.06f0                        # a little background variation, so sd > 0
+    noisy = copy(sharp)
+    noisy[5:9, 5:9] .= 0.95f0                   # a rival almost as strong as the peak
+    @test peak_quality(sharp) > peak_quality(noisy)
+
+    # No background outside the exclusion box: nothing to characterize, so no claim is made.
+    @test isnan(peak_quality(fill(0.5f0, 5, 5), 3))
+    # A perfectly flat background has zero spread, so the ratio is undefined rather than infinite.
+    flat = fill(0.5f0, 40, 40)
+    flat[20, 20] = 1.0f0
+    @test isnan(peak_quality(flat))
+
+    # Invariant to an affine rescaling of the surface, since it is a ratio of a difference to a
+    # spread. A measure that moved with the units would not be comparable between points.
+    s = 0.1f0 .* randn(MersenneTwister(11), Float32, 48, 48)
+    s[24, 24] = 3.0f0
+    @test peak_quality(s) ≈ peak_quality(2.0f0 .* s .+ 5.0f0) rtol = 1e-4
+
+    # A wider exclusion removes more of the peak's own skirt from the background. The value moves,
+    # but only slightly — measured within 0.005 AUC across radii 2, 5 — so `PEAK_EXCLUSION` is a
+    # constant rather than a tuning knob.
+    @test peak_quality(s, 2) > 0
+    @test peak_quality(s, 5) > 0
+
+    # A degenerate (constant-chip) correlation returns a surface of zeros, and a quality cannot be
+    # asserted about it. `track!` skips those points before asking, but the function must not invent
+    # a number if it is asked.
+    ws = workspace(Float32, 16, 20)
+    zero_surface = correlate!(ws, fill(1.0f0, 16 + 2 * 20 - 1, 16 + 2 * 20 - 1),
+                              fill(1.0f0, 16, 16), (20, 20))
+    @test isnan(peak_quality(zero_surface))
 end
 
 @testset "reflect101" begin

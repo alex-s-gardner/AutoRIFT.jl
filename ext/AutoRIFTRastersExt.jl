@@ -57,7 +57,7 @@ const MS_PER_YEAR = 365.25 * 24 * 60 * 60 * 1000
 
 Correlate two rasters, returning a `RasterStack` on the output grid.
 
-Layers are `vx`, `vy`, `correlation`, `chip_size`, and `interpolated`, each with its own
+Layers are `vx`, `vy`, `correlation`, `peak_snr`, `chip_size`, and `interpolated`, each with its own
 `missingval`. The output grid inherits the inputs' CRS and axis order, at `grid_spacing` times
 their pixel size.
 
@@ -138,7 +138,7 @@ function AutoRIFT.autorift(reference::AbstractRaster, secondary::AbstractRaster;
 
     outdims = DDExt.grid_dims(reference, grid)
     vx, vy = _to_velocity(result, reference, dt)
-    layers = (vx = vx, vy = vy, correlation = result.correlation,
+    layers = (vx = vx, vy = vy, correlation = result.correlation, peak_snr = result.peak_snr,
               chip_size = result.chip_size,
               interpolated = Matrix{Bool}(result.interpolated))
     # Per-layer `missingval`, set at construction rather than left to a caller to discover. `NaN`
@@ -146,7 +146,7 @@ function AutoRIFT.autorift(reference::AbstractRaster, secondary::AbstractRaster;
     # is deliberately distinct from a measured zero; `0` chip size means no level resolved the
     # point; `false` is not missing data but the honest default for a mask.
     return RasterStack(layers, outdims;
-                       missingval = (vx = NaN32, vy = NaN32, correlation = NaN32,
+                       missingval = (vx = NaN32, vy = NaN32, correlation = NaN32, peak_snr = NaN32,
                                      chip_size = UInt16(0), interpolated = false))
 end
 
