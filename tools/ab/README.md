@@ -16,7 +16,8 @@ pins, so the env is a valid oracle for the pin despite the version label.
 ## Running it
 
 Requires the real-data cache (`tools/realdata/README.md`). Each stage is Julia, then Python, then a
-comparison that writes a PNG to `plots/`.
+comparison that writes a PNG to `plots/`, which is gitignored — the figures are regenerated rather
+than committed, and the numbers they show are recorded here and in `bench_table.json`.
 
 ```bash
 # Stage 1 -- the correlator alone: one chip size, no pyramid, no outlier filter.
@@ -188,6 +189,137 @@ buffers, which is what makes larger blocks cost more under threading. `process_b
 keep when the scene will not fit at all; on a scene that fits, it trades peak for nothing. The
 `benchmark/memory.jl` figures (−36% at 4096², −56% at 6000²) are measured against *windowed,
 never-resident* input, which is the case blocking is for.
+
+## The full scene: every configuration, end to end
+
+The tables above are a 3072² window, where nothing is large enough to force a choice. This one is the
+**full Landsat 8/9 overlap** — 17121×16961, 290.4 Mpixel, grid 2127×2107 = 4.48 M points, chips 16/64,
+spacing 8, radius 20, upsampling 16 — which is where the choices matter.
+
+```bash
+julia --project=tools/ab tools/ab/bench_table.jl              # measure, then render
+julia --project=tools/ab tools/ab/bench_table.jl --replot      # re-render from the recorded results
+```
+
+Results are recorded in `bench_table.json` with the machine, OS and versions that produced them, and
+rendered to `plots/bench_table.pdf` — three pages: this table, then the accuracy comparison against
+the reference as maps (`plots/fig_heatmaps.png`) and as distributions (`plots/fig_histograms.png`).
+The figures come from `bench_figures.jl`, which reads the stage-2 bundle, so run stage 2 first if it
+is stale. Performance and accuracy are in one artifact because neither answers the question alone: a
+faster implementation that disagrees is not faster at the same job.
+
+Whole-process wall clock and peak RSS from `/usr/bin/time -l`, one fresh process per row: `ru_maxrss`
+is a high-water mark, so two configurations measured in one process both report the larger.
+
+Apple M2 Max, 12 cores, 96 GiB, macOS 26.5.2 · Julia 1.12.5 · AutoRIFT.jl 0.1.0 (`f3bf970`) ·
+reference autoRIFT 2.1.1, Python 3.10.20 with NumPy 1.26.4 and OpenCV 4.13.0 · Rasters 0.15.0,
+ArchGDAL 0.10.12, DiskArrays 0.4.22. Load average 3.7 during the run, so absolute times are a few
+percent pessimistic — equally for every row, so the ratios hold.
+
+| configuration | threads | lazy | blocks | runtime | peak RSS |
+|---|---:|:---:|---:|---:|---:|
+| python autoRIFT v2.1.2 | 12 | no | 1 | 336.2 s | 8126 MiB |
+| AutoRIFT.jl, eager, no blocks | 12 | no | 1 | 21.8 s | 7148 MiB |
+| AutoRIFT.jl, eager, no blocks | 1 | no | 1 | 69.8 s | 6701 MiB |
+| AutoRIFT.jl, lazy, block 2048 | 12 | yes | 81 | 41.9 s | 3926 MiB |
+| juliac binary, lazy, no blocks | 1\* | yes | 1 | 71.6 s | 6532 MiB |
+| juliac binary, lazy, block 2048 | 1\* | yes | 81 | 95.7 s | 3504 MiB |
+| juliac binary, lazy, block 1024 | 1\* | yes | 289 | 93.9 s | 3299 MiB |
+| juliac binary, lazy, block 512 | 1\* | yes | 1122 | 97.1 s | 3352 MiB |
+| juliac binary, lazy, block 256 | 1\* | yes | 4422 | 108.8 s | 3354 MiB |
+
+\* The binary is single-threaded: threading in a `--trim=safe` build is blocked upstream by
+[JuliaLang/julia#61319](https://github.com/JuliaLang/julia/issues/61319), so the thread pool is
+created but a spawned task resolves its entry point in the wrong world age and fails at runtime.
+
+The answer is the same in every row that can be compared byte for byte: lazy at 2048 against eager, 1
+thread against 12, and the binary at each block size against its own unblocked run.
+
+Three things this table says that the windowed ones cannot:
+
+**Lazy trades time for memory, and the trade is not free.** 41.9 s against 21.8 s for a 45% lower
+peak. Blocking a scene that fits in memory costs 1.9× the runtime and buys nothing; blocking one that
+does not fit is the only way to process it at all. That is the whole basis for choosing.
+
+**The two eager rows read raw planes, not rasters.** Measured through
+`autorift(::AbstractRaster, ...)` the same configuration peaks at **11590 MiB**, not 7148: `read` keeps
+the raster's `missingval`, so a filled copy of each scene is built and the nodata mask is a third array
+over the original — three scene-sized arrays where a plain `Matrix` needs one. An in-memory raster
+therefore costs 1.6× the equivalent array, and the lazy path avoids it because blocking never forms the
+copies.
+
+**Block size is nearly free above the halo, and the floor is the grid.** 2048 through 256 px spans
+81 to 4422 blocks and 54× the halo redundancy, yet peak moves by 1.6% and runtime by 16%: what is left
+resident is the output grid and the per-block buffers, and only the latter shrinks. The binary's
+unblocked row is the one that matters — 6532 against ~3.3 GiB blocked, which is the difference between
+fitting on a small instance and not.
+
+## Unexplained: large disagreements at maximum flow
+
+The global signed bias is exactly zero, but the difference is **not** uniform across the field. At
+maximum flow it is both larger and spatially coherent, and it is **not explained**. Recorded here, with
+the candidates that have been ruled out, so the next attempt does not repeat them.
+
+### What is observed
+
+In the fastest 5% of points the difference is **signed** rather than symmetric: 2293 negative against
+1428 positive on `dx`, 2341 against 1461 on `dy` — a sign test of `z` = −14.2 and −14.3. The median is
+−0.0625 px, exactly one 1/16 px upsampling step.
+
+Among the top 2% by `|dy|`, **25% differ by more than 0.25 px**, 5.6% by more than 0.5 px, and the
+largest reaches 4.77 px. 179 points across the grid differ by over 1 px, in 72 connected patches of
+which 44 are single points; the largest is 33 points at rows 113–129, cols 228–235, offset a coherent
++1.44 px at the same chip size on both sides.
+
+This is **not `dy`-specific**. `dx` carries the same offset at the same magnitude, and `|ddx|` and
+`|ddy|` have identical medians of 0.0625 px. `dy` only *looks* worse in the difference maps because the
+two fields differ in range — `dx` spans −0.25→+9.19 px, `dy` −3.19→+7.81. Lag-1 autocorrelation of the
+difference inside the trunk is 0.67: grid points are 8 px apart while chips are 16–64 px, so
+neighbouring estimates share most of their pixels and their tie-breaks correlate, which turns a
+±1-step difference into coherent patches rather than speckle.
+
+### One contributing factor, which does not account for it
+
+`autoRIFT.py:856-857` resizes each **coarse** level's result onto the fine grid with `INTER_CUBIC`, so
+a chip-32 or chip-64 estimate posted at a fine point is a bicubic interpolation of the coarse field
+rather than the value measured there; AutoRIFT.jl posts the measured value. The effect is real and in
+the right direction — 13.8% of chip-64 points exceed 0.25 px against 3.6% of chip-16 points — but it
+cannot be the primary cause: at chip 16 the reference takes the `ChipSize0X == ChipSizeUniX[i]` branch
+(`:812`) and does **no** resize, and 20.9% of max-flow points there still exceed 0.25 px.
+
+Stripping every known confound leaves almost all of it standing:
+
+| restriction | n | median \|ddy\| | > 0.25 px |
+|---|---:|---:|---:|
+| all max-flow points | 1686 | 0.165 | 25.0% |
+| + same chip on both sides | 1573 | 0.156 | 24.1% |
+| + both chip 16, so no cubic resize | 1402 | 0.125 | 20.9% |
+| + neither side interpolated | 1339 | 0.125 | **19.7%** |
+
+Against a 2.4% rate for the same restriction over all shared points, max flow is **8× worse**. Of the
+264 surviving disagreements, **87.5% have neither side as a local outlier** — both implementations
+produce locally consistent fields that disagree with each other, which is the signature of two
+defensible answers on a multi-peaked surface rather than one side erring.
+
+### Ruled out
+
+| candidate | evidence against |
+|---|---|
+| a rounded inter-level displacement prior | **Neither implementation carries one.** `Dx00` derives only from `self.Dx0` (`:590`), which is assigned only at initialization and never from a level's result; this harness sets it to `0`, so the `np.round` at `:585-586` is a no-op. The reference's coarse pass feeds the fine pass a *mask* (`MC2`, zeroing `SearchLimit`), never a displacement. |
+| the `INTER_CUBIC` coarse-to-fine resize | contributes, but 19.7% of max-flow points still exceed 0.25 px with chip 16 on both sides, where no resize runs |
+| chip decorrelation at large displacement | runs the wrong way — agreement *improves* as displacement/chip rises: 44.5% over 0.25 px in the lowest quintile against 17.5% in the highest |
+| a coarser chip being chosen | chip 32 is worse than chip 16 at max flow (50.3% against 20.9%), and 93% of large-error points used the *same* chip on both sides |
+| the hole fill | excluding points either side interpolated moves 20.9% to 19.7% |
+| search-radius saturation | `\|dy\|` reaches only 0.52 of the 20 px radius, and the trend against `\|dy\|`/radius is flat |
+| a projection or resampling difference | the harness passes raw arrays and pixel-index grids; no CRS is constructed on either side |
+
+### Where to look next
+
+The remaining candidates are inside the correlator at large displacement, which stage 1 compared only
+at modest displacement: the ZNCC normalization near a chip edge, the `filtDisp` outlier test's
+behaviour when a neighbourhood spans a shear margin, and the sub-pixel solver's peak selection when the
+surface has two comparable peaks. A stage-1 run restricted to fast-flow points would separate the
+correlator from everything built on it, which is the experiment this section is missing.
 
 ## The window-size artifact this harness exposes
 
