@@ -261,6 +261,15 @@ larger and spatially coherent, and one patch is understood: the two implementati
 peaks on a surface where the reference's choice is measurably worse. Recorded with the candidates that
 have been ruled out, so the next attempt does not repeat them.
 
+**`tools/synth/` settles what this section can only argue.** Every measurement below compares two
+answers on a scene whose true displacement nobody has, so it establishes which side is closer only
+through arbiters. The synthetic harness constructs the truth instead, and reproduces this disagreement
+from first principles: zero across 11,858 points of low deformation, rising to 66.2% of points beyond
+0.25 px where a chip spans the steepest strain, with AutoRIFT.jl at 0.1276 px against the reference's
+0.4032 px. It also shows the variable is **deformation within the chip footprint**, not flow speed —
+a 2° rigid rotation, which has no gradient variation at all, separates the two by 7.9×. Read that
+README for the direct comparison; read this one for what the real scene shows.
+
 ### What is observed
 
 Among the top 2% by `|dy|`, **25% differ by more than 0.25 px**, 5.6% by more than 0.5 px, and the
@@ -301,6 +310,18 @@ Over a 500-point random sample of the rest of the grid the two are indistinguish
 Neither side has a single negative value, and `arImgDisp_s` recovers synthetic pure translations exactly
 — 0.000 error at five different shifts — so its windowing and sign conventions are sound. Whatever this
 is, it is not a systematic fault.
+
+### Raw OpenCV is not a third opinion: it is the same answer
+
+`cv2.matchTemplate(TM_CCOEFF_NORMED)` refined by the same `pyrUp` cascade, with no autoRIFT machinery
+around it, returns the **identical `Float32`** to AutoRIFT.jl at 99.99–100.00% of points across all 26
+synthetic cases (`tools/synth/`). The residual is single 1/16 px quantization steps where two candidate
+peaks tie.
+
+Two independently written implementations — an FFT-based ZNCC in Julia and a spatial-domain matcher in
+C++ — agreeing to the last bit is what makes OpenCV usable as an arbiter here rather than a competing
+answer. It also means the maturity of OpenCV is evidence *about* AutoRIFT.jl: they are computing the
+same function, so a disagreement with the reference is not AutoRIFT.jl against the field.
 
 ### Chip-size convergence: an arbiter neither implementation controls
 
@@ -368,10 +389,20 @@ the patch.
 ## The window-size artifact this harness exposes
 
 On a window small enough that a level's coarse grid falls below the outlier filter's width, **the
-reference silently resolves nothing at that level**. At 1024² with chips 16–64 the coarse grids are
-7×7 and 3×3 against a filter width of 9, `CoarseCorValidFac` falls under `CoarseCorCutoff`, and
-`autorift()` hits `continue` — the reference used chip 16 for every point it answered while
-AutoRIFT.jl also used chip 64 for 558. Both then reach all three levels at 3072².
+reference silently resolves nothing at that level**. `autorift()` hits `continue` because
+`CoarseCorValidFac` falls under `CoarseCorCutoff`, and it does so without a warning — the reference used
+chip 16 for every point it answered while AutoRIFT.jl also used chip 64 for 558. Both then reach all
+three levels at 3072².
+
+The arithmetic, pinned by the single-level runs in `tools/synth/`, is that both quantities scale with
+`ChipSize0_GridSpacing_oversample_ratio = ChipSize0X / GridSpacingX` — so raising the chip at a fixed
+grid spacing shrinks the coarse grid and widens the filter at the same time:
+
+| chip | ratio | coarse step | coarse grid | `DispFiltC.FiltWidth` | |
+|---:|---:|---:|---:|---:|---|
+| 16 | 2 | 8 | 15×15 | 9 | resolves |
+| 32 | 4 | 16 | 7×7 | 17 | filter wider than grid |
+| 64 | 8 | 32 | 3×3 | 33 | filter wider than grid |
 
 So a coverage comparison on a small window measures the window rather than either implementation.
 Compare on a window large enough that every level's coarse grid clears the filter, or expect the
