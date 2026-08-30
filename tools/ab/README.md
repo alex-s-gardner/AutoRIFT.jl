@@ -254,72 +254,116 @@ resident is the output grid and the per-block buffers, and only the latter shrin
 unblocked row is the one that matters — 6532 against ~3.3 GiB blocked, which is the difference between
 fitting on a small instance and not.
 
-## Unexplained: large disagreements at maximum flow
+## Large disagreements at maximum flow
 
-The global signed bias is exactly zero, but the difference is **not** uniform across the field. At
-maximum flow it is both larger and spatially coherent, and it is **not explained**. Recorded here, with
-the candidates that have been ruled out, so the next attempt does not repeat them.
+The global signed bias is exactly zero, but the difference is **not** uniform. At maximum flow it is
+larger and spatially coherent, and one patch is understood: the two implementations pick different
+peaks on a surface where the reference's choice is measurably worse. Recorded with the candidates that
+have been ruled out, so the next attempt does not repeat them.
 
 ### What is observed
 
-In the fastest 5% of points the difference is **signed** rather than symmetric: 2293 negative against
-1428 positive on `dx`, 2341 against 1461 on `dy` — a sign test of `z` = −14.2 and −14.3. The median is
-−0.0625 px, exactly one 1/16 px upsampling step.
-
 Among the top 2% by `|dy|`, **25% differ by more than 0.25 px**, 5.6% by more than 0.5 px, and the
-largest reaches 4.77 px. 179 points across the grid differ by over 1 px, in 72 connected patches of
-which 44 are single points; the largest is 33 points at rows 113–129, cols 228–235, offset a coherent
-+1.44 px at the same chip size on both sides.
+largest reaches 4.77 px, against a 2.4% rate elsewhere. The largest coherent patch is grid rows
+113–129, columns 228–236 — 41 points at a median `dy` difference of **+1.38 px** while `dx` differs by
++0.31 px.
 
-This is **not `dy`-specific**. `dx` carries the same offset at the same magnitude, and `|ddx|` and
-`|ddy|` have identical medians of 0.0625 px. `dy` only *looks* worse in the difference maps because the
-two fields differ in range — `dx` spans −0.25→+9.19 px, `dy` −3.19→+7.81. Lag-1 autocorrelation of the
-difference inside the trunk is 0.67: grid points are 8 px apart while chips are 16–64 px, so
-neighbouring estimates share most of their pixels and their tie-breaks correlate, which turns a
-±1-step difference into coherent patches rather than speckle.
+The asymmetry between the axes is not a property of the correlator. `|ddx|` and `|ddy|` have identical
+medians of 0.0625 px over the whole grid; `dy` only *looks* worse in the difference maps because the
+fields differ in range (`dx` spans −0.25→+9.19 px, `dy` −3.19→+7.81). Lag-1 autocorrelation of 0.67
+inside the trunk turns ±1-step differences into coherent patches rather than speckle.
 
-### One contributing factor, which does not account for it
+### In that patch, AutoRIFT.jl is at the correlation peak and the reference is not
 
-`autoRIFT.py:856-857` resizes each **coarse** level's result onto the fine grid with `INTER_CUBIC`, so
-a chip-32 or chip-64 estimate posted at a fine point is a bicubic interpolation of the coarse field
-rather than the value measured there; AutoRIFT.jl posts the measured value. The effect is real and in
-the right direction — 13.8% of chip-64 points exceed 0.25 px against 3.6% of chip-16 points — but it
-cannot be the primary cause: at chip 16 the reference takes the `ChipSize0X == ChipSizeUniX[i]` branch
-(`:812`) and does **no** resize, and 20.9% of max-flow points there still exceed 0.25 px.
+Measured by evaluating **OpenCV's own `matchTemplate` surface** — the function the reference itself
+calls — at each side's reported displacement, on 117 patch points at chip 16:
 
-Stripping every known confound leaves almost all of it standing:
+| | median surface value | at the peak (within 0.01) |
+|---|---:|---:|
+| AutoRIFT.jl | **0.5213** | **95 of 117** |
+| autoRIFT.py | 0.3575 | 45 of 117 |
+| the surface's own maximum | 0.5239 | — |
 
-| restriction | n | median \|ddy\| | > 0.25 px |
-|---|---:|---:|---:|
-| all max-flow points | 1686 | 0.165 | 25.0% |
-| + same chip on both sides | 1573 | 0.156 | 24.1% |
-| + both chip 16, so no cubic resize | 1402 | 0.125 | 20.9% |
-| + neither side interpolated | 1339 | 0.125 | **19.7%** |
+The reference's value is **negative** at 14 points, where a real match scores 0.3–0.6 three pixels
+away. Excluding the reference's interpolated fills leaves the picture unchanged (111 points, medians
+0.5239 against 0.4137). The sign convention behind this comparison was established by planting known
+reference content into the secondary chip and confirming the returned offset, not assumed.
 
-Against a 2.4% rate for the same restriction over all shared points, max flow is **8× worse**. Of the
-264 surviving disagreements, **87.5% have neither side as a local outlier** — both implementations
-produce locally consistent fields that disagree with each other, which is the signature of two
-defensible answers on a multi-peaked surface rather than one side erring.
+### Where they agree, they agree exactly
+
+Over a 500-point random sample of the rest of the grid the two are indistinguishable:
+
+| | median surface value | at the peak |
+|---|---:|---:|
+| AutoRIFT.jl | 0.6477 | 86.2% |
+| autoRIFT.py | 0.6469 | 82.4% |
+
+Neither side has a single negative value, and `arImgDisp_s` recovers synthetic pure translations exactly
+— 0.000 error at five different shifts — so its windowing and sign conventions are sound. Whatever this
+is, it is not a systematic fault.
+
+### Chip-size convergence: an arbiter neither implementation controls
+
+Correlation is more robust at a larger chip, because more texture is averaged. So a point's own
+estimates across a ladder of chip sizes — 16, 24, 32, 48, 64 at a fixed 24 px radius — converge on the
+displacement that is really there, independently of which implementation reported what. Where those five
+agree to within 1 px a trustworthy answer exists, and the question becomes which side matches it.
+
+| population | n stable | AutoRIFT.jl | autoRIFT.py | jl within 0.25 px | py within 0.25 px |
+|---|---:|---:|---:|---:|---:|
+| `\|ddy\|` > 1.0 px | 14 | **0.354** | 1.714 | 43% | 7% |
+| `\|ddy\|` 0.5–1.0 px | 208 | **0.198** | 0.675 | 60% | 7% |
+| `\|ddy\|` 0.25–0.5 px | 303 | **0.177** | 0.395 | 64% | 23% |
+| `\|ddy\|` ≤ 0.25 px | 373 | 0.088 | 0.088 | 90% | 87% |
+| fast flow, `\|dy\|` > p98 | 363 | **0.125** | 0.280 | 83% | 39% |
+| fast flow and `\|ddy\|` > 0.25 | 276 | **0.182** | 0.476 | 69% | 7% |
+
+The gradient is the result. Where the two agree they track the converged answer identically; as the
+disagreement grows AutoRIFT.jl stays with it while the reference departs, by 4.8x at the worst points.
+
+Two things make this test valid, and both had to be fixed first. **Edge peaks must be rejected**: a
+large chip spans a velocity gradient, its peak leaves a fixed search window, and the estimate pins near
+zero — an early version of this ladder held the radius at 24 out to chip 256 and the *control*
+collapsed from `dy` +6.9 to +0.03, which is that failure and not a property of large chips. And **only
+the stable subset can be judged**: 58% of the anomalous points have a self-consistent ladder answer
+against 95% of controls (median spread 0.699 px against 0.225), so on roughly 40% of them neither
+implementation is right and the word does not apply.
 
 ### Ruled out
 
 | candidate | evidence against |
 |---|---|
-| a rounded inter-level displacement prior | **Neither implementation carries one.** `Dx00` derives only from `self.Dx0` (`:590`), which is assigned only at initialization and never from a level's result; this harness sets it to `0`, so the `np.round` at `:585-586` is a no-op. The reference's coarse pass feeds the fine pass a *mask* (`MC2`, zeroing `SearchLimit`), never a displacement. |
-| the `INTER_CUBIC` coarse-to-fine resize | contributes, but 19.7% of max-flow points still exceed 0.25 px with chip 16 on both sides, where no resize runs |
-| chip decorrelation at large displacement | runs the wrong way — agreement *improves* as displacement/chip rises: 44.5% over 0.25 px in the lowest quintile against 17.5% in the highest |
-| a coarser chip being chosen | chip 32 is worse than chip 16 at max flow (50.3% against 20.9%), and 93% of large-error points used the *same* chip on both sides |
-| the hole fill | excluding points either side interpolated moves 20.9% to 19.7% |
-| search-radius saturation | `\|dy\|` reaches only 0.52 of the 20 px radius, and the trend against `\|dy\|`/radius is flat |
+| absolute rather than signed peak finding | both call `minMaxLoc(result, NULL, NULL, NULL, &maxLoc)`, the signed maximum |
+| a rounded inter-level displacement prior | neither implementation carries one: `Dx00` derives only from `self.Dx0` (`:590`), never from a level's result, and this harness sets it to `0`; the reference's coarse pass feeds the fine pass a *mask*, never a displacement |
+| OpenCV `matchTemplate` vs an FFT ZNCC | agree to 8.5e-07 on the same window, Float32 epsilon, same argmax |
+| the sub-pixel refinement | the reference's own 5×5-clamp-plus-`pyrUp` cascade and `subpixel_peak` agree to 0.01 px on the same surface |
+| the `-ref_min` / `-chip_min` shift (`cpp:464-465`) | neutral to 1.19e-07 despite shift constants differing by ~7000 on filtered imagery |
+| crevasse-parallel elongated peaks | peaks in the patch are ~2× *sharper* along y than x (curvature ratio 1.96, half-max width 0.50 against 1.00), the opposite of a y-ridge; the structure tensor finds no strong linear texture |
+| a coarser chip being chosen | 93% of large-error points used the same chip on both sides |
+| the reference's hole fill | 12 of 138 patch points are interpolated; excluding them barely moves the medians |
+| grid marshalling shape sensitivity | a 2-D and a 1×N grid give identical answers, `max |difference| = 0.0000` |
 | a projection or resampling difference | the harness passes raw arrays and pixel-index grids; no CRS is constructed on either side |
 
-### Where to look next
+### Not a bug: `foo.create(cols, rows, …)` in the reference
 
-The remaining candidates are inside the correlator at large displacement, which stage 1 compared only
-at modest displacement: the ZNCC normalization near a chip edge, the `filtDisp` outlier test's
-behaviour when a neighbourhood spans a shear margin, and the sub-pixel solver's peak selection when the
-surface has two comparable peaks. A stage-1 run restricted to fast-flow points would separate the
-correlator from everything built on it, which is the experiment this section is missing.
+`autoriftcoremodule.cpp:291` and `:506` call `foo.create(cols, rows, CV_32FC1)` where
+`cv::Mat::create` takes `(rows, cols)`, which reads like a transposition. It is harmless, on two
+independent grounds. `cv::pyrUp(src, dst, dstsize)` **allocates `dst` to `dstsize` itself**, so the
+preceding `create` has no effect whatever its argument order — verified by passing a deliberately
+wrong-shaped destination and getting the requested shape back. And `x_count` and `y_count` are both
+hard-coded to 5 (`:484-491`), so `cols == rows` at every cascade step regardless.
+
+Recorded because the argument order invites exactly this false positive.
+
+### The 1-pixel chip-centre convention difference
+
+The reference centres its chip half a pixel differently: `int(-8 + 1915.5) = 1907` gives 1-based
+columns 1878–1893, centre 1885.5, where AutoRIFT.jl uses `round(1886.0) = 1886` and columns
+1879–1894, centre 1886.5. The two sample ground **1 px apart**. It cancels in the displacement, since
+each offsets chip and window together — which is why the global bias is zero — but they are describing
+slightly different ground. Correlating at the reference's placement does not reproduce its answers
+(median distance 0.500 px against 0.538), so this is a documentation matter rather than the cause of
+the patch.
 
 ## The window-size artifact this harness exposes
 
