@@ -63,6 +63,16 @@ end
 # zero displacement is a real measurement and must not look like a missing one.
 blank(A, keep) = map((v, k) -> k ? Float64(v) : NaN, A, keep)
 
+# A grid array as `heatmap!` needs it to appear in image orientation: x horizontal, y vertical,
+# increasing downward.
+#
+# `heatmap!(A)` treats A's *first* index as the x axis, so passing a `[row, col]` array directly draws
+# the image transposed — rows run horizontally. Transposing fixes the axes, and reversing the resulting
+# columns puts row 1 at the top, which is where the northernmost row of a north-up scene belongs.
+# Without this, a feature elongated along y appears elongated along x, which inverts the reading of any
+# anisotropy in the field.
+mapshow(A) = reverse(permutedims(A); dims = 2)
+
 # Page 1 of the comparison: every field as a map, both sides at one color scale.
 function heatmap_page(d; path = joinpath(FIG_PLOTS, "fig_heatmaps.png"))
     (; j, p, jok, pok, both, radial) = d
@@ -82,16 +92,16 @@ function heatmap_page(d; path = joinpath(FIG_PLOTS, "fig_heatmaps.png"))
                              xticklabelsvisible = false, yticklabelsvisible = false)
 
     for (row, (nm, J, P)) in enumerate((("dx", j.dx, p.dx), ("dy", j.dy, p.dy)))
-        hm = heatmap!(mapax((row, 1), "AutoRIFT.jl $nm"), blank(J, jok);
+        hm = heatmap!(mapax((row, 1), "AutoRIFT.jl $nm"), mapshow(blank(J, jok));
                       colormap = :balance, colorrange = dlim)
-        heatmap!(mapax((row, 2), "autoRIFT.py $nm"), blank(P, pok);
+        heatmap!(mapax((row, 2), "autoRIFT.py $nm"), mapshow(blank(P, pok));
                  colormap = :balance, colorrange = dlim)
         Colorbar(fig[row, 3], hm; label = "$nm (px)", width = 12)
 
         # Signed difference per axis on a diverging scale, so which way each side leans is visible.
         # A magnitude on a sequential scale cannot show that, and the sign is the whole question for a
         # bias: a field of +0.1 px and one of ±0.1 px look identical under `abs`.
-        hmd = heatmap!(mapax((row, 4), "difference in $nm"), blank(J .- P, both);
+        hmd = heatmap!(mapax((row, 4), "difference in $nm"), mapshow(blank(J .- P, both));
                        colormap = :balance, colorrange = (-2 * FIG_TOL, 2 * FIG_TOL))
         Colorbar(fig[row, 5], hmd; label = "AutoRIFT.jl − autoRIFT.py (px)", width = 12)
     end
@@ -122,7 +132,7 @@ function histogram_page(d; path = joinpath(FIG_PLOTS, "fig_histograms.png"))
     crange = (minimum(chips) - 0.5, maximum(chips) + 0.5)
     cmap = cgrad(:viridis, length(chips); categorical = true)
     for (row, (nm, C, ok)) in enumerate((("AutoRIFT.jl", j.chip, jok), ("autoRIFT.py", p.chip, pok)))
-        hm = heatmap!(mapax((row, 1), "$nm chip size"), blank(C, ok .& (C .> 0));
+        hm = heatmap!(mapax((row, 1), "$nm chip size"), mapshow(blank(C, ok .& (C .> 0)));
                       colormap = cmap, colorrange = crange)
         # `height = Relative(0.85)` so a categorical bar matches its map rather than spanning the
         # taller cell the map's `DataAspect` leaves behind.
@@ -135,7 +145,7 @@ function histogram_page(d; path = joinpath(FIG_PLOTS, "fig_histograms.png"))
     # and it is spatially structured, which a histogram of the same fact cannot show.
     samelevel = both .& (j.chip .== p.chip)
     disagree = map((b, s) -> b ? (s ? 0.0 : 1.0) : NaN, both, samelevel)
-    hm = heatmap!(mapax((1, 3), "chip size: agree or disagree"), disagree;
+    hm = heatmap!(mapax((1, 3), "chip size: agree or disagree"), mapshow(disagree);
                   colormap = cgrad([:gray75, :crimson]; categorical = true), colorrange = (-0.5, 1.5))
     Colorbar(fig[1, 4], hm; width = 12, ticks = (0:1, ["same", "differ"]), height = Relative(0.85))
 
@@ -143,7 +153,7 @@ function histogram_page(d; path = joinpath(FIG_PLOTS, "fig_histograms.png"))
     # get an answer, so two runs can agree everywhere they overlap and still disagree about most of the
     # grid — the half of the comparison no value statistic can show.
     cov = map((a, b) -> a && b ? 1.0 : a ? 2.0 : b ? 3.0 : 0.0, jok, pok)
-    hmc = heatmap!(mapax((2, 3), "coverage"), cov;
+    hmc = heatmap!(mapax((2, 3), "coverage"), mapshow(cov);
                    colormap = cgrad([:gray88, :gray30, :dodgerblue, :orangered]; categorical = true),
                    colorrange = (-0.5, 3.5))
     Colorbar(fig[2, 4], hmc; width = 12, height = Relative(0.85),
