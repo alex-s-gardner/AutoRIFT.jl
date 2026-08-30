@@ -614,19 +614,28 @@ end
     dims2 = (Y(1:n), X(1:n))
     ra, rb = Raster(a, dims2), Raster(b, dims2)
     @test ext._ondisk(ra)
-    # `CountingDisk` declares 256² chunks, so that is the block size the default derives.
-    @test ext._blocks(nothing, ra, rb) == (256, 256)
+    # The default is `HALO_BLOCKS` halos, rounded up to a whole number of the file's chunks: blocking at
+    # the chunk size alone reads 2x2 chunks per block because of the halo, so every chunk is decoded
+    # several times over. Measured 4.99 s at 256 against 3.48 s at 768 on real imagery.
+    pblk = AutoRIFT.params(; chip_size = 16, chip_size_max = 16, grid_spacing = 16, search_radius = 8)
+    hx, hy = AutoRIFT.halo(AutoRIFT.gridpoints((n, n), pblk.grid_spacing;
+                                               chip_size = pblk.chip_size_max,
+                                               search_radius = pblk.search_radius), pblk, (n, n))
+    got = ext._blocks(nothing, ra, rb, pblk)
+    @test got[1] % 256 == 0 && got[2] % 256 == 0        # still chunk-aligned
+    @test got[1] >= ext.HALO_BLOCKS * hy                # and at least the halo-derived target
+    @test all(got .<= n)                                 # never larger than the scene
     # A chunk too small to be a sensible block is raised to `MIN_BLOCK`. `Rasters.write` produces
     # *striped* GeoTIFFs, whose chunks are one row tall, and a 5-pixel block is below the halo — which
     # `block_layout` rejects outright. Bounded above by the scene, so a small image stays one block.
     tiny = Raster(CountingStripe{Float32}((512, 512), 3), (Y(1:512), X(1:512)))
-    @test ext._blocks(nothing, tiny, tiny) == (512, ext.MIN_BLOCK)
+    @test all(ext._blocks(nothing, tiny, tiny, pblk) .>= ext.MIN_BLOCK)
     small = Raster(CountingStripe{Float32}((64, 64), 4), (Y(1:64), X(1:64)))
-    @test ext._blocks(nothing, small, small) == (64, 64)
+    @test ext._blocks(nothing, small, small, pblk) == (64, 64)   # bounded by the scene
     # An explicit choice always wins, and an in-memory pair stays unblocked.
-    @test ext._blocks((64, 64), ra, rb) == (64, 64)
+    @test ext._blocks((64, 64), ra, rb, pblk) == (64, 64)
     mem = Raster(zeros(Float32, 8, 8), (Y(1:8), X(1:8)))
-    @test ext._blocks(nothing, mem, mem) === nothing
+    @test ext._blocks(nothing, mem, mem, pblk) === nothing
     @test !ext._ondisk(mem)
 
     autorift(ra, rb; chip_size = 16, chip_size_max = 16, grid_spacing = 16, search_radius = 8)

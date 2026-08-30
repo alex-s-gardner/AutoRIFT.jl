@@ -86,18 +86,51 @@ Throws for a preprocessing method with no finite reach, since no halo makes such
 blockwise-reproducible.
 """
 function halo(grid::PointSet, p::Params, imagesize::Tuple{Int,Int})
-    w = filter_reach(p.preprocess)
-    # A whole-image reduction, so there is no halo that makes a block agree with the scene. Named
-    # here rather than absorbed, because the alternative is a block whose filter output is quietly
-    # different from the untiled run's everywhere, not merely at its edge.
-    w >= 0 || throw(ArgumentError(
-        "`$(nameof(typeof(p.preprocess)))` estimates its correction from the whole image, so a " *
-        "block cannot reproduce it from local data and no halo fixes that. Use a windowed filter " *
-        "for tiled processing, or run this pair untiled."))
+    w = _filter_halo(p)
     # `_pass_geometry`'s pad is exactly the correlation reach plus the reference's 2-pixel slack
     # for the half-pixel grid offset and index truncation.
     _, _, _, _, pad, _ = _pass_geometry(_worst_level_points(grid, p), imagesize)
     return (pad[1] + w, pad[2] + w)
+end
+
+"""
+    AutoRIFT.halo(p::Params) -> (hx, hy)
+
+The halo for a grid [`AutoRIFT.gridpoints`](@ref) would build from `p`, without building it.
+
+`p` alone determines the answer for such a grid: every point carries the same chip size and radius,
+so the maxima `halo(grid, p, imagesize)` reduces over are the values in `p` — floored at
+`min_search_radius`, exactly as [`AutoRIFT.sanitize!`](@ref) floors them. Given that, the grid
+contributes nothing the parameters do not already state.
+
+Exists because a caller choosing a block size needs the halo *before* the run, and building a grid to
+ask costs 550 MiB and 50 ms on a Landsat-sized scene — for two integers. The grid form remains the
+one to use for a caller-supplied `PointSet`, where per-point radii and priors may vary and the maxima
+are genuinely a property of the points.
+"""
+function halo(p::Params)
+    w = _filter_halo(p)
+    # The same arithmetic `_pass_geometry` performs per point, with the maxima taken from `p`: half the
+    # widest chip, plus the radius, plus the prior, plus the reference's 2-pixel slack.
+    rx = max(p.search_radius.X, p.min_search_radius)
+    ry = max(p.search_radius.Y, p.min_search_radius)
+    hx = p.chip_size_max.X ÷ 2 + rx + ceil(Int, abs(p.dx_prior)) + 2
+    hy = p.chip_size_max.Y ÷ 2 + ry + ceil(Int, abs(p.dy_prior)) + 2
+    return (hx + w, hy + w)
+end
+
+# The preprocessing filter's contribution to the halo, and the one configuration that has none.
+#
+# A whole-image reduction has no halo that makes a block agree with the scene. Named rather than
+# absorbed, because the alternative is a block whose filter output is quietly different from the
+# untiled run's everywhere, not merely at its edge.
+function _filter_halo(p::Params)
+    w = filter_reach(p.preprocess)
+    w >= 0 || throw(ArgumentError(
+        "`$(nameof(typeof(p.preprocess)))` estimates its correction from the whole image, so a " *
+        "block cannot reproduce it from local data and no halo fixes that. Use a windowed filter " *
+        "for tiled processing, or run this pair untiled."))
+    return w
 end
 
 """
