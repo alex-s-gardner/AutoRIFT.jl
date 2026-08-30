@@ -4,10 +4,10 @@ Three implementations correlated on scenes whose displacement is known analytica
 AutoRIFT.jl, `autoRIFT.py`, and raw OpenCV `matchTemplate` with no autoRIFT machinery around it.
 
 The A/B harness beside this one (`tools/ab/`) compares AutoRIFT.jl against the reference on real
-Landsat, where neither answer is known to be right. That comparison found the two indistinguishable
-over most of a scene and disagreeing by more than 0.25 px at 6.7% of points, concentrated at maximum
-flow, and it could establish which side was closer only through arbiters. Here the truth is
-constructed, so accuracy is a measurement rather than an inference.
+Landsat, where neither answer is known to be right, so it can only measure *disagreement*. Here the
+truth is constructed, so accuracy is a measurement rather than an inference — and the two harnesses
+answer different questions: this one asks whether the implementations compute the same thing, that one
+asks what they do on ice.
 
 ## The result
 
@@ -28,30 +28,28 @@ Three independently written implementations — an FFT-based ZNCC in Julia, a sp
 C++, and `cv2.matchTemplate` called directly — returning the same float means each can serve as an
 arbiter for the others.
 
-## What this harness caught in itself
+## The reference's argument order
 
-An earlier run of this sweep reported `autoRIFT.py` as 7.9× less accurate on rigid rotation and worse
-on every deforming case. **That was a defect in this harness, not in the reference.** It is recorded
-here because the failure mode is easy to reproduce and hard to see.
-
-`arImgDisp_s(a, b)` **cuts its chip from `b` and its search window from `a`** — the reverse of what its
+**`arImgDisp_s(a, b)` cuts its chip from `b` and its search window from `a`** — the reverse of what the
 parameter names suggest. `a` binds to `I1` and `b` to `I2`, but the body calls the C++ as
 `arSubPixDisp_s_Py(..., I2.shape, I2.ravel(), I1.shape, I1.ravel(), ...)` (`autoRIFT.py:1251-1256`),
 and the C++ binds *its* first array to `sec_img`, which is where `chip` is cut from
-(`autoriftcoremodule.cpp:413,453`). Two swaps that compose rather than cancel. `runAutorift` inherits
-this: it calls `arImgDisp_s(self.I2, self.I1)`, so its chip comes from `self.I1`.
+(`autoriftcoremodule.cpp:413,453`). The two swaps compose rather than cancel.
 
-Passing the images the other way round does not produce a sign error that a global flip absorbs. The
-chip is then cut from the other image, so the estimate describes the displacement of a *different piece
-of ground*, and the discrepancy grows with displacement — up to 0.47 px on `rotation_2deg`. That is
-small enough to read as an accuracy result and large enough to look significant.
+`runAutorift` inherits this: it correlates with `arImgDisp_s(self.I2, self.I1)`
+(`autoRIFT.py:674,747`), so its chip comes from `self.I1` — which must therefore hold the **secondary**
+image for the chip to sit on the secondary.
 
-**A translation-only gate cannot detect it.** On a uniform field, "the displacement of the feature at
-the reference point" and "the displacement of the feature arriving at the secondary point" are the same
-number, so a reversed harness recovers a pure translation *exactly* — 0.0000 px — and looks correct.
-`gate.jl` therefore includes `rotation_2deg`, where the two attributions diverge and a swap shows up as
-a gross error. The inverted harness produced a full sweep of plausible numbers while passing a
-translation gate at 0.0000 px.
+Getting this backwards is not a sign error that a global flip absorbs. The chip is then cut from the
+other image, so the estimate describes the displacement of a different piece of ground: the residual is
+zero on a pure translation and grows with displacement wherever the field deforms, reaching 0.47 px on
+`rotation_2deg`. That is small enough to read as an accuracy result and large enough to look
+significant.
+
+**A translation-only gate cannot detect it**, which is why `gate.jl` also requires `rotation_2deg`. On a
+uniform field the displacement of the feature at the reference point and of the feature arriving at the
+secondary point are the same number, so a reversed pairing recovers a pure translation at exactly
+0.0000 px. Only a deforming field separates them.
 
 ## Running it
 
@@ -180,11 +178,14 @@ deformation is *within* the chip rather than of it.
 
 ## What this does not show
 
-- **It says nothing about the real-scene disagreement.** `tools/ab/` finds AutoRIFT.jl and the
-  reference differing by more than 0.25 px at 6.7% of points on real Landsat. This harness now shows
-  the two are the same algorithm on constructed scenes, so that disagreement must come from something
-  these cases do not reproduce — preprocessing, the search-radius field, or the pyramid interacting
-  with a scene this sweep does not model. It remains open.
+- **It does not explain the real-scene disagreement.** `tools/ab/` finds the two differing by more than
+  0.25 px at 6.7% of points on Landsat. What this sweep contributes is a set of eliminations: on
+  constructed imagery the correlator, the sub-pixel refinement, the response to deformation, and uint8
+  quantization are all *shared*, so none of them can be the cause. What remains untested here is
+  preprocessing (bypassed), the per-point search-radius field ITS_LIVE supplies (fixed at 20 px here),
+  and the pyramid on real scene structure. **Note that `tools/ab/` itself pairs the images in the order
+  this section shows to be reversed**, so its numbers need re-deriving before the residual is
+  attributed to anything.
 - **`py_pipeline` resolves nothing at chips 32 and 64 here.** Not an accuracy result: it is the
   window-size artifact `tools/ab/README.md` documents.
   `ChipSize0_GridSpacing_oversample_ratio = ChipSize0X / GridSpacingX` is 4 at chip 32 and 8 at chip

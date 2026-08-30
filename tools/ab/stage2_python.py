@@ -50,8 +50,12 @@ def main():
     # Already high-pass filtered by AutoRIFT.jl, so no preprocessing runs here. `DataType = 1`
     # keeps the float path: `uniform_data_type` would otherwise requantize to uint8 and the two
     # sides would no longer be correlating the same numbers.
-    obj.I1 = np.ascontiguousarray(arrays["filtered_reference"], dtype=np.float32)
-    obj.I2 = np.ascontiguousarray(arrays["filtered_secondary"], dtype=np.float32)
+    # `I1` holds the *secondary*, which is not what the field names suggest. `runAutorift` correlates
+    # with `arImgDisp_s(self.I2, self.I1)` (`autoRIFT.py:674,747`), and `arImgDisp_s` cuts its chip from
+    # its second argument, so the chip comes from `self.I1`. Putting the secondary there is what makes
+    # the chip sit on the secondary, matching AutoRIFT.jl and stage 1.
+    obj.I1 = np.ascontiguousarray(arrays["filtered_secondary"], dtype=np.float32)
+    obj.I2 = np.ascontiguousarray(arrays["filtered_reference"], dtype=np.float32)
     obj.DataType = 1
     obj.zeroMask = None
 
@@ -80,8 +84,12 @@ def main():
 
     shape = obj.Dx.shape
     dx = np.asarray(obj.Dx, dtype=np.float32)
-    # Undo the reference's final cartesian flip so both sides are in the matrix convention, then
-    # negate both axes into AutoRIFT.jl's secondary-to-reference convention. See tools/ab/compare.jl.
+    # Undo the reference's final cartesian flip, putting dy back down-rows as AutoRIFT.jl reports it.
+    #
+    # Whether a further negation of both axes is needed depends on the chip/window assignment above, so
+    # it is not applied blind here: the readers establish the sign by scoring both candidates, as
+    # `tools/synth/gate.jl` does. A hardcoded flip paired with a reversed assignment is how a
+    # displacement-dependent residual can look like an accuracy difference.
     dy = -np.asarray(obj.Dy, dtype=np.float32)
 
     chip_size = np.asarray(obj.ChipSizeX, dtype=np.int32)

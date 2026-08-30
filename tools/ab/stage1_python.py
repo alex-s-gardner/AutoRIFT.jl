@@ -65,14 +65,18 @@ def main():
     shape = x_grid.shape
     ones = np.ones(shape, dtype=np.float32)
 
-    # Argument order follows the reference's own call sites (`autoRIFT.py:673,747`), which pass
-    # `(self.I2, self.I1)`. The C++ binds the first to `sec_img` (the chip) and the second to
-    # `ref_img` (the search window), so the chip is cut from I2 and the window from I1 -- and
-    # `self.I1` is the reference scene. AutoRIFT.jl cuts its chip from the secondary and its
-    # window from the reference, which is the same assignment.
+    # `arImgDisp_s(a, b)` cuts its chip from `b` and its search window from `a`, the reverse of what the
+    # parameter names suggest: `a` binds to `I1` and `b` to `I2`, but the body calls the C++ as
+    # `(I2.ravel(), I1.ravel())` (`autoRIFT.py:1251-1256`) and the C++ binds *its* first array to
+    # `sec_img`, where the chip is cut from (`autoriftcoremodule.cpp:413,453`). Two swaps that compose.
+    #
+    # So `(ref, sec)` puts the chip on the secondary and the window on the reference, matching
+    # AutoRIFT.jl. Reversing it is not a sign error: the chip then comes from the other image, so the
+    # estimate describes different ground, and the residual grows with displacement wherever the field
+    # deforms while staying exactly zero under uniform motion.
     dx, dy = arImgDisp_s(
-        sec,
         ref,
+        sec,
         x_grid.copy(),
         y_grid.copy(),
         ones * np.float32(chip),

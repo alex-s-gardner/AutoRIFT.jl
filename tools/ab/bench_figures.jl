@@ -26,8 +26,10 @@ const FIG_SIZE = (1560, 929)
 # correlating, so the reference's grid is the top-left sub-block of the one it was handed. Cropping
 # AutoRIFT.jl to match compares the same grid points rather than resampling either side.
 #
-# The reference's displacements are negated on both axes: it reports feature motion, AutoRIFT.jl
-# reports the offset from secondary back to reference, which is its negative.
+# The reference's displacements are negated on both axes to reach AutoRIFT.jl's secondary-to-reference
+# convention. That negation is correct only for the chip/window assignment `stage2_python.py` uses; if
+# that assignment changes, this sign must be re-established by scoring both candidates rather than
+# carried over.
 function load_stage2()
     shapes = Dict{String,Tuple{Int,Int}}()
     scalars = Dict{String,Int}()
