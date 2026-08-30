@@ -261,14 +261,17 @@ larger and spatially coherent, and one patch is understood: the two implementati
 peaks on a surface where the reference's choice is measurably worse. Recorded with the candidates that
 have been ruled out, so the next attempt does not repeat them.
 
-**`tools/synth/` settles what this section can only argue.** Every measurement below compares two
-answers on a scene whose true displacement nobody has, so it establishes which side is closer only
-through arbiters. The synthetic harness constructs the truth instead, and reproduces this disagreement
-from first principles: zero across 11,858 points of low deformation, rising to 66.2% of points beyond
-0.25 px where a chip spans the steepest strain, with AutoRIFT.jl at 0.1276 px against the reference's
-0.4032 px. It also shows the variable is **deformation within the chip footprint**, not flow speed —
-a 2° rigid rotation, which has no gradient variation at all, separates the two by 7.9×. Read that
-README for the direct comparison; read this one for what the real scene shows.
+**`tools/synth/` narrows what this section can be about.** Against exact analytic truth on 26
+constructed scenes — translation, rotation, divergence, shear, noise, decorrelation, uint8, real texture
+— AutoRIFT.jl, `autoRIFT.py` and raw OpenCV are **bit-identical at 99.99–100.00% of points**, with
+median error against truth agreeing to four decimal places in every case. On constructed imagery the
+three are the same algorithm.
+
+So whatever produces the real-scene disagreement below is **not** the correlator, the sub-pixel
+refinement, or the response to deformation: those are now measured as shared. It has to come from
+something the synthetic cases do not model — the preprocessing filter, the per-point search-radius
+field ITS_LIVE supplies, or the pyramid interacting with real scene structure. That is a narrower
+question than this section was previously able to pose, and it is still open.
 
 ### What is observed
 
@@ -311,17 +314,23 @@ Neither side has a single negative value, and `arImgDisp_s` recovers synthetic p
 — 0.000 error at five different shifts — so its windowing and sign conventions are sound. Whatever this
 is, it is not a systematic fault.
 
-### Raw OpenCV is not a third opinion: it is the same answer
+### All three implementations are the same answer
 
 `cv2.matchTemplate(TM_CCOEFF_NORMED)` refined by the same `pyrUp` cascade, with no autoRIFT machinery
-around it, returns the **identical `Float32`** to AutoRIFT.jl at 99.99–100.00% of points across all 26
-synthetic cases (`tools/synth/`). The residual is single 1/16 px quantization steps where two candidate
-peaks tie.
+around it, returns the **identical `Float32`** to *both* AutoRIFT.jl and `arImgDisp_s` at 99.99–100.00%
+of points across all 26 synthetic cases (`tools/synth/`). The residual is single 1/16 px steps where two
+candidate peaks tie.
 
-Two independently written implementations — an FFT-based ZNCC in Julia and a spatial-domain matcher in
-C++ — agreeing to the last bit is what makes OpenCV usable as an arbiter here rather than a competing
-answer. It also means the maturity of OpenCV is evidence *about* AutoRIFT.jl: they are computing the
-same function, so a disagreement with the reference is not AutoRIFT.jl against the field.
+Three independently written implementations agreeing to the last bit makes each an arbiter for the
+others, and it means OpenCV's maturity is evidence about both correlators rather than a competing
+answer. It also bounds what this section's disagreement can be: not the matching, and not the sub-pixel
+refinement.
+
+**A caution this harness paid for.** `arImgDisp_s(a, b)` cuts its chip from `b`, not `a` — the wrapper
+re-swaps the pair before calling the C++, which binds *its* first array as the chip. Passing them the
+other way round still recovers a pure translation exactly, because on a uniform field both attributions
+of the displacement coincide; it fails only where the field deforms, and then by a plausible-looking
+fraction of a pixel. `tools/synth/gate.jl` tests a rotation case for exactly this reason.
 
 ### Chip-size convergence: an arbiter neither implementation controls
 

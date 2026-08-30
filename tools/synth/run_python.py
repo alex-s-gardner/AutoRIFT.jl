@@ -28,10 +28,20 @@ SCENES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scenes")
 def correlator_arm(ref, sec, arrays, scalars):
     """`arImgDisp_s` on the case's grid, in the matrix convention.
 
-    Argument order follows the reference's own call sites (`autoRIFT.py:673,747`), which pass
-    `(self.I2, self.I1)`: the C++ binds the first to the chip and the second to the search window, so
-    the chip comes from the secondary and the window from the reference. AutoRIFT.jl assigns them the
-    same way.
+    **`arImgDisp_s(a, b)` cuts its chip from `b` and its search window from `a`**, the reverse of what
+    the parameter names suggest. `a` binds to `I1` and `b` to `I2`, but the body then calls the C++ as
+    `arSubPixDisp_s_Py(..., I2.shape, I2.ravel(), I1.shape, I1.ravel(), ...)`
+    (`autoRIFT.py:1251-1256`), and the C++ binds *its* first array to `sec_img`, which is where `chip`
+    is cut from (`autoriftcoremodule.cpp:413,453`). Two swaps that compose rather than cancel.
+
+    So `(reference, secondary)` is passed here, putting the chip on the secondary and the window on the
+    reference -- the assignment AutoRIFT.jl makes.
+
+    Reversing this is not a sign error that a global flip absorbs. On a deforming field the chip then
+    comes from the other image, so the estimate belongs to a different grid point and the residual grows
+    with displacement: `rotation_2deg` reads 0.4706 px reversed against 0.0598 px correct. Pure
+    translations are unaffected, because a uniform field makes the two attributions coincide -- which is
+    why the translation gate cannot catch it.
     """
     from autoRIFT.autoRIFT import arImgDisp_s
 
@@ -48,8 +58,8 @@ def correlator_arm(ref, sec, arrays, scalars):
     ones = np.ones(shape, dtype=np.float32)
 
     dx, dy = arImgDisp_s(
-        np.ascontiguousarray(sec, dtype=np.float32),
         np.ascontiguousarray(ref, dtype=np.float32),
+        np.ascontiguousarray(sec, dtype=np.float32),
         x_grid.copy(),
         y_grid.copy(),
         ones * np.float32(chip),
@@ -63,8 +73,10 @@ def correlator_arm(ref, sec, arrays, scalars):
     )
     dx = np.asarray(dx, dtype=np.float32).reshape(shape)
     dy = np.asarray(dy, dtype=np.float32).reshape(shape)
-    # `arImgDisp_s` returns cartesian y (up positive) where AutoRIFT.jl reports dy down rows, so the
-    # reference's own final `Dy = -Dy` is undone to put both in the matrix convention.
+    # The reference's own final `Dy = -Dy` is undone, putting dy back down-rows as AutoRIFT.jl reports
+    # it. With the chip on the secondary (see above), what remains is the same secondary-to-reference
+    # offset every other arm returns, so all five share one convention and `gate.jl` measures `(-1, -1)`
+    # for each.
     return dx, -dy
 
 
@@ -81,8 +93,14 @@ def pipeline_arm(ref, sec, arrays, scalars, chip_size_max=None):
     spacing = scalars["grid_spacing"]
 
     obj = autoRIFT()
-    obj.I1 = np.ascontiguousarray(ref, dtype=np.float32)
-    obj.I2 = np.ascontiguousarray(sec, dtype=np.float32)
+    # `I1` is the *secondary*, which is not what the field names suggest. `runAutorift` correlates with
+    # `arImgDisp_s(self.I2, self.I1)` (`autoRIFT.py:674,747`), and `arImgDisp_s` cuts its chip from its
+    # second argument -- so the chip comes from `self.I1`. Putting the secondary there is what makes the
+    # chip sit on the secondary, matching the correlator arm above and AutoRIFT.jl.
+    #
+    # Measured on `rotation_2deg`: this assignment gives 0.0596 px, the reverse 0.4598 px.
+    obj.I1 = np.ascontiguousarray(sec, dtype=np.float32)
+    obj.I2 = np.ascontiguousarray(ref, dtype=np.float32)
     # The bundle already holds exactly the numbers to correlate, including for the quantized cases, so
     # the float path is right throughout: `DataType = 0` would rescale integers 0-255 a second time.
     obj.DataType = 1

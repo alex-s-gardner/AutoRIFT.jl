@@ -9,8 +9,8 @@
 using CairoMakie, Printf, Statistics
 
 include(joinpath(@__DIR__, "bundle.jl"))
+include(joinpath(@__DIR__, "gate.jl"))
 
-const SCENES = joinpath(@__DIR__, "scenes")
 const PLOTS = joinpath(@__DIR__, "plots")
 
 # The sub-pixel threshold the real-scene comparison is judged against, drawn as a reference line.
@@ -24,11 +24,10 @@ const SERIES = (("jl_correlator", "AutoRIFT.jl", :dodgerblue, :solid),
                 ("cv_pyrup", "OpenCV + pyrUp", :black, :dash),
                 ("cv_parabola", "OpenCV + parabola", :seagreen, :solid))
 
-# The sign that puts each arm in truth space, measured by `gate.jl` and restated here so this script
-# does not depend on running it.
-const SIGNS = Dict("jl_correlator" => (-1, -1), "jl_pipeline" => (-1, -1), "jl_rotation" => (-1, -1),
-                   "py_correlator" => (1, 1), "py_pipeline" => (1, 1),
-                   "cv_pyrup" => (-1, -1), "cv_parabola" => (-1, -1))
+# The sign that puts each arm in truth space, taken from `gate.jl`'s measured table rather than restated.
+# A second copy is how this script came to draw a 40 px error band for an arm whose median error was
+# 0.0157 px: the table was corrected in one file and not the other, and a figure has no gate to fail.
+const SIGNS = Dict(ARMS)
 
 """
     arm_error(dir, arm, tdx, tdy) -> Union{Matrix{Float64},Nothing}

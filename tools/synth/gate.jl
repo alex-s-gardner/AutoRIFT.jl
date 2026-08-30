@@ -25,14 +25,14 @@ const SCENES = joinpath(@__DIR__, "scenes")
 # Every arm, and the sign convention that puts it in truth space -- measured by this script, not
 # assumed, and recorded here so the scorer applies the same one.
 #
-# `(-1, -1)` for the Julia and OpenCV arms: both report where the secondary chip sits within the
-# reference window, which is the offset from secondary back to reference and so the negative of the
-# feature's motion. `(+1, +1)` for the reference arms: `arImgDisp_s` and `runAutorift` already return
-# feature motion, and `run_python.py` has additionally undone their cartesian y flip, so both axes are
-# in truth space already.
+# `(-1, -1)` for all five: every arm cuts its chip from the secondary and searches the reference, so
+# each reports the offset from secondary back to reference, which is the negative of feature motion.
+# `run_python.py` documents the argument order that makes the reference arms agree -- it is the reverse
+# of what `arImgDisp_s`'s parameter names suggest, and getting it wrong shows up here as a measured
+# `(-1, -1)` against an expected `(1, 1)` rather than as a plausible-looking accuracy result.
 const ARMS = ("jl_correlator" => (-1, -1), "jl_pipeline" => (-1, -1),
               "jl_rotation" => (-1, -1),
-              "py_correlator" => (1, 1), "py_pipeline" => (1, 1),
+              "py_correlator" => (-1, -1), "py_pipeline" => (-1, -1),
               "cv_pyrup" => (-1, -1), "cv_parabola" => (-1, -1))
 
 const SIGNS = ((1, 1), (-1, -1), (1, -1), (-1, 1))
@@ -76,10 +76,21 @@ function radial_error(dx, dy, tdx, tdy, (sx, sy))
 end
 
 function main()
-    # The translation cases: the only ones where a rigid chip is an exact model, so the only ones that
-    # can gate the harness. `divergence` and the shear cases deform the texture inside every chip, and
-    # an error there is the thing being measured rather than a fault.
-    gates = ("translate_integer" => 0.0, "translate_subpixel" => 1 / 16)
+    # The translation cases gate exactness: a rigid chip models a uniform shift perfectly, so any error
+    # is a fault rather than the deformation being measured.
+    #
+    # `rotation_2deg` is here for a different reason, and it is the case that matters most. A uniform
+    # field makes "displacement of the feature at the reference point" and "displacement of the feature
+    # arriving at the secondary point" the same number, so a translation cannot detect an arm that cuts
+    # its chip from the wrong image -- both attributions coincide and the arm looks exact. Under
+    # rotation they diverge by roughly the deformation times the displacement, so the swap shows up as a
+    # gross error. The harness ran inverted for a full sweep while passing a translation-only gate.
+    #
+    # The tolerance is loose because every arm has real error here: a rigid chip cannot represent
+    # rotated texture. It is set to catch the ~0.46 px signature of a reversed argument order, not to
+    # assert accuracy.
+    gates = ("translate_integer" => 0.0, "translate_subpixel" => 1 / 16,
+             "rotation_2deg" => 0.15)
     failures = String[]
 
     for (case, tol) in gates
