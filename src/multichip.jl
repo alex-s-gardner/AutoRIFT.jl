@@ -65,16 +65,20 @@ Displacement over the full grid, assembled from all chip-size levels.
 which level produced each point — `0` where none did — and `interpolated` marks points
 filled from their neighbours rather than measured.
 
-`peak_snr` answers a different question from `correlation`: whether the surface *determined* the
-displacement, rather than how high its peak was. See [`AutoRIFT.peak_quality`](@ref) for the
-measurements behind that distinction. At an `interpolated` point it is the median of the
-neighbourhood the displacement itself was taken from, since that is what stands behind the value;
-`correlation` is `NaN` there instead, having no surface of its own to report.
+`peak_snr` reports how far the peak stood above the rest of its surface, which is a different question
+from `correlation`, the peak's height. **To gate on reliability use `correlation`**: against disagreement
+with the Python reference it reaches an AUC of 0.870 where `peak_snr` reaches 0.512, and
+[`AutoRIFT.peak_quality`](@ref) records the measurement. `peak_snr` is the diagnostic for an *ambiguous*
+surface — one with rival peaks — and for the search-boundary condition below.
 
-A **negative** `peak_snr` marks a point whose correlation peak lay against the search boundary: the
-displacement is a lower bound and its sub-pixel part is quantized to whole pixels. Gate on
-`peak_snr .> 0` to exclude those, or select them to find where `search_radius` is too small —
-`AutoRIFT.peak_quality` documents the measurements. The magnitude is the quality either way.
+At an `interpolated` point it is the median of the neighbourhood the displacement itself was taken from,
+since that is what stands behind the value; `correlation` is `NaN` there instead, having no surface of its
+own to report.
+
+`peak_snr` is **zero** where the correlation peak lay against the search boundary: the displacement is a
+lower bound and its sub-pixel part is quantized to whole pixels, so any positive threshold excludes those
+points without the caller needing to know about them. Select them with `peak_snr .== 0` to find where
+`search_radius` is too small — `AutoRIFT.peak_quality` documents the measurements.
 
 `chip_size` holds the level's **x** extent. That identifies the level on its own, since the aspect
 is constant across levels, so the y extent is this times a fixed ratio.
@@ -788,11 +792,10 @@ function _fill_holes!(d::DisplacementField, p::Params)
                     # been too small to characterize — and mixing `NaN` into the selection would
                     # poison the median rather than skip the neighbour.
                     #
-                    # The median is taken over *signed* qualities, so `peak_quality`'s
-                    # search-boundary flag carries through by majority: a point filled from mostly
-                    # railed neighbours inherits a negative value, and one filled from mostly clear
-                    # neighbours a positive one. That is the correct reading, since a filled
-                    # displacement is only as trustworthy as the neighbourhood behind it.
+                    # `peak_quality`'s zero-at-the-search-boundary carries through by majority, since a
+                    # median over values including zeros returns zero once half the neighbourhood is
+                    # railed. That is the correct reading: a filled displacement is only as trustworthy
+                    # as the neighbourhood behind it.
                     s = d.peak_snr[ii, jj]
                     if !isnan(s)
                         ns += 1

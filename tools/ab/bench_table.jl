@@ -271,13 +271,16 @@ function render(r)
         <h1>AutoRIFT.jl's remaining outputs</h1>
         <p class="sub">The fields with no counterpart in the reference's output, so nothing on the
           previous pages can show them &middot; <b>correlation</b> is the ZNCC peak height and
-          <b>peak SNR</b> is how far that peak stands above the surface's own background, which is the
-          quantity that says whether the sub-pixel estimate was determined rather than guessed &middot;
-          a <b>negative</b> peak SNR marks a peak lying against the search boundary, where the
-          displacement is a lower bound and its sub-pixel part is quantized to whole pixels &mdash;
-          gate on <code>peak_snr .&gt; 0</code> to exclude those, or map them to find where
-          <code>search_radius</code> is too small &middot; <b>filled</b> points carry a displacement
-          taken from their neighbours rather than from a correlation surface of their own</p>
+          <b>peak SNR</b> is how far that peak stood above the surface's own background &mdash; nearly
+          independent quantities, at a rank correlation of 0.175 &middot; <b>gate on correlation, not
+          peak SNR</b>: against disagreement with the reference it reaches an AUC of 0.870 where peak
+          SNR reaches 0.512, and the panel at lower right shows why &mdash; correlation falls across
+          more than two orders of magnitude from its worst decile to its best, while peak SNR is flat
+          and not even monotonic &middot; both are reported as <b>zero</b> where the peak lay against
+          the search boundary, so any positive threshold rejects those points; select them with
+          <code>correlation .== 0</code> to find where <code>search_radius</code> is too small
+          &middot; <b>interpolated</b> points carry a displacement taken from their neighbours rather
+          than from a correlation surface of their own</p>
         <img class="fig" src="$(data_uri(figs.outputs))">
       </div>
     </body></html>

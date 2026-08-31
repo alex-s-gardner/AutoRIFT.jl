@@ -360,10 +360,16 @@ function _track_chunk!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
             # which is centred on the point, and the chip was offset by the prior.
             out.dx[i] = Float32(dx + pts.dx_prior[i])
             out.dy[i] = Float32(dy + pts.dy_prior[i])
-            out.correlation[i] = c
+            # Both quality outputs are zero where the peak lay against the search boundary: the
+            # displacement is a lower bound with no recoverable sub-pixel part, so neither the peak
+            # height nor its prominence describes a usable measurement. Zeroing them means any positive
+            # threshold on either rejects the point without the caller having to know the condition
+            # exists. The displacement itself is still reported — it is the best available bound.
+            railed = peak_at_boundary(surface)
+            out.correlation[i] = railed ? 0.0f0 : c
             # One more traversal of a surface already in cache, so the quality is measured where the
             # surface exists rather than reconstructed later from the displacement field.
-            out.peak_snr[i] = peak_quality(surface)
+            out.peak_snr[i] = railed ? 0.0f0 : peak_quality(surface)
         end
         return out
     finally

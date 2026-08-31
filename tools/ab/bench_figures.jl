@@ -240,36 +240,54 @@ function outputs_page(d; path = joinpath(FIG_PLOTS, "fig_outputs.png"))
                   colormap = :magma, colorrange = (0, 1))
     Colorbar(fig[1, 2], hm; label = "ZNCC peak", width = 12, height = Relative(0.85))
 
-    # `peak_snr` is signed: negative marks a peak against the search boundary, where the displacement is
-    # a lower bound. Magnitude and sign are therefore drawn separately — a single sequential scale would
-    # hide the flag, and a diverging one would imply the magnitudes either side are comparable.
+    # `peak_snr` is zero where the peak lay against the search boundary, so the count of railed points is
+    # stated in the title rather than mapped separately: on a scene whose flow the radius covers there
+    # are none, and an all-one-colour panel reads as a broken plot rather than as an empty set.
     snrok = jok .& .!isnan.(j.snr)
-    mag = map((v, k) -> k ? Float64(abs(v)) : NaN, j.snr, snrok)
-    hi = isempty(filter(isfinite, vec(mag))) ? 1.0 : quantile(filter(isfinite, vec(mag)), 0.99)
-    hm2 = heatmap!(mapax((1, 3), "peak SNR (quality)"), mapshow(mag);
-                   colormap = :viridis, colorrange = (0, hi))
+    snr = map((v, k) -> k ? Float64(v) : NaN, j.snr, snrok)
+    finite = filter(isfinite, vec(snr))
+    hi = isempty(finite) ? 1.0 : quantile(finite, 0.99)
+    nrail = count(iszero, finite)
+    hm2 = heatmap!(mapax((1, 3), @sprintf("peak SNR (quality); %d of %d at the search boundary",
+                                         nrail, length(finite))),
+                   mapshow(snr); colormap = :viridis, colorrange = (0, hi))
     Colorbar(fig[1, 4], hm2; label = "peak above background (sd)", width = 12,
              height = Relative(0.85))
 
-    # An all-interior panel is the expected result at a radius that covers the scene's flow, so the
-    # count is stated in the title: otherwise a uniformly grey map reads as a broken plot rather than as
-    # "no point railed".
-    railed = map((v, k) -> k ? (v < 0 ? 1.0 : 0.0) : NaN, j.snr, snrok)
-    nrail = count(isequal(1.0), filter(!isnan, vec(railed)))
-    hm3 = heatmap!(mapax((2, 1), @sprintf("search radius binding (%d of %d points)",
-                                          nrail, count(snrok))),
-                   mapshow(railed);
-                   colormap = cgrad([:gray80, :crimson]; categorical = true),
-                   colorrange = (-0.5, 1.5))
-    Colorbar(fig[2, 2], hm3; width = 12, height = Relative(0.85),
-             ticks = (0:1, ["interior", "at edge"]))
-
     interp = map((v, k) -> k ? Float64(v != 0) : NaN, j.interp, jok)
-    hm4 = heatmap!(mapax((2, 3), "how the point was answered"), mapshow(interp);
+    hm4 = heatmap!(mapax((2, 1), "interpolated"), mapshow(interp);
                    colormap = cgrad([:gray80, :dodgerblue]; categorical = true),
                    colorrange = (-0.5, 1.5))
-    Colorbar(fig[2, 4], hm4; width = 12, height = Relative(0.85),
-             ticks = (0:1, ["measured", "filled"]))
+    Colorbar(fig[2, 2], hm4; width = 12, height = Relative(0.85),
+             ticks = (0:1, ["false", "true"]))
+
+    # Quality against agreement, which is the pairing that says whether `peak_snr` is worth gating on:
+    # the disagreement with the reference is an independent label this output does not know about.
+    both = d.both
+    ax = Axis(fig[2, 3]; title = "disagreement against each quality measure",
+              xlabel = "quality decile (worst to best)", ylabel = "median |difference| (px)",
+              yscale = log10)
+    for (nm, q, col) in (("peak SNR", j.snr, :dodgerblue), ("correlation", j.corr, :orangered))
+        sel = both .& .!isnan.(q)
+        count(sel) < 100 && continue
+        vals = q[sel]
+        res = d.radial[sel]
+        edges = quantile(vals, range(0, 1; length = 11))
+        xs, ys = Float64[], Float64[]
+        for k in 1:(length(edges) - 1)
+            m = (vals .>= edges[k]) .& (vals .<= edges[k + 1])
+            count(m) < 20 && continue
+            push!(xs, k)
+            # Floored below the 1/16 px quantization step: a decile whose median difference is exactly
+            # zero is the expected result for a good one, and has no position on a log axis.
+            push!(ys, max(median(res[m]), 0.01))
+        end
+        length(xs) >= 2 && scatterlines!(ax, xs, ys; color = col, label = nm, markersize = 7)
+    end
+    axislegend(ax; position = :rt, framevisible = false, labelsize = 10)
+
+    Label(fig[2, 4], "lower is better\n\na measure that\ndiscriminates\nfalls to the right";
+          fontsize = 9, color = :gray40, tellheight = false)
 
     colgap!(fig.layout, 8)
     rowgap!(fig.layout, 8)

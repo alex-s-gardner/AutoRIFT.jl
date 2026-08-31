@@ -1,5 +1,6 @@
-using AutoRIFT: peak_index, peak, peak_offset, peak_quality, pyrup!, reflect101,
-                refinement_workspace, subpixel_peak, workspace, correlate!
+using AutoRIFT: peak_index, peak, peak_offset, peak_quality, peak_at_boundary, pyrup!, reflect101,
+                refinement_workspace, subpixel_peak, workspace, correlate!,
+                ImagePair, gridpoints, params, correlate_multichip
 
 @testset "peak_index scan order" begin
     # Row-major, first strict maximum wins -- matching OpenCV's minMaxLoc, NOT
@@ -107,29 +108,12 @@ end
     @test peak_quality(s, 2) > 0
     @test peak_quality(s, 5) > 0
 
-    # A peak against the search boundary is flagged by a negative sign, with the magnitude unchanged.
-    # The sign is the whole point: a caller gating on `peak_snr >= t` must not silently accept a
-    # displacement that is a lower bound with no recoverable sub-pixel part.
+    # `peak_quality` describes the surface and nothing else: the search-boundary rule belongs to
+    # `peak_at_boundary` and is applied by `track!`, so a peak at the edge still gets a real value here.
     edge = 0.05f0 .* ones(Float32, 40, 40)
-    edge[1, 20] = 1.0f0                      # first row
-    edge[3, 3] = 0.06f0                      # a little background variation, so sd > 0
-    @test peak_quality(edge) < 0
-    interior = copy(edge)
-    interior[1, 20] = 0.05f0
-    interior[20, 20] = 1.0f0
-    @test peak_quality(interior) > 0
-    # The magnitude is the same quantity in both cases, differing only because a peak at the edge has
-    # part of its exclusion box outside the surface and so keeps a few more background samples. The
-    # sign is the assertion; the magnitude is asserted only to be comparable.
-    @test abs(peak_quality(edge)) ≈ abs(peak_quality(interior)) rtol = 0.01
-    # Every boundary, and the corners. The background variation sits away from each peak so the
-    # standard deviation is nonzero without the peak itself supplying it.
-    for (i, j) in ((1, 20), (40, 20), (20, 1), (20, 40), (1, 1), (40, 40), (1, 40), (40, 1))
-        b = 0.05f0 .* ones(Float32, 40, 40)
-        b[20, 10] = 0.06f0
-        b[i, j] = 1.0f0
-        @test peak_quality(b) < 0
-    end
+    edge[1, 20] = 1.0f0
+    edge[3, 3] = 0.06f0
+    @test peak_quality(edge) > 0
 
     # A degenerate (constant-chip) correlation returns a surface of zeros, and a quality cannot be
     # asserted about it. `track!` skips those points before asking, but the function must not invent
@@ -138,6 +122,46 @@ end
     zero_surface = correlate!(ws, fill(1.0f0, 16 + 2 * 20 - 1, 16 + 2 * 20 - 1),
                               fill(1.0f0, 16, 16), (20, 20))
     @test isnan(peak_quality(zero_surface))
+end
+
+@testset "peak_at_boundary" begin
+    # The condition that makes `track!` report both quality outputs as zero. Every boundary and every
+    # corner, against an interior control.
+    for (i, j) in ((1, 20), (40, 20), (20, 1), (20, 40), (1, 1), (40, 40), (1, 40), (40, 1))
+        b = zeros(Float32, 40, 40)
+        b[i, j] = 1.0f0
+        @test peak_at_boundary(b)
+    end
+    for (i, j) in ((2, 20), (39, 20), (20, 2), (20, 39), (20, 20))
+        b = zeros(Float32, 40, 40)
+        b[i, j] = 1.0f0
+        @test !peak_at_boundary(b)
+    end
+    # A degenerate surface resolves to (1, 1), which *is* a boundary position. `track!` never asks —
+    # `degenerate` skips the point first — but the answer must still be the honest one for the surface
+    # it was given rather than a special case.
+    @test peak_at_boundary(zeros(Float32, 40, 40))
+end
+
+@testset "both quality outputs are zero at the search boundary" begin
+    # End to end through `track!`: a displacement large enough to put the peak on the surface edge must
+    # come back with a displacement but no quality, on *both* outputs. This is what lets a caller gate
+    # on `correlation` or `peak_snr` without knowing the condition exists.
+    n, cs, r = 256, 16, 12
+    ref, sec = shifted_pair(n, (r, 0); T = Float32)      # shift == radius: peak lands on the boundary
+    pair = ImagePair(ref, sec)
+    grid = gridpoints((n, n), 16; chip_size = cs, search_radius = r)
+    out = correlate_multichip(pair, grid, params(; chip_size = cs, chip_size_max = cs,
+                                                grid_spacing = 16, search_radius = r))
+    measured = findall(!isnan, out.dx)
+    @test !isempty(measured)
+    railed = [i for i in measured if out.correlation[i] == 0]
+    @test !isempty(railed)
+    # Zeroed together, never one without the other.
+    @test all(i -> out.peak_snr[i] == 0, railed)
+    @test all(i -> out.correlation[i] != 0, setdiff(measured, railed))
+    # The displacement survives: it is a lower bound, not a non-measurement.
+    @test all(i -> !isnan(out.dx[i]), railed)
 end
 
 @testset "reflect101" begin

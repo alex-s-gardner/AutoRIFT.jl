@@ -112,6 +112,33 @@ end
 const PEAK_EXCLUSION = 3
 
 """
+    peak_at_boundary(surface) -> Bool
+
+Whether the integer peak of `surface` lies on its first or last row or column.
+
+The surface spans `-radius … radius - 1`, so this means the true displacement is at or beyond the search
+limit: the reported value is a lower bound, and its sub-pixel part along that axis is unrecoverable because
+the peak's far side was never sampled. Measured on known translations at chip 16, radius 20, refining such
+a peak is *worse* than keeping the integer one — 1.34 px against 0.40 px at a true shift of −18.6, and
+0.94 px against exact at −19.0.
+
+`track!` therefore reports **both** `correlation` and `peak_snr` as zero at such a point, so any positive
+threshold on either rejects it without the caller having to know the condition exists. Zero is otherwise
+unreachable for both: a real ZNCC peak is strictly positive, and a real peak stands strictly above its own
+background. The displacement itself is still reported, being the best available bound. Select these points
+with `correlation .== 0` to find where `search_radius` needs raising — at the ITS_LIVE configuration over
+Jakobshavn 4.2% of points that correlate above 0.3 are affected, and 0.12% at chip 32.
+
+One function rather than the test written out at each site: the two outputs must agree about which points
+are railed, and a copy of the condition is how they would drift apart.
+"""
+@inline function peak_at_boundary(surface::AbstractMatrix)
+    i, j = peak_index(surface)
+    nr, nc = size(surface)
+    return (i == 1) | (j == 1) | (i == nr) | (j == nc)
+end
+
+"""
     peak_quality(surface[, exclusion = $PEAK_EXCLUSION]) -> Float32
 
 How far the correlation peak stands above the background, in background standard deviations.
@@ -119,64 +146,43 @@ How far the correlation peak stands above the background, in background standard
 `NaN32` when the surface is too small to have a background outside the exclusion box, or when the
 background is perfectly flat — both meaning "no quality could be assessed" rather than a low quality.
 
-A high value means the surface *determined* the displacement; a low one means the sub-pixel estimate
-was drawn from a peak that barely rose above the noise, so it is closer to a guess. This is not the
-same question as `correlation`, the peak value alone: a peak of 0.6 over quiet background is
-unambiguous where the same 0.6 over noisy background is not, which is why this discriminates better
-than the peak value does.
+A high value means the peak stood well clear of the rest of the surface; a low one means it barely rose
+above the noise. It answers a different question from `correlation`, the peak value alone — a peak of 0.6
+over quiet background is a sharper result than the same 0.6 over noisy background — and the two are
+nearly independent, at a Spearman rank correlation of 0.175 on a Landsat scene.
 
-# Why this quantity
+# Which measure to gate on
 
-Measured against two independent labels — disagreement with the Python reference on the same input,
-and each field's inconsistency with its own neighbours — over 52,866 correlation surfaces from a
-Landsat pair:
+**Use `correlation`, not this, to predict whether a displacement is reliable.** Measured on 73,272
+directly-measured points of a Jakobshavn pair, against the independent label "disagrees with
+`autoRIFT.py` by more than 0.25 px":
 
-| quantity | AUC vs disagreement | AUC vs self-inconsistency |
-|---|---:|---:|
-| this | 0.736 | 0.730 |
-| runner-up / peak | 0.734 | 0.745 |
-| peak value (`correlation`) | 0.699 | 0.723 |
-| Gaussian half width of the peak | 0.596 | 0.648 |
-| peak / background | 0.517 | 0.514 |
+| measure | AUC | rate in worst decile | rate in best decile |
+|---|---:|---:|---:|
+| `correlation` | **0.870** | 24.8% | 0.1% |
+| this | 0.512 | 6.8% | 6.5% |
 
-Peak *width* discriminates poorly because it measures curvature at the winning peak — set by chip
-size and texture scale — and is blind to a rival peak elsewhere, where ambiguity is a global property
-of the surface. `peak / background` is near-useless because the ZNCC background sits near zero, so
-the ratio is dominated by its denominator rather than by peak quality.
+`correlation` falls monotonically across its deciles over more than two orders of magnitude.
+`peak_snr` is flat at 3–7% and not even monotonic — its *highest* decile is among its worst — so as a
+reliability gate it has essentially no skill.
+
+That is not a defect in the quantity, it is what the quantity measures. A tall, isolated peak on a
+low-contrast surface earns a high SNR while still being a weak match, and a strong match on textured ice
+carries real structure in its background that depresses the SNR without making the answer worse. What
+`peak_snr` does report, and `correlation` cannot, is how *isolated* the chosen peak was — useful for
+diagnosing an ambiguous surface with rival peaks, and for the search-boundary condition below.
 
 The background **mean** rather than its median: measured identical to four decimal places (0.7365
 against 0.7364), and a mean accumulates in the same pass with no allocation where a median needs
 selection over every background sample, per point, per level.
 
-# Sign: a peak against the search boundary
-
-The value is **negated** when the integer peak lies on the first or last row or column of the surface.
-Magnitude still carries the quality; the sign carries "the search radius is binding here".
-
-The surface spans `-radius … radius - 1`, so a peak on its boundary means the true displacement is at
-or beyond the search limit. Two consequences make that worth marking rather than leaving implicit. The
-displacement is a lower bound on the real one — nothing beyond the boundary was searched. And the
-sub-pixel fraction along that axis is unrecoverable: the peak's far side is not sampled, so the
-upsampling has no curvature to fit and the estimate is quantized to whole pixels. Measured on known
-translations at chip 16, radius 20, the refined estimate at a boundary peak is *worse* than the integer
-peak — 1.34 px against 0.40 px at a true shift of −18.6, and 0.94 px against exact at −19.0.
-
-At the ITS_LIVE configuration over Jakobshavn this affects 4.2% of points that correlate above 0.3, and
-0.12% at chip 32; it is common exactly where a prior velocity field underestimates the flow.
-
-A caller gating on quality with `peak_snr .>= t` therefore silently accepts these; gate on
-`peak_snr .>= t` **and** `peak_snr .> 0` to exclude them, or select them with `peak_snr .< 0` to find
-where the radius needs raising. `NaN32` still means "no quality could be assessed", which is distinct
-from both.
+This is a property of the surface alone. The search-boundary condition — where the reported quality is
+forced to zero — is applied by the caller; see [`AutoRIFT.peak_at_boundary`](@ref).
 """
 @inline function peak_quality(surface::AbstractMatrix, exclusion::Int = PEAK_EXCLUSION)
     i, j = peak_index(surface)
     nr, nc = size(surface)
     h = Float64(@inbounds surface[i, j])
-    # A peak on the boundary: the displacement is railed against the search limit and its sub-pixel
-    # part is not recoverable. Recorded as the sign of the quality rather than as a sixth output array,
-    # since it qualifies this measurement and costs nothing to carry.
-    railed = (i == 1) | (j == 1) | (i == nr) | (j == nc)
     # Sum and sum of squares in one traversal, column-major for the reason `peak_index` documents.
     # Two passes would read the surface twice for a variance that one pass gives.
     s1 = 0.0
@@ -197,9 +203,7 @@ from both.
     # cancellation when the background is nearly constant — the same guard `_correlate_surface!`
     # applies for the same reason.
     sd = sqrt(max(s2 / n - mean * mean, 0.0))
-    sd > 0 || return NaN32
-    q = Float32((h - mean) / sd)
-    return railed ? -q : q
+    return sd > 0 ? Float32((h - mean) / sd) : NaN32
 end
 
 # ---------------------------------------------------------------------------

@@ -146,6 +146,50 @@ end
     @test !isempty(filter(cs -> cs > 32, vec(r.chip_size)))
 end
 
+@testset "the finest level that answers owns the point" begin
+    # The merge rule that makes `chip_size` meaningful: a coarser level's estimate must never replace a
+    # finer one, and a point a finer level answered must not even be offered to a coarser one. Both are
+    # asserted by replaying the level loop and checking what each level was asked for against what the
+    # merged result attributes to it.
+    #
+    # Worth pinning because the guard is one `continue` in `_merge_level!` plus one `wanted` mask in
+    # `_multichip`, and losing either would degrade accuracy silently: a coarse chip averages more
+    # ground, so its answer is smoother and still plausible everywhere it wrongly won.
+    n = 512
+    pair = banded_pair(n, (6, -4), 200:290)
+    grid = gridpoints((n, n), 8; chip_size = 16, search_radius = 20)
+    p = params(; chip_size = 16, chip_size_max = 64, grid_spacing = 8, search_radius = 20)
+    sizes = AutoRIFT._level_sizes(p)
+
+    result = AutoRIFT._empty_result(size(grid))
+    answered = Dict{Int,BitMatrix}()
+    for (k, cs) in enumerate(sizes)
+        wanted = result.chip_size .== 0
+        # Nothing a finer level already owns may be attempted.
+        @test !any(wanted .& (result.chip_size .!= 0))
+        lvl = chipsize_level(AutoRIFT.WholeScene(pair), grid, p, cs, wanted,
+                             AutoRIFT.measure_at(p, k))
+        isnothing(lvl) && continue
+        answered[cs.X] = .!isnan.(lvl.field.dx)
+        before = copy(result.chip_size)
+        AutoRIFT._merge_level!(result, lvl.field, lvl.filled, cs)
+        # Every point that already had an owner keeps it.
+        kept = before .!= 0
+        @test all(result.chip_size[kept] .== before[kept])
+    end
+
+    # And no point is attributed to a level coarser than one that answered it.
+    for (k, cs) in enumerate(sizes)
+        own = result.chip_size .== cs.X
+        any(own) || continue
+        for f in sizes[1:(k - 1)]
+            haskey(answered, f.X) || continue
+            @test !any(own .& answered[f.X])
+        end
+    end
+    @test count(!isnan, result.dx) > 0
+end
+
 @testset "peak_snr accompanies every measured point" begin
     n = 512
     pair = banded_pair(n, (6, -4), 200:290)
@@ -156,11 +200,8 @@ end
     # neither. `chip_size` follows the same rule, and a caller reading `peak_snr` to gate on quality
     # needs it: a measured point with no quality would silently fail any threshold.
     @test all(i -> isnan(r.dx[i]) == isnan(r.peak_snr[i]), eachindex(r.dx))
-    # A real match stands above its background, so the magnitudes are positive. The sign is not
-    # asserted: it is negative exactly where the peak lay against the search boundary, which this
-    # scene's 6/-4 px shift at radius 25 does not produce but a faster one would.
-    @test all(>(0), abs.(filter(isfinite, r.peak_snr)))
-    # This shift is well inside the search window, so nothing is railed.
+    # A real match stands above its background, and `peak_quality` reports zero only at a peak against
+    # the search boundary — which this scene's 6/-4 px shift at radius 25 does not produce.
     @test all(>(0), filter(isfinite, r.peak_snr))
 end
 
