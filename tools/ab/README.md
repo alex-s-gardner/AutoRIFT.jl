@@ -82,10 +82,16 @@ Stage 1, the correlator, one level at a time on a 512² window:
 The correlator is **bit-identical** — not merely close — at every chip size, on both axes, at every
 point. Same for `dy`.
 
-Stage 2, the whole pipeline on a 1024² window, 11,103 shared points: median radial **0.0000 px**,
-bias `+0.0000` on both axes, 99.8% within 0.2 px. Only 0.14% of points differ by more than 0.25 px and
-0.08% differ in `dy` by more than 0.25 px, with no spatially coherent structure — the densest 12×12
-block of the grid holds three of them.
+Stage 2, the whole pipeline on the full 3072² window, 85,505 shared points: median radial
+**0.0000 px**, bias `+0.0000` on both axes, 89.1% within 0.2 px. Points answered per level:
+16 → 55,678 / 55,182, 32 → 18,693 / 18,942, 64 → 15,608 / 14,092, and the two pick the **same level at
+92.7%** of shared points.
+
+**Use 3072², not a smaller window.** Below it the reference silently resolves nothing above chip 16:
+its coarse grid for a level is the fine grid decimated by `sparseSearchSampleRate × ChipSize0/spacing`,
+which at 1024² leaves 7×7 and 3×3 grids against a `DispFiltC.FiltWidth` of 9, so `CoarseCorValidFac`
+falls below `CoarseCorCutoff` and the level is skipped. A comparison on a smaller window is a comparison
+of chip 16 alone, whatever `chip_max` says.
 
 This holds only with the argument order and grid offset above correct; both are asserted at their call
 sites in `stage1_python.py` and `stage2_python.py`.
@@ -267,21 +273,28 @@ fitting on a small instance and not.
 
 ## Where the two still differ, and why
 
-The correlator is bit-identical and the pipeline agrees to a median of 0.0000 px. What remains is 0.14%
-of points beyond 0.25 px, spatially unstructured, and it is accounted for:
+The correlator is bit-identical and the pipeline agrees to a median of 0.0000 px with zero bias. What
+remains is 7.4% of points beyond 0.25 px, and it is the **pyramid**, not the correlator:
 
-| source | share of disagreeing points | share of agreeing points |
+| | disagreeing points | agreeing points |
 |---|---:|---:|
-| a hole fill on one side only | 17% | 1% |
-| a different chip-size level chosen | 11% | 0% |
+| chose a different chip-size level | **32.5%** | 5.3% |
+| filled from neighbours on the Julia side | 12.9% | 7.3% |
+| median `peak_snr` | 6.34 | 6.29 |
+| median displacement | 0.48 px | 0.58 px |
 
-Both are pipeline decisions, not correlator values: the two implementations' outlier filters and
-smallest-chip-wins merges accept marginally different point sets, so a point one side measured directly
-the other may have filled from neighbours. Where both measure at the same level they return the same
-number.
+43% of the disagreeing points differ in chip level or were filled — decisions made by the outlier filter
+and the smallest-chip-wins merge, not values returned by the correlator. A point one side answered at
+chip 16 the other may have answered at 32, and the two estimates then describe different footprints of
+ground; a point one side measured the other may have filled from neighbours.
 
-The residual beyond that is tie-breaking at 1/16 px on weak surfaces, which no two implementations can
-agree about — below a real correlation peak both are picking from noise.
+Two things this is *not*. It is not concentrated at fast flow: among the top 2% by displacement the rate
+is **4.1%**, lower than the 7.5% elsewhere, and the densest cluster sits at a displacement of 0.8 px.
+And it is not a quality effect — `peak_snr` is the same on both populations to two decimal places, so
+these are not weak-peak points.
+
+The residual beyond the level and fill differences is tie-breaking at 1/16 px, which no two
+implementations can agree about: below a real correlation peak both are picking from noise.
 
 ### Not a bug: `foo.create(cols, rows, …)` in the reference
 
@@ -319,21 +332,21 @@ Jakobshavn exceeds the 1/16 px quantization step over 1.3% of the scene and 0.25
 ## The window-size artifact this harness exposes
 
 On a window small enough that a level's coarse grid falls below the outlier filter's width, **the
-reference silently resolves nothing at that level**. `autorift()` hits `continue` because
-`CoarseCorValidFac` falls under `CoarseCorCutoff`, and it does so without a warning — the reference used
-chip 16 for every point it answered while AutoRIFT.jl also used chip 64 for 558. Both then reach all
-three levels at 3072².
+reference silently resolves nothing at that level** — `autorift()` hits `continue` because
+`CoarseCorValidFac` falls under `CoarseCorCutoff`, with no warning. The level's coarse pass still runs,
+so the only visible symptom is a missing chip size in the output.
 
-The arithmetic, pinned by the single-level runs in `tools/synth/`, is that both quantities scale with
-`ChipSize0_GridSpacing_oversample_ratio = ChipSize0X / GridSpacingX` — so raising the chip at a fixed
-grid spacing shrinks the coarse grid and widens the filter at the same time:
+Each level correlates a coarse grid decimated from the fine one by
+`sparseSearchSampleRate × ChipSize0X / GridSpacingX` — 8 at these settings — applied to a grid already
+scaled by `ChipSize0X / chip`. `DispFiltC.FiltWidth` is 9. So the coarse grid shrinks with the chip while
+the filter does not:
 
-| chip | ratio | coarse step | coarse grid | `DispFiltC.FiltWidth` | |
-|---:|---:|---:|---:|---:|---|
-| 16 | 2 | 8 | 15×15 | 9 | resolves |
-| 32 | 4 | 16 | 7×7 | 17 | filter wider than grid |
-| 64 | 8 | 32 | 3×3 | 33 | filter wider than grid |
+| window | fine grid | coarse grid at chip 16 / 32 / 64 | levels that resolve |
+|---:|---:|---|---|
+| 1024² | 112 | 14 / 7 / 3 | 16 only |
+| 2048² | 240 | 30 / 15 / 7 | 16, 32 |
+| **3072²** | 368 | 46 / 23 / 11 | **all three** |
 
-So a coverage comparison on a small window measures the window rather than either implementation.
-Compare on a window large enough that every level's coarse grid clears the filter, or expect the
-reference to be missing its coarse levels.
+A coverage or chip-size comparison below 3072² therefore measures the window, not either
+implementation — verified by intercepting `arImgDisp_s`, which at 1024² is called with chips 32 and 64
+for their coarse passes and never for a fine pass.

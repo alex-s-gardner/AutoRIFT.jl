@@ -54,7 +54,9 @@ function load_stage2()
 
     j = (dx = crop(rd("julia_dx", Float32, js)), dy = crop(rd("julia_dy", Float32, js)),
          corr = crop(rd("julia_correlation", Float32, js)),
-         chip = crop(rd("julia_chip_size", Int32, js)))
+         snr = crop(rd("julia_peak_snr", Float32, js)),
+         chip = crop(rd("julia_chip_size", Int32, js)),
+         interp = crop(rd("julia_interpolated", Int32, js)))
     rawpx = crop(rd("python_dx", Float32, ps))
     rawpy = crop(rd("python_dy", Float32, ps))
 
@@ -147,16 +149,25 @@ function histogram_page(d; path = joinpath(FIG_PLOTS, "fig_histograms.png"))
 
     # Which level answered each point, both sides at one scale. `0` means no level resolved it, which
     # is categorically different from a measurement and so is drawn as blank.
+    #
+    # Chip sizes are mapped to their *rank*, not their value. The levels are powers of two, so plotting
+    # the value against an evenly divided colour range puts 16 and 32 in the same band of a 16..64
+    # scale — 32 becomes invisible, which is exactly the level that answers the shear margins. Ranking
+    # gives each level its own colour whatever the sequence.
     chips = sort(filter(>(0), unique(vcat(vec(j.chip), vec(p.chip)))))
-    crange = (minimum(chips) - 0.5, maximum(chips) + 0.5)
+    rank = Dict(c => i for (i, c) in enumerate(chips))
+    asrank(C) = map(v -> get(rank, v, 0), C)
+    crange = (0.5, length(chips) + 0.5)
     cmap = cgrad(:viridis, length(chips); categorical = true)
     for (row, (nm, C, ok)) in enumerate((("AutoRIFT.jl", j.chip, jok), ("autoRIFT.py", p.chip, pok)))
-        hm = heatmap!(mapax((row, 1), "$nm chip size"), mapshow(blank(C, ok .& (C .> 0)));
+        hm = heatmap!(mapax((row, 1), "$nm chip size"),
+                      mapshow(blank(asrank(C), ok .& (C .> 0)));
                       colormap = cmap, colorrange = crange)
         # `height = Relative(0.85)` so a categorical bar matches its map rather than spanning the
-        # taller cell the map's `DataAspect` leaves behind.
-        Colorbar(fig[row, 2], hm; label = "chip size (px)", width = 12, ticks = chips,
-                 height = Relative(0.85))
+        # taller cell the map's `DataAspect` leaves behind. Ticks are labelled with the chip sizes
+        # themselves, so the rank mapping is invisible to a reader.
+        Colorbar(fig[row, 2], hm; label = "chip size (px)", width = 12,
+                 ticks = (1:length(chips), string.(chips)), height = Relative(0.85))
     end
 
     # Where the two chose a different level. A level difference changes how much the estimate is
@@ -210,6 +221,62 @@ function histogram_page(d; path = joinpath(FIG_PLOTS, "fig_histograms.png"))
     return path
 end
 
+# Page 3: the outputs that are AutoRIFT.jl's alone, which no comparison page can show.
+#
+# `correlation` and `peak_snr` have no counterpart in the reference's output, and `interpolated` marks
+# points whose displacement came from neighbours rather than a surface — so these are properties of the
+# result a user gates on, not quantities to diff. Drawn on their own page for that reason.
+function outputs_page(d; path = joinpath(FIG_PLOTS, "fig_outputs.png"))
+    (; j, jok) = d
+    fig = Figure(; size = FIG_SIZE, figure_padding = 12)
+    mapax(pos, title) = Axis(fig[pos...]; title, aspect = DataAspect(),
+                             xticksvisible = false, yticksvisible = false,
+                             xticklabelsvisible = false, yticklabelsvisible = false)
+
+    # Two by two rather than four across: the maps are square and the page is landscape, so a single row
+    # of four leaves most of the page empty and each map too small to read.
+    measured = jok .& .!isnan.(j.corr)
+    hm = heatmap!(mapax((1, 1), "correlation (peak height)"), mapshow(blank(j.corr, measured));
+                  colormap = :magma, colorrange = (0, 1))
+    Colorbar(fig[1, 2], hm; label = "ZNCC peak", width = 12, height = Relative(0.85))
+
+    # `peak_snr` is signed: negative marks a peak against the search boundary, where the displacement is
+    # a lower bound. Magnitude and sign are therefore drawn separately — a single sequential scale would
+    # hide the flag, and a diverging one would imply the magnitudes either side are comparable.
+    snrok = jok .& .!isnan.(j.snr)
+    mag = map((v, k) -> k ? Float64(abs(v)) : NaN, j.snr, snrok)
+    hi = isempty(filter(isfinite, vec(mag))) ? 1.0 : quantile(filter(isfinite, vec(mag)), 0.99)
+    hm2 = heatmap!(mapax((1, 3), "peak SNR (quality)"), mapshow(mag);
+                   colormap = :viridis, colorrange = (0, hi))
+    Colorbar(fig[1, 4], hm2; label = "peak above background (sd)", width = 12,
+             height = Relative(0.85))
+
+    # An all-interior panel is the expected result at a radius that covers the scene's flow, so the
+    # count is stated in the title: otherwise a uniformly grey map reads as a broken plot rather than as
+    # "no point railed".
+    railed = map((v, k) -> k ? (v < 0 ? 1.0 : 0.0) : NaN, j.snr, snrok)
+    nrail = count(isequal(1.0), filter(!isnan, vec(railed)))
+    hm3 = heatmap!(mapax((2, 1), @sprintf("search radius binding (%d of %d points)",
+                                          nrail, count(snrok))),
+                   mapshow(railed);
+                   colormap = cgrad([:gray80, :crimson]; categorical = true),
+                   colorrange = (-0.5, 1.5))
+    Colorbar(fig[2, 2], hm3; width = 12, height = Relative(0.85),
+             ticks = (0:1, ["interior", "at edge"]))
+
+    interp = map((v, k) -> k ? Float64(v != 0) : NaN, j.interp, jok)
+    hm4 = heatmap!(mapax((2, 3), "how the point was answered"), mapshow(interp);
+                   colormap = cgrad([:gray80, :dodgerblue]; categorical = true),
+                   colorrange = (-0.5, 1.5))
+    Colorbar(fig[2, 4], hm4; width = 12, height = Relative(0.85),
+             ticks = (0:1, ["measured", "filled"]))
+
+    colgap!(fig.layout, 8)
+    rowgap!(fig.layout, 8)
+    save(path, fig; px_per_unit = 2)
+    return path
+end
+
 # Both pages, and the statistics the report quotes in text.
 function accuracy_figures()
     mkpath(FIG_PLOTS)
@@ -228,7 +295,8 @@ function accuracy_figures()
              chip = d.scalars["chip"], chip_max = d.scalars["chip_max"],
              spacing = d.scalars["grid_spacing"], radius = d.scalars["radius"],
              signs = d.signs)
-    return (; heatmaps = heatmap_page(d), histograms = histogram_page(d), stats)
+    return (; heatmaps = heatmap_page(d), histograms = histogram_page(d),
+            outputs = outputs_page(d), stats)
 end
 
 # Standalone: draw both pages and print what they show.
@@ -237,5 +305,5 @@ if abspath(PROGRAM_FILE) == @__FILE__
     @printf("shared %d  median %.4f px  bias %+.4f/%+.4f  within %.1f%%  sign %s\n",
             r.stats.shared, r.stats.median, r.stats.bias_dx, r.stats.bias_dy,
             100 * r.stats.within, string(r.stats.signs))
-    println("wrote ", r.heatmaps, "\n      ", r.histograms)
+    println("wrote ", r.heatmaps, "\n      ", r.histograms, "\n      ", r.outputs)
 end
