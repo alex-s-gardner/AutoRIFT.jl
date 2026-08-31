@@ -107,6 +107,30 @@ end
     @test peak_quality(s, 2) > 0
     @test peak_quality(s, 5) > 0
 
+    # A peak against the search boundary is flagged by a negative sign, with the magnitude unchanged.
+    # The sign is the whole point: a caller gating on `peak_snr >= t` must not silently accept a
+    # displacement that is a lower bound with no recoverable sub-pixel part.
+    edge = 0.05f0 .* ones(Float32, 40, 40)
+    edge[1, 20] = 1.0f0                      # first row
+    edge[3, 3] = 0.06f0                      # a little background variation, so sd > 0
+    @test peak_quality(edge) < 0
+    interior = copy(edge)
+    interior[1, 20] = 0.05f0
+    interior[20, 20] = 1.0f0
+    @test peak_quality(interior) > 0
+    # The magnitude is the same quantity in both cases, differing only because a peak at the edge has
+    # part of its exclusion box outside the surface and so keeps a few more background samples. The
+    # sign is the assertion; the magnitude is asserted only to be comparable.
+    @test abs(peak_quality(edge)) ≈ abs(peak_quality(interior)) rtol = 0.01
+    # Every boundary, and the corners. The background variation sits away from each peak so the
+    # standard deviation is nonzero without the peak itself supplying it.
+    for (i, j) in ((1, 20), (40, 20), (20, 1), (20, 40), (1, 1), (40, 40), (1, 40), (40, 1))
+        b = 0.05f0 .* ones(Float32, 40, 40)
+        b[20, 10] = 0.06f0
+        b[i, j] = 1.0f0
+        @test peak_quality(b) < 0
+    end
+
     # A degenerate (constant-chip) correlation returns a surface of zeros, and a quality cannot be
     # asserted about it. `track!` skips those points before asking, but the function must not invent
     # a number if it is asked.

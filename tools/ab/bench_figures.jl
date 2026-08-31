@@ -26,10 +26,13 @@ const FIG_SIZE = (1560, 929)
 # correlating, so the reference's grid is the top-left sub-block of the one it was handed. Cropping
 # AutoRIFT.jl to match compares the same grid points rather than resampling either side.
 #
-# The reference's displacements are negated on both axes to reach AutoRIFT.jl's secondary-to-reference
-# convention. That negation is correct only for the chip/window assignment `stage2_python.py` uses; if
-# that assignment changes, this sign must be re-established by scoring both candidates rather than
-# carried over.
+# The reference's displacements are used as written, in the same sense as AutoRIFT.jl's: with the chip
+# cut from the secondary on both sides (see `stage2_python.py`), both report the offset from secondary
+# back to reference, and `stage2_python.py` has already undone the reference's cartesian y flip.
+#
+# The sign is not asserted here. `load_stage2` picks whichever of the four sign combinations minimises
+# the disagreement and reports it, so a convention change on either side surfaces as a printed sign
+# rather than as a figure full of apparent error.
 function load_stage2()
     shapes = Dict{String,Tuple{Int,Int}}()
     scalars = Dict{String,Int}()
@@ -52,13 +55,27 @@ function load_stage2()
     j = (dx = crop(rd("julia_dx", Float32, js)), dy = crop(rd("julia_dy", Float32, js)),
          corr = crop(rd("julia_correlation", Float32, js)),
          chip = crop(rd("julia_chip_size", Int32, js)))
-    p = (dx = crop(.-rd("python_dx", Float32, ps)), dy = crop(.-rd("python_dy", Float32, ps)),
+    rawpx = crop(rd("python_dx", Float32, ps))
+    rawpy = crop(rd("python_dy", Float32, ps))
+
+    # The sign that puts the reference in AutoRIFT.jl's sense, measured rather than assumed. Both sides
+    # cut their chip from the secondary, so `(+1, +1)` is expected — but asserting it is how a
+    # convention change on either side turns into a figure of apparent error instead of a visible flag.
+    signs = ((1, 1), (-1, -1), (1, -1), (-1, 1))
+    best, err = signs[1], Inf
+    for (sx, sy) in signs
+        ok = .!isnan.(rawpx) .& .!isnan.(j.dx)
+        count(ok) == 0 && continue
+        e = median(hypot.(j.dx[ok] .- sx .* rawpx[ok], j.dy[ok] .- sy .* rawpy[ok]))
+        e < err && ((best, err) = ((sx, sy), e))
+    end
+    p = (dx = best[1] .* rawpx, dy = best[2] .* rawpy,
          chip = crop(rd("python_chip_size", Int32, ps)))
 
     jok, pok = .!isnan.(j.dx), .!isnan.(p.dx)
     both = jok .& pok
     radial = sqrt.((j.dx .- p.dx) .^ 2 .+ (j.dy .- p.dy) .^ 2)
-    return (; j, p, jok, pok, both, radial, scalars, shape = (nr, nc))
+    return (; j, p, jok, pok, both, radial, scalars, shape = (nr, nc), signs = best)
 end
 
 # `NaN` where a point has no answer, so an unmeasured point reads as blank rather than as zero — a
@@ -209,15 +226,16 @@ function accuracy_figures()
              within_gated = mean(radial[both .& (j.corr .>= 0.5)] .<= FIG_TOL),
              npix = d.scalars["npix"], upsampling = d.scalars["upsampling"],
              chip = d.scalars["chip"], chip_max = d.scalars["chip_max"],
-             spacing = d.scalars["grid_spacing"], radius = d.scalars["radius"])
+             spacing = d.scalars["grid_spacing"], radius = d.scalars["radius"],
+             signs = d.signs)
     return (; heatmaps = heatmap_page(d), histograms = histogram_page(d), stats)
 end
 
 # Standalone: draw both pages and print what they show.
 if abspath(PROGRAM_FILE) == @__FILE__
     r = accuracy_figures()
-    @printf("shared %d  median %.4f px  bias %+.4f/%+.4f  within %.1f%%\n",
+    @printf("shared %d  median %.4f px  bias %+.4f/%+.4f  within %.1f%%  sign %s\n",
             r.stats.shared, r.stats.median, r.stats.bias_dx, r.stats.bias_dy,
-            100 * r.stats.within)
+            100 * r.stats.within, string(r.stats.signs))
     println("wrote ", r.heatmaps, "\n      ", r.histograms)
 end

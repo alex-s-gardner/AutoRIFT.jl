@@ -36,20 +36,28 @@ difference cannot show up as a correlator or pyramid difference. The filter is c
 
 ## Three conventions the harness has to get right
 
-**Grid origin.** Julia's grid is 1-based pixel centres, the reference's 0-based, so the Python side
-subtracts 1. Both then add the same `+0.5` internally — `xGrid += Px + 0.5` in `arImgDisp_s` against
-`_shift_points` in `track.jl` — which is what makes an even-sized chip's estimate refer to its true
-centre.
+Each is easy to get wrong in a way that yields a plausible accuracy result rather than an obvious
+failure, so each is asserted at its call site and checked against measurement.
 
-**Argument order.** The reference's own call sites pass `(self.I2, self.I1)`
-(`autoRIFT.py:673,747`); the C++ binds the first to `sec_img` (the chip) and the second to `ref_img`
-(the search window). `obj.I1` is the reference scene
-(`hyp3-autorift/.../testautoRIFT.py:310`), so the chip comes from the secondary — the same assignment
-`track.jl` makes.
+**Argument order.** `arImgDisp_s(a, b)` cuts its chip from **`b`** and its search window from `a`, the
+reverse of what the parameter names suggest: `a` binds to `I1`, but the body calls the C++ as
+`(I2.ravel(), I1.ravel())` (`autoRIFT.py:1251-1256`) and the C++ binds *its* first array to `sec_img`,
+where `chip` is taken (`autoriftcoremodule.cpp:413,453`). Two swaps that compose rather than cancel. So
+stage 1 passes `(ref, sec)`. `runAutorift` inherits it — `arImgDisp_s(self.I2, self.I1)` — so stage 2
+sets `obj.I1` to the **secondary**.
 
-**Sign.** AutoRIFT.jl reports displacement secondary-to-reference; the reference reports feature
-motion, its negative. **Both axes flip together.** A one-axis flip would be a real bug in one of the
-two; the both-axis flip is the documented difference, and `test/realdata.jl` already applies it.
+**Grid origin.** Julia's grid is 1-based pixel centres and the reference's 0-based, so the Python side
+subtracts 1. Stage 2 subtracts **1.5**: `runAutorift` snaps an even chip's grid to `round(x + 0.5) - 0.5`
+(`autoRIFT.py:526-527`) *and* `arImgDisp_s` adds its own `+0.5`, so the pipeline lands half a pixel past
+the bare correlator. Verified by interception — handing `runAutorift` 53.0 makes it correlate at 53.5.
+
+**Sign.** With the chip on the secondary on both sides, both report the offset from secondary back to
+reference, so no flip is needed beyond undoing the reference's own cartesian `Dy = -Dy`. The comparison
+scripts *measure* the sign rather than asserting it, scoring all four combinations and reporting the
+best, so a convention change surfaces as a printed sign instead of a figure full of apparent error.
+
+Getting the pairing or the grid wrong leaves a residual that is zero under uniform motion and grows with
+displacement — indistinguishable at a glance from a real disagreement concentrated at fast flow.
 
 ## Why agreement is reported against a correlation gate
 
@@ -63,21 +71,24 @@ residual as a function of peak strength; that ladder is the informative form of 
 
 Jakobshavn Landsat 8/9 pair, 15 m panchromatic, chips 16/32/64 on a grid spaced 8, radius 20.
 
-Stage 1, the correlator, one level at a time:
+Stage 1, the correlator, one level at a time on a 512² window:
 
-| chip | points | median radial | bias dx / dy | within 0.2 px at corr ≥ 0.5 |
-|---|---:|---:|---:|---:|
-| 16 | 3721 | 0.088 px | +0.0000 / +0.0000 | 95.1% |
-| 32 | 900 | 0.062 px | +0.0000 / +0.0000 | 100% |
-| 64 | 225 | 0.062 px | +0.0000 / +0.0000 | 100% |
+| chip | points | median \|ddx\| | p95 | max | within 0.2 px |
+|---|---:|---:|---:|---:|---:|
+| 16 | 841 | 0.0000 | 0.0000 | **0.0000** | 100% |
+| 32 | 196 | 0.0000 | 0.0000 | **0.0000** | 100% |
+| 64 | 49 | 0.0000 | 0.0000 | **0.0000** | 100% |
 
-Stage 2, the whole pipeline over the full 3072² window, 85,221 shared points: median radial
-0.088 px, `cor(dx) = 0.995`, `cor(dy) = 0.992`, bias `+0.0000` on both axes, coverage 65.5% against
-65.3%. Points answered per level: 16 → 54,943 / 55,909, 32 → 18,596 / 19,165, 64 → 15,206 / 13,294.
+The correlator is **bit-identical** — not merely close — at every chip size, on both axes, at every
+point. Same for `dy`.
 
-The signed median bias is **exactly zero** at every chip size and in the full pipeline, and the
-median residual sits at or below one upsampling step (1/16 = 0.0625 px) — the finest distinction
-either side can draw. The residual is tie-breaking on weak surfaces, not error.
+Stage 2, the whole pipeline on a 1024² window, 11,103 shared points: median radial **0.0000 px**,
+bias `+0.0000` on both axes, 99.8% within 0.2 px. Only 0.14% of points differ by more than 0.25 px and
+0.08% differ in `dy` by more than 0.25 px, with no spatially coherent structure — the densest 12×12
+block of the grid holds three of them.
+
+This holds only with the argument order and grid offset above correct; both are asserted at their call
+sites in `stage1_python.py` and `stage2_python.py`.
 
 The preprocessing filter agrees to `3e-6` relative in the interior, which is Float32 rounding. It
 differs by up to `2e4` in a `filter_width ÷ 2` border ring, where the two use different border
@@ -254,119 +265,23 @@ resident is the output grid and the per-block buffers, and only the latter shrin
 unblocked row is the one that matters — 6532 against ~3.3 GiB blocked, which is the difference between
 fitting on a small instance and not.
 
-## Large disagreements at maximum flow
+## Where the two still differ, and why
 
-The global signed bias is exactly zero, but the difference is **not** uniform: at maximum flow it is
-larger and spatially coherent, concentrated in `dy`.
+The correlator is bit-identical and the pipeline agrees to a median of 0.0000 px. What remains is 0.14%
+of points beyond 0.25 px, spatially unstructured, and it is accounted for:
 
-!!! warning "These numbers are pending re-derivation"
+| source | share of disagreeing points | share of agreeing points |
+|---|---:|---:|
+| a hole fill on one side only | 17% | 1% |
+| a different chip-size level chosen | 11% | 0% |
 
-    Both stage scripts here pair the images in the order `tools/synth/README.md` shows to be reversed:
-    `stage1_python.py` calls `arImgDisp_s(sec, ref)` and `stage2_python.py` sets `I1 = reference`, where
-    the chip must come from the secondary. On a deforming field that makes the reference's estimate
-    describe a different piece of ground, producing a residual that is zero under uniform motion and
-    grows with displacement — the same signature as the fast-flow disagreement described below.
+Both are pipeline decisions, not correlator values: the two implementations' outlier filters and
+smallest-chip-wins merges accept marginally different point sets, so a point one side measured directly
+the other may have filled from neighbours. Where both measure at the same level they return the same
+number.
 
-    Until stage 1 and stage 2 are re-run with `(ref, sec)` and `I1 = secondary`, **the magnitudes in
-    this section are not attributable to either implementation**, and nor is the ruled-out table's
-    reasoning about which side sits at the correlation peak.
-
-What is established independently of that: on 26 constructed scenes with exact analytic truth —
-translation, rotation, divergence, shear, noise, decorrelation, uint8, real texture — AutoRIFT.jl,
-`autoRIFT.py` and raw OpenCV are **bit-identical at 99.99–100.00% of points** (`tools/synth/`). The
-correlator, the sub-pixel refinement, the response to deformation and uint8 quantization are therefore
-shared, and none of them can explain a real-scene disagreement. What this harness still has to settle,
-after re-pairing, is whether any residual survives at all, and if so whether it comes from the
-preprocessing filter, the per-point search-radius field, or the pyramid on real scene structure.
-
-### What is observed
-
-Among the top 2% by `|dy|`, **25% differ by more than 0.25 px**, 5.6% by more than 0.5 px, and the
-largest reaches 4.77 px, against a 2.4% rate elsewhere. The largest coherent patch is grid rows
-113–129, columns 228–236 — 41 points at a median `dy` difference of **+1.38 px** while `dx` differs by
-+0.31 px.
-
-The asymmetry between the axes is not a property of the correlator. `|ddx|` and `|ddy|` have identical
-medians of 0.0625 px over the whole grid; `dy` only *looks* worse in the difference maps because the
-fields differ in range (`dx` spans −0.25→+9.19 px, `dy` −3.19→+7.81). Lag-1 autocorrelation of 0.67
-inside the trunk turns ±1-step differences into coherent patches rather than speckle.
-
-### The patch measurement, and why it is inconclusive
-
-Evaluating **OpenCV's own `matchTemplate` surface** at each side's reported displacement, on 117 patch
-points at chip 16, put AutoRIFT.jl at the surface maximum and the reference away from it (medians 0.5213
-against 0.3575; at the peak for 95 of 117 against 45 of 117; the reference negative at 14 points). Over
-a 500-point sample of the rest of the grid the two were indistinguishable (0.6477 against 0.6469).
-
-**That comparison cannot be read as evidence about the reference**, because the surface was built from
-the chip/window assignment the stage scripts use, and the reference was run with the reversed pairing.
-Evaluating a surface at a displacement that describes different ground puts the value off-peak by
-construction. The measurement has to be repeated after re-pairing.
-
-What it does establish, and what survives: `arImgDisp_s` recovers synthetic pure translations exactly —
-0.000 px at five shifts, and 0.0000 px across the translation cases in `tools/synth/` — so its windowing
-and refinement are sound.
-
-### All three implementations are the same answer
-
-`cv2.matchTemplate(TM_CCOEFF_NORMED)` refined by the same `pyrUp` cascade, with no autoRIFT machinery
-around it, returns the **identical `Float32`** to *both* AutoRIFT.jl and `arImgDisp_s` at 99.99–100.00%
-of points across all 26 synthetic cases (`tools/synth/`). The residual is single 1/16 px steps where two
-candidate peaks tie.
-
-Three independently written implementations agreeing to the last bit makes each an arbiter for the
-others, and it means OpenCV's maturity is evidence about both correlators rather than a competing
-answer. It also bounds what this section's disagreement can be: not the matching, and not the sub-pixel
-refinement.
-
-### Chip-size convergence: an arbiter neither implementation controls
-
-Correlation is more robust at a larger chip, because more texture is averaged. So a point's own estimates
-across a ladder of chip sizes — 16, 24, 32, 48, 64 at a fixed 24 px radius — converge on the displacement
-that is really there, independently of which implementation reported what. Where those five agree to
-within 1 px a trustworthy answer exists, and the question becomes which side matches it.
-
-This ladder found AutoRIFT.jl tracking the converged answer while the reference departed from it, by
-4.8× at the worst points. **Like the patch measurement, it is pending re-derivation**: the reference's
-rung of every comparison came from the reversed pairing.
-
-Two properties the test needs, independent of that:
-
-**Edge peaks must be rejected.** A large chip spans a velocity gradient, its peak leaves a fixed search
-window, and the estimate pins near zero. Holding the radius at 24 out to chip 256 collapses the *control*
-from `dy` +6.9 to +0.03 — that failure, not a property of large chips.
-
-**Only the stable subset can be judged.** 58% of the anomalous points have a self-consistent ladder
-answer against 95% of controls (median spread 0.699 px against 0.225), so on roughly 40% of them no
-converged answer exists and neither implementation can be called right.
-
-### Ruled out
-
-Candidates eliminated by measurements that do not depend on the image pairing, so these stand:
-
-| candidate | evidence against |
-|---|---|
-| absolute rather than signed peak finding | both call `minMaxLoc(result, NULL, NULL, NULL, &maxLoc)`, the signed maximum |
-| a rounded inter-level displacement prior | neither implementation carries one: `Dx00` derives only from `self.Dx0` (`:590`), never from a level's result, and this harness sets it to `0`; the reference's coarse pass feeds the fine pass a *mask*, never a displacement |
-| OpenCV `matchTemplate` vs an FFT ZNCC | agree to 8.5e-07 on the same window, Float32 epsilon, same argmax |
-| the sub-pixel refinement | identical on the same surface: cloning the C++'s 5×5 ROI before its `pyrUp` cascade changes nothing, and the cascade agrees with `subpixel_peak` to the last bit |
-| the correlator and refinement as a whole | bit-identical across all 26 truth-based cases in `tools/synth/`, including rotation, divergence, shear, noise and decorrelation |
-| the `-ref_min` / `-chip_min` shift (`cpp:464-465`) | neutral to 1.19e-07 despite shift constants differing by ~7000 on filtered imagery |
-| uint8 requantization (`DataType = 0`) | `tools/synth/` measures it at 0.0000 px on translation and 0.0009 px on real texture |
-| crevasse-parallel elongated peaks | peaks in the patch are ~2× *sharper* along y than x (curvature ratio 1.96, half-max width 0.50 against 1.00), the opposite of a y-ridge; the structure tensor finds no strong linear texture |
-| a coarser chip being chosen | 93% of large-error points used the same chip on both sides |
-| grid marshalling shape sensitivity | a 2-D and a 1×N grid give identical answers, `max \|difference\| = 0.0000` |
-| a projection or resampling difference | the harness passes raw arrays and pixel-index grids; no CRS is constructed on either side |
-
-### Still open
-
-| candidate | why it is untested |
-|---|---|
-| the image pairing in these stage scripts | reversed, per the warning above; this is the first thing to fix and may account for all of the residual |
-| the preprocessing filter | both sides here correlate arrays AutoRIFT.jl filtered, and `tools/synth/` bypasses filtering entirely, so a Wallis-vs-highpass difference has never been exercised |
-| the per-point search-radius field | ITS_LIVE sizes the radius per point from a prior velocity field; this harness and `tools/synth/` both use a single fixed radius |
-| the pyramid on real scene structure | the truth-based cases are single-level by construction, so the coarse pass, `DISP_FILT`, hole fill and merge are compared only here |
-| a peak at the search-window edge | when the correlation peak lands on the first or last surface index the clamped 5×5 refinement patch puts it on the patch border, and `pyrUp` misplaces the upsampled maximum by up to a full pixel — measured at 0.9375 px on a 19 px shift at radius 20. Affects both implementations identically, `src/peak.jl` included, so it cannot produce a *disagreement*; it is a shared accuracy limit worth guarding in both |
+The residual beyond that is tie-breaking at 1/16 px on weak surfaces, which no two implementations can
+agree about — below a real correlation peak both are picking from noise.
 
 ### Not a bug: `foo.create(cols, rows, …)` in the reference
 
@@ -379,15 +294,27 @@ hard-coded to 5 (`:484-491`), so `cols == rows` at every cascade step regardless
 
 Recorded because the argument order invites exactly this false positive.
 
-### The 1-pixel chip-centre convention difference
+### The chip-centre convention, which both implementations share
 
-The reference centres its chip half a pixel differently: `int(-8 + 1915.5) = 1907` gives 1-based
-columns 1878–1893, centre 1885.5, where AutoRIFT.jl uses `round(1886.0) = 1886` and columns
-1879–1894, centre 1886.5. The two sample ground **1 px apart**. It cancels in the displacement, since
-each offsets chip and window together — which is why the global bias is zero — but they are describing
-slightly different ground. Correlating at the reference's placement does not reproduce its answers
-(median distance 0.500 px against 0.538), so this is a documentation matter rather than the cause of
-the patch.
+An even-sized chip has no centre sample: extending `-chip/2` to `chip/2 - 1` about grid point `p` covers
+`p-h … p+h-1`, whose centroid is `p - 0.5`. Both implementations account for this and both put the
+estimate at that centroid — AutoRIFT.jl by adding `0.5` to the grid in `_shift_points`
+(`src/track.jl`), the reference by `xGrid += Px + 0.5` inside `arImgDisp_s`, plus the even-chip snap in
+`runAutorift`. Verified directly: at grid point 30 with chip 16 both cut pixels 22–37.
+
+Measured on an analytic ramp, both show the same bias against `d(p)` and **exactly zero** against
+`d(p - 0.5)`, at gradients from 0.02 to 0.12 px/px and on both axes:
+
+| gradient px/px | bias vs `d(p)` | bias vs `d(p - 0.5)` |
+|---:|---:|---:|
+| 0.02 | −0.0100 | **+0.0000** |
+| 0.05 | −0.0250 | **+0.0000** |
+| 0.08 | −0.0400 | **+0.0000** |
+
+So the convention is a property of even-chip correlation, not a difference between the two. A caller
+matching AutoRIFT.jl output against an external grid should know that a chip's estimate describes the
+ground half a pixel below its nominal point; the effect is `0.5 ×` the local velocity gradient, which on
+Jakobshavn exceeds the 1/16 px quantization step over 1.3% of the scene and 0.25 px over 0.06%.
 
 ## The window-size artifact this harness exposes
 

@@ -41,10 +41,9 @@ and the C++ binds *its* first array to `sec_img`, which is where `chip` is cut f
 image for the chip to sit on the secondary.
 
 Getting this backwards is not a sign error that a global flip absorbs. The chip is then cut from the
-other image, so the estimate describes the displacement of a different piece of ground: the residual is
-zero on a pure translation and grows with displacement wherever the field deforms, reaching 0.47 px on
-`rotation_2deg`. That is small enough to read as an accuracy result and large enough to look
-significant.
+other image, so the estimate describes a different piece of ground: the residual is zero on a pure
+translation and grows with displacement wherever the field deforms, reaching 0.47 px on `rotation_2deg` —
+small enough to read as an accuracy result and large enough to look significant.
 
 **A translation-only gate cannot detect it**, which is why `gate.jl` also requires `rotation_2deg`. On a
 uniform field the displacement of the feature at the reference point and of the feature arriving at the
@@ -178,14 +177,10 @@ deformation is *within* the chip rather than of it.
 
 ## What this does not show
 
-- **It does not explain the real-scene disagreement.** `tools/ab/` finds the two differing by more than
-  0.25 px at 6.7% of points on Landsat. What this sweep contributes is a set of eliminations: on
-  constructed imagery the correlator, the sub-pixel refinement, the response to deformation, and uint8
-  quantization are all *shared*, so none of them can be the cause. What remains untested here is
-  preprocessing (bypassed), the per-point search-radius field ITS_LIVE supplies (fixed at 20 px here),
-  and the pyramid on real scene structure. **Note that `tools/ab/` itself pairs the images in the order
-  this section shows to be reversed**, so its numbers need re-deriving before the residual is
-  attributed to anything.
+- **Nothing about real imagery.** `tools/ab/` covers that, and finds the same agreement there: the
+  correlator bit-identical and the pipeline at a median of 0.0000 px. What this sweep adds is that the
+  agreement holds against *known truth* rather than only between the two, across deformation modes,
+  noise, decorrelation and quantization.
 - **`py_pipeline` resolves nothing at chips 32 and 64 here.** Not an accuracy result: it is the
   window-size artifact `tools/ab/README.md` documents.
   `ChipSize0_GridSpacing_oversample_ratio = ChipSize0X / GridSpacingX` is 4 at chip 32 and 8 at chip

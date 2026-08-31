@@ -147,11 +147,36 @@ the ratio is dominated by its denominator rather than by peak quality.
 The background **mean** rather than its median: measured identical to four decimal places (0.7365
 against 0.7364), and a mean accumulates in the same pass with no allocation where a median needs
 selection over every background sample, per point, per level.
+
+# Sign: a peak against the search boundary
+
+The value is **negated** when the integer peak lies on the first or last row or column of the surface.
+Magnitude still carries the quality; the sign carries "the search radius is binding here".
+
+The surface spans `-radius … radius - 1`, so a peak on its boundary means the true displacement is at
+or beyond the search limit. Two consequences make that worth marking rather than leaving implicit. The
+displacement is a lower bound on the real one — nothing beyond the boundary was searched. And the
+sub-pixel fraction along that axis is unrecoverable: the peak's far side is not sampled, so the
+upsampling has no curvature to fit and the estimate is quantized to whole pixels. Measured on known
+translations at chip 16, radius 20, the refined estimate at a boundary peak is *worse* than the integer
+peak — 1.34 px against 0.40 px at a true shift of −18.6, and 0.94 px against exact at −19.0.
+
+At the ITS_LIVE configuration over Jakobshavn this affects 4.2% of points that correlate above 0.3, and
+0.12% at chip 32; it is common exactly where a prior velocity field underestimates the flow.
+
+A caller gating on quality with `peak_snr .>= t` therefore silently accepts these; gate on
+`peak_snr .>= t` **and** `peak_snr .> 0` to exclude them, or select them with `peak_snr .< 0` to find
+where the radius needs raising. `NaN32` still means "no quality could be assessed", which is distinct
+from both.
 """
 @inline function peak_quality(surface::AbstractMatrix, exclusion::Int = PEAK_EXCLUSION)
     i, j = peak_index(surface)
     nr, nc = size(surface)
     h = Float64(@inbounds surface[i, j])
+    # A peak on the boundary: the displacement is railed against the search limit and its sub-pixel
+    # part is not recoverable. Recorded as the sign of the quality rather than as a sixth output array,
+    # since it qualifies this measurement and costs nothing to carry.
+    railed = (i == 1) | (j == 1) | (i == nr) | (j == nc)
     # Sum and sum of squares in one traversal, column-major for the reason `peak_index` documents.
     # Two passes would read the surface twice for a variance that one pass gives.
     s1 = 0.0
@@ -172,7 +197,9 @@ selection over every background sample, per point, per level.
     # cancellation when the background is nearly constant — the same guard `_correlate_surface!`
     # applies for the same reason.
     sd = sqrt(max(s2 / n - mean * mean, 0.0))
-    return sd > 0 ? Float32((h - mean) / sd) : NaN32
+    sd > 0 || return NaN32
+    q = Float32((h - mean) / sd)
+    return railed ? -q : q
 end
 
 # ---------------------------------------------------------------------------

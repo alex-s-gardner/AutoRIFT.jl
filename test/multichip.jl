@@ -156,7 +156,11 @@ end
     # neither. `chip_size` follows the same rule, and a caller reading `peak_snr` to gate on quality
     # needs it: a measured point with no quality would silently fail any threshold.
     @test all(i -> isnan(r.dx[i]) == isnan(r.peak_snr[i]), eachindex(r.dx))
-    # A real match stands above its background, so the finite values are positive.
+    # A real match stands above its background, so the magnitudes are positive. The sign is not
+    # asserted: it is negative exactly where the peak lay against the search boundary, which this
+    # scene's 6/-4 px shift at radius 25 does not produce but a faster one would.
+    @test all(>(0), abs.(filter(isfinite, r.peak_snr)))
+    # This shift is well inside the search window, so nothing is railed.
     @test all(>(0), filter(isfinite, r.peak_snr))
 end
 

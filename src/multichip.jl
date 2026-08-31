@@ -71,6 +71,11 @@ measurements behind that distinction. At an `interpolated` point it is the media
 neighbourhood the displacement itself was taken from, since that is what stands behind the value;
 `correlation` is `NaN` there instead, having no surface of its own to report.
 
+A **negative** `peak_snr` marks a point whose correlation peak lay against the search boundary: the
+displacement is a lower bound and its sub-pixel part is quantized to whole pixels. Gate on
+`peak_snr .> 0` to exclude those, or select them to find where `search_radius` is too small —
+`AutoRIFT.peak_quality` documents the measurements. The magnitude is the quality either way.
+
 `chip_size` holds the level's **x** extent. That identifies the level on its own, since the aspect
 is constant across levels, so the y extent is this times a fixed ratio.
 
@@ -782,6 +787,12 @@ function _fill_holes!(d::DisplacementField, p::Params)
                     # it may itself have been filled by an earlier pass, or its surface may have
                     # been too small to characterize — and mixing `NaN` into the selection would
                     # poison the median rather than skip the neighbour.
+                    #
+                    # The median is taken over *signed* qualities, so `peak_quality`'s
+                    # search-boundary flag carries through by majority: a point filled from mostly
+                    # railed neighbours inherits a negative value, and one filled from mostly clear
+                    # neighbours a positive one. That is the correct reading, since a filled
+                    # displacement is only as trustworthy as the neighbourhood behind it.
                     s = d.peak_snr[ii, jj]
                     if !isnan(s)
                         ns += 1

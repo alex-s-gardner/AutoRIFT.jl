@@ -59,10 +59,21 @@ def main():
     obj.DataType = 1
     obj.zeroMask = None
 
-    # Julia's grid is 1-based pixel centres and the reference's is 0-based. `runAutorift` applies
-    # its own `round(xGrid) + 0.5`, so only the origin shift is applied here.
-    obj.xGrid = np.ascontiguousarray(arrays["grid_x"] - 1.0, dtype=np.float32)
-    obj.yGrid = np.ascontiguousarray(arrays["grid_y"] - 1.0, dtype=np.float32)
+    # Julia's grid is 1-based pixel centres and the reference's is 0-based, hence the `- 1.0`. The
+    # further `- 0.5` cancels a shift `runAutorift` applies that `arImgDisp_s` does not.
+    #
+    # `runAutorift` snaps an even chip's grid to `round(x + 0.5) - 0.5` (`autoRIFT.py:526-527`) and
+    # `arImgDisp_s` then adds its own `+0.5` internally, so the pair arrives half a pixel past where
+    # stage 1 puts it. Verified by intercepting the call: handing `runAutorift` a grid value of 53.0
+    # makes it correlate at 53.5, where `arImgDisp_s` given 53.0 correlates at 53.0.
+    #
+    # Both implementations attribute an even chip's estimate to the chip centroid, half a pixel below
+    # the grid point — AutoRIFT.jl in `_shift_points` (`src/track.jl`), the reference in the `+0.5`
+    # above. Applying that convention twice on this side would compare ground half a pixel apart, and
+    # since the offset is only visible where the velocity field varies, it would read as a
+    # displacement-dependent disagreement rather than as a grid error.
+    obj.xGrid = np.ascontiguousarray(arrays["grid_x"] - 1.5, dtype=np.float32)
+    obj.yGrid = np.ascontiguousarray(arrays["grid_y"] - 1.5, dtype=np.float32)
 
     chip = scalars["chip"]
     obj.ChipSize0X = chip
