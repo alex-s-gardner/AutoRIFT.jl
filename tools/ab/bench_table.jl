@@ -272,27 +272,11 @@ function render(r)
 
       <div class="page">
         <h1>Agreement with autoRIFT.py: chip size and coverage</h1>
-        <p class="sub">Which level answered each point, and where the two disagree &middot; the
-          histogram is binned in whole steps of 1/$(s.upsampling)&thinsp;px because the sub-pixel search
-          quantizes the differences &mdash; in pixels it is one unresolvable spike at zero</p>
         <img class="fig" src="$(data_uri(figs.histograms))">
       </div>
 
       <div class="page">
         <h1>Quality metrics: what to trust each estimate for</h1>
-        <p class="sub">Every point carries a displacement; these say how much to believe it, and the
-          reference reports none of them &middot; <b>correlation</b> is the height of the ZNCC peak the
-          match was taken from, so it answers "how well did the two chips resemble each other"
-          &middot; <b>peak SNR</b> is how far that peak stood above the rest of its own surface, which
-          answers "was the match unambiguous" &mdash; a different question, and the two are nearly
-          independent at a rank correlation of 0.125 &middot; both read <b>zero</b> where the peak lay
-          against the search boundary, so any positive threshold rejects those points and
-          <code>correlation .== 0</code> locates a too-small <code>search_radius</code></p>
-        <table class="stats"><tr>
-          <td><b>gate on correlation, not peak SNR</b></td>
-          <td>by decile, exact agreement rises monotonically with correlation, 31% &rarr; 98%</td>
-          <td>peak SNR sits near 80% for eight deciles, then <i>falls</i> to 45% in its highest</td>
-        </tr></table>
         <img class="fig" src="$(data_uri(figs.outputs))">
       </div>
     </body></html>
