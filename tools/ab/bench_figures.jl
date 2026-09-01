@@ -12,8 +12,11 @@ using CairoMakie, Printf, Statistics
 
 const FIG_D = joinpath(@__DIR__, "stage2")
 const FIG_PLOTS = joinpath(@__DIR__, "plots")
-# The sub-pixel matching-noise limit the comparison is judged against.
-const FIG_TOL = 0.2
+# The scale the difference maps are drawn at: one step of the sub-pixel search, which is the finest
+# distinction either implementation can draw. A scale rather than a pass/fail line — the two agree
+# exactly at most points, so what the maps have to show is *where* the rest sit, not how many clear
+# some cutoff.
+const FIG_STEP = 1 / 16
 
 # The canvas both pages are drawn at. Sized to the aspect of what is left on a landscape letter page
 # after the heading — 9.4in by 5.6in — so `bench_table.jl` can scale a page to full width and have it
@@ -122,8 +125,12 @@ function heatmap_page(d; path = joinpath(FIG_PLOTS, "fig_heatmaps.png"))
         # Signed difference per axis on a diverging scale, so which way each side leans is visible.
         # A magnitude on a sequential scale cannot show that, and the sign is the whole question for a
         # bias: a field of +0.1 px and one of ±0.1 px look identical under `abs`.
+        #
+        # Scaled to ±4 sub-pixel steps, so the unit of the colour bar is the smallest difference either
+        # implementation can express. Anything visible here is at least one step; a point where the two
+        # agree exactly is the background colour.
         hmd = heatmap!(mapax((row, 4), "difference in $nm"), mapshow(blank(J .- P, both));
-                       colormap = :balance, colorrange = (-2 * FIG_TOL, 2 * FIG_TOL))
+                       colormap = :balance, colorrange = (-4 * FIG_STEP, 4 * FIG_STEP))
         Colorbar(fig[row, 5], hmd; label = "AutoRIFT.jl − autoRIFT.py (px)", width = 12)
     end
 
@@ -189,28 +196,48 @@ function histogram_page(d; path = joinpath(FIG_PLOTS, "fig_histograms.png"))
     Colorbar(fig[2, 4], hmc; width = 12, height = Relative(0.85),
              ticks = (0:3, ["neither", "both", "jl only", "py only"]))
 
-    # The one histogram on this page: the signed difference per axis. Symmetric about zero is the
-    # claim — a shifted center is a systematic bias, which is a different defect from a wide spread.
+    # The one histogram on this page: the signed difference per axis, in units of one sub-pixel step.
+    # Symmetric about zero is the claim — a shifted center is a systematic bias, which is a different
+    # defect from a wide spread.
+    #
+    # Steps rather than pixels, and ±8 of them rather than ±1 px. The differences are quantized by the
+    # sub-pixel search, so in pixels the whole distribution is a single spike at zero with nothing
+    # resolvable either side of it; one bin per step is the finest binning that carries information and
+    # the coarsest that loses none.
     #
     # The tail is excluded from the bins rather than clamped into the end one: clamping piles every
     # outlier into a single edge bin, drawing a spike that reads as a real mode. The excluded fraction
     # is stated instead.
+    step = 1 / scalars["upsampling"]
+    lim = 8
     ax = Axis(fig[1:2, 5]; title = "difference in dx and dy",
-              xlabel = "AutoRIFT.jl − autoRIFT.py (px)", ylabel = "points")
+              xlabel = "AutoRIFT.jl − autoRIFT.py (steps of 1/$(scalars["upsampling"]) px)",
+              ylabel = "points")
     for (v, c, nm) in ((ddx, (:dodgerblue, 0.55), "dx"), (ddy, (:orangered, 0.55), "dy"))
-        hist!(ax, filter(x -> abs(x) <= 1, v); bins = 121, color = c, label = nm)
+        hist!(ax, filter(x -> abs(x) <= lim, v ./ step);
+              bins = range(-lim - 0.5, lim + 0.5; step = 1), color = c, label = nm)
     end
     vlines!(ax, [0]; color = :black, linestyle = :dash)
     axislegend(ax; position = :rt, framevisible = false)
     # Below the legend rather than beside it: the distribution is a spike at zero, so the upper corners
     # are the only clear space and both cannot have it.
-    text!(ax, 0.97, 0.72;
-          text = @sprintf("median %+.4f px (dx)\nmedian %+.4f px (dy)\n\nbeyond ±1 px: %.1f%% of dx,\n\
-                           %.1f%% of dy\n\nsame chip size at %.1f%%\nof shared points",
+    #
+    # How often the two agree *exactly*, and how far the tail runs, rather than a fraction clearing some
+    # tolerance: the spike at zero is most of the distribution, so a cutoff anywhere in the tail reports
+    # its own placement more than it reports the agreement.
+    rad = sqrt.(ddx .^ 2 .+ ddy .^ 2)
+    text!(ax, 0.97, 0.70;
+          text = @sprintf("median %+.4f px (dx)\nmedian %+.4f px (dy)\n\nidentical to the last bit:\n\
+                           %.1f%% of dx, %.1f%% of dy\n\nradial tail: p99 %.1f steps,\nmax %.0f steps\n\n\
+                           beyond ±%d steps: %.2f%% of dx,\n%.2f%% of dy\n\nsame chip size at %.1f%%\n\
+                           of shared points",
                           median(ddx), median(ddy),
-                          100 * mean(abs.(ddx) .> 1), 100 * mean(abs.(ddy) .> 1),
+                          100 * mean(ddx .== 0), 100 * mean(ddy .== 0),
+                          quantile(rad, 0.99) / step, maximum(rad) / step,
+                          lim, 100 * mean(abs.(ddx) .> lim * step),
+                          100 * mean(abs.(ddy) .> lim * step),
                           100 * count(samelevel) / count(both)),
-          space = :relative, align = (:right, :top), fontsize = 10, color = :gray35)
+          space = :relative, align = (:right, :top), fontsize = 9, color = :gray35)
 
     colgap!(fig.layout, 8)
     rowgap!(fig.layout, 8)
@@ -233,8 +260,8 @@ function outputs_page(d; path = joinpath(FIG_PLOTS, "fig_outputs.png"))
                              xticksvisible = false, yticksvisible = false,
                              xticklabelsvisible = false, yticklabelsvisible = false)
 
-    # Two by two rather than four across: the maps are square and the page is landscape, so a single row
-    # of four leaves most of the page empty and each map too small to read.
+    # Three maps in a row, each with its own colorbar. The maps are square and the page is landscape, so
+    # three across fills it without shrinking any of them below legibility.
     measured = jok .& .!isnan.(j.corr)
     hm = heatmap!(mapax((1, 1), "correlation (peak height)"), mapshow(blank(j.corr, measured));
                   colormap = :magma, colorrange = (0, 1))
@@ -255,39 +282,11 @@ function outputs_page(d; path = joinpath(FIG_PLOTS, "fig_outputs.png"))
              height = Relative(0.85))
 
     interp = map((v, k) -> k ? Float64(v != 0) : NaN, j.interp, jok)
-    hm4 = heatmap!(mapax((2, 1), "interpolated"), mapshow(interp);
+    hm4 = heatmap!(mapax((1, 5), "interpolated"), mapshow(interp);
                    colormap = cgrad([:gray80, :dodgerblue]; categorical = true),
                    colorrange = (-0.5, 1.5))
-    Colorbar(fig[2, 2], hm4; width = 12, height = Relative(0.85),
+    Colorbar(fig[1, 6], hm4; width = 12, height = Relative(0.85),
              ticks = (0:1, ["false", "true"]))
-
-    # Quality against agreement, which is the pairing that says whether `peak_snr` is worth gating on:
-    # the disagreement with the reference is an independent label this output does not know about.
-    both = d.both
-    ax = Axis(fig[2, 3]; title = "disagreement against each quality measure",
-              xlabel = "quality decile (worst to best)", ylabel = "median |difference| (px)",
-              yscale = log10)
-    for (nm, q, col) in (("peak SNR", j.snr, :dodgerblue), ("correlation", j.corr, :orangered))
-        sel = both .& .!isnan.(q)
-        count(sel) < 100 && continue
-        vals = q[sel]
-        res = d.radial[sel]
-        edges = quantile(vals, range(0, 1; length = 11))
-        xs, ys = Float64[], Float64[]
-        for k in 1:(length(edges) - 1)
-            m = (vals .>= edges[k]) .& (vals .<= edges[k + 1])
-            count(m) < 20 && continue
-            push!(xs, k)
-            # Floored below the 1/16 px quantization step: a decile whose median difference is exactly
-            # zero is the expected result for a good one, and has no position on a log axis.
-            push!(ys, max(median(res[m]), 0.01))
-        end
-        length(xs) >= 2 && scatterlines!(ax, xs, ys; color = col, label = nm, markersize = 7)
-    end
-    axislegend(ax; position = :rt, framevisible = false, labelsize = 10)
-
-    Label(fig[2, 4], "lower is better\n\na measure that\ndiscriminates\nfalls to the right";
-          fontsize = 9, color = :gray40, tellheight = false)
 
     colgap!(fig.layout, 8)
     rowgap!(fig.layout, 8)
@@ -301,14 +300,21 @@ function accuracy_figures()
     d = load_stage2()
     (; j, both, radial) = d
     e = radial[both]
+    # Reported without a pass/fail threshold. Most shared points agree to the last bit, so a
+    # "fraction within X px" says only where X happens to fall in a tail that is already narrower than
+    # one step of the sub-pixel search — move X a little and the headline moves a lot, which is a
+    # property of the cutoff rather than of the two implementations. What does carry information: how
+    # often they agree *exactly*, and how far the tail reaches, both stated in sub-pixel steps.
+    step = 1 / d.scalars["upsampling"]
     stats = (; shared = count(both),
              jl_only = count(d.jok .& .!d.pok), ref_only = count(d.pok .& .!d.jok),
-             median = median(e), p95 = quantile(e, 0.95),
+             median = median(e), p95 = quantile(e, 0.95), p99 = quantile(e, 0.99),
+             pmax = maximum(e),
+             exact = mean(e .== 0), within_step = mean(e .<= step),
+             steps_p99 = quantile(e, 0.99) / step, steps_max = maximum(e) / step,
              bias_dx = median(j.dx[both] .- d.p.dx[both]),
              bias_dy = median(j.dy[both] .- d.p.dy[both]),
              cor_dx = cor(j.dx[both], d.p.dx[both]), cor_dy = cor(j.dy[both], d.p.dy[both]),
-             within = mean(e .<= FIG_TOL),
-             within_gated = mean(radial[both .& (j.corr .>= 0.5)] .<= FIG_TOL),
              npix = d.scalars["npix"], upsampling = d.scalars["upsampling"],
              chip = d.scalars["chip"], chip_max = d.scalars["chip_max"],
              spacing = d.scalars["grid_spacing"], radius = d.scalars["radius"],
@@ -320,8 +326,9 @@ end
 # Standalone: draw both pages and print what they show.
 if abspath(PROGRAM_FILE) == @__FILE__
     r = accuracy_figures()
-    @printf("shared %d  median %.4f px  bias %+.4f/%+.4f  within %.1f%%  sign %s\n",
-            r.stats.shared, r.stats.median, r.stats.bias_dx, r.stats.bias_dy,
-            100 * r.stats.within, string(r.stats.signs))
+    s = r.stats
+    @printf("shared %d  exact %.1f%%  median %.4f px  bias %+.4f/%+.4f  p99 %.2f steps  max %.1f steps  sign %s\n",
+            s.shared, 100 * s.exact, s.median, s.bias_dx, s.bias_dy,
+            s.steps_p99, s.steps_max, string(s.signs))
     println("wrote ", r.heatmaps, "\n      ", r.histograms, "\n      ", r.outputs)
 end

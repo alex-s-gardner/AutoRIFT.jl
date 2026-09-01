@@ -34,6 +34,7 @@
 # from the real-data cache by the stage scripts. The scripts that produce them are kept.
 /tools/ab/stage1/
 /tools/ab/stage2/
+/tools/ab/xchg/
 /tools/ab/Manifest.toml
 __pycache__/
 

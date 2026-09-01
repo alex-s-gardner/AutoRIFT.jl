@@ -34,7 +34,7 @@ julia --project=tools/ab tools/ab/compare2.jl full
 Both stages hand the reference the arrays **AutoRIFT.jl already filtered**, so a preprocessing
 difference cannot show up as a correlator or pyramid difference. The filter is compared separately.
 
-## Three conventions the harness has to get right
+## Four conventions the harness has to get right
 
 Each is easy to get wrong in a way that yields a plausible accuracy result rather than an obvious
 failure, so each is asserted at its call site and checked against measurement.
@@ -56,8 +56,25 @@ reference, so no flip is needed beyond undoing the reference's own cartesian `Dy
 scripts *measure* the sign rather than asserting it, scoring all four combinations and reporting the
 best, so a convention change surfaces as a printed sign instead of a figure full of apparent error.
 
+**Array layout.** Julia is column-major and NumPy row-major, so a 2-D array moved between them is
+transposed unless the reader says otherwise — and for a square array that is silent. A transposed
+displacement field still looks like a displacement field: it reads as a spatial offset in whatever is
+being measured, which is the same signature as a real grid error. Use `xchg.py` / `xchg.jl` for any array
+crossing the boundary. They put the element type and both dimensions in the file, so `xread`/`read` take
+the layout from the header rather than from a caller-supplied shape, and refuse a file they did not
+write. Do not hand-roll `reshape(dims[::-1]).T` in a new diagnostic; that idiom is correct in
+`stage1_python.py` and `stage2_python.py` only because those two shapes are checked against the
+manifest.
+
+    sh tools/ab/xchg_test.sh          # Julia writes -> Python reads, and back, both asserted
+
+Run that before trusting a diagnostic that moves arrays across the boundary. It uses a non-square array
+whose values encode their own position, so a transpose fails on both the shape and the values.
+
 Getting the pairing or the grid wrong leaves a residual that is zero under uniform motion and grows with
-displacement — indistinguishable at a glance from a real disagreement concentrated at fast flow.
+displacement — indistinguishable at a glance from a real disagreement concentrated at fast flow. A
+layout error is worse: it fabricates a defect at a location that has nothing to do with the code being
+diagnosed.
 
 ## Why agreement is reported against a correlation gate
 

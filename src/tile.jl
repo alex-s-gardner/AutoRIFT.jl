@@ -23,9 +23,9 @@
 #
 # Deliberately *not* in the halo: the outlier filter and hole fill. Their reach compounds across
 # iterations, and on the strided coarse grid `dilate_within(keep, coarse_buffer)` alone reaches
-# `coarse_buffer * coarse_stride * grid_spacing` — 1024 px at defaults, more than every other term
-# together. A halo covering that would be mostly overlap at any block size worth asking for, so
-# rejection runs once on the assembled field instead. See `docs/plan-tiling.md`.
+# `coarse_buffer * coarse_stride * oversample * grid_spacing` — 2048 px at defaults, more than every
+# other term together. A halo covering that would be mostly overlap at any block size worth asking
+# for, so rejection runs once on the assembled field instead. See `docs/plan-tiling.md`.
 
 """
     AutoRIFT.Block
@@ -90,7 +90,8 @@ function halo(grid::PointSet, p::Params, imagesize::Tuple{Int,Int})
     # `_pass_geometry`'s pad is exactly the correlation reach plus the reference's 2-pixel slack
     # for the half-pixel grid offset and index truncation.
     _, _, _, _, pad, _ = _pass_geometry(_worst_level_points(grid, p), imagesize)
-    return (pad[1] + w, pad[2] + w)
+    ox, oy = _level_centre_offset(p)
+    return (pad[1] + w + ox, pad[2] + w + oy)
 end
 
 """
@@ -116,7 +117,10 @@ function halo(p::Params)
     ry = max(p.search_radius.Y, p.min_search_radius)
     hx = p.chip_size_max.X ÷ 2 + rx + ceil(Int, abs(p.dx_prior)) + 2
     hy = p.chip_size_max.Y ÷ 2 + ry + ceil(Int, abs(p.dy_prior)) + 2
-    return (hx + w, hy + w)
+    # A decimated level correlates at its cells' centres, which reach further than the grid points the
+    # rest of this arithmetic is derived from.
+    ox, oy = _level_centre_offset(p)
+    return (hx + w + ox, hy + w + oy)
 end
 
 # The preprocessing filter's contribution to the halo, and the one configuration that has none.
@@ -163,6 +167,37 @@ function _worst_level_points(grid::PointSet, p::Params)
     # The same floor a level applies, applied by the same function, so the two cannot drift.
     sanitize!(pts, p.min_search_radius)
     return pts
+end
+
+"""
+    AutoRIFT._level_centre_offset(p::Params) -> (ox, oy)
+
+Pixels past its own grid point that the coarsest level's correlation reaches, from sitting at a cell
+centre.
+
+A decimated level correlates at the centre of each `stride`-by-`stride` cell rather than at the cell's
+first grid point (see `AutoRIFT._cell_centres`), which is up to `(stride - 1) / 2` cells further along
+each axis. A halo derived from grid points alone is short by that much, and a block would read too
+little to reproduce the untiled run — visible only as a last-bits difference in the peak height at
+points near a block seam, since the displacement itself survives a slightly different transform.
+
+Taken over every level rather than at `chip_size_max`, because the stride is set by the chip-to-spacing
+ratio and it is the *largest* offset that has to fit, whichever level produces it.
+
+Half a pixel is added for the parity snap `AutoRIFT._cell_centres` applies, which can move a centre
+that much further out again.
+"""
+function _level_centre_offset(p::Params)
+    sx = sy = 0.0
+    for cs in chip_sizes(p)
+        stride = _level_decimation(p, cs)
+        stride <= 1 && continue
+        half = (stride - 1) / 2
+        # `+ 0.5` for the snap to the chip's pixel parity, which rounds the centre either way.
+        sx = max(sx, half * p.grid_spacing.X + 0.5)
+        sy = max(sy, half * p.grid_spacing.Y + 0.5)
+    end
+    return (ceil(Int, sx), ceil(Int, sy))
 end
 
 """

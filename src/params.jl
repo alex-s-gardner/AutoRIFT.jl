@@ -310,9 +310,11 @@ chip_size = (X = 16, Y = 32)   # taller than wide
 - `min_search_radius = 6`: floor applied to non-zero radii, per axis.
 - `dx_prior = 0.0`, `dy_prior = 0.0`: a-priori displacement the search window is
   centred on.
-- `coarse_stride = 4`: decimation factor for the coarse pass.
+- `coarse_stride = 4`: how sparsely the coarse pass samples, as a rate against one point per chip.
+  The step in grid points is this times the chip-to-spacing ratio, so on a grid posted finer than its
+  chips the coarse pass is sparser than this number alone suggests — see `AutoRIFT._sparse_stride`.
 - `coarse_buffer = 8`: dilation radius applied to the coarse validity mask
-  before it restricts the fine search.
+  before it restricts the fine search, in coarse cells.
 - `min_coarse_valid_fraction = 0.01`: skip a chip-size level whose coarse pass
   validates a smaller fraction than this.
 

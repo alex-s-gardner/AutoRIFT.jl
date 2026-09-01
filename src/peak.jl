@@ -149,22 +149,25 @@ background is perfectly flat — both meaning "no quality could be assessed" rat
 A high value means the peak stood well clear of the rest of the surface; a low one means it barely rose
 above the noise. It answers a different question from `correlation`, the peak value alone — a peak of 0.6
 over quiet background is a sharper result than the same 0.6 over noisy background — and the two are
-nearly independent, at a Spearman rank correlation of 0.175 on a Landsat scene.
+nearly independent, at a Spearman rank correlation of 0.125 on a Landsat scene.
 
 # Which measure to gate on
 
-**Use `correlation`, not this, to predict whether a displacement is reliable.** Measured on 73,272
-directly-measured points of a Jakobshavn pair, against the independent label "disagrees with
+**Use `correlation`, not this, to predict whether a displacement is reliable.** Measured on 82,796
+points of a Jakobshavn pair carrying both quantities, against the independent label "disagrees with
 `autoRIFT.py` by more than 0.25 px":
 
 | measure | AUC | rate in worst decile | rate in best decile |
 |---|---:|---:|---:|
-| `correlation` | **0.870** | 24.8% | 0.1% |
-| this | 0.512 | 6.8% | 6.5% |
+| `correlation` | **0.842** | 29.4% | 0.2% |
+| this | 0.499 | 10.2% | 10.7% |
 
 `correlation` falls monotonically across its deciles over more than two orders of magnitude.
-`peak_snr` is flat at 3–7% and not even monotonic — its *highest* decile is among its worst — so as a
-reliability gate it has essentially no skill.
+`peak_snr` is flat at 5–11% and *not* monotonic — its highest decile is among its worst — so as a
+reliability gate on its own it has essentially no skill. Nor is the flatness an artifact of pooling
+points of differing correlation: within a band of fixed `correlation` the ranking inverts, at an AUC of
+0.36 over 0.2–0.4 and 0.18 over 0.4–0.6, because at a given peak height the sharper-looking peak is the
+one sitting on quieter — less textured, less informative — background.
 
 That is not a defect in the quantity, it is what the quantity measures. A tall, isolated peak on a
 low-contrast surface earns a high SNR while still being a weak match, and a strong match on textured ice

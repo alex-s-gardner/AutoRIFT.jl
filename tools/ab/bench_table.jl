@@ -250,8 +250,9 @@ function render(r)
           <td><b>median difference</b> $(@sprintf("%.3f", s.median)) px</td>
           <td><b>correlation</b> $(@sprintf("%.4f", s.cor_dx)) (dx),
               $(@sprintf("%.4f", s.cor_dy)) (dy)</td>
-          <td><b>within 0.2 px</b> $(@sprintf("%.1f%%", 100 * s.within)),
-              rising to $(@sprintf("%.1f%%", 100 * s.within_gated)) at correlation &ge; 0.5</td>
+          <td><b>identical to the last bit</b> at $(@sprintf("%.1f%%", 100 * s.exact)) of points;
+              the tail reaches $(@sprintf("%.1f", s.steps_p99)) steps of 1/$(s.upsampling)&thinsp;px
+              at p99</td>
         </tr></table>
         <img class="fig" src="$(data_uri(figs.heatmaps))">
       </div>
@@ -260,10 +261,10 @@ function render(r)
         <h1>Agreement with autoRIFT.py: chip size and coverage</h1>
         <p class="sub">Which level answered each point, and where the two disagree about it &middot;
           chip size and coverage are categorical, so a difference in them is a disagreement rather than
-          a magnitude &middot; the median difference of $(@sprintf("%.3f", s.median)) px is
-          $(@sprintf("%.1f", s.median * s.upsampling)) steps at 1/$(s.upsampling) px, the finest
-          distinction either implementation can draw &mdash; below a real correlation peak both pick
-          from noise, and no two implementations can agree about that</p>
+          a magnitude &middot; the displacement histogram beside them is binned in whole steps of
+          1/$(s.upsampling)&thinsp;px, the finest distinction either implementation can draw: the
+          differences are quantized by the sub-pixel search, so in pixels the distribution is a single
+          spike at zero with nothing resolvable either side of it</p>
         <img class="fig" src="$(data_uri(figs.histograms))">
       </div>
 
@@ -272,11 +273,12 @@ function render(r)
         <p class="sub">The fields with no counterpart in the reference's output, so nothing on the
           previous pages can show them &middot; <b>correlation</b> is the ZNCC peak height and
           <b>peak SNR</b> is how far that peak stood above the surface's own background &mdash; nearly
-          independent quantities, at a rank correlation of 0.175 &middot; <b>gate on correlation, not
-          peak SNR</b>: against disagreement with the reference it reaches an AUC of 0.870 where peak
-          SNR reaches 0.512, and the panel at lower right shows why &mdash; correlation falls across
-          more than two orders of magnitude from its worst decile to its best, while peak SNR is flat
-          and not even monotonic &middot; both are reported as <b>zero</b> where the peak lay against
+          independent quantities, at a rank correlation of 0.125 &middot; <b>gate on correlation, not
+          peak SNR</b>: sorted into deciles of each, the share of points matching the reference to the
+          last bit rises monotonically with correlation &mdash; 31%, 48%, 60%, 73%, 84%, 90%, 95%, 97%,
+          98% &mdash; while peak SNR sits flat near 80% across its first eight deciles and then
+          <i>falls</i> to 45% in its highest, because a tall isolated peak on a low-contrast surface
+          scores well while still being a weak match &middot; both are reported as <b>zero</b> where the peak lay against
           the search boundary, so any positive threshold rejects those points; select them with
           <code>correlation .== 0</code> to find where <code>search_radius</code> is too small
           &middot; <b>interpolated</b> points carry a displacement taken from their neighbours rather

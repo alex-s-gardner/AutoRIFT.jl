@@ -66,6 +66,43 @@ end
     @test isnan(out[end, end])
 end
 
+@testset "resample: an explicit scale overrides the size ratio" begin
+    # The default is `size(A) / size(out)` per axis, which is what `cv2.resize` uses and so what the
+    # chip-size levels are matched against. `scale` exists for a caller whose two grids stand in a
+    # correspondence the sizes do not imply.
+    n, stride = 371, 2
+    sr = length(1:stride:n)
+    src = Float32.(reshape(collect(1:sr), :, 1))
+
+    # On the stride lattice each destination reads the cell it was sliced from.
+    strided = resample(src, (n, 1), Nearest(); scale = (1 / stride, 1.0))
+    @test all(i -> strided[i, 1] == Float32(min(cld(i, stride), sr)), 1:n)
+
+    # The inferred ratio drifts against it over the far part of the axis, which is the error a
+    # chip-size level would otherwise carry.
+    ratio = resample(src, (n, 1), Nearest())
+    @test count(i -> ratio[i, 1] != strided[i, 1], 1:n) > 90
+
+    # Where the size does divide, the two coincide, which pins the default against the override.
+    @test resample(src, (stride * sr, 1), Nearest()) ==
+          resample(src, (stride * sr, 1), Nearest(); scale = (1 / stride, 1.0))
+
+    # The bicubic kernel is `a = -0.75`, matching `cv2.INTER_CUBIC`. Both members interpolate through
+    # their samples and so agree at the nodes; they part company between them, which is why the
+    # parameter is pinned rather than left to taste. Checked against the polynomial OpenCV evaluates.
+    cv(t, a = -0.75) = (a * ((t + 1)^3) - 5a * ((t + 1)^2) + 8a * (t + 1) - 4a,
+                        (a + 2) * t^3 - (a + 3) * t^2 + 1.0,
+                        (a + 2) * ((1 - t)^3) - (a + 3) * ((1 - t)^2) + 1.0,
+                        a * ((2 - t)^3) - 5a * ((2 - t)^2) + 8a * (2 - t) - 4a)
+    w = AutoRIFT.MVector4()
+    for t in 0.0:0.05:1.0
+        AutoRIFT._cubic_weights!(w, t)
+        v = cv(t)
+        @test all(k -> isapprox(w[k], v[k]; atol = 1e-12), 1:4)
+        @test sum(w[k] for k in 1:4) ≈ 1.0        # partition of unity, so a constant field survives
+    end
+end
+
 @testset "dilate_within" begin
     m = falses(11, 11)
     m[6, 6] = true
@@ -220,20 +257,167 @@ end
     if !isempty(coarse)
         for c in coarse
             stride = Int(c) ÷ 16
-            # The source index `resample!(…, Nearest())` maps each destination to, so the grouping
-            # follows the resampler's own arithmetic rather than an assumed cell origin.
+            # The cell `_decimate_level` took the point from — `cld(i, stride)`, since it slices
+            # `1:stride:n`. Spelled out rather than taken from `resample`, so this asserts the lattice
+            # and not merely the resampler's self-consistency.
             srows = length(1:stride:nr)
             scols = length(1:stride:nc)
-            src(i, ns, nd) = clamp(floor(Int, (i - 0.5) * ns / nd) + 1, 1, ns)
+            cellof(i, ns) = min(cld(i, stride), ns)
             seen = Dict{Tuple{Int,Int},Float32}()
             for j in 1:nc, i in 1:nr
                 (r.chip_size[i, j] == c && isfinite(r.peak_snr[i, j])) || continue
-                key = (src(i, srows, nr), src(j, scols, nc))
+                key = (cellof(i, srows), cellof(j, scols))
                 v = get!(seen, key, r.peak_snr[i, j])
                 @test v == r.peak_snr[i, j]
             end
         end
     end
+end
+
+@testset "a coarse level is correlated where it is read back from" begin
+    # The round trip a decimated level makes: `_decimate_level` picks where to correlate, and
+    # `_undecimate_level` interpolates the answers back with the half-sample convention, which places
+    # coarse node `k` at fine position `(k - 0.5) * stride + 0.5`. The two have to name the same place. A
+    # level correlated at its cells' first grid point instead measures the field half a cell from where
+    # every consumer assumes, which is a displacement error the size of the field's variation over that
+    # distance — 0.14 px on a Landsat pair, and growing with `stride`.
+    n = 512
+    p = params(; chip_size = 16, chip_size_max = 64, grid_spacing = 8, search_radius = 20)
+    grid = gridpoints((n, n), 8; chip_size = 16, search_radius = 20)
+    nr, nc = size(grid)
+    for stride in (2, 4)
+        sub = AutoRIFT._decimate_level(grid, trues(nr, nc), stride)
+        @test !isnothing(sub)
+        # Where the interpolant reads node `k` from, in fine-grid index space, against where the node was
+        # actually placed — expressed in the same units by mapping through the grid's own coordinates.
+        x0 = grid.x[1, 1]
+        sx = grid.x[1, 2] - grid.x[1, 1]
+        for k in axes(sub.grid.x, 2)
+            placed = (sub.grid.x[1, k] - x0) / sx + 1          # fine index the node sits at
+            # The last cell along an axis can be short, so the centre is taken over the rows and columns
+            # the cell actually spans rather than a full `stride` of them.
+            c = sub.cols[k]
+            expected = (c + min(c + stride - 1, nc)) / 2
+            @test placed ≈ expected
+        end
+    end
+
+    # A level that is not decimated must not be moved at all.
+    @test AutoRIFT._decimate_level(grid, trues(nr, nc), 1).grid.x == grid.x
+end
+
+@testset "a coarse level lands on its own cells when the stride does not divide the grid" begin
+    # `_undecimate_level` must read a coarse node back onto the cell `_decimate_level` sliced it from.
+    # The two lattices coincide when `stride` divides the grid and diverge when it does not: at
+    # `nr = 371, stride = 2` the size ratio is 186/371, which crosses a whole cell at row 186 and
+    # shifts every row beyond it. On a real scene that surfaces as rings of chip-size disagreement
+    # tracing the level boundaries in the far half of the grid, so the odd size is the case to assert.
+    full = gridpoints((3072, 3072), 8; chip_size = 16, search_radius = 20)
+    for nr in (371, 368), stride in (2, 4)
+        sub = AutoRIFT._decimate_level(full[1:nr, 1:nr], trues(nr, nr), stride)
+        @test !isnothing(sub)
+        sr = length(sub.rows)
+        # `peak_snr` carries a distinct value per node and is resampled `Nearest`, so it shows directly
+        # which coarse cell each destination read — `cld(i, stride)`, the cell the slice took it from.
+        # This is the assertion that pins the lattice; the bicubic channel cannot serve, because for an
+        # even stride a cell centre falls on a half-integer fine row and so no destination ever
+        # coincides with a node.
+        tag = Float32.(reshape(1:(sr * sr), sr, sr))
+        field = DisplacementField(fill(0.0f0, sr, sr), fill(0.0f0, sr, sr), fill(1.0f0, sr, sr),
+                                  tag, trues(sr, sr))
+        up = AutoRIFT._undecimate_level((; field, filled = Int[]), (nr, nr), sub.rows, sub.cols)
+        for j in 1:nr, i in 1:nr
+            @test up.field.peak_snr[i, j] == tag[min(cld(i, stride), sr), min(cld(j, stride), sr)]
+        end
+        # A constant field survives interpolation exactly, whatever the lattice — the kernel is a
+        # partition of unity, and this is what says the bicubic channel carries no scale error.
+        flat = DisplacementField(fill(2.5f0, sr, sr), fill(-1.5f0, sr, sr), fill(1.0f0, sr, sr),
+                                 fill(1.0f0, sr, sr), trues(sr, sr))
+        upf = AutoRIFT._undecimate_level((; field = flat, filled = Int[]), (nr, nr),
+                                         sub.rows, sub.cols)
+        @test all(v -> isapprox(v, 2.5f0; atol = 1e-5), filter(!isnan, upf.field.dx))
+        @test all(v -> isapprox(v, -1.5f0; atol = 1e-5), filter(!isnan, upf.field.dy))
+    end
+end
+
+@testset "a coarse hole is filled from the closest evidence that covers it" begin
+    # `_fill_level_holes` fills in order of increasing reach: the finer levels' answer at that same
+    # point, then a median of this level's own neighbourhood, then its nearest finite value however
+    # far. Only the order is asserted here — each step must win over the ones that reach further,
+    # because a hole beside a velocity discontinuity is filled across it otherwise.
+    #
+    # `prior` arrives already reduced onto the level's own grid; `_undecimate_level` does that, and the
+    # testset below pins the reduction itself.
+    n = 9
+
+    # A broad slow region, a gap, then a thin fast sliver — the shape a fast-flowing feature's edge
+    # has. The nearest finite cell to column 6 is the sliver, so a nearest-neighbour fill hands it the
+    # sliver's 10.0 even though its neighbourhood is mostly the slow region.
+    A = fill(NaN32, n, n)
+    A[:, 1:4] .= 1.0f0
+    A[:, 7] .= 10.0f0
+
+    # With a prior covering the gap, the prior wins over both the median and the nearest value.
+    prior = fill(NaN32, n, n)
+    prior[:, 5:6] .= -7.0f0
+    got = AutoRIFT._fill_level_holes(A, prior)
+    @test all(≈(-7.0f0), got[:, 5:6])
+    # The measured values are untouched: filling may not alter what was actually correlated.
+    @test got[:, [1, 2, 3, 4, 7]] == A[:, [1, 2, 3, 4, 7]]
+
+    # Without a prior, the median of the level's own neighbourhood answers where it reaches, and being
+    # a neighbourhood statistic it lands between the two populations rather than on the nearer one.
+    nomedian = AutoRIFT._fill_level_holes(A, nothing)
+    @test all(v -> 1.0f0 < v < 10.0f0, nomedian[:, 6])
+    @test all(≈(10.0f0), AutoRIFT._fill_nan_nearest(A)[:, 6])
+
+    # The per-hole median must equal the swept one, which is what says the gather is a pure speedup.
+    swept = let B = copy(A), m = AutoRIFT.windowmedian(A, 5)
+        for i in eachindex(B)
+            isnan(B[i]) && isfinite(m[i]) && (B[i] = m[i])
+        end
+        AutoRIFT._fill_nan_nearest(B)
+    end
+    @test nomedian == swept
+
+    # A hole beyond the median's reach still gets the nearest value, since nothing nearer exists.
+    far = fill(NaN32, n, n)
+    far[1, 1] = 3.0f0
+    @test all(≈(3.0f0), AutoRIFT._fill_level_holes(far, nothing))
+
+    # Nothing finite anywhere is left alone rather than invented.
+    @test all(isnan, AutoRIFT._fill_level_holes(fill(NaN32, n, n), nothing))
+end
+
+@testset "the prior is mean-filtered before it is reduced onto a level" begin
+    # `_undecimate_level` reduces the finer levels' answer with a `stride + 1` mean filter and *then* an
+    # area resize, not the resize alone. The filter's window is one wider than a cell, so it reaches
+    # across cell boundaries and closes a partly-missing neighbourhood before the area step weights what
+    # is left — the reference's `colfilt(Dx, (Scale+1, Scale+1), 2)` ahead of its `INTER_AREA`
+    # (`autoRIFT.py:823-839`). Pinned because dropping it reproduces the reference's own `DxF0` at 1.6%
+    # of points instead of 90%, and the prior is what fills most of a coarse level's holes.
+    #
+    # A single fine value beside a hole is the discriminating case: the filter spreads it into the
+    # neighbouring cell, where the bare resize leaves that cell empty.
+    stride, n = 2, 9
+    rows = cols = 1:stride:(stride * n)
+    prior = fill(NaN32, stride * n, stride * n)
+    prior[1, 1] = 4.0f0
+    field = DisplacementField(fill(NaN32, n, n), fill(NaN32, n, n), fill(NaN32, n, n),
+                              fill(NaN32, n, n), trues(n, n))
+    field.dx[n, n] = 0.0f0                  # one measurement, far away, so the prior decides cell 1
+    field.dy[n, n] = 0.0f0
+    up = AutoRIFT._undecimate_level((; field, filled = Int[]), (stride * n, stride * n),
+                                    rows, cols, prior, prior)
+    # The reduction the level performs, recovered by filling the level's own field with it.
+    reduced = AutoRIFT._fill_level_holes(field.dx,
+        AutoRIFT.resample(AutoRIFT.windowmean(prior, stride + 1), (n, n), Area();
+                          scale = (Float64(stride), Float64(stride))))
+    bare = resample(prior, (n, n), Area(); scale = (Float64(stride), Float64(stride)))
+    @test reduced[1, 1] ≈ 4.0f0             # the prior reached this cell
+    @test reduced[1, 2] ≈ 4.0f0             # and the next one, which the bare resize cannot fill
+    @test isnan(bare[1, 2])
+    @test size(up.field.dx) == (stride * n, stride * n)
 end
 
 @testset "chipsize_level in isolation" begin
@@ -293,6 +477,41 @@ end
     # answer worse where both measure.
     both = findall(i -> !isnan(strict.dx[i]) && !isnan(loose.dx[i]), eachindex(strict.dx))
     @test all(i -> abs(strict.dx[i] - loose.dx[i]) < 0.5, both)
+end
+
+@testset "the coarse pass samples at the rate times the oversampling" begin
+    # `coarse_stride` is a rate against one point per chip, not a step in grid points, so on a grid
+    # posted finer than its chips the sparse pass steps by the rate times that ratio — the reference's
+    # `sparseSearchSampleRate * ChipSize0_GridSpacing_oversample_ratio` (`autoRIFT.py:605-614`).
+    #
+    # This is what makes `coarse_buffer` reach as far as the reference's: the buffer is in coarse cells
+    # and is expanded back by the same factor, so a step of `coarse_stride` alone covers half the
+    # ground. The symptom is not a wrong displacement but a level that declines to search a
+    # neighbourhood, leaving a coarser chip to claim it — measured on a Landsat pair as a region where
+    # this level's share of the output ran 855 points against 317.
+    p = params(; chip_size = 16, chip_size_max = 64, grid_spacing = 8, search_radius = 20)
+    @test AutoRIFT._oversample(p) == 2
+    @test AutoRIFT._sparse_stride(p) == p.coarse_stride * AutoRIFT._oversample(p)
+
+    # One point per chip leaves nothing to correct for, and the two must coincide there.
+    flat = params(; chip_size = 32, chip_size_max = 32, grid_spacing = 32, search_radius = 20)
+    @test AutoRIFT._oversample(flat) == 1
+    @test AutoRIFT._sparse_stride(flat) == flat.coarse_stride
+
+    # The sparse grid really is sampled at that step, rather than the step merely being computed.
+    n = 1024
+    grid = gridpoints((n, n), 8; chip_size = 16, search_radius = 20)
+    pts = AutoRIFT._level_points(grid, p, AutoRIFT.extent(16), trues(size(grid)))
+    setup = AutoRIFT._coarse_points(pts, p, AutoRIFT.extent(16))
+    @test !isnothing(setup)
+    st = AutoRIFT._sparse_stride(p)
+    @test step(setup.rows) == st
+    @test step(setup.cols) == st
+
+    # `rescale`'s overlap term keeps taking the rate, not the step: it is written against
+    # `sparseSearchSampleRate` itself, and passing the step would change the filter's threshold.
+    @test setup.filt == AutoRIFT.rescale(AutoRIFT.relax(p.outliers),
+                                         AutoRIFT._oversample(p), p.coarse_stride)
 end
 
 @testset "result shape and validation" begin
