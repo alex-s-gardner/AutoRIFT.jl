@@ -25,7 +25,7 @@
 # redundancy: neighbouring windows overlap heavily, and one table over the whole image would serve
 # every point. `boxsum` already reads four corners at an arbitrary offset, so the change is small.
 #
-# Measured on 1024x1024 with the default geometry, and it does not pay:
+# Measured on 1024x1024 with the default geometry, and it does not pay on time:
 #
 #     per-point, 81x81 window    7.24 us x 729 points = 5.28 ms
 #     global, 1024x1024          1.81 ms x 3 levels   = 5.42 ms
@@ -39,11 +39,20 @@
 # Two plausible-sounding explanations that turned out wrong, recorded so they are not re-argued:
 # `boxsum` locality is *not* the issue (2.15 ns from a 1025x1025 table against 2.16 ns from an
 # 82x82 one — identical, since the four corner reads miss cache either way), and neither is the
-# 16 MiB the two Float64 tables would occupy. The redundancy is simply smaller than it looks.
+# 16 MiB the two Float64 tables would occupy at that size. The redundancy is simply smaller than it
+# looks.
 #
-# This would flip on a scene where the coarse levels do real work: heavily decorrelated imagery, or
-# a `chip_size` small relative to the texture scale. Worth re-measuring there rather than treating
-# it as settled for every input.
+# Memory runs the same way, and by a wide margin at scene scale. A window table is 54 KiB, so the
+# sum and squares for every thread of a 12-thread run come to 1.26 MiB. Global tables over a
+# 17121x16961 scene are 2.16 GiB each, 4.33 GiB for the pair. Per-point storage is negligible
+# against the images themselves — on that scene the two input planes, the two filtered planes and
+# their masks account for essentially the whole 7.5 GiB peak — so a global table is 4 GiB spent to
+# remove nothing measurable.
+#
+# The time result would flip on a scene where the coarse levels do real work: heavily decorrelated
+# imagery, or a `chip_size` small relative to the texture scale. Worth re-measuring there rather
+# than treating it as settled for every input. The memory result does not flip — it follows from the
+# table being the size of the image rather than of a window.
 
 """
     integral!(S, A)
