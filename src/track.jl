@@ -105,6 +105,11 @@ makes correlating a *subset* of a point set give the same answer as correlating 
 reading those points out — see [`AutoRIFT.PassGeometry`](@ref), which explains why those are
 otherwise different computations. It may only widen the pass, never narrow it.
 
+`okmask` is the pixels valid in both images, defaulting to [`valid`](@ref) of the pair. Pass it when
+correlating the same pair repeatedly: the intersection is a property of the pair, so a caller running
+several passes over one — as the chip-size loop does — computes it once instead of per pass. It must
+be `valid(pair)`; a narrower mask silently skips points, which is what the default guards against.
+
 A point is skipped, leaving `NaN`, if its search radius is zero in either axis, if its
 chip lies wholly outside the image, or if its chip contains no valid pixel. The last is
 what keeps zero-padding out of the result: the images are padded so the inner loop needs
@@ -114,7 +119,8 @@ other such chip. See `valid` on [`ImagePair`](@ref).
 function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Params;
                 subpixel::SubpixelMethod = p.subpixel,
                 measure::SimilarityMeasure = first(p.similarity),
-                geometry::Union{Nothing,PassGeometry} = nothing)
+                geometry::Union{Nothing,PassGeometry} = nothing,
+                okmask::AbstractMatrix{Bool} = valid(pair))
     # Interpolating the `Tuple`s directly would be the natural spelling, but showing a `Tuple`
     # reaches `textwidth` and `Base.repeat`, which `--trim` cannot resolve — so this one message
     # would make the whole package untrimmable. Element counts say the same thing here: `out`
@@ -151,12 +157,12 @@ function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Param
     # whole-scene path has `Matrix`. The barrier also lets the loop specialize on the concrete pair
     # rather than on the union, which is the ordinary reason for one.
     if fits
-        _dispatch_pass!(out, pair.reference, pair.secondary, valid(pair),
+        _dispatch_pass!(out, pair.reference, pair.secondary, okmask,
                         _shift_points(flat, (0, 0)), chipx, chipy, rx, ry, p, measure, subpixel)
     else
         # The mask pads to `false`, which is what distinguishes "outside the image" from "dark".
         _dispatch_pass!(out, _zeropad(pair.reference, pad), _zeropad(pair.secondary, pad),
-                        _zeropad(valid(pair), pad), _shift_points(flat, pad),
+                        _zeropad(okmask, pad), _shift_points(flat, pad),
                         chipx, chipy, rx, ry, p, measure, subpixel)
     end
     return out
@@ -353,8 +359,17 @@ function _track_chunk!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
             # over masked or featureless terrain is a systematic corner-pinned bias.
             degenerate(ws) && continue
 
-            dx, dy, c = isnothing(rw) ? peak_offset(surface, (prx, pry)) :
-                                        subpixel_peak(rw, surface, (prx, pry), up)
+            # One location of the peak serves all four quantities this point needs. `peak_index` is
+            # the top self-time frame in a profiled pass, so locating it once rather than inside
+            # each of `peak_offset`, `peak_at_boundary`, `peak_quality` and the refinement is worth
+            # 6% of a point — see `AutoRIFT.peak_report`.
+            #
+            # `c` is the correlation at the peak actually reported, so it comes from the refinement
+            # wherever there is one and from the integer peak otherwise.
+            pi_, pj, ipeak, railed, snr = peak_report(surface)
+            dx, dy, c = isnothing(rw) ?
+                (_offset_at(pi_, pj, (prx, pry))..., ipeak) :
+                subpixel_peak(rw, surface, (prx, pry), up, pi_, pj)
 
             # Back to displacement about the grid point: the surface is centred on the window,
             # which is centred on the point, and the chip was offset by the prior.
@@ -365,11 +380,8 @@ function _track_chunk!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
             # height nor its prominence describes a usable measurement. Zeroing them means any positive
             # threshold on either rejects the point without the caller having to know the condition
             # exists. The displacement itself is still reported — it is the best available bound.
-            railed = peak_at_boundary(surface)
             out.correlation[i] = railed ? 0.0f0 : c
-            # One more traversal of a surface already in cache, so the quality is measured where the
-            # surface exists rather than reconstructed later from the displacement field.
-            out.peak_snr[i] = railed ? 0.0f0 : peak_quality(surface)
+            out.peak_snr[i] = railed ? 0.0f0 : snr
         end
         return out
     finally

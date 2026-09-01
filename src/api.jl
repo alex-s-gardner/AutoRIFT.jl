@@ -486,7 +486,9 @@ end
 # new one that forgets pays a redundant pass rather than leaking non-finite values into the correlator.
 # `WallisGapfill` is the method that still needs it: its random fill can leave them behind.
 function _prepare(img::AbstractMatrix, mask::AbstractMatrix{Bool}, p::Params)
-    out, v = preprocess(img, resident(mask), p.preprocess, p.rng_seed)
+    m = resident(mask)
+    out, v = _slabbed(p) ? _preprocess_slabbed(img, m, p) :
+                           preprocess(img, m, p.preprocess, p.rng_seed)
     return _finishes_nonfinite(p.preprocess) ? (out, v) : replace_nonfinite(out, v)
 end
 
@@ -494,6 +496,89 @@ end
 _prepare(pair::ImagePair, p::Params) = ImagePair(
     _prepare(pair.reference, pair.reference_valid, p),
     _prepare(pair.secondary, pair.secondary_valid, p))
+
+# Whether filtering this run's images may be split across tasks.
+#
+# Unlike `process_block_size`, threading is not something the caller asked for, so a filter that
+# cannot be split takes the serial path rather than raising — the alternative would turn a working
+# configuration into an error for a scheduling decision the caller never made.
+_slabbed(p::Params) = istrue(p.threaded) && _slabbable(p.preprocess) &&
+                      filter_reach(p.preprocess) >= 0
+
+"""
+    AutoRIFT._slabbable(method) -> Bool
+
+Whether `method` gives each pixel the same value when applied to a row slab containing that pixel's
+whole [`AutoRIFT.filter_reach`](@ref) as when applied to the whole image.
+
+Two things can make it false, and only one of them is the reach. A filter with no finite reach is
+already excluded by that trait, since a slab is a window and no window reproduces a whole-image
+estimate. What this adds is **per-pixel determinism**: [`WallisGapfill`](@ref) draws its fill from
+one generator in a single scan, so which pixel receives which draw depends on the traversal order,
+and slabbing would change the image rather than merely the schedule.
+
+Declared per method rather than inferred, and defaulting to `true`, because the reach trait already
+carries the structural case — so a new filter declares only the narrower property, and the cost of
+forgetting is a filter that threads when it should not, which its own tests catch as a changed image.
+"""
+_slabbable(::PreprocessMethod) = true
+_slabbable(::WallisGapfill) = false
+
+# `preprocess` over row slabs, one task each, with the whole-image result.
+#
+# Each task filters a slab grown by `filter_reach` on both sides and keeps only the rows it owns, so
+# every pixel is filtered from the same neighbourhood a whole-image call would give it. That makes
+# the values agree; what makes them agree *bit for bit* is the alignment below.
+#
+# The windowed means in `src/window.jl` already work in `_BAND_ROWS`-tall bands and **reseed each
+# band's running sum** from the window its first row sees — which is what makes their banding exact
+# rather than approximate. Snapping slab starts to a multiple of `_BAND_ROWS` therefore lands each
+# task's internal band grid on the same rows the serial call would have used, so no value is the
+# result of a differently-ordered accumulation. Verified on a 3072² Landsat window: 0 of 9,437,184
+# elements differ. **A slab boundary off that lattice reassociates the sums** and the output moves in
+# the last bits, so this coupling is load-bearing: a change to `_BAND_ROWS` or to the banding must
+# keep it.
+#
+# Measured 5.1x on 12 threads at 3072², which matters because `_prepare` is otherwise the whole
+# serial fraction of a threaded run — 12% at 3072² and, extrapolated by pixel count, ~20% of a
+# full-scene Landsat pair.
+function _preprocess_slabbed(img::AbstractMatrix, mask::AbstractMatrix{Bool}, p::Params)
+    nr, nc = size(img)
+    reach = filter_reach(p.preprocess)
+    rows = _slab_rows(nr, reach)
+    # One slab is the whole image, so take the path that does not copy through a view.
+    rows >= nr && return preprocess(img, mask, p.preprocess, p.rng_seed)
+
+    out = Matrix{Float32}(undef, nr, nc)
+    v = Matrix{Bool}(undef, nr, nc)
+    tasks = map(1:rows:nr) do lo
+        StableTasks.@spawn begin
+            hi = min(lo + rows - 1, nr)
+            # The slab this task reads, and where its own rows sit inside it.
+            rlo, rhi = max(lo - reach, 1), min(hi + reach, nr)
+            sout, sv = preprocess(view(img, rlo:rhi, :), view(mask, rlo:rhi, :),
+                                  p.preprocess, p.rng_seed)
+            keep = (lo - rlo + 1):(lo - rlo + 1 + hi - lo)
+            copyto!(view(out, lo:hi, :), view(sout, keep, :))
+            copyto!(view(v, lo:hi, :), view(sv, keep, :))
+        end
+    end
+    foreach(wait, tasks)
+    return out, v
+end
+
+# Rows per slab: the image split across the available threads, but never so thin that a slab is
+# mostly the halo it reads, and always a whole number of `_BAND_ROWS` bands.
+#
+# The band multiple is the load-bearing part and the reason this is a named function rather than two
+# expressions at the call site — see `_preprocess_slabbed` for why the alignment is what makes the
+# result bit-identical. A result of `nr` or more means one slab, i.e. do not thread.
+function _slab_rows(nr::Int, reach::Int)
+    # `2 * reach` is what a slab reads beyond its own rows, so a slab that short would read more
+    # overlap than data. `_BAND_ROWS` floors it, since a slab below one band cannot align anyway.
+    nslabs = clamp(fld(nr, max(2 * reach, _BAND_ROWS)), 1, Threads.nthreads())
+    return cld(cld(nr, _BAND_ROWS), nslabs) * _BAND_ROWS
+end
 
 # Prepare `img`, unless the cache already holds it prepared — in which case reuse that.
 #

@@ -159,14 +159,26 @@ Correlate each pass in one call, over a whole filtered scene. See [`AutoRIFT.Pas
 
 `prepared` is the **filtered** pair — the pair `_prepare` produced. The blocked runner takes an
 unfiltered one instead, and holding the pair here is what keeps the two from being confused.
+
+`okmask` is [`valid`](@ref) of that pair: the pixels usable in both images. Held rather than
+recomputed because it is a property of the pair, which does not change within a run, while
+[`track!`](@ref) needs it once per pass — six times over a three-level run. At a full Landsat
+scene the intersection is 35 MiB a call, so recomputing it is ~208 MiB of churn for an answer
+already in hand. `Blocked` needs no equivalent: its blocks read mask windows into dense buffers
+per block, so there is no whole-scene mask to hold.
 """
-struct WholeScene{P<:ImagePair} <: PassRunner
+struct WholeScene{P<:ImagePair,M<:AbstractMatrix{Bool}} <: PassRunner
     prepared::P
+    okmask::M
 end
+
+# The mask derived from the pair, so every existing construction keeps working and no caller has to
+# know the field exists. `valid` is the one definition of the intersection either way.
+WholeScene(prepared::ImagePair) = WholeScene(prepared, valid(prepared))
 
 run_pass(r::WholeScene, pts::PointSet{2}, p::Params, measure::SimilarityMeasure,
          subpixel::SubpixelMethod) =
-    track(r.prepared, pts, p; subpixel, measure)
+    track(r.prepared, pts, p; subpixel, measure, okmask = r.okmask)
 
 # A whole-scene pass sees every point of whatever set it is given, so a reshaped grid needs no
 # change here: the subset is already expressed in the `PointSet` handed to `run_pass`. Only a

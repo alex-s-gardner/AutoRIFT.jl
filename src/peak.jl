@@ -100,9 +100,18 @@ places as it does in the reference.
     it works in one consistent convention.
 """
 @inline function peak_offset(surface::AbstractMatrix, radius::Tuple{Int,Int})
-    rx, ry = radius
     i, j, v = peak(surface)
-    return Float64(j - rx - 1), Float64(i - ry - 1), v
+    return (_offset_at(i, j, radius)..., v)
+end
+
+# The displacement a peak at `(i, j)` stands for, for a caller that has already located it.
+#
+# The arithmetic of `peak_offset` without its scan. Split out because the per-point path locates
+# the peak once and derives four quantities from it — see `peak_report` — so the offset has to be
+# available from the index rather than only from the surface.
+@inline function _offset_at(i::Int, j::Int, radius::Tuple{Int,Int})
+    rx, ry = radius
+    return Float64(j - rx - 1), Float64(i - ry - 1)
 end
 
 # How far around the peak is excluded from the background, in surface samples.
@@ -132,11 +141,14 @@ Jakobshavn 4.2% of points that correlate above 0.3 are affected, and 0.12% at ch
 One function rather than the test written out at each site: the two outputs must agree about which points
 are railed, and a copy of the condition is how they would drift apart.
 """
-@inline function peak_at_boundary(surface::AbstractMatrix)
-    i, j = peak_index(surface)
-    nr, nc = size(surface)
-    return (i == 1) | (j == 1) | (i == nr) | (j == nc)
-end
+@inline peak_at_boundary(surface::AbstractMatrix) =
+    _at_boundary(peak_index(surface)..., size(surface)...)
+
+# The boundary test on an already-located peak, so a caller holding one does not scan again.
+# `peak_at_boundary` is this composed with `peak_index`, which is what keeps the two spellings of
+# the condition from being two conditions.
+@inline _at_boundary(i::Int, j::Int, nr::Int, nc::Int) =
+    (i == 1) | (j == 1) | (i == nr) | (j == nc)
 
 """
     peak_quality(surface[, exclusion = $PEAK_EXCLUSION]) -> Float32
@@ -182,8 +194,13 @@ selection over every background sample, per point, per level.
 This is a property of the surface alone. The search-boundary condition — where the reported quality is
 forced to zero — is applied by the caller; see [`AutoRIFT.peak_at_boundary`](@ref).
 """
-@inline function peak_quality(surface::AbstractMatrix, exclusion::Int = PEAK_EXCLUSION)
-    i, j = peak_index(surface)
+@inline peak_quality(surface::AbstractMatrix, exclusion::Int = PEAK_EXCLUSION) =
+    _quality_at(surface, peak_index(surface)..., exclusion)
+
+# The background pass, given the peak's location. `peak_quality` is this composed with
+# `peak_index`; the per-point path calls it directly, having already located the peak.
+@inline function _quality_at(surface::AbstractMatrix, i::Int, j::Int,
+                             exclusion::Int = PEAK_EXCLUSION)
     nr, nc = size(surface)
     h = Float64(@inbounds surface[i, j])
     # Sum and sum of squares in one traversal, column-major for the reason `peak_index` documents.
@@ -207,6 +224,29 @@ forced to zero — is applied by the caller; see [`AutoRIFT.peak_at_boundary`](@
     # applies for the same reason.
     sd = sqrt(max(s2 / n - mean * mean, 0.0))
     return sd > 0 ? Float32((h - mean) / sd) : NaN32
+end
+
+"""
+    AutoRIFT.peak_report(surface) -> (i, j, value, railed, quality)
+
+Everything the grid loop needs about a correlation surface, from **one** location of its peak.
+
+The composition of [`peak`](@ref), [`AutoRIFT.peak_at_boundary`](@ref) and
+[`AutoRIFT.peak_quality`](@ref), which every point needs together. Called separately they locate
+the same peak three times over — and with sub-pixel refinement, which locates it again, four
+times. `peak_index` is the top self-time frame in a profiled pass, so that redundancy is the
+measurable kind: at chip 16 and radius 20, the geometry ITS_LIVE runs Landsat at, three separate
+scans cost 3.92 us against 2.15 us fused, which is 45% of the scan cost and 6% of a whole point.
+
+`i`, `j` are the integer peak, suitable for [`subpixel_peak`](@ref)'s five-argument form so the
+refinement does not scan again either. `railed` and `quality` are the two derived quantities;
+`track!` is what zeroes both at the search boundary, since that policy belongs to the caller.
+"""
+@inline function peak_report(surface::AbstractMatrix, exclusion::Int = PEAK_EXCLUSION)
+    i, j = peak_index(surface)
+    nr, nc = size(surface)
+    return (i, j, (@inbounds surface[i, j]), _at_boundary(i, j, nr, nc),
+            _quality_at(surface, i, j, exclusion))
 end
 
 # ---------------------------------------------------------------------------
@@ -557,19 +597,35 @@ function.
 
 With `upsampling == 1` this is exactly [`peak_offset`](@ref).
 """
+subpixel_peak(rw::RefinementWorkspace, surface::AbstractMatrix{Float32},
+              radius::Tuple{Int,Int}, upsampling::Integer) =
+    subpixel_peak(rw, surface, radius, upsampling, peak_index(surface)...)
+
+"""
+    subpixel_peak(rw, surface, radius, upsampling, pi, pj) -> (dx, dy, correlation)
+
+[`subpixel_peak`](@ref) refining about an integer peak the caller has already located.
+
+`(pi, pj)` must be what [`peak_index`](@ref) would return for `surface`; the four-argument form
+is this with that call supplied. It exists because the per-point path derives the displacement,
+the boundary flag and the peak quality from one location — see [`AutoRIFT.peak_report`](@ref) —
+and refining would otherwise scan the surface a second time to find the peak it already has.
+"""
 function subpixel_peak(
     rw::RefinementWorkspace, surface::AbstractMatrix{Float32},
-    radius::Tuple{Int,Int}, upsampling::Integer,
+    radius::Tuple{Int,Int}, upsampling::Integer, pi_::Int, pj::Int,
 )
-    upsampling == 1 && return peak_offset(surface, radius)
+    nr, nc = size(surface)
+    p = size(rw.patch, 1)
+    # No refinement asked for, or a surface too small to refine on: the integer peak is the answer.
+    # Taken from the supplied location rather than re-scanned, which is the whole point of this form.
+    (upsampling == 1 || nr < p || nc < p) &&
+        return (_offset_at(pi_, pj, radius)..., @inbounds surface[pi_, pj])
     upsampling <= rw.max_upsampling || throw(ArgumentError(
         "upsampling $upsampling exceeds the workspace maximum " *
         "$(rw.max_upsampling)"))
 
     rx, ry = radius
-    nr, nc = size(surface)
-    pi_, pj = peak_index(surface)
-    p = size(rw.patch, 1)
 
     # Clamp the patch to the surface. The reference does the same, and the
     # clamping is why the patch origin has to be tracked separately: the peak is
@@ -577,9 +633,6 @@ function subpixel_peak(
     half = p ÷ 2
     i0 = clamp(pi_ - half, 1, max(nr - p + 1, 1))
     j0 = clamp(pj - half, 1, max(nc - p + 1, 1))
-
-    # A surface smaller than the patch cannot be refined; report the integer peak.
-    (nr < p || nc < p) && return peak_offset(surface, radius)
 
     @inbounds for j in 1:p, i in 1:p
         rw.patch[i, j] = surface[i0 + i - 1, j0 + j - 1]
