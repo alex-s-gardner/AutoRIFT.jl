@@ -148,7 +148,11 @@ function measure()
 
     # The reference gets no thread count to set: its correlation loop is serial, so what it uses is
     # whatever OpenCV's filter calls take. Reported as the measured mean rather than a requested count.
-    r = timed(`micromamba run -n arift-ref python $(joinpath(HERE, "bench_scene.py"))`, "python")
+    # `AUTORIFT_BENCH_DIR` is passed explicitly rather than left to inheritance, since `WORK` defaults to
+    # a fresh temp dir that the caller never set — the child would then look somewhere else and exit
+    # immediately, recording its startup as the run.
+    r = timed(`micromamba run -n arift-ref env AUTORIFT_BENCH_DIR=$WORK python $(joinpath(HERE, "bench_scene.py"))`,
+              "python")
     add!("python autoRIFT v2.1.2", @sprintf("%.1f†", r[3]), "no", 1, r)
 
     for th in (12, 1)
@@ -202,10 +206,15 @@ function render(r)
     s = figs.stats
     # Both the requested thread count and the cores actually used: a run given 12 threads that achieves
     # 3.8 has told you something the setting alone hides, and for autoRIFT.py there is no setting at all.
+    #
+    # Slowest first, so the table reads as a ranking. Sorted here rather than in `measure`, so the JSON
+    # keeps measurement order — that is the record of what ran when, and comparing two runs wants them
+    # in the same sequence.
+    ranked = sort(collect(r.table); by = t -> -t.seconds)
     body = join(("""<tr><td class="l">$(t.label)</td><td>$(t.threads)</td>""" *
                  """<td>$(@sprintf("%.2f", t.cores))</td><td>$(t.lazy)</td>""" *
                  """<td>$(t.blocks)</td><td>$(@sprintf("%.1f s", t.seconds))</td>""" *
-                 """<td>$(@sprintf("%.0f MiB", t.peak))</td></tr>""" for t in r.table), "\n")
+                 """<td>$(@sprintf("%.0f MiB", t.peak))</td></tr>""" for t in ranked), "\n")
     html = """
     <!DOCTYPE html><html><head><meta charset="utf-8"><style>
       @page { size: letter landscape; margin: 0.8in; }
@@ -228,7 +237,9 @@ function render(r)
       table.stats td { border: none; padding: 0 20pt 0 0; white-space: nowrap; }
     </style></head><body>
       <h1>AutoRIFT: runtime and peak memory, full Landsat 8/9 scene</h1>
-      <p class="sub">$(r.scene.rows) &times; $(r.scene.cols) pixels &middot;
+      <p class="sub"><code>LC09_L1TP_009011_20230618_20230618_02_T1_B8</code> &rarr;
+        <code>LC08_L1TP_009011_20230626_20230710_02_T1_B8</code> &middot; 8 days apart<br>
+        $(r.scene.rows) &times; $(r.scene.cols) pixels &middot;
         grid $(r.grid.rows) &times; $(r.grid.cols) =
         $(@sprintf("%.2f", r.grid.rows * r.grid.cols / 1e6)) M points &middot;
         chip $(r.chip)&ndash;$(r.chip_max) px, spacing $(r.spacing),
@@ -276,7 +287,7 @@ function render(r)
       </div>
 
       <div class="page">
-        <h1>Quality metrics: what to trust each estimate for</h1>
+        <h1>Quality metrics</h1>
         <img class="fig" src="$(data_uri(figs.outputs))">
       </div>
     </body></html>
@@ -295,7 +306,7 @@ function main()
     println()
     println("| configuration | threads | cores used | lazy | blocks | runtime | peak RSS |")
     println("|---|---:|---:|:---:|---:|---:|---:|")
-    for t in r.table
+    for t in sort(collect(r.table); by = t -> -t.seconds)
         @printf("| %s | %s | %.2f | %s | %d | %.1f s | %.0f MiB |\n",
                 t.label, t.threads, t.cores, t.lazy, t.blocks, t.seconds, t.peak)
     end
