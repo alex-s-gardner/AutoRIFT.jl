@@ -359,16 +359,18 @@ function _track_chunk!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
             # over masked or featureless terrain is a systematic corner-pinned bias.
             degenerate(ws) && continue
 
-            # One location of the peak serves all four quantities this point needs. `peak_index` is
-            # the top self-time frame in a profiled pass, so locating it once rather than inside
-            # each of `peak_offset`, `peak_at_boundary`, `peak_quality` and the refinement is worth
-            # 6% of a point — see `AutoRIFT.peak_report`.
+            # One location of the peak serves all four quantities this point needs — the
+            # displacement, the peak height, the boundary flag and the prominence — each of which
+            # has a form taking an already-located peak for exactly this reason. See
+            # `AutoRIFT.peak_quality` for what the four naive calls cost.
             #
             # `c` is the correlation at the peak actually reported, so it comes from the refinement
             # wherever there is one and from the integer peak otherwise.
-            pi_, pj, ipeak, railed, snr = peak_report(surface)
+            pi_, pj = peak_index(surface)
+            railed = peak_at_boundary(surface, pi_, pj)
+            snr = peak_quality(surface, pi_, pj)
             dx, dy, c = isnothing(rw) ?
-                (_offset_at(pi_, pj, (prx, pry))..., ipeak) :
+                (_offset_at(pi_, pj, (prx, pry))..., (@inbounds surface[pi_, pj])) :
                 subpixel_peak(rw, surface, (prx, pry), up, pi_, pj)
 
             # Back to displacement about the grid point: the surface is centred on the window,

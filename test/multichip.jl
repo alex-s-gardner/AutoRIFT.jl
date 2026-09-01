@@ -545,8 +545,9 @@ end
         rows = stride:stride:n
         isempty(rows) && continue
         ncoarse = length(rows)
-        lo = stride ÷ 2
-        hi = stride - 1 - lo
+        # From the helper the source now uses, so the test cannot drift from it by restating the
+        # convention independently — which is the whole failure mode this testset exists for.
+        lo, _, hi, _ = AutoRIFT._window_margins(stride, stride)
 
         # Which coarse cell each fine index draws its radius from, read straight off
         # `_cell_max_radius!`'s window: a one-hot radius field at coarse point `k` must reduce to

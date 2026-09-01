@@ -832,7 +832,10 @@ end
 function _expand_coarse_mask(mask::AbstractMatrix{Bool}, gridsize::Tuple{Int,Int}, stride::Int)
     nr, nc = gridsize
     sr, sc = size(mask)
-    lo = stride ÷ 2
+    # The same left margin `_cell_max_radius!` reduces over, from the same helper. This is the
+    # inverse map — fine index to cell — and it agrees with the forward one only if both take their
+    # margin from one place; `test/multichip.jl` pins the round trip.
+    lo, _, _, _ = _window_margins(stride, stride)
     out = Matrix{Bool}(undef, nr, nc)
     @inbounds for j in 1:nc
         cj = clamp(fld(j + lo, stride), 1, sc)
@@ -883,8 +886,10 @@ end
 # reductions use so the two agree at the boundaries.
 function _cell_max_radius!(out, radius, rows, cols, stride::Int)
     nr, nc = size(radius)
-    lo = stride ÷ 2
-    hi = stride - 1 - lo
+    # The cell's extent about its centre, from the one place that convention lives. Writing it out
+    # here would be a third transcription of a rule `window.jl` documents as the easiest in the
+    # package to get backwards.
+    lo, _, hi, _ = _window_margins(stride, stride)
     @inbounds for (jo, j) in enumerate(cols), (io, i) in enumerate(rows)
         m = 0
         for jj in max(j - lo, 1):min(j + hi, nc)
@@ -940,8 +945,7 @@ end
 # rather than deducing it later from a missing correlation.
 function _fill_holes!(d::DisplacementField, p::Params)
     w = p.fill_window
-    lo = w ÷ 2
-    hi = w - 1 - lo
+    lo, _, hi, _ = _window_margins(w, w)
     # Two thirds of a full window: enough neighbours that the median means something, and
     # strict enough that an isolated point does not seed a fill.
     needed = 2 * w^2 ÷ 3

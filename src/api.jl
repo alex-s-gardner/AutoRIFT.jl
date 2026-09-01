@@ -497,32 +497,14 @@ _prepare(pair::ImagePair, p::Params) = ImagePair(
     _prepare(pair.reference, pair.reference_valid, p),
     _prepare(pair.secondary, pair.secondary_valid, p))
 
-# Whether filtering this run's images may be split across tasks.
+# Whether filtering this run's images may be split across tasks. The method's own
+# `AutoRIFT._slabbable` answers whether splitting reproduces the whole-image result; this adds only
+# the run's threading choice.
 #
 # Unlike `process_block_size`, threading is not something the caller asked for, so a filter that
 # cannot be split takes the serial path rather than raising — the alternative would turn a working
 # configuration into an error for a scheduling decision the caller never made.
-_slabbed(p::Params) = istrue(p.threaded) && _slabbable(p.preprocess) &&
-                      filter_reach(p.preprocess) >= 0
-
-"""
-    AutoRIFT._slabbable(method) -> Bool
-
-Whether `method` gives each pixel the same value when applied to a row slab containing that pixel's
-whole [`AutoRIFT.filter_reach`](@ref) as when applied to the whole image.
-
-Two things can make it false, and only one of them is the reach. A filter with no finite reach is
-already excluded by that trait, since a slab is a window and no window reproduces a whole-image
-estimate. What this adds is **per-pixel determinism**: [`WallisGapfill`](@ref) draws its fill from
-one generator in a single scan, so which pixel receives which draw depends on the traversal order,
-and slabbing would change the image rather than merely the schedule.
-
-Declared per method rather than inferred, and defaulting to `true`, because the reach trait already
-carries the structural case — so a new filter declares only the narrower property, and the cost of
-forgetting is a filter that threads when it should not, which its own tests catch as a changed image.
-"""
-_slabbable(::PreprocessMethod) = true
-_slabbable(::WallisGapfill) = false
+_slabbed(p::Params) = istrue(p.threaded) && _slabbable(p.preprocess)
 
 # `preprocess` over row slabs, one task each, with the whole-image result.
 #
@@ -556,9 +538,16 @@ function _preprocess_slabbed(img::AbstractMatrix, mask::AbstractMatrix{Bool}, p:
             hi = min(lo + rows - 1, nr)
             # The slab this task reads, and where its own rows sit inside it.
             rlo, rhi = max(lo - reach, 1), min(hi + reach, nr)
-            sout, sv = preprocess(view(img, rlo:rhi, :), view(mask, rlo:rhi, :),
+            # `_read_block`, not a view. A view defers the read, so a lazy array is then walked one
+            # element at a time — measured at 444 s against 0.6 s for a single 512² window, which is
+            # the pathology that helper exists to avoid. `_prepare` is reachable with a disk-backed
+            # pair on any non-blocked run, so this path has to take the same care the blocked one does.
+            slab = rlo:rhi
+            cols = axes(img, 2)
+            sout, sv = preprocess(_read_block(img, slab, cols),
+                                  _read_block(mask, slab, cols),
                                   p.preprocess, p.rng_seed)
-            keep = (lo - rlo + 1):(lo - rlo + 1 + hi - lo)
+            keep = (lo:hi) .- (rlo - 1)     # this task's own rows, in slab coordinates
             copyto!(view(out, lo:hi, :), view(sout, keep, :))
             copyto!(view(v, lo:hi, :), view(sv, keep, :))
         end

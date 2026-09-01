@@ -106,9 +106,8 @@ end
 
 # The displacement a peak at `(i, j)` stands for, for a caller that has already located it.
 #
-# The arithmetic of `peak_offset` without its scan. Split out because the per-point path locates
-# the peak once and derives four quantities from it — see `peak_report` — so the offset has to be
-# available from the index rather than only from the surface.
+# The arithmetic of `peak_offset` without its scan, and a separate name rather than a method of it
+# because it takes no surface and returns two values where `peak_offset` returns three.
 @inline function _offset_at(i::Int, j::Int, radius::Tuple{Int,Int})
     rx, ry = radius
     return Float64(j - rx - 1), Float64(i - ry - 1)
@@ -140,15 +139,18 @@ Jakobshavn 4.2% of points that correlate above 0.3 are affected, and 0.12% at ch
 
 One function rather than the test written out at each site: the two outputs must agree about which points
 are railed, and a copy of the condition is how they would drift apart.
-"""
-@inline peak_at_boundary(surface::AbstractMatrix) =
-    _at_boundary(peak_index(surface)..., size(surface)...)
 
-# The boundary test on an already-located peak, so a caller holding one does not scan again.
-# `peak_at_boundary` is this composed with `peak_index`, which is what keeps the two spellings of
-# the condition from being two conditions.
-@inline _at_boundary(i::Int, j::Int, nr::Int, nc::Int) =
-    (i == 1) | (j == 1) | (i == nr) | (j == nc)
+    peak_at_boundary(surface, i, j) -> Bool
+
+The same test on a peak the caller has already located. `(i, j)` must be what
+[`peak_index`](@ref) would return; the one-argument form is this composed with that call. The
+correlator uses this form, having located the peak once for every quantity it derives.
+"""
+@inline peak_at_boundary(surface::AbstractMatrix, i::Int, j::Int) =
+    (i == 1) | (j == 1) | (i == size(surface, 1)) | (j == size(surface, 2))
+
+@inline peak_at_boundary(surface::AbstractMatrix) =
+    peak_at_boundary(surface, peak_index(surface)...)
 
 """
     peak_quality(surface[, exclusion = $PEAK_EXCLUSION]) -> Float32
@@ -193,14 +195,19 @@ selection over every background sample, per point, per level.
 
 This is a property of the surface alone. The search-boundary condition — where the reported quality is
 forced to zero — is applied by the caller; see [`AutoRIFT.peak_at_boundary`](@ref).
-"""
-@inline peak_quality(surface::AbstractMatrix, exclusion::Int = PEAK_EXCLUSION) =
-    _quality_at(surface, peak_index(surface)..., exclusion)
 
-# The background pass, given the peak's location. `peak_quality` is this composed with
-# `peak_index`; the per-point path calls it directly, having already located the peak.
-@inline function _quality_at(surface::AbstractMatrix, i::Int, j::Int,
-                             exclusion::Int = PEAK_EXCLUSION)
+    peak_quality(surface, i, j[, exclusion = $PEAK_EXCLUSION]) -> Float32
+
+The same measure on a peak the caller has already located. `(i, j)` must be what
+[`peak_index`](@ref) would return; the form without them is this composed with that call.
+
+The correlator uses this form. Every point needs the displacement, the peak value, the boundary
+flag and this quality, and the four naive calls locate the same peak four times over —
+`peak_index` is the top self-time frame in a profiled pass, so at chip 16 and radius 20, the
+geometry ITS_LIVE runs Landsat at, that is 3.92 us against 2.15 us, 6% of a whole point.
+"""
+@inline function peak_quality(surface::AbstractMatrix, i::Int, j::Int,
+                              exclusion::Int = PEAK_EXCLUSION)
     nr, nc = size(surface)
     h = Float64(@inbounds surface[i, j])
     # Sum and sum of squares in one traversal, column-major for the reason `peak_index` documents.
@@ -226,28 +233,8 @@ forced to zero — is applied by the caller; see [`AutoRIFT.peak_at_boundary`](@
     return sd > 0 ? Float32((h - mean) / sd) : NaN32
 end
 
-"""
-    AutoRIFT.peak_report(surface) -> (i, j, value, railed, quality)
-
-Everything the grid loop needs about a correlation surface, from **one** location of its peak.
-
-The composition of [`peak`](@ref), [`AutoRIFT.peak_at_boundary`](@ref) and
-[`AutoRIFT.peak_quality`](@ref), which every point needs together. Called separately they locate
-the same peak three times over — and with sub-pixel refinement, which locates it again, four
-times. `peak_index` is the top self-time frame in a profiled pass, so that redundancy is the
-measurable kind: at chip 16 and radius 20, the geometry ITS_LIVE runs Landsat at, three separate
-scans cost 3.92 us against 2.15 us fused, which is 45% of the scan cost and 6% of a whole point.
-
-`i`, `j` are the integer peak, suitable for [`subpixel_peak`](@ref)'s five-argument form so the
-refinement does not scan again either. `railed` and `quality` are the two derived quantities;
-`track!` is what zeroes both at the search boundary, since that policy belongs to the caller.
-"""
-@inline function peak_report(surface::AbstractMatrix, exclusion::Int = PEAK_EXCLUSION)
-    i, j = peak_index(surface)
-    nr, nc = size(surface)
-    return (i, j, (@inbounds surface[i, j]), _at_boundary(i, j, nr, nc),
-            _quality_at(surface, i, j, exclusion))
-end
+@inline peak_quality(surface::AbstractMatrix, exclusion::Int = PEAK_EXCLUSION) =
+    peak_quality(surface, peak_index(surface)..., exclusion)
 
 # ---------------------------------------------------------------------------
 # Sub-pixel refinement
@@ -607,9 +594,9 @@ subpixel_peak(rw::RefinementWorkspace, surface::AbstractMatrix{Float32},
 [`subpixel_peak`](@ref) refining about an integer peak the caller has already located.
 
 `(pi, pj)` must be what [`peak_index`](@ref) would return for `surface`; the four-argument form
-is this with that call supplied. It exists because the per-point path derives the displacement,
-the boundary flag and the peak quality from one location — see [`AutoRIFT.peak_report`](@ref) —
-and refining would otherwise scan the surface a second time to find the peak it already has.
+is this with that call supplied, and is what the tests and benchmarks use. The correlator calls
+this one: it has already located the peak to derive the displacement, the boundary flag and the
+prominence, and refining would otherwise scan the surface again for a peak it holds.
 """
 function subpixel_peak(
     rw::RefinementWorkspace, surface::AbstractMatrix{Float32},
