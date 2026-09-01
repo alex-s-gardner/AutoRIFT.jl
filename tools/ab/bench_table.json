@@ -20,8 +20,8 @@
         "julia": "1.12.5",
         "autorift_jl": "0.1.0",
         "autorift_py": "2.1.1",
-        "commit": "4cc1e3e",
-        "note": "Library rows re-measured at this commit; the python row is the reference and cannot have moved, and the seven juliac rows are as measured at fd42181 against a binary built before this commit. The eager rows agree with the previous measurement to within a few percent, which is the intended result: the changes since fd42181 are a redundancy removal in the per-point path and should not move a whole-scene time. Load average was 6.6 during this run against 3.7 for the previous one, so these times are the more pessimistic of the two."
+        "commit": "8d7c1ec",
+        "note": "Library rows measured at 8d7c1ec, with serial filtering. The python row is the reference and cannot have moved; the seven juliac rows are as measured at fd42181, against a binary built before it. Commits after 8d7c1ec change only comments, so they cannot move a number here. The eager rows agree with the fd42181 measurement to within a few percent, which is the intended result: slabbed preprocessing was added and then reverted over that span, and what remains is a redundancy removal in the per-point path that should not move a whole-scene time. Load average was 6.6 during this run against 3.7 for the previous one, so these times are the more pessimistic of the two. The 8192 block size is not reported, at 9 blocks on 12 threads: fewer blocks than threads means every block is in flight at once, so the run holds nine 8341x8341 working sets, 2.2x the scene area, and peaked at 16772 MiB against 3947 at 2048. That measures the block size being large relative to the scene, not what blocking costs."
     },
     "table": [
         {
@@ -70,15 +70,6 @@
             "cores": 3.59
         },
         {
-            "label": "AutoRIFT.jl, lazy, block 8192",
-            "threads": "12",
-            "lazy": "yes",
-            "blocks": 9,
-            "seconds": 111.84,
-            "peak": 16772.0,
-            "cores": 2.19
-        },
-        {
             "label": "juliac binary, lazy, no blocks",
             "threads": "1*",
             "lazy": "yes",
@@ -86,15 +77,6 @@
             "seconds": 69.42,
             "peak": 6531.859375,
             "cores": 1.0164217804667242
-        },
-        {
-            "label": "juliac binary, lazy, block 8192",
-            "threads": "1*",
-            "lazy": "yes",
-            "blocks": 9,
-            "seconds": 105.68,
-            "peak": 6525.203125,
-            "cores": 1.0109765329295988
         },
         {
             "label": "juliac binary, lazy, block 4096",

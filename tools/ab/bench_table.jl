@@ -159,10 +159,15 @@ function measure()
         add!("AutoRIFT.jl, eager, no blocks", string(th), "no", 1, julia(th, "raw", 0, "eager_$th"))
     end
 
-    # Three block sizes on the threaded library path, so the peak-memory/runtime trade has more than
-    # one point on it. The scene's grid is 2127x2107, so 8192, 4096 and 2048 partition it into 9, 25 and
-    # 81 blocks — all genuine partitions, none degenerate.
-    for bs in (2048, 4096, 8192)
+    # Two block sizes on the threaded library path, so the peak-memory/runtime trade has more than one
+    # point on it. The scene's grid is 2127x2107, so 4096 and 2048 partition it into 25 and 81 blocks.
+    #
+    # 8192 is excluded, at 9 blocks. It is a genuine partition, but fewer blocks than the machine has
+    # threads, so every block is in flight at once and the run holds nine 8341x8341 working sets — 2.2x
+    # the scene area, for a measured 16772 MiB against 3947 at 2048. That is the cost of the block size
+    # being large relative to the scene rather than anything the blocking does, and reporting it beside
+    # sizes that do bound memory invites reading it as the latter.
+    for bs in (2048, 4096)
         add!("AutoRIFT.jl, lazy, block $bs", "12", "yes", nblocks(bs),
              julia(12, "lazy", bs, "lazy_$bs"))
     end
@@ -174,7 +179,7 @@ function measure()
     # `threaded = true` trims with no verifier error and then dies at run time, because the task entry
     # closure is trimmed away. See `app/README.md`. The 12-thread numbers at each block size are the
     # library rows above, which exercise the same blocking on the same scene.
-    for bs in (0, 8192, 4096, 2048, 1024, 512, 256)
+    for bs in (0, 4096, 2048, 1024, 512, 256)
         label = bs == 0 ? "juliac binary, lazy, no blocks" : "juliac binary, lazy, block $bs"
         cmd = `$BIN $(joinpath(WORK, "ref.bin")) $(joinpath(WORK, "sec.bin")) $nr $nc
                $(joinpath(WORK, "bin_$bs.bin")) $CHIP $RADIUS $SPACING $bs $UPSAMPLING 1`
