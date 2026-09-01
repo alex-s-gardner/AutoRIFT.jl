@@ -155,11 +155,22 @@ function measure()
         add!("AutoRIFT.jl, eager, no blocks", string(th), "no", 1, julia(th, "raw", 0, "eager_$th"))
     end
 
-    add!("AutoRIFT.jl, lazy, block 2048", "12", "yes", nblocks(2048), julia(12, "lazy", 2048, "lazy"))
+    # Three block sizes on the threaded library path, so the peak-memory/runtime trade has more than
+    # one point on it. The scene's grid is 2127x2107, so 8192, 4096 and 2048 partition it into 9, 25 and
+    # 81 blocks — all genuine partitions, none degenerate.
+    for bs in (2048, 4096, 8192)
+        add!("AutoRIFT.jl, lazy, block $bs", "12", "yes", nblocks(bs),
+             julia(12, "lazy", bs, "lazy_$bs"))
+    end
 
     # `[mmap] = 1` is the binary's lazy path: its contract is raw planes, so there is no GDAL in a
     # trimmed build and demand-paged pages are what stand in for a lazy read.
-    for bs in (0, 2048, 1024, 512, 256)
+    #
+    # Every binary row is single-threaded, and that is a build constraint rather than a choice here:
+    # `threaded = true` trims with no verifier error and then dies at run time, because the task entry
+    # closure is trimmed away. See `app/README.md`. The 12-thread numbers at each block size are the
+    # library rows above, which exercise the same blocking on the same scene.
+    for bs in (0, 8192, 4096, 2048, 1024, 512, 256)
         label = bs == 0 ? "juliac binary, lazy, no blocks" : "juliac binary, lazy, block $bs"
         cmd = `$BIN $(joinpath(WORK, "ref.bin")) $(joinpath(WORK, "sec.bin")) $nr $nc
                $(joinpath(WORK, "bin_$bs.bin")) $CHIP $RADIUS $SPACING $bs $UPSAMPLING 1`
@@ -232,7 +243,10 @@ function render(r)
       <tbody>
     $body
       </tbody></table>
-      <p class="note">* Multi-threading is not currently supported in the standalone binary.<br>
+      <p class="note">* The standalone binary is single-threaded, and by build constraint rather than
+        choice: <code>threaded = true</code> trims without a verifier error and then fails at run time,
+        because the task entry closure is trimmed away. The 12-thread rows above measure the same
+        blocking on the same scene through the library.<br>
         &dagger; Mean cores used, measured as CPU time over elapsed time. autoRIFT.py's correlation loop
         is serial &mdash; it runs at one core for 85% of the run, reaching ~11 cores only during the
         OpenCV filter calls &mdash; so this is what it achieves on a 12-core machine, not a setting.</p>

@@ -20,89 +20,125 @@
         "julia": "1.12.5",
         "autorift_jl": "0.1.0",
         "autorift_py": "2.1.1",
-        "commit": "f3bf970"
+        "commit": "fd42181"
     },
     "table": [
         {
             "label": "python autoRIFT v2.1.2",
-            "threads": "2.4\u2020",
+            "threads": "2.3†",
             "lazy": "no",
             "blocks": 1,
-            "seconds": 336.2,
-            "peak": 8126,
-            "cores": 2.35
+            "seconds": 177.5,
+            "peak": 6884.375,
+            "cores": 2.3485070422535212
         },
         {
             "label": "AutoRIFT.jl, eager, no blocks",
             "threads": "12",
             "lazy": "no",
             "blocks": 1,
-            "seconds": 21.8,
-            "peak": 7148,
-            "cores": 3.81
+            "seconds": 23.68,
+            "peak": 7227.78125,
+            "cores": 4.1646959459459465
         },
         {
             "label": "AutoRIFT.jl, eager, no blocks",
             "threads": "1",
             "lazy": "no",
             "blocks": 1,
-            "seconds": 69.8,
-            "peak": 6701,
-            "cores": 1.02
+            "seconds": 82.44,
+            "peak": 6880.984375,
+            "cores": 1.0179524502668607
         },
         {
             "label": "AutoRIFT.jl, lazy, block 2048",
             "threads": "12",
             "lazy": "yes",
             "blocks": 81,
-            "seconds": 41.9,
-            "peak": 3926,
-            "cores": 4.93
+            "seconds": 51.85,
+            "peak": 3754.125,
+            "cores": 4.4808100289296044
+        },
+        {
+            "label": "AutoRIFT.jl, lazy, block 4096",
+            "threads": "12",
+            "lazy": "yes",
+            "blocks": 25,
+            "seconds": 60.68,
+            "peak": 9795,
+            "cores": 3.913810151615029
+        },
+        {
+            "label": "AutoRIFT.jl, lazy, block 8192",
+            "threads": "12",
+            "lazy": "yes",
+            "blocks": 9,
+            "seconds": 99.43,
+            "peak": 17631.6875,
+            "cores": 2.3267625465151363
         },
         {
             "label": "juliac binary, lazy, no blocks",
             "threads": "1*",
             "lazy": "yes",
             "blocks": 1,
-            "seconds": 71.6,
-            "peak": 6532,
-            "cores": 0.99
+            "seconds": 69.42,
+            "peak": 6531.859375,
+            "cores": 1.0164217804667242
+        },
+        {
+            "label": "juliac binary, lazy, block 8192",
+            "threads": "1*",
+            "lazy": "yes",
+            "blocks": 9,
+            "seconds": 105.68,
+            "peak": 6525.203125,
+            "cores": 1.0109765329295988
+        },
+        {
+            "label": "juliac binary, lazy, block 4096",
+            "threads": "1*",
+            "lazy": "yes",
+            "blocks": 25,
+            "seconds": 104.04,
+            "peak": 4085.1875,
+            "cores": 1.016147635524798
         },
         {
             "label": "juliac binary, lazy, block 2048",
             "threads": "1*",
             "lazy": "yes",
             "blocks": 81,
-            "seconds": 95.7,
-            "peak": 3504,
-            "cores": 1.02
+            "seconds": 92.13,
+            "peak": 3498.453125,
+            "cores": 1.0151959188103767
         },
         {
             "label": "juliac binary, lazy, block 1024",
             "threads": "1*",
             "lazy": "yes",
             "blocks": 289,
-            "seconds": 93.9,
-            "peak": 3299,
-            "cores": 1.02
+            "seconds": 92.26,
+            "peak": 3331,
+            "cores": 1.0174506828528072
         },
         {
             "label": "juliac binary, lazy, block 512",
             "threads": "1*",
             "lazy": "yes",
             "blocks": 1122,
-            "seconds": 97.1,
-            "peak": 3352,
-            "cores": 1.01
+            "seconds": 95.47,
+            "peak": 3338.359375,
+            "cores": 1.0168639363150729
         },
         {
             "label": "juliac binary, lazy, block 256",
             "threads": "1*",
             "lazy": "yes",
             "blocks": 4422,
-            "seconds": 108.8,
-            "peak": 3354,
-            "cores": 1.01
+            "seconds": 106.2,
+            "peak": 3354.390625,
+            "cores": 1.0155367231638417
         }
     ]
 }
