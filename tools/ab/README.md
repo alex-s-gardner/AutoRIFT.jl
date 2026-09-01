@@ -278,9 +278,16 @@ does not fit is the only way to process it at all. That is the whole basis for c
 **The two eager rows read raw planes, not rasters.** Measured through
 `autorift(::AbstractRaster, ...)` the same configuration peaks at **11590 MiB**, not 7148: `read` keeps
 the raster's `missingval`, so a filled copy of each scene is built and the nodata mask is a third array
-over the original — three scene-sized arrays where a plain `Matrix` needs one. An in-memory raster
-therefore costs 1.6× the equivalent array, and the lazy path avoids it because blocking never forms the
-copies.
+over the original — three scene-sized arrays where a plain `Matrix` needs one. The lazy path avoids the
+copies entirely, because blocking never forms them.
+
+That 1.6× is a property of this code path, not of `Raster`. One pass producing a plain `Matrix{T}`
+beside a `BitMatrix` brings resident input from 2.6× the correlator's requirement down to 1.06×, or
+1.09 GiB per image rather than 2.34 on this scene. It is deliberately not implemented: measured before
+and after, peak RSS is unchanged — 11908 against 11904 MiB — because the ceiling is set inside the
+correlator, roughly 5 GiB above where the inputs sit, so shrinking them only widens the headroom
+beneath it. The input arrays are the wrong lever for peak memory on this path; the per-thread
+workspaces and output are where the 12 GiB comes from.
 
 **Block size is nearly free above the halo, and the floor is the grid.** 2048 through 256 px spans
 81 to 4422 blocks and 54× the halo redundancy, yet peak moves by 1.6% and runtime by 16%: what is left
