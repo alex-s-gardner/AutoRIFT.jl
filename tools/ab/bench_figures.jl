@@ -180,21 +180,31 @@ function histogram_page(d; path = joinpath(FIG_PLOTS, "fig_histograms.png"))
     # Where the two chose a different level. A level difference changes how much the estimate is
     # smoothed, so this map is the mechanism behind much of the residual spread on the previous page —
     # and it is spatially structured, which a histogram of the same fact cannot show.
+    # Named swatches rather than a colour bar for the two categorical maps below. A bar implies an
+    # ordered range between its ends and stretches to the map's height, so a two- or four-category
+    # field reads as a gradient it is not; a legend states the categories and nothing else.
+    swatches(pos, colors, labels) =
+        Legend(fig[pos...], [PolyElement(; color = c) for c in colors], labels;
+               framevisible = false, patchsize = (16, 16), rowgap = 8, labelsize = 12,
+               halign = :left, valign = :center, tellheight = false, tellwidth = true)
+
     samelevel = both .& (j.chip .== p.chip)
     disagree = map((b, s) -> b ? (s ? 0.0 : 1.0) : NaN, both, samelevel)
-    hm = heatmap!(mapax((1, 3), "chip size: agree or disagree"), mapshow(disagree);
-                  colormap = cgrad([:gray75, :crimson]; categorical = true), colorrange = (-0.5, 1.5))
-    Colorbar(fig[1, 4], hm; width = 12, ticks = (0:1, ["same", "differ"]), height = Relative(0.85))
+    heatmap!(mapax((1, 3), @sprintf("chip size: same level at %.1f%% of shared points",
+                                    100 * count(samelevel) / max(count(both), 1))),
+             mapshow(disagree);
+             colormap = cgrad([:gray75, :crimson]; categorical = true), colorrange = (-0.5, 1.5))
+    swatches((1, 4), (:gray75, :crimson), ["same level", "different level"])
 
     # Coverage: which side answered at all. The pyramid and the outlier filter decide *which* points
     # get an answer, so two runs can agree everywhere they overlap and still disagree about most of the
     # grid — the half of the comparison no value statistic can show.
     cov = map((a, b) -> a && b ? 1.0 : a ? 2.0 : b ? 3.0 : 0.0, jok, pok)
-    hmc = heatmap!(mapax((2, 3), "coverage"), mapshow(cov);
-                   colormap = cgrad([:gray88, :gray30, :dodgerblue, :orangered]; categorical = true),
-                   colorrange = (-0.5, 3.5))
-    Colorbar(fig[2, 4], hmc; width = 12, height = Relative(0.85),
-             ticks = (0:3, ["neither", "both", "jl only", "py only"]))
+    heatmap!(mapax((2, 3), "coverage: which side answered"), mapshow(cov);
+             colormap = cgrad([:gray88, :gray30, :dodgerblue, :orangered]; categorical = true),
+             colorrange = (-0.5, 3.5))
+    swatches((2, 4), (:gray88, :gray30, :dodgerblue, :orangered),
+             ["neither", "both", "AutoRIFT.jl only", "autoRIFT.py only"])
 
     # The one histogram on this page: the signed difference per axis, in units of one sub-pixel step.
     # Symmetric about zero is the claim — a shifted center is a systematic bias, which is a different
@@ -229,15 +239,13 @@ function histogram_page(d; path = joinpath(FIG_PLOTS, "fig_histograms.png"))
     text!(ax, 0.97, 0.70;
           text = @sprintf("median %+.4f px (dx)\nmedian %+.4f px (dy)\n\nidentical to the last bit:\n\
                            %.1f%% of dx, %.1f%% of dy\n\nradial tail: p99 %.1f steps,\nmax %.0f steps\n\n\
-                           beyond ±%d steps: %.2f%% of dx,\n%.2f%% of dy\n\nsame chip size at %.1f%%\n\
-                           of shared points",
+                           beyond ±%d steps: %.2f%% of dx,\n%.2f%% of dy",
                           median(ddx), median(ddy),
                           100 * mean(ddx .== 0), 100 * mean(ddy .== 0),
                           quantile(rad, 0.99) / step, maximum(rad) / step,
                           lim, 100 * mean(abs.(ddx) .> lim * step),
-                          100 * mean(abs.(ddy) .> lim * step),
-                          100 * count(samelevel) / count(both)),
-          space = :relative, align = (:right, :top), fontsize = 9, color = :gray35)
+                          100 * mean(abs.(ddy) .> lim * step)),
+          space = :relative, align = (:right, :top), fontsize = 13, color = :gray30)
 
     colgap!(fig.layout, 8)
     rowgap!(fig.layout, 8)
@@ -281,12 +289,23 @@ function outputs_page(d; path = joinpath(FIG_PLOTS, "fig_outputs.png"))
     Colorbar(fig[1, 4], hm2; label = "peak above background (sd)", width = 12,
              height = Relative(0.85))
 
+    # Two categories, so a legend of two swatches rather than a colour bar. A bar implies an ordered
+    # range between its ends and sizes itself to the map's height, which for a Boolean leaves a tall
+    # gradient labelled `true`/`false` — and those labels name the field rather than what it says about
+    # the point. Named swatches state the two conditions, and the fraction interpolated goes in the
+    # title, which is the number a reader wants and no legend can carry.
     interp = map((v, k) -> k ? Float64(v != 0) : NaN, j.interp, jok)
-    hm4 = heatmap!(mapax((1, 5), "interpolated"), mapshow(interp);
+    nint = count(i -> jok[i] && j.interp[i] != 0, eachindex(j.interp))
+    hm4 = heatmap!(mapax((1, 5), @sprintf("how each point got its displacement (%.1f%% filled)",
+                                          100 * nint / max(count(jok), 1))),
+                   mapshow(interp);
                    colormap = cgrad([:gray80, :dodgerblue]; categorical = true),
                    colorrange = (-0.5, 1.5))
-    Colorbar(fig[1, 6], hm4; width = 12, height = Relative(0.85),
-             ticks = (0:1, ["false", "true"]))
+    Legend(fig[1, 6],
+           [PolyElement(; color = :gray80), PolyElement(; color = :dodgerblue)],
+           ["measured on its own\ncorrelation surface", "filled from\nits neighbours"];
+           framevisible = false, patchsize = (20, 20), rowgap = 12, labelsize = 15,
+           halign = :left, valign = :center, tellheight = false, tellwidth = true)
 
     colgap!(fig.layout, 8)
     rowgap!(fig.layout, 8)
