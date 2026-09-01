@@ -279,12 +279,15 @@ function render(r)
       </div>
 
       <div class="page">
-        <h1>AutoRIFT.jl's remaining outputs</h1>
-        <p class="sub">The reference reports none of these, so no comparison page can show them
-          &middot; both read <b>zero</b> where the peak lay against the search boundary, so any positive
-          threshold rejects those points and <code>correlation .== 0</code> finds where
-          <code>search_radius</code> is too small &middot; peak SNR reads high on a tall peak over
-          low-contrast ground, which is why it is the weaker gate</p>
+        <h1>Quality metrics: what to trust each estimate for</h1>
+        <p class="sub">Every point carries a displacement; these say how much to believe it, and the
+          reference reports none of them &middot; <b>correlation</b> is the height of the ZNCC peak the
+          match was taken from, so it answers "how well did the two chips resemble each other"
+          &middot; <b>peak SNR</b> is how far that peak stood above the rest of its own surface, which
+          answers "was the match unambiguous" &mdash; a different question, and the two are nearly
+          independent at a rank correlation of 0.125 &middot; both read <b>zero</b> where the peak lay
+          against the search boundary, so any positive threshold rejects those points and
+          <code>correlation .== 0</code> locates a too-small <code>search_radius</code></p>
         <table class="stats"><tr>
           <td><b>gate on correlation, not peak SNR</b></td>
           <td>by decile, exact agreement rises monotonically with correlation, 31% &rarr; 98%</td>

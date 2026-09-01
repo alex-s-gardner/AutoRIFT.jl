@@ -167,14 +167,17 @@ function histogram_page(d; path = joinpath(FIG_PLOTS, "fig_histograms.png"))
     crange = (0.5, length(chips) + 0.5)
     cmap = cgrad(:viridis, length(chips); categorical = true)
     for (row, (nm, C, ok)) in enumerate((("AutoRIFT.jl", j.chip, jok), ("autoRIFT.py", p.chip, pok)))
-        hm = heatmap!(mapax((row, 1), "$nm chip size"),
-                      mapshow(blank(asrank(C), ok .& (C .> 0)));
-                      colormap = cmap, colorrange = crange)
-        # `height = Relative(0.85)` so a categorical bar matches its map rather than spanning the
-        # taller cell the map's `DataAspect` leaves behind. Ticks are labelled with the chip sizes
-        # themselves, so the rank mapping is invisible to a reader.
-        Colorbar(fig[row, 2], hm; label = "chip size (px)", width = 12,
-                 ticks = (1:length(chips), string.(chips)), height = Relative(0.85))
+        heatmap!(mapax((row, 1), "$nm chip size"),
+                 mapshow(blank(asrank(C), ok .& (C .> 0)));
+                 colormap = cmap, colorrange = crange)
+        # A legend of named swatches, not a colour bar. Chip size is a small set of discrete levels, and
+        # a bar draws them as a continuum with a range between them that no point can take — the ticks
+        # then have to undo that impression. One swatch per level says what the map contains.
+        Legend(fig[row, 2],
+               [PolyElement(; color = cmap[i]) for i in eachindex(chips)],
+               ["$c px" for c in chips]; framevisible = false, patchsize = (16, 16),
+               rowgap = 8, labelsize = 12, halign = :left, valign = :center,
+               tellheight = false, tellwidth = true)
     end
 
     # Where the two chose a different level. A level difference changes how much the estimate is
@@ -270,10 +273,19 @@ function outputs_page(d; path = joinpath(FIG_PLOTS, "fig_outputs.png"))
 
     # Three maps in a row, each with its own colorbar. The maps are square and the page is landscape, so
     # three across fills it without shrinking any of them below legibility.
+    #
+    # A colour bar is tied to its map's own height rather than given `height = Relative(...)`. The
+    # relative form is a fraction of the *grid cell*, and a `DataAspect` map leaves a cell far taller
+    # than the square it draws in, so the bar overran the panel it labels. Linking the axis makes the
+    # bar exactly as tall as the data it describes, whatever the layout does around it.
+    barof(pos, hm, label, ax) =
+        Colorbar(fig[pos...], hm; label, width = 12, tellheight = false,
+                 halign = :left, height = @lift(($(ax.scene.viewport)).widths[2]))
+
     measured = jok .& .!isnan.(j.corr)
-    hm = heatmap!(mapax((1, 1), "correlation (peak height)"), mapshow(blank(j.corr, measured));
-                  colormap = :magma, colorrange = (0, 1))
-    Colorbar(fig[1, 2], hm; label = "ZNCC peak", width = 12, height = Relative(0.85))
+    axc = mapax((1, 1), "correlation (peak height)")
+    hm = heatmap!(axc, mapshow(blank(j.corr, measured)); colormap = :magma, colorrange = (0, 1))
+    barof((1, 2), hm, "ZNCC peak", axc)
 
     # `peak_snr` is zero where the peak lay against the search boundary, so the count of railed points is
     # stated in the title rather than mapped separately: on a scene whose flow the radius covers there
@@ -283,11 +295,10 @@ function outputs_page(d; path = joinpath(FIG_PLOTS, "fig_outputs.png"))
     finite = filter(isfinite, vec(snr))
     hi = isempty(finite) ? 1.0 : quantile(finite, 0.99)
     nrail = count(iszero, finite)
-    hm2 = heatmap!(mapax((1, 3), @sprintf("peak SNR (quality); %d of %d at the search boundary",
-                                         nrail, length(finite))),
-                   mapshow(snr); colormap = :viridis, colorrange = (0, hi))
-    Colorbar(fig[1, 4], hm2; label = "peak above background (sd)", width = 12,
-             height = Relative(0.85))
+    axs = mapax((1, 3), @sprintf("peak SNR; %d of %d at the search boundary",
+                                 nrail, length(finite)))
+    hm2 = heatmap!(axs, mapshow(snr); colormap = :viridis, colorrange = (0, hi))
+    barof((1, 4), hm2, "peak above background (sd)", axs)
 
     # Two categories, so a legend of two swatches rather than a colour bar. A bar implies an ordered
     # range between its ends and sizes itself to the map's height, which for a Boolean leaves a tall
