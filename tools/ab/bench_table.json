@@ -20,12 +20,13 @@
         "julia": "1.12.5",
         "autorift_jl": "0.1.0",
         "autorift_py": "2.1.1",
-        "commit": "fd42181"
+        "commit": "4cc1e3e",
+        "note": "Library rows re-measured at this commit; the python row is the reference and cannot have moved, and the seven juliac rows are as measured at fd42181 against a binary built before this commit. The eager rows agree with the previous measurement to within a few percent, which is the intended result: the changes since fd42181 are a redundancy removal in the per-point path and should not move a whole-scene time. Load average was 6.6 during this run against 3.7 for the previous one, so these times are the more pessimistic of the two."
     },
     "table": [
         {
             "label": "python autoRIFT v2.1.2",
-            "threads": "2.3†",
+            "threads": "2.3\u2020",
             "lazy": "no",
             "blocks": 1,
             "seconds": 177.5,
@@ -37,45 +38,45 @@
             "threads": "12",
             "lazy": "no",
             "blocks": 1,
-            "seconds": 23.68,
-            "peak": 7227.78125,
-            "cores": 4.1646959459459465
+            "seconds": 25.59,
+            "peak": 7452.34375,
+            "cores": 3.784290738569754
         },
         {
             "label": "AutoRIFT.jl, eager, no blocks",
             "threads": "1",
             "lazy": "no",
             "blocks": 1,
-            "seconds": 82.44,
-            "peak": 6880.984375,
-            "cores": 1.0179524502668607
+            "seconds": 79.5,
+            "peak": 7417.78125,
+            "cores": 1.0163522012578619
         },
         {
             "label": "AutoRIFT.jl, lazy, block 2048",
             "threads": "12",
             "lazy": "yes",
             "blocks": 81,
-            "seconds": 51.85,
-            "peak": 3754.125,
-            "cores": 4.4808100289296044
+            "seconds": 52.66,
+            "peak": 3947.0,
+            "cores": 4.31
         },
         {
             "label": "AutoRIFT.jl, lazy, block 4096",
             "threads": "12",
             "lazy": "yes",
             "blocks": 25,
-            "seconds": 60.68,
-            "peak": 9795,
-            "cores": 3.913810151615029
+            "seconds": 67.09,
+            "peak": 9771.0,
+            "cores": 3.59
         },
         {
             "label": "AutoRIFT.jl, lazy, block 8192",
             "threads": "12",
             "lazy": "yes",
             "blocks": 9,
-            "seconds": 99.43,
-            "peak": 17631.6875,
-            "cores": 2.3267625465151363
+            "seconds": 111.84,
+            "peak": 16772.0,
+            "cores": 2.19
         },
         {
             "label": "juliac binary, lazy, no blocks",

@@ -730,30 +730,32 @@ _finishes_nonfinite(::Union{Highpass,Wallis,Sobel,Laplacian}) = true
 """
     AutoRIFT._slabbable(method) -> Bool
 
-Whether `method` may be applied to row slabs of an image, in parallel, and give every pixel the value
-a whole-image call would.
+Whether `method` may be applied to row slabs of an image in parallel, giving every pixel the value a
+whole-image call would.
 
-Two conditions, and both have to hold:
+**Currently `false` for every method**, so filtering always runs serially. The trait is kept because
+the property it names is real and the mechanism is written (`AutoRIFT._preprocess_slabbed`); what a
+measurement showed is that the mechanism is a net loss at scene scale.
 
-**A bounded reach.** A pixel's result must depend only on a bounded neighbourhood, so that a slab
-grown by [`filter_reach`](@ref) contains everything the pixels it owns need. A method whose estimate
-is global has a negative reach and no slab can reproduce it.
+On the 17121x16961 Landsat pair the benchmark table uses, at 12 threads, slabbing takes filtering from
+2.50 s to 0.89 s — and takes the whole run from 24.24 s to 30.81 s, with peak RSS from 7395 to
+9645 MiB. It wins its own 1.6 s and loses 6.6 s elsewhere. The cause is the shape of
+`_preprocess_slabbed`: each task calls the allocating `preprocess` on its slab and then copies only
+its own rows out, so a 1.08 GiB plane accrues roughly a gigabyte of transient per image, and the
+resulting churn slows the correlation that follows more than the filter gained.
 
-**Per-pixel determinism.** [`WallisGapfill`](@ref) draws its fill from one generator in a single
-scan, so which pixel receives which draw depends on the traversal order. Slabbing it would change
-the image rather than merely the schedule — the one case where the reach is finite and splitting is
-still wrong.
+Two conditions would have to hold for a method to be slabbable, and they are why the trait exists
+rather than a bare `false` in the caller. **A bounded reach**, so a slab grown by
+[`filter_reach`](@ref) contains everything its own pixels need — a method whose estimate is global has
+a negative reach and no slab reproduces it. **Per-pixel determinism**: [`WallisGapfill`](@ref) draws
+its fill from one generator in a single scan, so which pixel receives which draw depends on traversal
+order, and slabbing would change the image rather than the schedule.
 
-Declared per method and defaulting to `false`, which is the safe direction in both senses. A filter
-that forgets to declare it runs serially, costing speed; the opposite default would silently thread a
-filter that must not be. It also keeps the declaration honest about a third consideration that is
-neither of the above: a method with no per-pixel work to spread — [`NoPreprocess`](@ref) is a copy —
-is *slower* threaded, measured at 3.3x on 3072² across eight threads, because the slab copies and the
-task overhead cost more than the memcpy they parallelise. [`Decibel`](@ref) has the same zero reach
-and is 2.4x *faster*, so the discriminator is real work, not reach.
+Re-enabling this means first making `_preprocess_slabbed` write in place — `tile.jl`'s
+`_prepare_block` already filters straight into pooled views, which is the shape that would remove the
+transient. Until then a method declaring `true` here would be slower, and the default says so.
 """
 _slabbable(::PreprocessMethod) = false
-_slabbable(::Union{Highpass,Wallis,Sobel,Laplacian,Decibel,Deramp}) = true
 
 # Shared tail: a filter can produce a non-finite value from finite input, so finiteness of the
 # output is part of validity too.

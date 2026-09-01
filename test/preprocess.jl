@@ -468,3 +468,32 @@ end
     # Sizes are still checked across every combination.
     @test_throws DimensionMismatch ImagePair(img, img; secondary_valid = trues(4, 4))
 end
+
+@testset "slabbed filtering reproduces the whole-image result" begin
+    # `AutoRIFT._slabbable` is `false` for every method, so `_slabbed` never selects this path and
+    # nothing else reaches it. It is tested directly because the property it would need is the hard
+    # part: a slab grown by `filter_reach` must give each of its own rows the value a whole-image
+    # call gives it, *bit for bit*, which requires the slab's band seams to land where the
+    # whole-image scan's do. Enabling the trait without this holding would silently change output.
+    #
+    # `_slabbable` is bypassed rather than set, so the check does not depend on the trait's value.
+    Threads.nthreads() > 1 || return
+
+    rng = Random.MersenneTwister(0x5ab)
+    for (nrows, ncols) in ((257, 96), (512, 64))
+        img = rand(rng, Float32, nrows, ncols) .* 100.0f0 .+ 10.0f0
+        mask = trues(nrows, ncols)
+        mask[rand(rng, CartesianIndices(mask), nrows)] .= false
+
+        for method in (:highpass, :wallis, :sobel, :laplacian, :decibel)
+            p = AutoRIFT.params(; preprocess = method, filter_width = 5, threaded = true)
+            AutoRIFT.filter_reach(p.preprocess) < 0 && continue
+
+            slabbed, sv = AutoRIFT._preprocess_slabbed(img, mask, p)
+            serial, cv = AutoRIFT.preprocess(img, mask, p.preprocess, p.rng_seed)
+
+            @test slabbed == serial
+            @test sv == cv
+        end
+    end
+end
