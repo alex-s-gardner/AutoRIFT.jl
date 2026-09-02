@@ -796,15 +796,28 @@ function _numerators!(ws::CorrelationWorkspace, search, cd, nr, nc, ch, cw)
     return out
 end
 
+# `Float32` accumulator, matching the FFT path this one is an alternative to — `_numerators_fft!`
+# transforms in `Float32` throughout, so the two agree on the width the numerator is computed at
+# rather than differing either side of `DIRECT_THRESHOLD`.
+#
+# The numerator tolerates a narrower accumulator than the denominator, and the asymmetry is the point:
+# it is a sum of products of *mean-removed* values, so the terms straddle zero and no large constant
+# accumulates for the sum to cancel against. The variance in `_correlate_surface!` is the opposite
+# shape — `sumsq - sum^2/n` differences two large nearly-equal quantities — which is why the integral
+# images stay `Float64`. See the head of `integral.jl`.
+#
+# `Float32` is also *exact* for the default geometry: a 16x16 `UInt8` chip accumulates to at most
+# 16646400, inside the 2^24 where `Float32` represents every integer. Above that the relative error is
+# ~1e-7, against a peak located to a fraction of a pixel from a 16x-upsampled surface.
 function _numerators_direct!(out, search, cd, nr, nc, ch, cw)
     @inbounds for j in 1:nc
         for i in 1:nr
-            acc = 0.0
+            acc = 0.0f0
             for jj in 1:cw
                 # `search` is column-major, so the inner loop over rows walks
                 # contiguous memory in both arrays.
                 @simd for ii in 1:ch
-                    acc += Float64(cd[ii, jj]) * Float64(search[i + ii - 1, j + jj - 1])
+                    acc += Float32(cd[ii, jj]) * Float32(search[i + ii - 1, j + jj - 1])
                 end
             end
             out[i, j] = acc
