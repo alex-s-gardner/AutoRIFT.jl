@@ -309,3 +309,41 @@ end
         @test all(>(0), pts.radius_x)
     end
 end
+
+@testset "a scalar geometry field is stored once" begin
+    # A field the caller gave as a scalar is an `AutoRIFT.Uniform`, holding one value rather than one
+    # per point. On a Landsat-sized grid each such field is 34 MiB materialized, and four of them are
+    # constant on every grid built from `params`.
+    pts = gridpoints((512, 512), 8; chip_size = 32, search_radius = 20)
+
+    # Read-only fields take it; `radius_x`/`radius_y` must not, because the coarse pass writes them
+    # per point — see `AutoRIFT._apply_coarse_mask!`.
+    for f in (:chip_size_x, :chip_size_y, :chip_size_min_x, :chip_size_max_x)
+        @test getfield(pts, f) isa AutoRIFT.Uniform
+    end
+    for f in (:radius_x, :radius_y)
+        @test getfield(pts, f) isa Array
+    end
+
+    # It must behave as the array it replaces: same axes, same values, indexable both ways.
+    @test axes(pts.chip_size_x) == axes(pts.x)
+    @test all(==(32), pts.chip_size_x)
+    @test pts.chip_size_x[3] == 32
+    @test pts.chip_size_x[2, 3] == 32
+    @test collect(pts.chip_size_x) == fill(32, size(pts.x))
+
+    # `scatter` takes `vec` of every field, and a dense result there would undo the saving at the
+    # point the correlator is called.
+    flat = AutoRIFT.scatter(pts)
+    @test flat.chip_size_x isa AutoRIFT.Uniform
+    @test length(flat.chip_size_x) == npoints(pts)
+    @test Base.summarysize(flat.chip_size_x) < 100
+
+    # An array for one axis beside a scalar for the other: each field carries its own type parameter,
+    # and sharing one across a pair made this combination a `MethodError`.
+    n = 4
+    mixed = pointset(collect(1.0:n), collect(1.0:n); chip_size_x = fill(32, n), chip_size = 16)
+    @test mixed.chip_size_x isa Array
+    @test mixed.chip_size_y isa AutoRIFT.Uniform
+    @test all(==(16), mixed.chip_size_y)
+end
