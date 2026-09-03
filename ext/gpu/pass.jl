@@ -158,7 +158,7 @@ function _gpu_batch!(backend_obj, ws::GPUWorkspace, out::AutoRIFT.DisplacementFi
                           Int32(fy), Int32(fx); ndrange = nb * nr * nc)
 
     peak_kernel!(be)(view(ws.peak_i, 1:nb), view(ws.peak_j, 1:nb), view(ws.corr, 1:nb),
-                     view(ws.snr, 1:nb), view(ws.surface, :, :, 1:nb), d_rx, d_ry,
+                     view(ws.ppr, 1:nb), view(ws.surface, :, :, 1:nb), d_rx, d_ry,
                      Int32(AutoRIFT.PEAK_EXCLUSION); ndrange = nb)
 
     _refine_batch!(backend_obj, ws, nb, d_rx, d_ry, up)
@@ -169,7 +169,7 @@ function _gpu_batch!(backend_obj, ws::GPUWorkspace, out::AutoRIFT.DisplacementFi
     h_dx = Array(view(ws.dx, 1:nb))
     h_dy = Array(view(ws.dy, 1:nb))
     h_corr = Array(view(ws.corr, 1:nb))
-    h_snr = Array(view(ws.snr, 1:nb))
+    h_ppr = Array(view(ws.ppr, 1:nb))
     h_deg = Array(view(ws.degenerate, 1:nb))
     h_pi = Array(view(ws.peak_i, 1:nb))
     h_pj = Array(view(ws.peak_j, 1:nb))
@@ -183,7 +183,7 @@ function _gpu_batch!(backend_obj, ws::GPUWorkspace, out::AutoRIFT.DisplacementFi
 
         # Both quality outputs are zero where the peak lay against the search boundary: the
         # displacement is a lower bound with no recoverable sub-pixel part, so neither the peak
-        # height nor its prominence describes a usable measurement. Zeroing them means any positive
+        # height nor its ratio to the best rival describes a usable measurement. Zeroing them means any positive
         # threshold on either rejects the point without the caller knowing the condition exists.
         railed = h_pi[b] == 1 || h_pj[b] == 1 ||
                  h_pi[b] == 2 * prys[lo + b - 1] || h_pj[b] == 2 * prxs[lo + b - 1]
@@ -193,7 +193,7 @@ function _gpu_batch!(backend_obj, ws::GPUWorkspace, out::AutoRIFT.DisplacementFi
         out.dx[i] = Float32(h_dx[b] + pts.dx_prior[i])
         out.dy[i] = Float32(h_dy[b] + pts.dy_prior[i])
         out.correlation[i] = railed ? 0.0f0 : h_corr[b]
-        out.peak_snr[i] = railed ? 0.0f0 : h_snr[b]
+        out.peak_ratio[i] = railed ? 0.0f0 : h_ppr[b]
     end
     return out
 end

@@ -62,7 +62,7 @@ function main()
     push!(manifest, dump_array(OUT, "julia_dx", Matrix{Float32}(out.dx)))
     push!(manifest, dump_array(OUT, "julia_dy", Matrix{Float32}(out.dy)))
     push!(manifest, dump_array(OUT, "julia_correlation", Matrix{Float32}(out.correlation)))
-    push!(manifest, dump_array(OUT, "julia_peak_snr", Matrix{Float32}(out.peak_snr)))
+    push!(manifest, dump_array(OUT, "julia_peak_ratio", Matrix{Float32}(out.peak_ratio)))
     push!(manifest, dump_array(OUT, "julia_chip_size", Matrix{Int32}(out.chip_size)))
     push!(manifest, dump_array(OUT, "julia_interpolated",
                                Matrix{Int32}(map(v -> v ? Int32(1) : Int32(0), out.interpolated))))

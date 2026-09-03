@@ -29,6 +29,9 @@ julia --project=tools/ab tools/ab/compare.jl chip32
 julia --project=tools/ab tools/ab/stage2_julia.jl 3072 16 64 20
 micromamba run -n arift-ref python tools/ab/stage2_python.py
 julia --project=tools/ab tools/ab/compare2.jl full
+
+# Which quality measure predicts disagreement -- reads the stage-2 dump, no imagery of its own.
+julia --project=tools/ab tools/ab/peak_ratio_skill.jl
 ```
 
 Both stages hand the reference the arrays **AutoRIFT.jl already filtered**, so a preprocessing
@@ -304,7 +307,7 @@ remains is 7.4% of points beyond 0.25 px, and it is the **pyramid**, not the cor
 |---|---:|---:|
 | chose a different chip-size level | **32.5%** | 5.3% |
 | filled from neighbours on the Julia side | 12.9% | 7.3% |
-| median `peak_snr` | 6.34 | 6.29 |
+| median `peak_ratio` | 1.65 | 1.83 |
 | median displacement | 0.48 px | 0.58 px |
 
 43% of the disagreeing points differ in chip level or were filled — decisions made by the outlier filter
@@ -314,8 +317,9 @@ ground; a point one side measured the other may have filled from neighbours.
 
 Two things this is *not*. It is not concentrated at fast flow: among the top 2% by displacement the rate
 is **4.1%**, lower than the 7.5% elsewhere, and the densest cluster sits at a displacement of 0.8 px.
-And it is not a quality effect — `peak_snr` is the same on both populations to two decimal places, so
-these are not weak-peak points.
+And it is not a quality effect — the disagreeing points are only marginally the more ambiguous, at a
+median `peak_ratio` of 1.65 against 1.83, which is well inside the spread of either population. So
+these are not points where a rival peak beat the right one.
 
 The residual beyond the level and fill differences is tie-breaking at 1/16 px, which no two
 implementations can agree about: below a real correlation peak both are picking from noise.

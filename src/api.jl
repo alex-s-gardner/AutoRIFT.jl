@@ -249,8 +249,8 @@ Estimate the displacement of surface features between two images of the same sce
 to sub-pixel precision.
 
 Both images must be co-registered to a common grid and the same size. The result carries `dx`
-and `dy` in pixels, the peak `correlation`, the `peak_snr` quality of the peak the estimate came
-from, the `chip_size` that produced each point, and an `interpolated` mask — see
+and `dy` in pixels, the peak `correlation`, the `peak_ratio` of that peak to the best rival on the
+same surface, the `chip_size` that produced each point, and an `interpolated` mask — see
 [`MultichipResult`](@ref). Points where no scale could produce a coherent estimate are `NaN`, which
 is deliberately distinct from a measured displacement of zero.
 

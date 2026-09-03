@@ -57,7 +57,7 @@ function load_stage2()
 
     j = (dx = crop(rd("julia_dx", Float32, js)), dy = crop(rd("julia_dy", Float32, js)),
          corr = crop(rd("julia_correlation", Float32, js)),
-         snr = crop(rd("julia_peak_snr", Float32, js)),
+         ppr = crop(rd("julia_peak_ratio", Float32, js)),
          chip = crop(rd("julia_chip_size", Int32, js)),
          interp = crop(rd("julia_interpolated", Int32, js)))
     rawpx = crop(rd("python_dx", Float32, ps))
@@ -261,7 +261,7 @@ end
 
 # Page 3: the outputs that are AutoRIFT.jl's alone, which no comparison page can show.
 #
-# `correlation` and `peak_snr` have no counterpart in the reference's output, and `interpolated` marks
+# `correlation` and `peak_ratio` have no counterpart in the reference's output, and `interpolated` marks
 # points whose displacement came from neighbours rather than a surface — so these are properties of the
 # result a user gates on, not quantities to diff. Drawn on their own page for that reason.
 function outputs_page(d; path = joinpath(FIG_PLOTS, "fig_outputs.png"))
@@ -287,18 +287,18 @@ function outputs_page(d; path = joinpath(FIG_PLOTS, "fig_outputs.png"))
     hm = heatmap!(axc, mapshow(blank(j.corr, measured)); colormap = :magma, colorrange = (0, 1))
     barof((1, 2), hm, "ZNCC peak", axc)
 
-    # `peak_snr` is zero where the peak lay against the search boundary, so the count of railed points is
+    # `peak_ratio` is zero where the peak lay against the search boundary, so the count of railed points is
     # stated in the title rather than mapped separately: on a scene whose flow the radius covers there
     # are none, and an all-one-colour panel reads as a broken plot rather than as an empty set.
-    snrok = jok .& .!isnan.(j.snr)
-    snr = map((v, k) -> k ? Float64(v) : NaN, j.snr, snrok)
-    finite = filter(isfinite, vec(snr))
+    pprok = jok .& .!isnan.(j.ppr)
+    ppr = map((v, k) -> k ? Float64(v) : NaN, j.ppr, pprok)
+    finite = filter(isfinite, vec(ppr))
     hi = isempty(finite) ? 1.0 : quantile(finite, 0.99)
     nrail = count(iszero, finite)
-    axs = mapax((1, 3), @sprintf("peak SNR; %d of %d at the search boundary",
+    axs = mapax((1, 3), @sprintf("peak ratio; %d of %d at the search boundary",
                                  nrail, length(finite)))
-    hm2 = heatmap!(axs, mapshow(snr); colormap = :viridis, colorrange = (0, hi))
-    barof((1, 4), hm2, "peak above background (sd)", axs)
+    hm2 = heatmap!(axs, mapshow(ppr); colormap = :viridis, colorrange = (0, hi))
+    barof((1, 4), hm2, "primary / secondary peak", axs)
 
     # Two categories, so a legend of two swatches rather than a colour bar. A bar implies an ordered
     # range between its ends and sizes itself to the map's height, which for a Boolean leaves a tall

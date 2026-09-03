@@ -76,9 +76,13 @@ than silently resolved: both parallelise the same loop.
 over ~15,000 points across per-point radii, degenerate chips, railed peaks, `NoRefine`, and
 `UInt8`/`Int16` input, with two stated exceptions.
 
-`correlation` agrees to **1e-5** and `peak_snr` to a distributional bound — median 2.5e-7 and 99th
-percentile 1.0e-6, with a handful of genuine outliers whose *background* includes the cancelling
-shifts described below, capped by count rather than by magnitude. The asymmetry is
+`correlation` agrees to **1e-5** and `peak_ratio` to a distributional bound — median below 1e-6 and
+95th percentile below 1e-5, with outliers whose *secondary* peak is one of the cancelling shifts
+described below, capped by count rather than by magnitude. Those outliers are a larger share than
+`correlation`'s because a ratio's denominator is a single sample, where a mean over the whole
+background dilutes any one of them: measured, a textured scene stays within 6.6e-7 over 4900 points
+while a scene with a constant patch puts 86 of 4416 points above 1%. `peak_ratio`'s `NaN` and `Inf`
+cases agree exactly, being decided by a count and a sign rather than by arithmetic. The asymmetry is
 not a weakness in the port: the numerator is computed by MPSGraph where the CPU uses FFTW, and no
 amount of care makes two transform libraries reassociate a sum identically. What makes it
 acceptable is that a peak's *location* is three orders of magnitude less sensitive than its value
@@ -208,7 +212,7 @@ Per point at 1024², chip 32, radius 25, a batch of 1024:
 |---|---:|
 | subpixel cascade, 64× | 46.0 |
 | gather (chip + window, both mean-removed) | 12.6 |
-| peak, boundary, prominence | 5.6 |
+| peak, boundary, peak ratio | 5.6 |
 | zero-fill and place the transform buffers | 3.5 |
 | forward transforms (×2) | 2.2 |
 | inverse transform | 2.3 |

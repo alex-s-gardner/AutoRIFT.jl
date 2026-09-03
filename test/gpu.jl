@@ -7,7 +7,7 @@
 # What is asserted, and why it is not "identical"
 # ---------------------------------------------------------------------------
 #
-# **`dx` and `dy` are bit-identical**, with two stated exceptions below. `correlation` and `peak_snr`
+# **`dx` and `dy` are bit-identical**, with two stated exceptions below. `correlation` and `peak_ratio`
 # agree to a tolerance, because the numerator is computed by a different transform library and no
 # amount of care makes MPSGraph and FFTW reassociate a sum the same way. That asymmetry is the point
 # of the gate rather than a weakness in it: a peak's *location* is three orders of magnitude less
@@ -148,37 +148,36 @@ function check_pass(pair, pts, pc, pg, chip, radius; label = "")
                        rtol = 1.0f-5, atol = 1.0f-6)
     end
 
-    # `peak_snr` gets its own, much looser bound, and it is a *distributional* one rather than a
-    # per-point one. Three reasons, in order of how much they matter:
+    # `peak_ratio` gets a *distributional* bound rather than a per-point one, for one reason: it
+    # reads the whole surface, including shifts where the CPU's denominator has cancelled and the
+    # value there is not a correlation at all. A point whose *peak* is a valid correlation may still
+    # carry such shifts elsewhere, so the `[-1, 1]` filter above does not exclude them, and the
+    # secondary peak may be one of them on either path independently.
     #
-    #   * It is a ratio of two moments of the whole surface, so it reads every shift — including
-    #     ones where the CPU's denominator has cancelled and its value is not a correlation. A point
-    #     whose *peak* is a valid correlation may still have such shifts in its background, so the
-    #     `[-1, 1]` filter above does not exclude them. Measured on a scene with a constant patch:
-    #     a handful of points differ by ~1.3% for exactly this reason.
-    #   * The background mean and variance accumulate over `4*rx*ry` samples in `Float32` on the
-    #     device against `Float64` on the host, so it amplifies the surface difference rather than
-    #     tracking it.
-    #   * `AutoRIFT.peak_quality` records that it has no skill as a reliability gate anyway — AUC
-    #     0.499 against `correlation`'s 0.842 — so a per-point tolerance would be asserting
-    #     precision in a quantity nothing downstream thresholds.
+    # The tail is worse than `correlation`'s, and the reason is structural rather than incidental: a
+    # maximum is dominated by its single largest sample where a mean over `4*rx*ry` samples dilutes
+    # it. Measured, the two scenes bracket this — a textured scene gives a maximum relative
+    # difference of 6.6e-7 over 4900 points, while the flat-patch scene gives 86 of 4416 points above
+    # 1% and a worst case of 58%, all of them where a cancelled shift won the secondary. Bounding the
+    # maximum would therefore mean a threshold loose enough to hide any real regression.
     #
-    # What is still worth asserting is that the kernel computes the *same statistic*: a wrong
-    # exclusion box or background count shifts every value, which a median ratio catches and a
-    # per-point tolerance would only report as thousands of failures.
-    # Measured on the flat-patch scene, which is the worst of the cases here: median 2.5e-7,
-    # 95th percentile 7.7e-7, 99th 1.0e-6, and 6 of 4286 points above 1%. So the assertion is a
-    # percentile bound plus a cap on the *count* of outliers, rather than a bound on the maximum:
-    # the tail is a handful of points where the two paths genuinely disagree, and a threshold loose
-    # enough to admit them would be loose enough to hide a real regression in the other 4280.
-    snr = [(a.peak_snr[i], b.peak_snr[i]) for i in cmp
-           if !isnan(a.peak_snr[i]) && !isnan(b.peak_snr[i]) && abs(a.peak_snr[i]) > 1.0f-3]
-    if length(snr) >= 100
-        rel = sort([abs(x - y) / abs(x) for (x, y) in snr])
-        @test rel[cld(length(rel), 2)] < 1.0f-5          # median: tracks the surface difference
-        @test rel[cld(99 * length(rel), 100)] < 1.0f-4   # 99th percentile: no systematic shift
-        @test count(>(0.01), rel) <= cld(length(rel), 200)   # measured 6 of 4286; 0.5% is the cap
+    # What the percentile bound does assert is that the kernel computes the *same statistic*: a wrong
+    # exclusion box, or `max` in place of the CPU's `>` comparison so a `NaN` propagates, shifts
+    # every value at once — which a median catches and a per-point tolerance would only report as
+    # thousands of indistinguishable failures.
+    pr = [(a.peak_ratio[i], b.peak_ratio[i]) for i in cmp
+          if isfinite(a.peak_ratio[i]) && isfinite(b.peak_ratio[i]) && abs(a.peak_ratio[i]) > 1.0f-3]
+    if length(pr) >= 100
+        rel = sort([abs(x - y) / abs(x) for (x, y) in pr])
+        @test rel[cld(length(rel), 2)] < 1.0f-6          # median: tracks the surface difference
+        @test rel[cld(95 * length(rel), 100)] < 1.0f-5   # 95th percentile: no systematic shift
+        @test count(>(0.01), rel) <= cld(3 * length(rel), 100)   # measured 86 of 4416 at worst
     end
+    # The non-finite cases are structural, not numerical: `NaN` means the surface was too small to
+    # hold a rival and `Inf` means no rival was positive, and both are decided by counting and sign
+    # rather than by arithmetic. So they must land on exactly the same points, with no tolerance.
+    @test [i for i in cmp if isnan(a.peak_ratio[i])] == [i for i in cmp if isnan(b.peak_ratio[i])]
+    @test [i for i in cmp if isinf(a.peak_ratio[i])] == [i for i in cmp if isinf(b.peak_ratio[i])]
     return a, b
 end
 
@@ -279,7 +278,7 @@ end
         @test count(==(0.0f0), a.correlation) == count(==(0.0f0), b.correlation)
         @test count(==(0.0f0), a.correlation) > 0
         # Zero in both quality outputs together, never one alone.
-        @test findall(==(0.0f0), b.correlation) == findall(==(0.0f0), b.peak_snr)
+        @test findall(==(0.0f0), b.correlation) == findall(==(0.0f0), b.peak_ratio)
     end
 
     @testset "NoRefine reports the integer peak" begin
@@ -345,7 +344,7 @@ end
             @test isequal(r.dx, results[1].dx)
             @test isequal(r.dy, results[1].dy)
             @test isequal(r.correlation, results[1].correlation)
-            @test isequal(r.peak_snr, results[1].peak_snr)
+            @test isequal(r.peak_ratio, results[1].peak_ratio)
             @test r.searched == results[1].searched
         end
     end
@@ -384,7 +383,7 @@ end
         @test isequal(a.dx, b.dx)
         @test isequal(a.dy, b.dy)
         @test isequal(a.correlation, b.correlation)
-        @test isequal(a.peak_snr, b.peak_snr)
+        @test isequal(a.peak_ratio, b.peak_ratio)
         @test a.searched == b.searched
     end
 

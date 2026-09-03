@@ -93,7 +93,7 @@ struct GPUWorkspace{T,M<:AbstractArray{T,3},C<:AbstractArray{Complex{T},3},
     dx::V
     dy::V
     corr::V
-    snr::V
+    ppr::V
     searched::B
 
     # Extents this workspace was built for, so a mismatched call errors rather than reading out of

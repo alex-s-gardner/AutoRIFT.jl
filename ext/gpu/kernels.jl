@@ -8,7 +8,7 @@
 #
 # `_track_chunk!` in `src/track.jl` is the loop this replaces: one point at a time, each doing a
 # gather, a chip mean removal, two summed-area tables, an FFT numerator, a per-shift normalisation,
-# a peak scan, a prominence, and a subpixel cascade. Here each of those is a kernel over the whole
+# a peak scan, a peak ratio, and a subpixel cascade. Here each of those is a kernel over the whole
 # batch, and the buffers live on the device between them, so no correlation surface crosses the bus.
 #
 # The gate is that `dx` and `dy` are **bit-identical** to the CPU path — measured, 0 differences
@@ -368,10 +368,10 @@ end
 end
 
 # ---------------------------------------------------------------------------
-# Peak location, boundary, prominence
+# Peak location, boundary, peak ratio
 # ---------------------------------------------------------------------------
 #
-# One workitem per point. `peak_index`, `peak_at_boundary` and `peak_quality` fused, as
+# One workitem per point. `peak_index`, `peak_at_boundary` and `peak_ratio` fused, as
 # `_track_chunk!` fuses them and for the same reason: every point needs all three from one located
 # peak, and locating it four times over is 6% of a point on the CPU.
 #
@@ -379,7 +379,7 @@ end
 # tie-breaking is row-major to match OpenCV's `minMaxLoc`; the extra clause reconciles them. This is
 # the one kernel where a "simplification" would silently bias every displacement on a plateau, and
 # 8-bit imagery produces plateaus routinely.
-@kernel function peak_kernel!(peak_i, peak_j, corr, snr, @Const(surface), @Const(rxs),
+@kernel function peak_kernel!(peak_i, peak_j, corr, ppr, @Const(surface), @Const(rxs),
                               @Const(rys), exclusion::Int32)
     k = @index(Global)
 
@@ -401,28 +401,31 @@ end
         peak_j[k] = best_j
         corr[k] = surface[best_i, best_j, k]
 
-        # The prominence: how far the peak stands above the background outside an exclusion box, in
-        # background standard deviations. Sum and sum of squares in one traversal, as
-        # `peak_quality` does.
-        s1 = 0.0f0
-        s2 = 0.0f0
+        # The primary-to-secondary peak ratio: the peak divided by the largest rival outside the
+        # exclusion box. One traversal and a maximum, as `peak_ratio` does, and in `Float32` for the
+        # reason recorded there — so the two paths differ only by the surface they were handed, not
+        # by the arithmetic applied to it. `test/gpu.jl` bounds what remains.
+        second = -Inf32
         cnt = Int32(0)
         for c in 1:nc, r in 1:nr
             if !(abs(r - best_i) <= exclusion && abs(c - best_j) <= exclusion)
                 v = surface[r, c, k]
-                s1 += v
-                s2 += v * v
+                # `v > second`, not `max`: `max` propagates a `NaN` where the comparison skips it,
+                # and the CPU form skips. A surface can carry `NaN` from a masked pixel, so the two
+                # would disagree exactly where it matters.
+                v > second && (second = v)
                 cnt += Int32(1)
             end
         end
-        # Too little background to characterise, or a perfectly flat one: both mean "no quality
-        # could be assessed" rather than a low quality, which is what `NaN` says.
-        if cnt < 8
-            snr[k] = NaN32
+        h = surface[best_i, best_j, k]
+        # The three cases `peak_ratio` documents, in its order: nothing outside the box to compare
+        # against, no peak to take a ratio of, and no positive rival to divide by.
+        if cnt == 0 || !(h > 0)
+            ppr[k] = NaN32
+        elseif second <= 0
+            ppr[k] = Inf32
         else
-            m = s1 / Float32(cnt)
-            sd = sqrt(max(s2 / Float32(cnt) - m * m, 0.0f0))
-            snr[k] = sd > 0 ? (surface[best_i, best_j, k] - m) / sd : NaN32
+            ppr[k] = h / second
         end
     end
 end

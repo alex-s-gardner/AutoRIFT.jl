@@ -52,7 +52,7 @@ because only some inputs know which way is north:
 | `AbstractDimArray` | `DimStack` | `dx`, `dy` — as above, with coordinates |
 | `AbstractRaster` | `RasterStack` | `vx`, `vy` — feature motion, `+vy` north |
 
-Every form also carries `correlation`, `peak_snr`, `chip_size` and `interpolated` per point.
+Every form also carries `correlation`, `peak_ratio`, `chip_size` and `interpolated` per point.
 
 The last two need `DimensionalData` or `Rasters` loaded. The raster path is the only
 one that can orient the result, so it is the only one that reports `vx`/`vy`: the

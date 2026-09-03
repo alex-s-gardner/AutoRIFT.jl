@@ -29,15 +29,16 @@
 
 Per-point results of a correlation pass.
 
-`dx` and `dy` are displacements in pixels, `correlation` the peak similarity, `peak_snr` how far that
-peak stood above the surface's background (see [`AutoRIFT.peak_quality`](@ref)), and `searched` marks
-the points that were actually correlated. Non-searched and failed points are `NaN` in `dx`/`dy` and
-`false` in `searched` — distinguishing "no measurement" from a measurement of zero, which the
-reference conflates.
+`dx` and `dy` are displacements in pixels, `correlation` the peak similarity, `peak_ratio` how far that
+peak stood above the best rival peak elsewhere on the surface (see [`AutoRIFT.peak_ratio`](@ref)), and
+`searched` marks the points that were actually correlated. Non-searched and failed points are `NaN` in
+`dx`/`dy` and `false` in `searched` — distinguishing "no measurement" from a measurement of zero, which
+the reference conflates.
 
-`correlation` and `peak_snr` are both quality measures and they are not interchangeable: the first is
-how strong the match was, the second whether it was *unambiguous*. A peak of 0.6 over quiet
-background locates a displacement; the same 0.6 over noisy background does not.
+`correlation` and `peak_ratio` are both quality measures and they are not interchangeable: the first is
+how strong the match was, the second whether it was *unique*. A peak of 0.6 with no rival locates a
+displacement; the same 0.6 with a second peak of 0.58 a wavelength away does not say which of the two
+the feature moved by.
 
 `searched` is a `Matrix{Bool}` rather than a `BitMatrix` deliberately. `BitArray` packs 64
 elements per word, so writing one element is a read-modify-write of that word — and the
@@ -52,7 +53,7 @@ struct DisplacementField{N,A<:AbstractArray{Float32,N},B<:AbstractArray{Bool,N}}
     dx::A
     dy::A
     correlation::A
-    peak_snr::A
+    peak_ratio::A
     searched::B
 end
 
@@ -397,15 +398,15 @@ function _track_chunk!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
             degenerate(ws) && continue
 
             # One location of the peak serves all four quantities this point needs — the
-            # displacement, the peak height, the boundary flag and the prominence — each of which
+            # displacement, the peak height, the boundary flag and the peak ratio — each of which
             # has a form taking an already-located peak for exactly this reason. See
-            # `AutoRIFT.peak_quality` for what the four naive calls cost.
+            # `AutoRIFT.peak_ratio` for what the four naive calls cost.
             #
             # `c` is the correlation at the peak actually reported, so it comes from the refinement
             # wherever there is one and from the integer peak otherwise.
             pi_, pj = peak_index(surface)
             railed = peak_at_boundary(surface, pi_, pj)
-            snr = peak_quality(surface, pi_, pj)
+            ppr = peak_ratio(surface, pi_, pj)
             dx, dy, c = isnothing(rw) ?
                 (_offset_at(pi_, pj, (prx, pry))..., (@inbounds surface[pi_, pj])) :
                 subpixel_peak(rw, surface, (prx, pry), up, pi_, pj)
@@ -416,11 +417,12 @@ function _track_chunk!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
             out.dy[i] = Float32(dy + pts.dy_prior[i])
             # Both quality outputs are zero where the peak lay against the search boundary: the
             # displacement is a lower bound with no recoverable sub-pixel part, so neither the peak
-            # height nor its prominence describes a usable measurement. Zeroing them means any positive
-            # threshold on either rejects the point without the caller having to know the condition
-            # exists. The displacement itself is still reported — it is the best available bound.
+            # height nor its ratio to the best rival describes a usable measurement. Zeroing them means
+            # any positive threshold on either rejects the point without the caller having to know the
+            # condition exists — and zero is below the 1 a real ratio cannot go under. The displacement
+            # itself is still reported — it is the best available bound.
             out.correlation[i] = railed ? 0.0f0 : c
-            out.peak_snr[i] = railed ? 0.0f0 : snr
+            out.peak_ratio[i] = railed ? 0.0f0 : ppr
         end
         return out
     finally

@@ -227,22 +227,22 @@ end
     @test count(!isnan, result.dx) > 0
 end
 
-@testset "peak_snr accompanies every measured point" begin
+@testset "peak_ratio accompanies every measured point" begin
     n = 512
     pair = banded_pair(n, (6, -4), 200:290)
     grid = gridpoints((n, n), 32; chip_size = 32, search_radius = 25)
     r = correlate_multichip(pair, grid, params(; chip_size = 32, chip_size_max = 128))
 
     # A point carrying a displacement carries a quality for it, and a point carrying neither carries
-    # neither. `chip_size` follows the same rule, and a caller reading `peak_snr` to gate on quality
+    # neither. `chip_size` follows the same rule, and a caller reading `peak_ratio` to gate on quality
     # needs it: a measured point with no quality would silently fail any threshold.
-    @test all(i -> isnan(r.dx[i]) == isnan(r.peak_snr[i]), eachindex(r.dx))
-    # A real match stands above its background, and `peak_quality` reports zero only at a peak against
+    @test all(i -> isnan(r.dx[i]) == isnan(r.peak_ratio[i]), eachindex(r.dx))
+    # A real match stands above its background, and `peak_ratio` reports zero only at a peak against
     # the search boundary — which this scene's 6/-4 px shift at radius 25 does not produce.
-    @test all(>(0), filter(isfinite, r.peak_snr))
+    @test all(>(0), filter(isfinite, r.peak_ratio))
 end
 
-@testset "peak_snr is not interpolated across a coarse cell" begin
+@testset "peak_ratio is not interpolated across a coarse cell" begin
     # A decimated level posts one estimate per chip footprint. `dx`/`dy` are spread over the cell
     # bicubically, but a quality describes one specific correlation surface and there is no surface
     # between two cells for an interpolated value to be about — so it is resampled `Nearest` and
@@ -252,7 +252,7 @@ end
     grid = gridpoints((n, n), 8; chip_size = 16, search_radius = 20)
     r = correlate_multichip(pair, grid, params(; chip_size = 16, chip_size_max = 64,
                                                grid_spacing = 8, search_radius = 20))
-    nr, nc = size(r.peak_snr)
+    nr, nc = size(r.peak_ratio)
     coarse = filter(c -> c > 16, unique(r.chip_size))
     if !isempty(coarse)
         for c in coarse
@@ -265,10 +265,10 @@ end
             cellof(i, ns) = min(cld(i, stride), ns)
             seen = Dict{Tuple{Int,Int},Float32}()
             for j in 1:nc, i in 1:nr
-                (r.chip_size[i, j] == c && isfinite(r.peak_snr[i, j])) || continue
+                (r.chip_size[i, j] == c && isfinite(r.peak_ratio[i, j])) || continue
                 key = (cellof(i, srows), cellof(j, scols))
-                v = get!(seen, key, r.peak_snr[i, j])
-                @test v == r.peak_snr[i, j]
+                v = get!(seen, key, r.peak_ratio[i, j])
+                @test v == r.peak_ratio[i, j]
             end
         end
     end
@@ -317,7 +317,7 @@ end
         sub = AutoRIFT._decimate_level(full[1:nr, 1:nr], trues(nr, nr), stride)
         @test !isnothing(sub)
         sr = length(sub.rows)
-        # `peak_snr` carries a distinct value per node and is resampled `Nearest`, so it shows directly
+        # `peak_ratio` carries a distinct value per node and is resampled `Nearest`, so it shows directly
         # which coarse cell each destination read — `cld(i, stride)`, the cell the slice took it from.
         # This is the assertion that pins the lattice; the bicubic channel cannot serve, because for an
         # even stride a cell centre falls on a half-integer fine row and so no destination ever
@@ -327,7 +327,7 @@ end
                                   tag, trues(sr, sr))
         up = AutoRIFT._undecimate_level((; field, filled = Int[]), (nr, nr), sub.rows, sub.cols)
         for j in 1:nr, i in 1:nr
-            @test up.field.peak_snr[i, j] == tag[min(cld(i, stride), sr), min(cld(j, stride), sr)]
+            @test up.field.peak_ratio[i, j] == tag[min(cld(i, stride), sr), min(cld(j, stride), sr)]
         end
         # A constant field survives interpolation exactly, whatever the lattice — the kernel is a
         # partition of unity, and this is what says the bicubic channel carries no scale error.
