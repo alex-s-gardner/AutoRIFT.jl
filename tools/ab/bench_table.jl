@@ -125,10 +125,12 @@ function timed(cmd::Cmd, tag::AbstractString)
             (peak = parse(Float64, first(split(strip(line)))) / 2^20)
     end
     seconds === nothing && error("no timing for $tag; see $log")
-    cores = something(cpu, 0.0) / seconds
-    @printf("  %-32s %7.1f s  %6.0f MiB  %5.2f cores\n", tag, seconds, something(peak, 0.0), cores)
+    cputime = something(cpu, 0.0)
+    cores = cputime / seconds
+    @printf("  %-32s %7.1f s  %8.1f s cpu  %6.0f MiB  %5.2f cores\n",
+            tag, seconds, cputime, something(peak, 0.0), cores)
     flush(stdout)
-    return seconds, something(peak, 0.0), cores
+    return seconds, something(peak, 0.0), cores, cputime
 end
 
 function measure()
@@ -142,7 +144,8 @@ function measure()
 
     rows = Any[]
     add!(label, threads, lazy, blocks, r) =
-        push!(rows, (; label, threads, lazy, blocks, seconds = r[1], peak = r[2], cores = r[3]))
+        push!(rows, (; label, threads, lazy, blocks, seconds = r[1], peak = r[2], cores = r[3],
+                     cpu = r[4]))
     julia(th, mode, bs, tag) = timed(
         `$(Base.julia_cmd()) --startup-file=no --project=$HERE -t $th $rowfile $mode $bs $WORK`, tag)
 
@@ -216,9 +219,15 @@ function render(r)
     # keeps measurement order — that is the record of what ran when, and comparing two runs wants them
     # in the same sequence.
     ranked = sort(collect(r.table); by = t -> -t.seconds)
+    # `cpu` is carried beside `runtime` because the two separate the questions a single wall clock
+    # conflates. CPU time is the work done; wall clock is that work divided by the parallelism
+    # achieved. A row whose wall clock rose while its CPU time held did not get more expensive, it
+    # got less parallel — and on a shared machine that is the difference between a regression and a
+    # busy afternoon. Older rows of this table were misread exactly that way.
     body = join(("""<tr><td class="l">$(t.label)</td><td>$(t.threads)</td>""" *
                  """<td>$(@sprintf("%.2f", t.cores))</td><td>$(t.lazy)</td>""" *
                  """<td>$(t.blocks)</td><td>$(@sprintf("%.1f s", t.seconds))</td>""" *
+                 """<td>$(@sprintf("%.1f s", get(t, :cpu, 0.0)))</td>""" *
                  """<td>$(@sprintf("%.0f MiB", t.peak))</td></tr>""" for t in ranked), "\n")
     html = """
     <!DOCTYPE html><html><head><meta charset="utf-8"><style>
@@ -255,7 +264,7 @@ function render(r)
         AutoRIFT.jl $(r.provenance.autorift_jl) ($(r.provenance.commit)) &middot;
         autoRIFT $(r.provenance.autorift_py)</p>
       <table><thead><tr><th>configuration</th><th>threads</th><th>cores used</th><th>lazy</th>
-        <th>blocks</th><th>runtime</th><th>peak RSS</th></tr></thead>
+        <th>blocks</th><th>runtime</th><th>CPU time&Dagger;</th><th>peak RSS</th></tr></thead>
       <tbody>
     $body
       </tbody></table>
@@ -265,7 +274,12 @@ function render(r)
         blocking on the same scene through the library.<br>
         &dagger; Mean cores used, measured as CPU time over elapsed time. autoRIFT.py's correlation loop
         is serial &mdash; it runs at one core for 85% of the run, reaching ~11 cores only during the
-        OpenCV filter calls &mdash; so this is what it achieves on a 12-core machine, not a setting.</p>
+        OpenCV filter calls &mdash; so this is what it achieves on a 12-core machine, not a setting.<br>
+        &Dagger; User plus system time, summed over all threads: the work done, where runtime is that
+        work divided by the parallelism achieved. Read the two together. A row whose runtime rises while
+        its CPU time holds became less parallel rather than more expensive &mdash; which on a shared
+        machine distinguishes a real regression from a busy one, and is how the threaded rows of this
+        table should be compared across runs.</p>
 
       <div class="page">
         <h1>Agreement with autoRIFT.py: displacement</h1>
@@ -309,11 +323,12 @@ end
 function main()
     r = "--replot" in ARGS ? JSON3.read(read(RESULTS, String)) : measure()
     println()
-    println("| configuration | threads | cores used | lazy | blocks | runtime | peak RSS |")
-    println("|---|---:|---:|:---:|---:|---:|---:|")
+    println("| configuration | threads | cores used | lazy | blocks | runtime | CPU time | peak RSS |")
+    println("|---|---:|---:|:---:|---:|---:|---:|---:|")
     for t in sort(collect(r.table); by = t -> -t.seconds)
-        @printf("| %s | %s | %.2f | %s | %d | %.1f s | %.0f MiB |\n",
-                t.label, t.threads, t.cores, t.lazy, t.blocks, t.seconds, t.peak)
+        @printf("| %s | %s | %.2f | %s | %d | %.1f s | %.1f s | %.0f MiB |\n",
+                t.label, t.threads, t.cores, t.lazy, t.blocks, t.seconds,
+                get(t, :cpu, 0.0), t.peak)
     end
     @printf("\nwrote %s\n      %s\n", RESULTS, render(r))
 end

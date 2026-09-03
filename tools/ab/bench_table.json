@@ -20,8 +20,8 @@
   "julia": "1.12.5",
   "autorift_jl": "0.1.0",
   "autorift_py": "2.1.1",
-  "commit": "65b67ac",
-  "note": "Measured at load 2.68 after the NCC hot-loop change (b1d74bf): four accumulator chains in prepare_chip! and integral_both!, ifelse for the denominator guard, FFTW_PATIENT plans. The change helps serially and not under threading, which a direct A/B of the eager row against its parent b4fb528 settles -- same machine, back to back, identical 920544 points: 1 thread 74.29 s -> 66.26 s (1.12x), 12 threads 24.67 s -> 25.40 s (1.03x SLOWER). So the 33-35 s 12-thread row here is not a regression from the change, and equally the change buys nothing there: at 12 threads this workload is bound by memory bandwidth rather than by the arithmetic the change removed, so cheaper points do not shorten it. Quote the serial row for the optimization and the threaded row for throughput; they answer different questions. An earlier revision of this note blamed the 12-thread number on machine contention. That was wrong and is retracted: two runs at load 3.45 and 2.68 agree to 4%, and the A/B above reproduces the threaded result at both commits. What remains unexplained is that this row achieves ~2.85 cores where the 8d7c1ec run recorded 3.78; base and HEAD both sit at ~2.85 today, so whatever moved it is not this change. The 4096 lazy row peaked at 9784 MiB against 3654 at 2048: 25 blocks on 12 threads holds twelve 6144-pixel working sets at once, which measures the block size being large relative to the scene rather than what blocking costs. 8192 is excluded for the same reason at 9 blocks."
+  "commit": "63e290d",
+  "note": "Measured at load 1.98 after the NCC hot-loop change (b1d74bf): four accumulator chains in prepare_chip! and integral_both!, ifelse for the denominator guard, FFTW_PATIENT plans. This run carries the CPU-time column, which exists because two earlier readings of this table were wrong without it. Wall clock is work divided by parallelism achieved; CPU time is the work. On a shared machine only the latter is comparable across runs. The change is a real win at both thread counts, from an interleaved A/B against its parent b4fb528 -- two reps, alternating base/HEAD so a load spike cannot land on one side, identical 920544 points: 1 thread 75.6 -> 68.6 s CPU (9.3% less work, wall 74.1 -> 67.0), 12 threads 89.7 -> 82.2 s CPU (8.4% less, wall 22.2 -> 21.6). Both reproduce to within 0.3 s. Two retracted claims, recorded so neither is re-derived. First: that the 12-thread wall clock (33-35 s at load 2.7-3.5) was contention. Second: that a non-interleaved A/B showed the change 1.03x SLOWER threaded. The first was right in substance and dismissed too early; the second was the artifact -- its base and HEAD runs were not interleaved, so a load spike biased one side. At load 1.98 this row is 21.3 s at 3.83 cores, faster than the 8d7c1ec run's 25.6 s, so the ~2.85 cores seen at higher load was the machine and not a lost-parallelism regression. The 4096 lazy row peaked at 9537 MiB against 3599 at 2048: 25 blocks on 12 threads holds twelve 6144-pixel working sets at once, which measures the block size being large relative to the scene rather than what blocking costs. 8192 is excluded for the same reason at 9 blocks."
  },
  "table": [
   {
@@ -29,99 +29,110 @@
    "threads": "2.3\u2020",
    "lazy": "no",
    "blocks": 1,
-   "seconds": 181.46,
-   "peak": 6881.640625,
-   "cores": 2.2970902678276204
+   "seconds": 180.38,
+   "peak": 6882.46875,
+   "cores": 2.312118860184056,
+   "cpu": 417.06
   },
   {
    "label": "AutoRIFT.jl, eager, no blocks",
    "threads": "12",
    "lazy": "no",
    "blocks": 1,
-   "seconds": 34.63,
-   "peak": 6956.78125,
-   "cores": 2.8457984406583883
+   "seconds": 21.33,
+   "peak": 7079.578125,
+   "cores": 3.826066572902016,
+   "cpu": 81.61
   },
   {
    "label": "AutoRIFT.jl, eager, no blocks",
    "threads": "1",
    "lazy": "no",
    "blocks": 1,
-   "seconds": 67.67,
-   "peak": 6699.03125,
-   "cores": 1.0187675483966308
+   "seconds": 67.25,
+   "peak": 6657.21875,
+   "cores": 1.0224535315985128,
+   "cpu": 68.75999999999999
   },
   {
    "label": "AutoRIFT.jl, lazy, block 2048",
    "threads": "12",
    "lazy": "yes",
    "blocks": 81,
-   "seconds": 47.32,
-   "peak": 3654.34375,
-   "cores": 4.512045646661031
+   "seconds": 44.52,
+   "peak": 3599.40625,
+   "cores": 4.724393530997304,
+   "cpu": 210.32999999999998
   },
   {
    "label": "AutoRIFT.jl, lazy, block 4096",
    "threads": "12",
    "lazy": "yes",
    "blocks": 25,
-   "seconds": 57.09,
-   "peak": 9784.015625,
-   "cores": 3.9068138027675596
+   "seconds": 58.56,
+   "peak": 9536.890625,
+   "cores": 3.734801912568306,
+   "cpu": 218.71
   },
   {
    "label": "juliac binary, lazy, no blocks",
    "threads": "1*",
    "lazy": "yes",
    "blocks": 1,
-   "seconds": 65.77,
-   "peak": 6361.0625,
-   "cores": 1.0215903907556636
+   "seconds": 66.37,
+   "peak": 6361.59375,
+   "cores": 1.019135151423836,
+   "cpu": 67.64
   },
   {
    "label": "juliac binary, lazy, block 4096",
    "threads": "1*",
    "lazy": "yes",
    "blocks": 25,
-   "seconds": 102.89,
-   "peak": 3957.859375,
-   "cores": 1.0111769851297503
+   "seconds": 101.93,
+   "peak": 3959.640625,
+   "cores": 1.0143235553811438,
+   "cpu": 103.39
   },
   {
    "label": "juliac binary, lazy, block 2048",
    "threads": "1*",
    "lazy": "yes",
    "blocks": 81,
-   "seconds": 90.51,
-   "peak": 3392.109375,
-   "cores": 1.0180090597724007
+   "seconds": 90.44,
+   "peak": 3366.296875,
+   "cores": 1.0168067226890756,
+   "cpu": 91.96
   },
   {
    "label": "juliac binary, lazy, block 1024",
    "threads": "1*",
    "lazy": "yes",
    "blocks": 289,
-   "seconds": 93.24,
-   "peak": 3193.03125,
-   "cores": 1.0171600171600172
+   "seconds": 92.13,
+   "peak": 3169.859375,
+   "cores": 1.013676326929339,
+   "cpu": 93.39
   },
   {
    "label": "juliac binary, lazy, block 512",
    "threads": "1*",
    "lazy": "yes",
    "blocks": 1122,
-   "seconds": 96.93,
-   "peak": 3159.015625,
-   "cores": 1.0148560817084493
+   "seconds": 95.95,
+   "peak": 3157.59375,
+   "cores": 1.0159458051068264,
+   "cpu": 97.48
   },
   {
    "label": "juliac binary, lazy, block 256",
    "threads": "1*",
    "lazy": "yes",
    "blocks": 4422,
-   "seconds": 112.53,
-   "peak": 3162.90625,
-   "cores": 1.0125299920021327
+   "seconds": 112.29,
+   "peak": 3171.671875,
+   "cores": 1.0139816546442246,
+   "cpu": 113.86
   }
  ]
 }
