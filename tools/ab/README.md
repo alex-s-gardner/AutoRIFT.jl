@@ -141,15 +141,19 @@ compilation. Apple M2 Max, 12 cores, 3072² window, 137,641 grid points, chips 1
 
 | | AutoRIFT.jl | reference | ratio | per point |
 |---|---:|---:|---:|---:|
-| 1 thread | 6.019 s | 14.637 s | **2.43×** | 43.7 vs 108.1 µs |
-| 12 threads | 1.635 s | 5.245 s | **3.21×** | 11.9 vs 38.7 µs |
-| 12 threads, warm `Cache` | 1.440 s | — | **3.64×** | 10.5 µs |
+| 1 thread | 5.487 s | 14.637 s | **2.67×** | 39.9 vs 106.3 µs |
+| 12 threads | 1.288 s | 5.245 s | **4.07×** | 9.4 vs 38.1 µs |
+| 12 threads, warm `Cache` | 1.173 s | — | **4.47×** | 8.5 µs |
 
 Per-point figures are given because the reference truncates its grid to 368² against 371², so it
 solves 1.6% fewer points; normalizing changes the ratio by under 0.05×.
 
-Single-threaded is the algorithmic comparison: **2.43×**. The rest is parallel scaling, where the gap
-widens because the two scale differently on this machine — 3.68× against 2.79× from 1 to 12 threads.
+The reference column is carried over from an earlier run of the same command rather than re-measured
+alongside: it is a separate process running unchanged code, and a Python row costs a quarter of an hour
+to reproduce. Re-run `bench_python.py` before quoting the ratios as simultaneous.
+
+Single-threaded is the algorithmic comparison: **2.67×**. The rest is parallel scaling, where the gap
+widens because the two scale differently on this machine — 4.26× against 2.79× from 1 to 12 threads.
 The warm-`Cache` row has no counterpart in the reference, which has no batch entry point; it is what
 a driver over many pairs pays once buffers and FFT plans are reused.
 
@@ -248,22 +252,32 @@ faster implementation that disagrees is not faster at the same job.
 Whole-process wall clock and peak RSS from `/usr/bin/time -l`, one fresh process per row: `ru_maxrss`
 is a high-water mark, so two configurations measured in one process both report the larger.
 
-Apple M2 Max, 12 cores, 96 GiB, macOS 26.5.2 · Julia 1.12.5 · AutoRIFT.jl 0.1.0 (`f3bf970`) ·
+Apple M2 Max, 12 cores, 96 GiB, macOS 26.5.2 · Julia 1.12.5 · AutoRIFT.jl 0.1.0 (`f88c3a8`) ·
 reference autoRIFT 2.1.1, Python 3.10.20 with NumPy 1.26.4 and OpenCV 4.13.0 · Rasters 0.15.0,
-ArchGDAL 0.10.12, DiskArrays 0.4.22. Load average 3.7 during the run, so absolute times are a few
+ArchGDAL 0.10.12, DiskArrays 0.4.22. Load average 2.0 during the run, so absolute times are a few
 percent pessimistic — equally for every row, so the ratios hold.
 
-| configuration | threads | lazy | blocks | runtime | peak RSS |
-|---|---:|:---:|---:|---:|---:|
-| python autoRIFT v2.1.2 | 12 | no | 1 | 336.2 s | 8126 MiB |
-| AutoRIFT.jl, eager, no blocks | 12 | no | 1 | 21.8 s | 7148 MiB |
-| AutoRIFT.jl, eager, no blocks | 1 | no | 1 | 69.8 s | 6701 MiB |
-| AutoRIFT.jl, lazy, block 2048 | 12 | yes | 81 | 41.9 s | 3926 MiB |
-| juliac binary, lazy, no blocks | 1\* | yes | 1 | 71.6 s | 6532 MiB |
-| juliac binary, lazy, block 2048 | 1\* | yes | 81 | 95.7 s | 3504 MiB |
-| juliac binary, lazy, block 1024 | 1\* | yes | 289 | 93.9 s | 3299 MiB |
-| juliac binary, lazy, block 512 | 1\* | yes | 1122 | 97.1 s | 3352 MiB |
-| juliac binary, lazy, block 256 | 1\* | yes | 4422 | 108.8 s | 3354 MiB |
+CPU time beside wall clock because the two answer different questions: wall clock is what a user
+waits, CPU time is what the work costs. A row using about one core's worth of CPU over its wall
+clock was not competing with anything, which is the check that a row is worth reading at all.
+
+| configuration | lazy | blocks | runtime | CPU time | peak RSS |
+|---|:---:|---:|---:|---:|---:|
+| python autoRIFT v2.1.2† | no | 1 | 173.9 s | 414.0 s | 6884 MiB |
+| AutoRIFT.jl, eager, no blocks, 12 threads | no | 1 | 20.8 s | 79.8 s | 6984 MiB |
+| AutoRIFT.jl, lazy, block 2048, 12 threads | yes | 81 | 42.0 s | 206.3 s | 3781 MiB |
+| AutoRIFT.jl, lazy, block 4096, 12 threads | yes | 25 | 59.6 s | 222.3 s | 9643 MiB |
+| AutoRIFT.jl, eager, no blocks, 1 thread | no | 1 | 63.8 s | 65.6 s | 6701 MiB |
+| juliac binary, lazy, no blocks, 1 thread\* | yes | 1 | 65.0 s | 66.4 s | 6362 MiB |
+| juliac binary, lazy, block 2048, 1 thread\* | yes | 81 | 88.1 s | 89.4 s | 3396 MiB |
+| juliac binary, lazy, block 1024, 1 thread\* | yes | 289 | 91.2 s | 92.7 s | 3212 MiB |
+| juliac binary, lazy, block 512, 1 thread\* | yes | 1122 | 95.8 s | 97.3 s | 3154 MiB |
+| juliac binary, lazy, block 4096, 1 thread\* | yes | 25 | 98.9 s | 100.3 s | 3966 MiB |
+| juliac binary, lazy, block 256, 1 thread\* | yes | 4422 | 109.2 s | 110.8 s | 3172 MiB |
+
+† The reference's correlation loop is serial, but OpenCV's own threading is not: it uses 2.4 cores'
+worth over the run, which is why its CPU time exceeds its wall clock. `cv2.setNumThreads` does not
+constrain it on macOS, where OpenCV dispatches through GCD.
 
 \* The binary is single-threaded: threading in a `--trim=safe` build is blocked upstream by
 [JuliaLang/julia#61319](https://github.com/JuliaLang/julia/issues/61319), so the thread pool is
@@ -272,11 +286,15 @@ created but a spawned task resolves its entry point in the wrong world age and f
 The answer is the same in every row that can be compared byte for byte: lazy at 2048 against eager, 1
 thread against 12, and the binary at each block size against its own unblocked run.
 
-Three things this table says that the windowed ones cannot:
+Four things this table says that the windowed ones cannot:
 
-**Lazy trades time for memory, and the trade is not free.** 41.9 s against 21.8 s for a 45% lower
-peak. Blocking a scene that fits in memory costs 1.9× the runtime and buys nothing; blocking one that
+**Lazy trades time for memory, and the trade is not free.** 42.0 s against 20.8 s for a 46% lower
+peak. Blocking a scene that fits in memory costs 2.0× the runtime and buys nothing; blocking one that
 does not fit is the only way to process it at all. That is the whole basis for choosing.
+
+**Block 4096 is the exception, and it is not a memory saving at all.** 9643 MiB against 6984 for the
+unblocked row: a block that large holds more per-block buffer than the whole scene costs eagerly, so
+blocking there pays 2.9× the runtime to raise peak memory by 38%. The useful range is 2048 and below.
 
 **The two eager rows read raw planes, not rasters.** Measured through
 `autorift(::AbstractRaster, ...)` the same configuration peaks at **11590 MiB**, not 7148: `read` keeps
@@ -293,9 +311,9 @@ beneath it. The input arrays are the wrong lever for peak memory on this path; t
 workspaces and output are where the 12 GiB comes from.
 
 **Block size is nearly free above the halo, and the floor is the grid.** 2048 through 256 px spans
-81 to 4422 blocks and 54× the halo redundancy, yet peak moves by 1.6% and runtime by 16%: what is left
+81 to 4422 blocks and 54× the halo redundancy, yet peak moves by 7.7% and runtime by 24%: what is left
 resident is the output grid and the per-block buffers, and only the latter shrinks. The binary's
-unblocked row is the one that matters — 6532 against ~3.3 GiB blocked, which is the difference between
+unblocked row is the one that matters — 6362 against ~3.2 GiB blocked, which is the difference between
 fitting on a small instance and not.
 
 ## Where the two still differ, and why

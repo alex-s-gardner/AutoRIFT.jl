@@ -1,7 +1,7 @@
 # Correlating on a GPU
 
 > **Experimental, and slower than the CPU path on a machine with cores free.** The device does not
-> beat this package's threaded CPU correlator on a single image pair: 0.65 s against **0.26 s** at
+> beat this package's threaded CPU correlator on a single image pair: 0.65 s against **0.23 s** at
 > 1024², chip 32, radius 25 on 8 threads. Every speedup quoted below is against **one** CPU core,
 > which is the comparison that matters only when the other cores are already busy — a batch driver
 > running one pair per single-threaded process, with the device otherwise idle. On an otherwise free
@@ -30,21 +30,21 @@ One correlation pass, `track!` over a dense grid:
 
 | scene | chip | radius | points | CPU | GPU | speedup | GPU µs/point |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 640² | 16 | 20 | 5,329 | 0.58 s | 0.18 s | **3.2×** | 34.5 |
-| 640² | 32 | 25 | 4,900 | 0.68 s | 0.25 s | **2.8×** | 50.2 |
-| 1024² | 32 | 25 | 13,924 | 1.90 s | 0.70 s | **2.7×** | 50.2 |
-| 1024² | 64 | 25 | 3,249 | 0.55 s | 0.30 s | 1.9× | 91.2 |
-| 2048² | 32 | 25 | 60,516 | 8.44 s | 3.02 s | **2.8×** | 49.9 |
+| 640² | 16 | 20 | 5,329 | 0.55 s | 0.19 s | **3.0×** | 34.8 |
+| 640² | 32 | 25 | 4,900 | 0.61 s | 0.25 s | **2.5×** | 50.2 |
+| 1024² | 32 | 25 | 13,924 | 1.74 s | 0.68 s | **2.6×** | 48.5 |
+| 1024² | 64 | 25 | 3,249 | 0.50 s | 0.30 s | 1.7× | 91.3 |
+| 2048² | 32 | 25 | 60,516 | 7.52 s | 2.89 s | **2.6×** | 47.8 |
 
 A whole `autorift` — three chip-size levels, with preprocessing, the coarse pass, the outlier
 filter and the merge all still on the host:
 
 | scene | grid spacing | CPU | GPU | speedup |
 |---:|---:|---:|---:|---:|
-| 640² | 32 | 0.037 s | 0.036 s | 1.0× |
-| 1024² | 32 | 0.118 s | 0.072 s | 1.6× |
-| 1024² | 8 | 0.456 s | 0.194 s | **2.4×** |
-| 2048² | 32 | 0.567 s | 0.283 s | 2.0× |
+| 640² | 32 | 0.045 s | 0.038 s | 1.2× |
+| 1024² | 32 | 0.125 s | 0.077 s | 1.6× |
+| 1024² | 8 | 0.450 s | 0.195 s | **2.3×** |
+| 2048² | 32 | 0.560 s | 0.283 s | 2.0× |
 
 Two things to read off that. The end-to-end gain is smaller than the per-pass one because
 **only the pass is on the device** — Amdahl's share of the host-side pipeline sets the ceiling,
@@ -56,11 +56,11 @@ point per chip.
 
 | | time |
 |---|---:|
-| 1024², chip 32, radius 25, 8 CPU threads | **0.26 s** |
+| 1024², chip 32, radius 25, 8 CPU threads | **0.23 s** |
 | the same on the GPU | 0.65 s |
 
 That is not a defect to be fixed later, it is what the numbers say: intra-pair threading across
-8 performance cores is 2.5× the device. **The GPU is worth using when the CPU is otherwise
+8 performance cores is 2.8× the device. **The GPU is worth using when the CPU is otherwise
 occupied** — a batch driver running one pair per process, where each process has one core and
 the device is idle — and not as a way to make a single pair faster on an otherwise free machine.
 `benchmark/suite/throughput.jl` already measures pair-level parallelism at 2.7× intra-pair
