@@ -21,118 +21,129 @@
   "autorift_jl": "0.1.0",
   "autorift_py": "2.1.1",
   "commit": "63e290d",
-  "note": "Measured at load 1.98 after the NCC hot-loop change (b1d74bf): four accumulator chains in prepare_chip! and integral_both!, ifelse for the denominator guard, FFTW_PATIENT plans. This run carries the CPU-time column, which exists because two earlier readings of this table were wrong without it. Wall clock is work divided by parallelism achieved; CPU time is the work. On a shared machine only the latter is comparable across runs. The change is a real win at both thread counts, from an interleaved A/B against its parent b4fb528 -- two reps, alternating base/HEAD so a load spike cannot land on one side, identical 920544 points: 1 thread 75.6 -> 68.6 s CPU (9.3% less work, wall 74.1 -> 67.0), 12 threads 89.7 -> 82.2 s CPU (8.4% less, wall 22.2 -> 21.6). Both reproduce to within 0.3 s. Two retracted claims, recorded so neither is re-derived. First: that the 12-thread wall clock (33-35 s at load 2.7-3.5) was contention. Second: that a non-interleaved A/B showed the change 1.03x SLOWER threaded. The first was right in substance and dismissed too early; the second was the artifact -- its base and HEAD runs were not interleaved, so a load spike biased one side. At load 1.98 this row is 21.3 s at 3.83 cores, faster than the 8d7c1ec run's 25.6 s, so the ~2.85 cores seen at higher load was the machine and not a lost-parallelism regression. The 4096 lazy row peaked at 9537 MiB against 3599 at 2048: 25 blocks on 12 threads holds twelve 6144-pixel working sets at once, which measures the block size being large relative to the scene rather than what blocking costs. 8192 is excluded for the same reason at 9 blocks."
+  "note": "Measured at load 1.98 after the NCC hot-loop change (b1d74bf): four accumulator chains in prepare_chip! and integral_both!, ifelse for the denominator guard, FFTW_PATIENT plans. This run carries the CPU-time column, which exists because two earlier readings of this table were wrong without it. Wall clock is work divided by parallelism achieved; CPU time is the work. On a shared machine only the latter is comparable across runs. The change is a real win at both thread counts, from an interleaved A/B against its parent b4fb528 -- two reps, alternating base/HEAD so a load spike cannot land on one side, identical 920544 points: 1 thread 75.6 -> 68.6 s CPU (9.3% less work, wall 74.1 -> 67.0), 12 threads 89.7 -> 82.2 s CPU (8.4% less, wall 22.2 -> 21.6). Both reproduce to within 0.3 s. Two retracted claims, recorded so neither is re-derived. First: that the 12-thread wall clock (33-35 s at load 2.7-3.5) was contention. Second: that a non-interleaved A/B showed the change 1.03x SLOWER threaded. The first was right in substance and dismissed too early; the second was the artifact -- its base and HEAD runs were not interleaved, so a load spike biased one side. At load 1.98 this row is 21.3 s at 3.83 cores, faster than the 8d7c1ec run's 25.6 s, so the ~2.85 cores seen at higher load was the machine and not a lost-parallelism regression. The 4096 lazy row peaked at 9537 MiB against 3599 at 2048: 25 blocks on 12 threads holds twelve 6144-pixel working sets at once, which measures the block size being large relative to the scene rather than what blocking costs. 8192 is excluded for the same reason at 9 blocks. Column set reduced afterwards: `cores used` is dropped, being CPU time over runtime, and the thread count moved into the configuration label. Rows group by implementation rather than sorting purely by runtime, which interleaved the three and separated the comparisons a reader wants. The `group` fields and thread-annotated labels in this file were backfilled onto the load-1.98 measurements rather than re-measured -- a relabel, no timing changed -- because the machine was at load 4.4 by then and re-running the threaded rows there is exactly the error the CPU-time column exists to prevent."
  },
  "table": [
   {
-   "label": "python autoRIFT v2.1.2",
+   "label": "python autoRIFT v2.1.2\u2020",
    "threads": "2.3\u2020",
    "lazy": "no",
    "blocks": 1,
    "seconds": 180.38,
    "peak": 6882.46875,
    "cores": 2.312118860184056,
-   "cpu": 417.06
+   "cpu": 417.06,
+   "group": "reference"
   },
   {
-   "label": "AutoRIFT.jl, eager, no blocks",
+   "label": "AutoRIFT.jl, eager, no blocks, 12 threads",
    "threads": "12",
    "lazy": "no",
    "blocks": 1,
    "seconds": 21.33,
    "peak": 7079.578125,
    "cores": 3.826066572902016,
-   "cpu": 81.61
+   "cpu": 81.61,
+   "group": "library"
   },
   {
-   "label": "AutoRIFT.jl, eager, no blocks",
+   "label": "AutoRIFT.jl, eager, no blocks, 1 thread",
    "threads": "1",
    "lazy": "no",
    "blocks": 1,
    "seconds": 67.25,
    "peak": 6657.21875,
    "cores": 1.0224535315985128,
-   "cpu": 68.75999999999999
+   "cpu": 68.75999999999999,
+   "group": "library"
   },
   {
-   "label": "AutoRIFT.jl, lazy, block 2048",
+   "label": "AutoRIFT.jl, lazy, block 2048, 12 threads",
    "threads": "12",
    "lazy": "yes",
    "blocks": 81,
    "seconds": 44.52,
    "peak": 3599.40625,
    "cores": 4.724393530997304,
-   "cpu": 210.32999999999998
+   "cpu": 210.32999999999998,
+   "group": "library"
   },
   {
-   "label": "AutoRIFT.jl, lazy, block 4096",
+   "label": "AutoRIFT.jl, lazy, block 4096, 12 threads",
    "threads": "12",
    "lazy": "yes",
    "blocks": 25,
    "seconds": 58.56,
    "peak": 9536.890625,
    "cores": 3.734801912568306,
-   "cpu": 218.71
+   "cpu": 218.71,
+   "group": "library"
   },
   {
-   "label": "juliac binary, lazy, no blocks",
-   "threads": "1*",
+   "label": "juliac binary, lazy, no blocks, 1 thread*",
+   "threads": "1",
    "lazy": "yes",
    "blocks": 1,
    "seconds": 66.37,
    "peak": 6361.59375,
    "cores": 1.019135151423836,
-   "cpu": 67.64
+   "cpu": 67.64,
+   "group": "binary"
   },
   {
-   "label": "juliac binary, lazy, block 4096",
-   "threads": "1*",
+   "label": "juliac binary, lazy, block 4096, 1 thread*",
+   "threads": "1",
    "lazy": "yes",
    "blocks": 25,
    "seconds": 101.93,
    "peak": 3959.640625,
    "cores": 1.0143235553811438,
-   "cpu": 103.39
+   "cpu": 103.39,
+   "group": "binary"
   },
   {
-   "label": "juliac binary, lazy, block 2048",
-   "threads": "1*",
+   "label": "juliac binary, lazy, block 2048, 1 thread*",
+   "threads": "1",
    "lazy": "yes",
    "blocks": 81,
    "seconds": 90.44,
    "peak": 3366.296875,
    "cores": 1.0168067226890756,
-   "cpu": 91.96
+   "cpu": 91.96,
+   "group": "binary"
   },
   {
-   "label": "juliac binary, lazy, block 1024",
-   "threads": "1*",
+   "label": "juliac binary, lazy, block 1024, 1 thread*",
+   "threads": "1",
    "lazy": "yes",
    "blocks": 289,
    "seconds": 92.13,
    "peak": 3169.859375,
    "cores": 1.013676326929339,
-   "cpu": 93.39
+   "cpu": 93.39,
+   "group": "binary"
   },
   {
-   "label": "juliac binary, lazy, block 512",
-   "threads": "1*",
+   "label": "juliac binary, lazy, block 512, 1 thread*",
+   "threads": "1",
    "lazy": "yes",
    "blocks": 1122,
    "seconds": 95.95,
    "peak": 3157.59375,
    "cores": 1.0159458051068264,
-   "cpu": 97.48
+   "cpu": 97.48,
+   "group": "binary"
   },
   {
-   "label": "juliac binary, lazy, block 256",
-   "threads": "1*",
+   "label": "juliac binary, lazy, block 256, 1 thread*",
+   "threads": "1",
    "lazy": "yes",
    "blocks": 4422,
    "seconds": 112.29,
    "peak": 3171.671875,
    "cores": 1.0139816546442246,
-   "cpu": 113.86
+   "cpu": 113.86,
+   "group": "binary"
   }
  ]
 }

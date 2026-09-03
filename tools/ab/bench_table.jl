@@ -143,9 +143,11 @@ function measure()
             nr, nc, nr * nc / 1e6, gy, gx, gy * gx / 1e6, first(Sys.loadavg()))
 
     rows = Any[]
-    add!(label, threads, lazy, blocks, r) =
-        push!(rows, (; label, threads, lazy, blocks, seconds = r[1], peak = r[2], cores = r[3],
-                     cpu = r[4]))
+    # `group` orders the rendered table; `threads` stays in the JSON as data even though the label
+    # carries it, so a later reader can filter on it without parsing prose.
+    add!(group, label, threads, lazy, blocks, r) =
+        push!(rows, (; group, label, threads, lazy, blocks, seconds = r[1], peak = r[2],
+                     cores = r[3], cpu = r[4]))
     julia(th, mode, bs, tag) = timed(
         `$(Base.julia_cmd()) --startup-file=no --project=$HERE -t $th $rowfile $mode $bs $WORK`, tag)
 
@@ -156,10 +158,11 @@ function measure()
     # immediately, recording its startup as the run.
     r = timed(`micromamba run -n arift-ref env AUTORIFT_BENCH_DIR=$WORK python $(joinpath(HERE, "bench_scene.py"))`,
               "python")
-    add!("python autoRIFT v2.1.2", @sprintf("%.1f†", r[3]), "no", 1, r)
+    add!("reference", "python autoRIFT v2.1.2†", @sprintf("%.1f", r[3]), "no", 1, r)
 
     for th in (12, 1)
-        add!("AutoRIFT.jl, eager, no blocks", string(th), "no", 1, julia(th, "raw", 0, "eager_$th"))
+        add!("library", "AutoRIFT.jl, eager, no blocks, $th thread$(th == 1 ? "" : "s")",
+             string(th), "no", 1, julia(th, "raw", 0, "eager_$th"))
     end
 
     # Two block sizes on the threaded library path, so the peak-memory/runtime trade has more than one
@@ -171,7 +174,7 @@ function measure()
     # being large relative to the scene rather than anything the blocking does, and reporting it beside
     # sizes that do bound memory invites reading it as the latter.
     for bs in (2048, 4096)
-        add!("AutoRIFT.jl, lazy, block $bs", "12", "yes", nblocks(bs),
+        add!("library", "AutoRIFT.jl, lazy, block $bs, 12 threads", "12", "yes", nblocks(bs),
              julia(12, "lazy", bs, "lazy_$bs"))
     end
 
@@ -183,10 +186,10 @@ function measure()
     # closure is trimmed away. See `app/README.md`. The 12-thread numbers at each block size are the
     # library rows above, which exercise the same blocking on the same scene.
     for bs in (0, 4096, 2048, 1024, 512, 256)
-        label = bs == 0 ? "juliac binary, lazy, no blocks" : "juliac binary, lazy, block $bs"
+        label = (bs == 0 ? "juliac binary, lazy, no blocks" : "juliac binary, lazy, block $bs") * ", 1 thread*"
         cmd = `$BIN $(joinpath(WORK, "ref.bin")) $(joinpath(WORK, "sec.bin")) $nr $nc
                $(joinpath(WORK, "bin_$bs.bin")) $CHIP $RADIUS $SPACING $bs $UPSAMPLING 1`
-        add!(label, "1*", "yes", nblocks(bs), timed(cmd, "bin_$bs"))
+        add!("binary", label, "1", "yes", nblocks(bs), timed(cmd, "bin_$bs"))
     end
 
     result = (; scene = (; rows = nr, cols = nc), grid = (; rows = gy, cols = gx),
@@ -196,6 +199,21 @@ function measure()
         JSON3.pretty(io, result)
     end
     return result
+end
+
+# Rows grouped by implementation, fastest first within each group.
+#
+# Not sorted by runtime alone, which was the previous arrangement and reads worse: it interleaves the
+# reference, the library and the binary, so the comparisons a reader actually wants — this block size
+# against that one, one thread against twelve — end up separated by unrelated rows. Grouping puts the
+# binary's block-size sweep in one place, where it reads as a sweep.
+#
+# `group` is absent from a results file written before it existed, so those sort as one block rather
+# than erroring: `--replot` on an old JSON must still render.
+function ranked_rows(r)
+    order = Dict("reference" => 1, "library" => 2, "binary" => 3)
+    return sort(collect(r.table);
+                by = t -> (get(order, get(t, :group, "library"), 9), t.seconds))
 end
 
 # A PNG inlined as a data URI. Chrome resolves `file://` subresources inconsistently in headless
@@ -218,14 +236,14 @@ function render(r)
     # Slowest first, so the table reads as a ranking. Sorted here rather than in `measure`, so the JSON
     # keeps measurement order — that is the record of what ran when, and comparing two runs wants them
     # in the same sequence.
-    ranked = sort(collect(r.table); by = t -> -t.seconds)
+    ranked = ranked_rows(r)
     # `cpu` is carried beside `runtime` because the two separate the questions a single wall clock
     # conflates. CPU time is the work done; wall clock is that work divided by the parallelism
     # achieved. A row whose wall clock rose while its CPU time held did not get more expensive, it
     # got less parallel — and on a shared machine that is the difference between a regression and a
     # busy afternoon. Older rows of this table were misread exactly that way.
-    body = join(("""<tr><td class="l">$(t.label)</td><td>$(t.threads)</td>""" *
-                 """<td>$(@sprintf("%.2f", t.cores))</td><td>$(t.lazy)</td>""" *
+    body = join(("""<tr><td class="l">$(t.label)</td>""" *
+                 """<td>$(t.lazy)</td>""" *
                  """<td>$(t.blocks)</td><td>$(@sprintf("%.1f s", t.seconds))</td>""" *
                  """<td>$(@sprintf("%.1f s", get(t, :cpu, 0.0)))</td>""" *
                  """<td>$(@sprintf("%.0f MiB", t.peak))</td></tr>""" for t in ranked), "\n")
@@ -263,7 +281,7 @@ function render(r)
         Julia $(r.provenance.julia) &middot;
         AutoRIFT.jl $(r.provenance.autorift_jl) ($(r.provenance.commit)) &middot;
         autoRIFT $(r.provenance.autorift_py)</p>
-      <table><thead><tr><th>configuration</th><th>threads</th><th>cores used</th><th>lazy</th>
+      <table><thead><tr><th>configuration</th><th>lazy</th>
         <th>blocks</th><th>runtime</th><th>CPU time&Dagger;</th><th>peak RSS</th></tr></thead>
       <tbody>
     $body
@@ -272,14 +290,17 @@ function render(r)
         choice: <code>threaded = true</code> trims without a verifier error and then fails at run time,
         because the task entry closure is trimmed away. The 12-thread rows above measure the same
         blocking on the same scene through the library.<br>
-        &dagger; Mean cores used, measured as CPU time over elapsed time. autoRIFT.py's correlation loop
-        is serial &mdash; it runs at one core for 85% of the run, reaching ~11 cores only during the
-        OpenCV filter calls &mdash; so this is what it achieves on a 12-core machine, not a setting.<br>
+        &dagger; autoRIFT.py has no thread setting to match: its correlation loop is serial, running at
+        one core for 85% of the run and reaching ~11 cores only during the OpenCV filter calls. Its
+        CPU time over its runtime works out to ~2.3 cores, which is what it achieves on a 12-core
+        machine rather than a configuration choice. This OpenCV is built against Grand Central
+        Dispatch, which ignores <code>cv2.setNumThreads</code>, so it cannot be capped either.<br>
         &Dagger; User plus system time, summed over all threads: the work done, where runtime is that
-        work divided by the parallelism achieved. Read the two together. A row whose runtime rises while
-        its CPU time holds became less parallel rather than more expensive &mdash; which on a shared
-        machine distinguishes a real regression from a busy one, and is how the threaded rows of this
-        table should be compared across runs.</p>
+        work divided by the parallelism achieved. <b>Compare runs by CPU time, choose a configuration
+        by runtime.</b> A row whose runtime rose while its CPU time held became less parallel rather
+        than more expensive, which on a shared machine is the difference between a real regression and
+        a busy afternoon &mdash; two readings of the threaded rows of this table were wrong before the
+        column was here. Dividing the two gives the mean cores used, so it is not also tabulated.</p>
 
       <div class="page">
         <h1>Agreement with autoRIFT.py: displacement</h1>
@@ -323,12 +344,11 @@ end
 function main()
     r = "--replot" in ARGS ? JSON3.read(read(RESULTS, String)) : measure()
     println()
-    println("| configuration | threads | cores used | lazy | blocks | runtime | CPU time | peak RSS |")
-    println("|---|---:|---:|:---:|---:|---:|---:|---:|")
-    for t in sort(collect(r.table); by = t -> -t.seconds)
-        @printf("| %s | %s | %.2f | %s | %d | %.1f s | %.1f s | %.0f MiB |\n",
-                t.label, t.threads, t.cores, t.lazy, t.blocks, t.seconds,
-                get(t, :cpu, 0.0), t.peak)
+    println("| configuration | lazy | blocks | runtime | CPU time | peak RSS |")
+    println("|---|:---:|---:|---:|---:|---:|")
+    for t in ranked_rows(r)
+        @printf("| %s | %s | %d | %.1f s | %.1f s | %.0f MiB |\n",
+                t.label, t.lazy, t.blocks, t.seconds, get(t, :cpu, 0.0), t.peak)
     end
     @printf("\nwrote %s\n      %s\n", RESULTS, render(r))
 end
