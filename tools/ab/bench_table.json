@@ -1,127 +1,127 @@
 {
-    "scene": {
-        "rows": 17121,
-        "cols": 16961
-    },
-    "grid": {
-        "rows": 2127,
-        "cols": 2107
-    },
-    "chip": 16,
-    "chip_max": 64,
-    "spacing": 8,
-    "radius": 20,
-    "upsampling": 16,
-    "provenance": {
-        "cpu": "Apple M2 Max",
-        "cores": 12,
-        "ram_gib": 96,
-        "os": "macOS 26.5.2",
-        "julia": "1.12.5",
-        "autorift_jl": "0.1.0",
-        "autorift_py": "2.1.1",
-        "commit": "8d7c1ec",
-        "note": "Library rows measured at 8d7c1ec, with serial filtering. The python row is the reference and cannot have moved; the seven juliac rows are as measured at fd42181, against a binary built before it. Commits after 8d7c1ec change only comments, so they cannot move a number here. The eager rows agree with the fd42181 measurement to within a few percent, which is the intended result: slabbed preprocessing was added and then reverted over that span, and what remains is a redundancy removal in the per-point path that should not move a whole-scene time. Load average was 6.6 during this run against 3.7 for the previous one, so these times are the more pessimistic of the two. The 8192 block size is not reported, at 9 blocks on 12 threads: fewer blocks than threads means every block is in flight at once, so the run holds nine 8341x8341 working sets, 2.2x the scene area, and peaked at 16772 MiB against 3947 at 2048. That measures the block size being large relative to the scene, not what blocking costs."
-    },
-    "table": [
-        {
-            "label": "python autoRIFT v2.1.2",
-            "threads": "2.3\u2020",
-            "lazy": "no",
-            "blocks": 1,
-            "seconds": 177.5,
-            "peak": 6884.375,
-            "cores": 2.3485070422535212
-        },
-        {
-            "label": "AutoRIFT.jl, eager, no blocks",
-            "threads": "12",
-            "lazy": "no",
-            "blocks": 1,
-            "seconds": 25.59,
-            "peak": 7452.34375,
-            "cores": 3.784290738569754
-        },
-        {
-            "label": "AutoRIFT.jl, eager, no blocks",
-            "threads": "1",
-            "lazy": "no",
-            "blocks": 1,
-            "seconds": 79.5,
-            "peak": 7417.78125,
-            "cores": 1.0163522012578619
-        },
-        {
-            "label": "AutoRIFT.jl, lazy, block 2048",
-            "threads": "12",
-            "lazy": "yes",
-            "blocks": 81,
-            "seconds": 52.66,
-            "peak": 3947.0,
-            "cores": 4.31
-        },
-        {
-            "label": "AutoRIFT.jl, lazy, block 4096",
-            "threads": "12",
-            "lazy": "yes",
-            "blocks": 25,
-            "seconds": 67.09,
-            "peak": 9771.0,
-            "cores": 3.59
-        },
-        {
-            "label": "juliac binary, lazy, no blocks",
-            "threads": "1*",
-            "lazy": "yes",
-            "blocks": 1,
-            "seconds": 69.42,
-            "peak": 6531.859375,
-            "cores": 1.0164217804667242
-        },
-        {
-            "label": "juliac binary, lazy, block 4096",
-            "threads": "1*",
-            "lazy": "yes",
-            "blocks": 25,
-            "seconds": 104.04,
-            "peak": 4085.1875,
-            "cores": 1.016147635524798
-        },
-        {
-            "label": "juliac binary, lazy, block 2048",
-            "threads": "1*",
-            "lazy": "yes",
-            "blocks": 81,
-            "seconds": 92.13,
-            "peak": 3498.453125,
-            "cores": 1.0151959188103767
-        },
-        {
-            "label": "juliac binary, lazy, block 1024",
-            "threads": "1*",
-            "lazy": "yes",
-            "blocks": 289,
-            "seconds": 92.26,
-            "peak": 3331,
-            "cores": 1.0174506828528072
-        },
-        {
-            "label": "juliac binary, lazy, block 512",
-            "threads": "1*",
-            "lazy": "yes",
-            "blocks": 1122,
-            "seconds": 95.47,
-            "peak": 3338.359375,
-            "cores": 1.0168639363150729
-        },
-        {
-            "label": "juliac binary, lazy, block 256",
-            "threads": "1*",
-            "lazy": "yes",
-            "blocks": 4422,
-            "seconds": 106.2,
-            "peak": 3354.390625,
-            "cores": 1.0155367231638417
-        }
-    ]
+ "scene": {
+  "rows": 17121,
+  "cols": 16961
+ },
+ "grid": {
+  "rows": 2127,
+  "cols": 2107
+ },
+ "chip": 16,
+ "chip_max": 64,
+ "spacing": 8,
+ "radius": 20,
+ "upsampling": 16,
+ "provenance": {
+  "cpu": "Apple M2 Max",
+  "cores": 12,
+  "ram_gib": 96,
+  "os": "macOS 26.5.2",
+  "julia": "1.12.5",
+  "autorift_jl": "0.1.0",
+  "autorift_py": "2.1.1",
+  "commit": "baac591",
+  "note": "Measured after the NCC hot-loop change (b1d74bf): four accumulator chains in prepare_chip! and integral_both!, ifelse for the denominator guard, and FFTW_PATIENT plans. Compare rows by cores used, not by runtime alone. This run achieved 2.91 cores on the 12-thread eager row against 3.78 for the previous run at 8d7c1ec, so that row is 33.2 s against 25.6 s despite strictly less work per point -- the machine was busier, not the code slower. The python row moved the same way, 193.2 s against 177.5 at 2.17 cores against 2.35, on a reference that cannot have changed, which is what identifies the cause as contention. The comparable rows are the two that ran at ~1.0 cores in both runs: eager 1 thread is 67.2 s against 79.5, a 1.18x speedup, which is the honest end-to-end figure for the change. The binary rows are flat because this binary was rebuilt from the same source but its 8d7c1ec counterpart was not the bottleneck being measured -- block size is, and those ratios hold within a run. The 4096 lazy row peaked at 10291 MiB against 3637 at 2048: 25 blocks on 12 threads holds twelve 6144-pixel working sets at once, which measures the block size being large relative to the scene rather than what blocking costs. 8192 is excluded for the same reason at 9 blocks."
+ },
+ "table": [
+  {
+   "label": "python autoRIFT v2.1.2",
+   "threads": "2.2\u2020",
+   "lazy": "no",
+   "blocks": 1,
+   "seconds": 193.16,
+   "peak": 6885.453125,
+   "cores": 2.171101677365914
+  },
+  {
+   "label": "AutoRIFT.jl, eager, no blocks",
+   "threads": "12",
+   "lazy": "no",
+   "blocks": 1,
+   "seconds": 33.17,
+   "peak": 6987.6875,
+   "cores": 2.909255351220983
+  },
+  {
+   "label": "AutoRIFT.jl, eager, no blocks",
+   "threads": "1",
+   "lazy": "no",
+   "blocks": 1,
+   "seconds": 67.17,
+   "peak": 6703.15625,
+   "cores": 1.0239690337948488
+  },
+  {
+   "label": "AutoRIFT.jl, lazy, block 2048",
+   "threads": "12",
+   "lazy": "yes",
+   "blocks": 81,
+   "seconds": 46.66,
+   "peak": 3637,
+   "cores": 4.578225460780112
+  },
+  {
+   "label": "AutoRIFT.jl, lazy, block 4096",
+   "threads": "12",
+   "lazy": "yes",
+   "blocks": 25,
+   "seconds": 59.61,
+   "peak": 10290.8125,
+   "cores": 3.8037242073477606
+  },
+  {
+   "label": "juliac binary, lazy, no blocks",
+   "threads": "1*",
+   "lazy": "yes",
+   "blocks": 1,
+   "seconds": 70.02,
+   "peak": 6361.78125,
+   "cores": 0.9840045701228219
+  },
+  {
+   "label": "juliac binary, lazy, block 4096",
+   "threads": "1*",
+   "lazy": "yes",
+   "blocks": 25,
+   "seconds": 104.32,
+   "peak": 3973.59375,
+   "cores": 1.0082438650306749
+  },
+  {
+   "label": "juliac binary, lazy, block 2048",
+   "threads": "1*",
+   "lazy": "yes",
+   "blocks": 81,
+   "seconds": 91.6,
+   "peak": 3354.21875,
+   "cores": 1.0141921397379914
+  },
+  {
+   "label": "juliac binary, lazy, block 1024",
+   "threads": "1*",
+   "lazy": "yes",
+   "blocks": 289,
+   "seconds": 96.05,
+   "peak": 3195.734375,
+   "cores": 1.010515356585112
+  },
+  {
+   "label": "juliac binary, lazy, block 512",
+   "threads": "1*",
+   "lazy": "yes",
+   "blocks": 1122,
+   "seconds": 99.5,
+   "peak": 3187.53125,
+   "cores": 1.0096482412060301
+  },
+  {
+   "label": "juliac binary, lazy, block 256",
+   "threads": "1*",
+   "lazy": "yes",
+   "blocks": 4422,
+   "seconds": 117.97,
+   "peak": 3169.046875,
+   "cores": 1.0069509197253539
+  }
+ ]
 }

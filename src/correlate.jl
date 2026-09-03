@@ -80,6 +80,33 @@
 #     1 for a zero-variance template. Both of these we already do — see the clamp in
 #     `_correlate_surface!` and `degenerate`. Arrived at independently, which is reassuring rather
 #     than surprising: it is the only sane way to handle the cancellation.
+#
+# ---------------------------------------------------------------------------
+# Why there is no LoopVectorization dependency
+# ---------------------------------------------------------------------------
+#
+# `@turbo` is the obvious thing to reach for in a file like this, and it was measured on all four of
+# this package's hot-loop shapes rather than argued about. It does not earn a dependency here, and
+# each shape says no for its own reason:
+#
+#   * **The normalisation loops** gained 1.8-2.1x — and plain Julia with `ifelse` in place of the
+#     branch gains the same 1.8-2.1x, indistinguishable at every geometry tried. The win was the
+#     unpredictable branch, not the macro. That form is what the three `_correlate_surface!` methods
+#     use.
+#
+#   * **`integral_both!`** is 3x *slower* under `@turbo`. A summed-area table is a serial prefix
+#     recurrence; restructuring it into two vectorizable phases doubles the memory traffic and loses
+#     more than vectorization returns.
+#
+#   * **`prepare_chip!`** gained 1.15-1.41x over the hand-unrolled form, the smallest gain on the
+#     cheapest stage — and it needs linear indexing, which the strided-view call site in `track.jl`
+#     cannot give.
+#
+#   * **`_numerators_direct!`** is the one genuine fit, at 2.1-6.8x. But `DIRECT_THRESHOLD` sits
+#     below every configuration the public API can reach, so that loop runs only in tests.
+#
+# The transforms are 68-76% of a `correlate!` call and are inside FFTW, where no Julia-level
+# vectorizer reaches at all. Re-measure before adding the dependency, not after.
 
 """
     CorrelationWorkspace
