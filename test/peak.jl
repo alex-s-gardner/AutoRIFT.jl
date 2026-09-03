@@ -133,6 +133,40 @@ end
     # the peak and every surface looks ambiguous.
     @test peak_ratio(s, 2) <= peak_ratio(s, 3) <= peak_ratio(s, 5)
 
+    # The implementation carries four running maxima and splits each column against the exclusion
+    # box, both for speed. Neither may change the answer, so the plain single-accumulator scan is
+    # written out here and asserted to agree exactly — including on the cases the split decides
+    # (non-square surfaces, an exclusion wider than the surface) and the ones `ifelse` decides
+    # (`NaN`, all-equal, all-negative), where a `max`-based form would propagate rather than skip.
+    function reference_ratio(A, i, j, e)
+        h = Float32(A[i, j])
+        second = -Inf32
+        n = 0
+        for c in axes(A, 2), r in axes(A, 1)
+            (abs(r - i) <= e && abs(c - j) <= e) && continue
+            v = Float32(A[r, c])
+            v > second && (second = v)
+            n += 1
+        end
+        n == 0 && return NaN32
+        !(h > 0) && return NaN32
+        second <= 0 && return Inf32
+        return h / second
+    end
+    rng = MersenneTwister(31337)
+    for trial in 1:400
+        A = trial % 8 == 0 ? rand(rng, Float32, rand(rng, 5:40), rand(rng, 5:40)) :
+            rand(rng, Float32, rand(rng, (5, 8, 16, 32, 40)), rand(rng, (5, 8, 16, 32, 40)))
+        trial % 5 == 0 && (A[rand(rng, axes(A, 1)), rand(rng, axes(A, 2))] = NaN32)
+        trial % 11 == 0 && (A .= 0.0f0)
+        trial % 13 == 0 && (A .= NaN32)
+        trial % 17 == 0 && (A .= -1.0f0)
+        i, j = peak_index(A)
+        for e in (0, 1, 2, 3, 5, 8, 20)
+            @test isequal(peak_ratio(A, i, j, e), reference_ratio(A, i, j, e))
+        end
+    end
+
     # `peak_ratio` describes the surface and nothing else: the search-boundary rule belongs to
     # `peak_at_boundary` and is applied by `track!`, so a peak at the edge still gets a real value here.
     edge = 0.05f0 .* ones(Float32, 40, 40)

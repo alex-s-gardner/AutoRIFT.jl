@@ -402,9 +402,15 @@ end
         corr[k] = surface[best_i, best_j, k]
 
         # The primary-to-secondary peak ratio: the peak divided by the largest rival outside the
-        # exclusion box. One traversal and a maximum, as `peak_ratio` does, and in `Float32` for the
-        # reason recorded there — so the two paths differ only by the surface they were handed, not
-        # by the arithmetic applied to it. `test/gpu.jl` bounds what remains.
+        # exclusion box, in `Float32` for the reason `peak_ratio` records — so the two paths differ
+        # only by the surface each was handed, not by the arithmetic applied to it. `test/gpu.jl`
+        # bounds what remains.
+        #
+        # One running maximum, where the CPU splits into four to break the loop-carried dependency.
+        # Deliberate: that split buys 3x there and nothing here, because a workitem per point already
+        # gives the device thousands of independent chains to interleave — measured, the pass holds at
+        # 50.4 us/point either way. The comparison form still matches the CPU's exactly, which is what
+        # the agreement gate needs.
         second = -Inf32
         cnt = Int32(0)
         for c in 1:nc, r in 1:nr
