@@ -56,25 +56,29 @@
 #     threshold, OpenCV returns ±1 rather than dividing. Across all 72 correlation fixtures the
 #     worst excursion outside [-1, 1] here is 9.0e-5, so on those the branch would never fire.
 #
-#     **That does not generalise, and this measure is missing.** On a search window that is partly
-#     *constant* — cloud, saturated snow, a fill-valued region — `ΣW² - (ΣW)²/n` cancels to near zero
-#     at some shifts while `_numerators_fft!` transforms the **raw** window in `Float32` and so
-#     carries an absolute error set by its DC magnitude. Measured on a 640² scene with an interior
-#     constant patch, chip 32 radius 25: 2.0% of points reach a `correlation` above 1, worst **3.94**,
-#     and the reported peak lands 26 px from the true one. At that point the numerator's *relative*
-#     error is a healthy 1.6e-7 — the denominator is 1.97e-6. An exactly-evaluated numerator over the
-#     same `Float64` denominator gives a clean [-0.369, 1.000], which puts the fault in the
-#     raw-window transform rather than in the tables. The fixtures are synthetic texture and contain
-#     nothing like it.
+#     **The surface can leave [-1, 1] on input the fixtures do not contain**, and the branch is still
+#     absent. Over an **exactly** constant part of a window — saturated snow, or a fill value that no
+#     validity mask caught — `ΣW² - (ΣW)²/n` cancels to within rounding of zero while the numerator
+#     carries a `Float32` transform's absolute error, and a small error over a ~1e-6 denominator is a
+#     large ratio. Measured on a 640² scene with a saturated 201² block, chip 32 radius 25 and the
+#     default `Highpass`: 1.5% of surfaces exceed 1, worst **7.1**. A near-constant block instead —
+#     one DN of sensor noise — produces **no** excursion at all, so this needs exact constancy rather
+#     than merely low contrast.
 #
-#     Two fixes, and the second is the better one. A clamp bounds the *symptom*: it would stop the
-#     surface leaving [-1, 1], and OpenCV's own choice suggests it is enough in practice. Subtracting
-#     the window mean before the transform removes the *cause*, since the numerator is invariant to it
-#     (`Σ T'(W - c) = Σ T'W` because `Σ T' = 0`, per rearrangement 2 above) and a centered window puts
-#     no DC term into the transform to set the rounding scale. Measured, that is also strictly more
-#     accurate than what this path does today: 3.88e-5 worst numerator error against 6.05e-5. The GPU
-#     path does it for an unrelated reason — `Float32` tables need it — and `docs/gpu.md` records the
-#     comparison that found this.
+#     It is nonetheless **not reachable in the output**, which is why no clamp is implemented. A
+#     garbage peak from a vanishing denominator is spatially incoherent, and that is precisely what
+#     [`GardnerFilter`](@ref) tests for: through `autorift` at the default settings the same scene
+#     reports **zero** points wrong by more than a pixel and **zero** `correlation` above 1, at one
+#     level and at three. Only `outliers = :none` leaks them — 114 points, of which every one above
+#     0.8 correlation is wrong — and that setting exists for diagnosis rather than production.
+#
+#     If it ever does need fixing, the fix is the clamp and **not** mean-removal. Measured on the
+#     failing scene: clamping a variance below `n * eps * ΣW²` to zero gives 0 surfaces out of range
+#     and 0 wrong peaks against the exact answer, for one comparison per shift. Subtracting the
+#     window mean before the transform is *worse* than doing nothing (100 surfaces out of range,
+#     against 130) — the tables must then be rebuilt on the shifted window to stay consistent with
+#     the transform, which reintroduces the same cancellation in the denominator. That the numerator
+#     alone improves is real but irrelevant, since the denominator is the binding term.
 #
 #   * **`max(sumsq - sum^2/n, 0)` to stop a negative variance**, and returning the whole surface as
 #     1 for a zero-variance template. Both of these we already do — see the clamp in

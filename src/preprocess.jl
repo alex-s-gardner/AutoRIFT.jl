@@ -866,9 +866,11 @@ end
 # columns (13 ms — worse, the count-array traffic dominates), and Float32 accumulation
 # (1.37x but changed results by 2e-6, since a running sum drifts across a whole row).
 #
-# A bandwidth estimate puts the floor at 0.4 ms, so what remains is per-element scalar
-# work that cv2 vectorises. Closing it means cache tiling, an M8 item. Filtering runs
-# once per image rather than once per grid point, so this is not on the hot path.
+# A bandwidth estimate puts the floor at 0.4 ms, so what remains is per-element scalar work that
+# cv2 vectorises; closing it would mean cache tiling. Not attempted, and the reason is the
+# denominator rather than the gap: filtering runs once per image where correlation runs once per
+# grid point, so this is a few percent of a run. `benchmark/README.md` carries the changes that were
+# measured, and the ones measured but not implemented.
 _masked_boxmean(img::AbstractMatrix, mask::AbstractMatrix{Bool}, w::Int) =
     _masked_boxmean!(Matrix{Float32}(undef, size(img)), img, mask, w, nothing)
 
