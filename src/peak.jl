@@ -268,8 +268,23 @@ end
 # `Vector{NTuple{4,Int}}` indexed per output row yields indices the compiler cannot prove
 # contiguous, so the loop stayed scalar. See `pyrup!` for why that split is exact.
 #
-# The other four were measured and rejected, which is worth recording so they are not retried
+# The other five were measured and rejected, which is worth recording so they are not retried
 # blind:
+#
+#   * **Evaluating the composite interpolant directly.** `pyrup!` is a separable *linear* map, so
+#     `log2(up)` doublings compose into one fixed `(patch*up) x patch` matrix `K` — depending only on
+#     the patch size and the upsampling, hence the same for every point — and the whole cascade is
+#     `K·P·K'`. Verified to 4.2e-7 of the cascade, with identical displacements over 500 real
+#     surfaces, so the factorisation is right. It is nonetheless **1.03-1.06x**, i.e. nothing, from
+#     16x through 128x and through BLAS; a hand-written form and a running-argmax form that never
+#     materialises the surface are both 3x *worse*.
+#
+#     The operation counts say why, and they are the thing to check before trying this again: the
+#     cascade sums level areas, `n² · (1 + 1/4 + 1/16 + …) → n² · 4/3`, where the composite is
+#     `n² · patch`. At 64x that is 520,000 multiplies against 614,250 — a 15% saving, paid back in
+#     access pattern. The same change *does* pay 5.4x on a GPU, and the difference is not the
+#     arithmetic but the traffic: there the cascade writes every level through device memory, where
+#     here 820 kB stays in L2. `docs/gpu.md` records both halves.
 #
 #   * Cropping the cascade around the running peak at each level. The large win in
 #     principle. But the peak's deviation from its own rescaled position was measured at up
