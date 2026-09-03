@@ -94,8 +94,11 @@ For small instances, [`app/`](app/README.md) builds a trimmed standalone binary:
 bit-identical displacements at **27.2 MiB peak RSS against 424.2 MiB**, since 97% of an
 ordinary process's memory floor is the Julia runtime rather than AutoRIFT.
 
-The correlation can also run on a GPU — `autorift(a, b; backend = :metal)` after `using Metal`,
-measured **2.7–3.2× a CPU core** on the pass and 2.4× end to end, with `dx`/`dy` bit-identical.
-[`docs/gpu.md`](docs/gpu.md) covers what agrees and what does not, when the device is worth using
-(it does *not* beat a threaded CPU on a single pair), and how the kernels avoid needing `Float64`
-on hardware that has none.
+The correlation can also run on a GPU — `autorift(a, b; backend = :metal)` after `using Metal` —
+but this is **experimental and does not currently outperform the CPU path**. It is 2.7–3.2× a
+single CPU core on the pass, and *slower* than the threaded CPU correlator on one pair: 0.65 s
+against **0.26 s** at 1024² on 8 threads. So it pays only where the cores are already busy and the
+device is idle, such as a batch driver running one pair per single-threaded process. `dx`/`dy` are
+bit-identical to the CPU's; `correlation` differs by up to 1e-5.
+[`docs/gpu.md`](docs/gpu.md) covers what agrees and what does not, and how the kernels avoid
+needing `Float64` on hardware that has none.

@@ -366,6 +366,11 @@ already carries its own — that is an error rather than a silent override.
   `docs/gpu-feasibility.md` for why that asymmetry is a property of Float32 transforms rather
   than of the device. There is no `:gpu`: a machine may have more than one kind of device, and
   naming the vendor is the whole content of the keyword.
+
+  **The GPU backends are experimental and do not currently outperform the CPU.** A device pass is
+  2.7-3.2x one CPU core but *slower* than `threaded = true` on a single pair — 0.65 s against
+  0.26 s at 1024², chip 32, radius 25 on 8 threads. Prefer `threaded = true` unless the cores are
+  already committed and the device is idle, which is the batch-driver case `docs/gpu.md` describes.
 - `progress = false`: show a progress meter.
 - `rng_seed = 0`: seed for the noise [`WallisGapfill`](@ref) fills gaps with, so a run is
   reproducible. Read by that filter alone; every other `preprocess` choice ignores it.

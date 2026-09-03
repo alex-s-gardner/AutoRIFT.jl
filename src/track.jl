@@ -207,12 +207,24 @@ end
 #
 # Not a fallback to the CPU. A caller who asked for a GPU and silently got a CPU run would see only
 # that it was slow, which is the failure mode hardest to diagnose from the outside.
+#
+# `CUDAGPU` is a third case and must not be told to load CUDA: there is no CUDA adapter, so `using
+# CUDA` succeeds and changes nothing, sending the caller after a dependency that was never the
+# problem. It gets its own message naming the actual state.
 _dispatch_pass!(b::Backend, ::DisplacementField, _ref, _sec, _okmask, ::PointSet{1},
                 ::Int, ::Int, ::Int, ::Int, ::Params, ::SimilarityMeasure, ::SubpixelMethod) =
     throw(ArgumentError(
         "`backend = $(nameof(typeof(b)))()` needs $(required_package(b)) to be loaded. Run " *
         "`using $(required_package(b))` first — the device kernels live in a package extension, " *
         "so the core stays free of a GPU dependency."))
+
+_dispatch_pass!(::CUDAGPU, ::DisplacementField, _ref, _sec, _okmask, ::PointSet{1},
+                ::Int, ::Int, ::Int, ::Int, ::Params, ::SimilarityMeasure, ::SubpixelMethod) =
+    throw(ArgumentError(
+        "`backend = :cuda` is not implemented — loading CUDA will not help. The device kernels " *
+        "are vendor-neutral (KernelAbstractions.jl), but only the Metal adapter ships, so there " *
+        "is no CUDA extension to load. Use `backend = :metal` on an Apple GPU, or `threaded = " *
+        "true`, which is faster than either device path on a machine with cores free."))
 
 """
     track(pair, pts, p; subpixel = p.subpixel, measure, geometry) -> DisplacementField

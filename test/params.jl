@@ -178,6 +178,20 @@ end
     @test AutoRIFT.params(; threaded = true).backend === AutoRIFT.CPU()
     @test !AutoRIFT.istrue(AutoRIFT.params(; backend = :metal).threaded)
 
+    # Selecting a device whose kernels are not loaded must say which package to load — except for
+    # `:cuda`, where no adapter exists, so `using CUDA` would succeed and change nothing. Telling a
+    # caller to load a package that cannot help is the one unhelpful thing this error can do, and
+    # these two cases are why the message is not shared.
+    let a = rand(Float32, 96, 96), kw = (; chip_size = 16, search_radius = 6)
+        @test_throws "is not implemented — loading CUDA will not help" AutoRIFT.autorift(
+            a, copy(a); backend = :cuda, kw...)
+        # Skipped where Metal is loaded and functional, which is the one case this does not throw.
+        if !(isdefined(Main, :Metal) && Main.Metal.functional())
+            @test_throws "needs Metal to be loaded" AutoRIFT.autorift(
+                a, copy(a); backend = :metal, kw...)
+        end
+    end
+
     # The positional constructor is stable API and predates this field, so the 19-argument form
     # must still work and must mean the CPU. `app/` calls exactly this.
     p = AutoRIFT.Params((ZNCC(),), Highpass(), PyramidRefine(), GardnerFilter(),

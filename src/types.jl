@@ -732,6 +732,10 @@ Where the correlation kernels run. Concrete subtypes: [`AutoRIFT.CPU`](@ref),
 Selected with the `backend` keyword, which accepts the `Symbol` naming a backend or an
 instance. `CPU()` is the default and the only one that needs no additional package.
 
+The GPU backends are **experimental and do not currently outperform the CPU**: a device pass is
+2.7-3.2x one CPU core, but slower than a threaded CPU run on a single image pair. They are worth
+selecting where the cores are already committed and the device is idle. See `docs/gpu.md`.
+
 A singleton per backend, carried as a `Params` **type parameter** rather than a field value, so the
 grid loop's choice is resolved at compile time and the unused paths are eliminated — the same
 arrangement `threaded` uses, for the same reason. That is also what keeps `Params` `isbitstype`, and
@@ -759,6 +763,8 @@ struct CPU <: Backend end
 Run the correlation on an Apple GPU through Metal.jl. Needs `using Metal`.
 
 Requires Metal.jl 1.10 or later, which is where the batched FFT this depends on landed.
+
+Experimental, and slower than a threaded CPU run on one image pair — see [`AutoRIFT.Backend`](@ref).
 """
 struct MetalGPU <: Backend end
 
@@ -766,6 +772,11 @@ struct MetalGPU <: Backend end
     AutoRIFT.CUDAGPU()
 
 Run the correlation on an NVIDIA GPU through CUDA.jl. Needs `using CUDA`.
+
+**Not implemented.** The kernels in `ext/gpu/` are vendor-neutral, written against
+KernelAbstractions.jl, but only the Metal adapter ships — so selecting this backend finds no
+extension to load. Declared here because a `Params` type parameter must exist before the extension
+that implements it, which is what makes adding the adapter a new file rather than a change here.
 """
 struct CUDAGPU <: Backend end
 

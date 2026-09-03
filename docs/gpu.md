@@ -1,5 +1,17 @@
 # Correlating on a GPU
 
+> **Experimental, and slower than the CPU path on a machine with cores free.** The device does not
+> beat this package's threaded CPU correlator on a single image pair: 0.65 s against **0.26 s** at
+> 1024², chip 32, radius 25 on 8 threads. Every speedup quoted below is against **one** CPU core,
+> which is the comparison that matters only when the other cores are already busy — a batch driver
+> running one pair per single-threaded process, with the device otherwise idle. On an otherwise free
+> machine, `threaded = true` is both faster and the supported path.
+>
+> Treat `backend` as a preview: only the correlation pass runs on the device, only the Metal adapter
+> exists, `correlation` differs from the CPU's by up to 1e-5, and none of it is measured beyond
+> 2048² — the full-scene table in `tools/ab/` is CPU-only. Use it to evaluate the device, not to
+> produce results you depend on.
+
 ```julia
 using AutoRIFT, Metal
 out = autorift(image1, image2; chip_size = 32, search_radius = 25, backend = :metal)
