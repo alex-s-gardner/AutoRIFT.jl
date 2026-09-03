@@ -346,6 +346,10 @@ out = autorift(image1, image2, p)
 with defaults, and a second spelling of the defaults would be a second place for them to drift.
 The positional form is stable API — the field order is `Params`'s own, in declaration order.
 
+The call above omits the trailing `backend` field, which then defaults to `AutoRIFT.CPU()`. Pass
+`AutoRIFT.MetalGPU()` or `AutoRIFT.CUDAGPU()` as a twentieth argument to select a device; see
+[`AutoRIFT.Backend`](@ref).
+
 Validity masks are not accepted here. They are per-image data rather than configuration, and the
 keyword form or [`ImagePair`](@ref) is where they belong; this overload exists for the case where
 *nothing* is a runtime value.

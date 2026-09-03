@@ -168,11 +168,22 @@ function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Param
     return out
 end
 
-# One pass over `pts`, threaded or not, on whatever concrete array types the caller resolved.
+# One pass over `pts`, on whatever concrete array types the caller resolved.
 #
 # Split from `track!` so the padded and unpadded paths each arrive here monomorphic — see the note at
 # the call sites.
-function _dispatch_pass!(out::DisplacementField, ref, sec, okmask, pts::PointSet{1},
+#
+# The backend is a `Params` type parameter, so this dispatches at compile time and a build that only
+# ever constructs `CPU()` contains no other method. `p.backend` is passed positionally for the reason
+# `AutoRIFT.PassRunner` records: a keyword annotated with an abstract type is unresolvable under
+# `--trim`.
+_dispatch_pass!(out::DisplacementField, ref, sec, okmask, pts::PointSet{1},
+                chipx::Int, chipy::Int, rx::Int, ry::Int, p::Params,
+                measure::SimilarityMeasure, subpixel::SubpixelMethod) =
+    _dispatch_pass!(p.backend, out, ref, sec, okmask, pts, chipx, chipy, rx, ry, p, measure,
+                    subpixel)
+
+function _dispatch_pass!(::CPU, out::DisplacementField, ref, sec, okmask, pts::PointSet{1},
                         chipx::Int, chipy::Int, rx::Int, ry::Int, p::Params,
                         measure::SimilarityMeasure, subpixel::SubpixelMethod)
     up = upsampling(subpixel)
@@ -188,6 +199,20 @@ function _dispatch_pass!(out::DisplacementField, ref, sec, okmask, pts::PointSet
                                        rx, ry, up, p, measure, eachindex(pts))
     return out
 end
+
+# The device pass lives in a package extension, so this is what a caller who selected a GPU backend
+# without loading its package reaches. Defined here, on the abstract backend, for the reason
+# `_detector` is: the alternative is a bare `MethodError` on an internal function, which names
+# neither the keyword that caused it nor the package that would fix it.
+#
+# Not a fallback to the CPU. A caller who asked for a GPU and silently got a CPU run would see only
+# that it was slow, which is the failure mode hardest to diagnose from the outside.
+_dispatch_pass!(b::Backend, ::DisplacementField, _ref, _sec, _okmask, ::PointSet{1},
+                ::Int, ::Int, ::Int, ::Int, ::Params, ::SimilarityMeasure, ::SubpixelMethod) =
+    throw(ArgumentError(
+        "`backend = $(nameof(typeof(b)))()` needs $(required_package(b)) to be loaded. Run " *
+        "`using $(required_package(b))` first — the device kernels live in a package extension, " *
+        "so the core stays free of a GPU dependency."))
 
 """
     track(pair, pts, p; subpixel = p.subpixel, measure, geometry) -> DisplacementField

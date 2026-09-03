@@ -166,6 +166,9 @@ docstring. A name absent here is internal and may change in a patch release.
 const PUBLIC_NAMES = (
     # Configuration.
     :params, :Params, :chip_sizes, :chip_measures, :measure_at, :filter_width, :filter_reach,
+    # Where the kernels run. The backends are API because they appear in `Params`' type, so a
+    # caller building one positionally — as `app/` does — needs the names.
+    :Backend, :CPU, :MetalGPU, :CUDAGPU, :isgpu,
     # Geometry is two-dimensional throughout, and `Extent` is how it is spelled. Public because it
     # appears in `Params`' fields and in every geometry keyword, so a caller building one by hand
     # needs the name — and because a C caller's struct layout is derived from it.
