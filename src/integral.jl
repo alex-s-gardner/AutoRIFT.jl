@@ -25,7 +25,7 @@
 # redundancy: neighbouring windows overlap heavily, and one table over the whole image would serve
 # every point. `boxsum` already reads four corners at an arbitrary offset, so the change is small.
 #
-# Measured on 1024x1024 with the default geometry, and it does not pay:
+# Measured on 1024x1024 with the default geometry, and it does not pay on time:
 #
 #     per-point, 81x81 window    7.24 us x 729 points = 5.28 ms
 #     global, 1024x1024          1.81 ms x 3 levels   = 5.42 ms
@@ -39,11 +39,20 @@
 # Two plausible-sounding explanations that turned out wrong, recorded so they are not re-argued:
 # `boxsum` locality is *not* the issue (2.15 ns from a 1025x1025 table against 2.16 ns from an
 # 82x82 one — identical, since the four corner reads miss cache either way), and neither is the
-# 16 MiB the two Float64 tables would occupy. The redundancy is simply smaller than it looks.
+# 16 MiB the two Float64 tables would occupy at that size. The redundancy is simply smaller than it
+# looks.
 #
-# This would flip on a scene where the coarse levels do real work: heavily decorrelated imagery, or
-# a `chip_size` small relative to the texture scale. Worth re-measuring there rather than treating
-# it as settled for every input.
+# Memory runs the same way, and by a wide margin at scene scale. A window table is 54 KiB, so the
+# sum and squares for every thread of a 12-thread run come to 1.26 MiB. Global tables over a
+# 17121x16961 scene are 2.16 GiB each, 4.33 GiB for the pair. Per-point storage is negligible
+# against the images themselves — on that scene the two input planes, the two filtered planes and
+# their masks account for essentially the whole 7.5 GiB peak — so a global table is 4 GiB spent to
+# remove nothing measurable.
+#
+# The time result would flip on a scene where the coarse levels do real work: heavily decorrelated
+# imagery, or a `chip_size` small relative to the texture scale. Worth re-measuring there rather
+# than treating it as settled for every input. The memory result does not flip — it follows from the
+# table being the size of the image rather than of a window.
 
 """
     integral!(S, A)
@@ -135,6 +144,9 @@ whole correlation at chip 32/64/128. Bit-identical to calling the two functions 
 running sum accumulates in the same order over the same values, so this trades memory traffic and
 nothing else. Verified exactly, not to a tolerance.
 
+Four columns are traversed at once, for a further **1.2-1.63x** and also bit-identically — see the
+comment on the loop for why the summation order is unchanged.
+
 The separate [`integral!`](@ref) and [`integral_sq!`](@ref) remain, because `NCC` needs only the
 squares and the tests exercise each independently.
 """
@@ -154,7 +166,52 @@ function integral_both!(S::AbstractMatrix{Float64}, S2::AbstractMatrix{Float64},
             S[i, 1] = 0.0
             S2[i, 1] = 0.0
         end
-        for j in 1:n
+        # Four columns per pass. The recurrence down a single column is a serial dependency
+        # chain — each `run += v` waits for the previous add to retire — so one column at a
+        # time runs at the adder's latency rather than its throughput. Four columns have four
+        # independent chains, which fills those slots: 1.2-1.63x over window extents 27 to 273.
+        #
+        # **Bit-identical to one column at a time**, which is what makes this a memory-order
+        # change and not a numerical one. Two orders are preserved exactly: each `r`
+        # accumulates down its own column in row order, and the writes across a row chain
+        # left to right from `S[i+1, j]` — the same left-to-right order the column-at-a-time
+        # version produces by reading the previous column's finished value. Verified with
+        # `==`, not `isapprox`.
+        j = 1
+        while j + 3 <= n
+            r0 = r1 = r2 = r3 = 0.0
+            q0 = q1 = q2 = q3 = 0.0
+            for i in 1:m
+                v0 = Float64(A[i, j])
+                v1 = Float64(A[i, j + 1])
+                v2 = Float64(A[i, j + 2])
+                v3 = Float64(A[i, j + 3])
+                r0 += v0
+                r1 += v1
+                r2 += v2
+                r3 += v3
+                q0 += v0 * v0
+                q1 += v1 * v1
+                q2 += v2 * v2
+                q3 += v3 * v3
+                a0 = S[i + 1, j] + r0
+                a1 = a0 + r1
+                a2 = a1 + r2
+                S[i + 1, j + 1] = a0
+                S[i + 1, j + 2] = a1
+                S[i + 1, j + 3] = a2
+                S[i + 1, j + 4] = a2 + r3
+                b0 = S2[i + 1, j] + q0
+                b1 = b0 + q1
+                b2 = b1 + q2
+                S2[i + 1, j + 1] = b0
+                S2[i + 1, j + 2] = b1
+                S2[i + 1, j + 3] = b2
+                S2[i + 1, j + 4] = b2 + q3
+            end
+            j += 4
+        end
+        while j <= n
             run = 0.0
             runsq = 0.0
             for i in 1:m
@@ -164,6 +221,7 @@ function integral_both!(S::AbstractMatrix{Float64}, S2::AbstractMatrix{Float64},
                 S[i + 1, j + 1] = run + S[i + 1, j]
                 S2[i + 1, j + 1] = runsq + S2[i + 1, j]
             end
+            j += 1
         end
     end
     return S, S2
@@ -240,8 +298,13 @@ No bounds checking: the caller is responsible for `i + h <= size(S, 1)` and
 `j + w <= size(S, 2)`. This is called once per candidate shift per grid point —
 hundreds of millions of times per image pair — so the check is hoisted to the
 loop that computes the shift range instead.
+
+The element type is unconstrained beyond `Number`, which the four reads and three operations
+here are all that is required. The tables the CPU path builds are `Float64` or `ComplexF64` for
+the cancellation reason at the head of this file; a device without `Float64` builds `Float32`
+tables over a mean-centered window instead, which removes that cancellation rather than
+tolerating it.
 """
-@inline function boxsum(S::AbstractMatrix{<:Union{Float64,ComplexF64}}, i::Int, j::Int,
-                        h::Int, w::Int)
+@inline function boxsum(S::AbstractMatrix{<:Number}, i::Int, j::Int, h::Int, w::Int)
     @inbounds return S[i + h, j + w] - S[i, j + w] - S[i + h, j] + S[i, j]
 end

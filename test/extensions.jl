@@ -247,7 +247,7 @@ end
     ref, sec = projected_pair(300, (0, 4))
     st = autorift(ref, sec; EXT_KW...)
 
-    @test issetequal(keys(st), (:vx, :vy, :correlation, :peak_snr, :chip_size, :interpolated))
+    @test issetequal(keys(st), (:vx, :vy, :correlation, :peak_ratio, :chip_size, :interpolated))
     @test eltype(st.vx) === Float32
     @test eltype(st.vy) === Float32
     @test eltype(st.correlation) === Float32
@@ -294,7 +294,7 @@ end
     @test ds isa DimStack
     @test !(ds isa RasterStack)
     @test map(DimensionalData.name, dims(ds)) == (:azimuth, :range)
-    @test issetequal(keys(ds), (:dx, :dy, :correlation, :peak_snr, :chip_size, :interpolated))
+    @test issetequal(keys(ds), (:dx, :dy, :correlation, :peak_ratio, :chip_size, :interpolated))
 
     # `dx`/`dy` here, not `vx`/`vy`: without a CRS there is no map orientation to flip to, so the
     # core's raw secondary-to-reference offsets are the honest output.

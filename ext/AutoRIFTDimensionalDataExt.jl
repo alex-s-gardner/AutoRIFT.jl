@@ -35,7 +35,7 @@ using DimensionalData.Lookups: Lookup, isregular
 
 Correlate two dimensional arrays, returning a stack on the output grid.
 
-Layers are `dx`, `dy` (pixels), `correlation`, `peak_snr`, `chip_size`, and `interpolated` — see
+Layers are `dx`, `dy` (pixels), `correlation`, `peak_ratio`, `chip_size`, and `interpolated` — see
 [`AutoRIFT.MultichipResult`](@ref). Accepts every keyword [`AutoRIFT.params`](@ref) does.
 
 The first dimension is taken as rows and the second as columns, matching the array core. For a
@@ -153,7 +153,7 @@ the right internal representation but an awkward one to hand to a consumer writi
 expects a byte per value.
 """
 layers(r::AutoRIFT.MultichipResult) = (
-    dx = r.dx, dy = r.dy, correlation = r.correlation, peak_snr = r.peak_snr,
+    dx = r.dx, dy = r.dy, correlation = r.correlation, peak_ratio = r.peak_ratio,
     chip_size = r.chip_size, interpolated = Matrix{Bool}(r.interpolated))
 
 """

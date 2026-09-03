@@ -684,7 +684,7 @@ function _run_one_block!(out::DisplacementField, buf::BlockBuffers, raw::ImagePa
     out.dx[b.grid_rows, b.grid_cols] .= bout.dx
     out.dy[b.grid_rows, b.grid_cols] .= bout.dy
     out.correlation[b.grid_rows, b.grid_cols] .= bout.correlation
-    out.peak_snr[b.grid_rows, b.grid_cols] .= bout.peak_snr
+    out.peak_ratio[b.grid_rows, b.grid_cols] .= bout.peak_ratio
     out.searched[b.grid_rows, b.grid_cols] .= bout.searched
     return out
 end

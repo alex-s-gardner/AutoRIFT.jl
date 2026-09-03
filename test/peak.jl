@@ -1,4 +1,4 @@
-using AutoRIFT: peak_index, peak, peak_offset, peak_quality, peak_at_boundary, pyrup!, reflect101,
+using AutoRIFT: peak_index, peak, peak_offset, peak_ratio, peak_at_boundary, pyrup!, reflect101,
                 refinement_workspace, subpixel_peak, workspace, correlate!,
                 ImagePair, gridpoints, params, correlate_multichip
 
@@ -78,50 +78,111 @@ end
     @test peak_offset(a, (rx, ry))[1:2] == (0.0, 0.0)
 end
 
-@testset "peak_quality" begin
-    # A sharp peak over noise scores high; the same peak over noise of its own amplitude does not.
-    # That contrast is the whole point of the quantity — it is what `correlation`, the peak value
-    # alone, cannot express.
+@testset "peak_ratio" begin
+    # An unrivalled peak scores high; the same peak with a rival almost as tall does not. That
+    # contrast is the whole point of the quantity — the two surfaces have the *same* `correlation`,
+    # so the peak value alone cannot separate them.
     sharp = 0.05f0 .* ones(Float32, 40, 40)
     sharp[20, 20] = 1.0f0
-    sharp[1, 1] = 0.06f0                        # a little background variation, so sd > 0
-    noisy = copy(sharp)
-    noisy[5:9, 5:9] .= 0.95f0                   # a rival almost as strong as the peak
-    @test peak_quality(sharp) > peak_quality(noisy)
+    rival = copy(sharp)
+    rival[5, 5] = 0.95f0
+    @test peak_ratio(sharp) > peak_ratio(rival)
+    @test peak_ratio(rival) ≈ 1.0f0 / 0.95f0
+    # Both surfaces peak at the same height, which is the point: `correlation` cannot tell them apart.
+    @test peak(sharp)[3] == peak(rival)[3]
 
-    # No background outside the exclusion box: nothing to characterize, so no claim is made.
-    @test isnan(peak_quality(fill(0.5f0, 5, 5), 3))
-    # A perfectly flat background has zero spread, so the ratio is undefined rather than infinite.
-    flat = fill(0.5f0, 40, 40)
-    flat[20, 20] = 1.0f0
-    @test isnan(peak_quality(flat))
+    # At least 1 by construction — the primary is the surface maximum, so no rival can exceed it.
+    for seed in 1:20
+        s = randn(MersenneTwister(seed), Float32, 32, 32)
+        s .-= minimum(s)                        # positive, so the ratio is a ratio of heights
+        @test peak_ratio(s) >= 1.0f0
+    end
 
-    # Invariant to an affine rescaling of the surface, since it is a ratio of a difference to a
-    # spread. A measure that moved with the units would not be comparable between points.
-    s = 0.1f0 .* randn(MersenneTwister(11), Float32, 48, 48)
+    # Nothing outside the exclusion box: no rival exists, so no ratio is computed. The box has to
+    # cover the surface from wherever the peak actually is — a constant surface peaks at `(1, 1)`, so
+    # an exclusion of 3 leaves the far row and column outside it and a rival is found after all.
+    @test isnan(peak_ratio(fill(0.5f0, 4, 4), 3))
+    @test peak_ratio(fill(0.5f0, 5, 5), 3) == 1.0f0
+
+    # A rival exactly equal to the peak: fully ambiguous, and 1 is the value that says so.
+    tied = 0.05f0 .* ones(Float32, 40, 40)
+    tied[20, 20] = 1.0f0
+    tied[5, 5] = 1.0f0
+    @test peak_ratio(tied) == 1.0f0
+
+    # No positive rival at all — the peak is the only candidate the surface offers. `Inf`, not `NaN`:
+    # ordering must place the cleanest surface above every merely-good one.
+    lone = zeros(Float32, 40, 40)
+    lone[20, 20] = 1.0f0
+    @test peak_ratio(lone) == Inf32
+    negative = fill(-0.5f0, 40, 40)
+    negative[20, 20] = 1.0f0
+    @test peak_ratio(negative) == Inf32
+
+    # Scale-invariant, being a ratio of two heights — but *not* shift-invariant, unlike a measure
+    # expressed in units of background spread. Adding a constant changes the answer, and honestly so:
+    # a peak of 1.0 beside a rival of 0.5 is twice as tall, while 6.0 beside 5.5 is barely distinct.
+    s = 0.1f0 .* rand(MersenneTwister(11), Float32, 48, 48)
     s[24, 24] = 3.0f0
-    @test peak_quality(s) ≈ peak_quality(2.0f0 .* s .+ 5.0f0) rtol = 1e-4
+    @test peak_ratio(s) ≈ peak_ratio(2.0f0 .* s) rtol = 1e-5
+    @test peak_ratio(s) > peak_ratio(s .+ 5.0f0)
 
-    # A wider exclusion removes more of the peak's own skirt from the background. The value moves,
-    # but only slightly — measured within 0.005 AUC across radii 2, 5 — so `PEAK_EXCLUSION` is a
-    # constant rather than a tuning knob.
-    @test peak_quality(s, 2) > 0
-    @test peak_quality(s, 5) > 0
+    # A wider exclusion box searches further from the peak for its rival, so it can only find a
+    # weaker one — the ratio is non-decreasing in the exclusion. This monotonicity is why the box has
+    # to be wide enough to clear the peak's own skirt: at exclusion 0 the rival is the sample next to
+    # the peak and every surface looks ambiguous.
+    @test peak_ratio(s, 2) <= peak_ratio(s, 3) <= peak_ratio(s, 5)
 
-    # `peak_quality` describes the surface and nothing else: the search-boundary rule belongs to
+    # The implementation carries four running maxima and splits each column against the exclusion
+    # box, both for speed. Neither may change the answer, so the plain single-accumulator scan is
+    # written out here and asserted to agree exactly — including on the cases the split decides
+    # (non-square surfaces, an exclusion wider than the surface) and the ones `ifelse` decides
+    # (`NaN`, all-equal, all-negative), where a `max`-based form would propagate rather than skip.
+    function reference_ratio(A, i, j, e)
+        h = Float32(A[i, j])
+        second = -Inf32
+        n = 0
+        for c in axes(A, 2), r in axes(A, 1)
+            (abs(r - i) <= e && abs(c - j) <= e) && continue
+            v = Float32(A[r, c])
+            v > second && (second = v)
+            n += 1
+        end
+        n == 0 && return NaN32
+        !(h > 0) && return NaN32
+        second <= 0 && return Inf32
+        return h / second
+    end
+    rng = MersenneTwister(31337)
+    for trial in 1:400
+        A = trial % 8 == 0 ? rand(rng, Float32, rand(rng, 5:40), rand(rng, 5:40)) :
+            rand(rng, Float32, rand(rng, (5, 8, 16, 32, 40)), rand(rng, (5, 8, 16, 32, 40)))
+        trial % 5 == 0 && (A[rand(rng, axes(A, 1)), rand(rng, axes(A, 2))] = NaN32)
+        trial % 11 == 0 && (A .= 0.0f0)
+        trial % 13 == 0 && (A .= NaN32)
+        trial % 17 == 0 && (A .= -1.0f0)
+        i, j = peak_index(A)
+        for e in (0, 1, 2, 3, 5, 8, 20)
+            @test isequal(peak_ratio(A, i, j, e), reference_ratio(A, i, j, e))
+        end
+    end
+
+    # `peak_ratio` describes the surface and nothing else: the search-boundary rule belongs to
     # `peak_at_boundary` and is applied by `track!`, so a peak at the edge still gets a real value here.
     edge = 0.05f0 .* ones(Float32, 40, 40)
     edge[1, 20] = 1.0f0
-    edge[3, 3] = 0.06f0
-    @test peak_quality(edge) > 0
+    @test peak_ratio(edge) > 1.0f0
 
-    # A degenerate (constant-chip) correlation returns a surface of zeros, and a quality cannot be
-    # asserted about it. `track!` skips those points before asking, but the function must not invent
-    # a number if it is asked.
+    # A degenerate (constant-chip) correlation returns a surface of zeros. There is no peak to take a
+    # ratio of, so no number is invented — `track!` skips those points before asking, but the
+    # function must hold the line if it is asked.
     ws = workspace(Float32, 16, 20)
     zero_surface = correlate!(ws, fill(1.0f0, 16 + 2 * 20 - 1, 16 + 2 * 20 - 1),
                               fill(1.0f0, 16, 16), (20, 20))
-    @test isnan(peak_quality(zero_surface))
+    @test isnan(peak_ratio(zero_surface))
+    # An all-`NaN` surface reaches the same conclusion by a different route: `peak_index` finds no
+    # candidate and returns `(1, 1)`, where the value is `NaN` rather than a peak.
+    @test isnan(peak_ratio(fill(NaN32, 40, 40)))
 end
 
 @testset "peak_at_boundary" begin
@@ -146,7 +207,7 @@ end
 @testset "both quality outputs are zero at the search boundary" begin
     # End to end through `track!`: a displacement large enough to put the peak on the surface edge must
     # come back with a displacement but no quality, on *both* outputs. This is what lets a caller gate
-    # on `correlation` or `peak_snr` without knowing the condition exists.
+    # on `correlation` or `peak_ratio` without knowing the condition exists.
     n, cs, r = 256, 16, 12
     ref, sec = shifted_pair(n, (r, 0); T = Float32)      # shift == radius: peak lands on the boundary
     pair = ImagePair(ref, sec)
@@ -158,7 +219,7 @@ end
     railed = [i for i in measured if out.correlation[i] == 0]
     @test !isempty(railed)
     # Zeroed together, never one without the other.
-    @test all(i -> out.peak_snr[i] == 0, railed)
+    @test all(i -> out.peak_ratio[i] == 0, railed)
     @test all(i -> out.correlation[i] != 0, setdiff(measured, railed))
     # The displacement survives: it is a lower bound, not a non-measurement.
     @test all(i -> !isnan(out.dx[i]), railed)

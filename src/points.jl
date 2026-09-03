@@ -23,6 +23,38 @@
 # free: no copy, no conversion.
 
 """
+    AutoRIFT.Uniform(value, size) <: AbstractArray
+
+One value, indexable at every position of a `size`-shaped array, stored once.
+
+A [`PointSet`](@ref) field the caller gave as a scalar holds this instead of a materialized array.
+The saving is the whole point: on a 2107x2127 grid a dense `Int` field is 34 MiB, and four such fields
+are constant on every grid built from [`params`](@ref) — the two chip extents and the two chip-size
+bounds. `Uniform` stores 24 bytes for each.
+
+Read-only, which is why only those four fields use it. `radius_x`/`radius_y` are written per point by
+the coarse pass (see `AutoRIFT._apply_coarse_mask!`), so they stay dense; a caller supplying any field
+as an array gets that array unchanged.
+
+`IndexLinear`, so `eachindex` and `vec` behave as the correlator expects, and the constant read is
+hoisted out of an inner loop rather than fetched per point.
+"""
+struct Uniform{T,N} <: AbstractArray{T,N}
+    value::T
+    size::NTuple{N,Int}
+end
+
+Base.size(u::Uniform) = u.size
+Base.axes(u::Uniform) = map(Base.OneTo, u.size)
+Base.IndexStyle(::Type{<:Uniform}) = IndexLinear()
+Base.@propagate_inbounds Base.getindex(u::Uniform, ::Int) = u.value
+Base.@propagate_inbounds Base.getindex(u::Uniform{T,N}, ::Vararg{Int,N}) where {T,N} = u.value
+# `vec` and `similar` on a `Uniform` must not silently materialize: `scatter` takes `vec` of every
+# field, and a dense result there would undo the saving at the point the correlator is called.
+Base.vec(u::Uniform) = Uniform(u.value, (length(u),))
+Base.similar(u::Uniform, ::Type{T}, dims::Dims) where {T} = Array{T}(undef, dims)
+
+"""
     PointSet{N}
 
 Where to correlate, and with what geometry. Fields are `N`-dimensional arrays of
@@ -50,25 +82,38 @@ filtering steps are neighbourhood operations.
   fine chips while smooth ice admits coarse ones. Default to zero, which means unbounded — every
   level runs everywhere, and a caller who supplies neither sees no change.
 
+Every field carries its own type parameter, because a field is an [`AutoRIFT.Uniform`](@ref) exactly
+when the caller gave *that* field as a scalar, and callers mix freely: `chip_size_x` as a per-point
+array beside a scalar `chip_size_y` is ordinary use. One parameter shared across two fields would make
+such a pair a `MethodError`.
+
 See also [`pointset`](@ref), [`gridpoints`](@ref), [`npoints`](@ref).
 """
-struct PointSet{N,A<:AbstractArray{Float64,N},R<:AbstractArray{Int,N}}
-    x::A
-    y::A
-    radius_x::R
-    radius_y::R
-    dx_prior::A
-    dy_prior::A
-    chip_size_x::R
-    chip_size_y::R
-    chip_size_min_x::R
-    chip_size_max_x::R
+struct PointSet{N,X<:AbstractArray{Float64,N},Y<:AbstractArray{Float64,N},
+                RX<:AbstractArray{Int,N},RY<:AbstractArray{Int,N},
+                DX<:AbstractArray{Float64,N},DY<:AbstractArray{Float64,N},
+                CX<:AbstractArray{Int,N},CY<:AbstractArray{Int,N},
+                CN<:AbstractArray{Int,N},CM<:AbstractArray{Int,N}}
+    x::X
+    y::Y
+    radius_x::RX
+    radius_y::RY
+    dx_prior::DX
+    dy_prior::DY
+    chip_size_x::CX
+    chip_size_y::CY
+    chip_size_min_x::CN
+    chip_size_max_x::CM
 
-    function PointSet(x::A, y::A, radius_x::R, radius_y::R, dx_prior::A,
-                      dy_prior::A, chip_size_x::R, chip_size_y::R,
-                      chip_size_min_x::R = fill!(similar(chip_size_x), 0),
-                      chip_size_max_x::R = fill!(similar(chip_size_x), 0)) where {
-                          N,A<:AbstractArray{Float64,N},R<:AbstractArray{Int,N}}
+    function PointSet(x::X, y::Y, radius_x::RX, radius_y::RY, dx_prior::DX,
+                      dy_prior::DY, chip_size_x::CX, chip_size_y::CY,
+                      chip_size_min_x::CN = Uniform(0, size(chip_size_x)),
+                      chip_size_max_x::CM = Uniform(0, size(chip_size_x))) where {
+                          N,X<:AbstractArray{Float64,N},Y<:AbstractArray{Float64,N},
+                          RX<:AbstractArray{Int,N},RY<:AbstractArray{Int,N},
+                          DX<:AbstractArray{Float64,N},DY<:AbstractArray{Float64,N},
+                          CX<:AbstractArray{Int,N},CY<:AbstractArray{Int,N},
+                          CN<:AbstractArray{Int,N},CM<:AbstractArray{Int,N}}
         ax = axes(x)
         for (name, f) in ((:y, y), (:radius_x, radius_x), (:radius_y, radius_y),
                           (:dx_prior, dx_prior), (:dy_prior, dy_prior),
@@ -79,8 +124,9 @@ struct PointSet{N,A<:AbstractArray{Float64,N},R<:AbstractArray{Int,N}}
                 "PointSet field `$name` has axes $(axes(f)), expected $ax to " *
                 "match `x`"))
         end
-        return new{N,A,R}(x, y, radius_x, radius_y, dx_prior, dy_prior,
-                          chip_size_x, chip_size_y, chip_size_min_x, chip_size_max_x)
+        return new{N,X,Y,RX,RY,DX,DY,CX,CY,CN,CM}(
+            x, y, radius_x, radius_y, dx_prior, dy_prior,
+            chip_size_x, chip_size_y, chip_size_min_x, chip_size_max_x)
     end
 end
 
@@ -186,17 +232,19 @@ function pointset(
     rx = _tofield(Int, isnokw(search_radius_x) ? rad.X : search_radius_x, x, :search_radius_x)
     ry = _tofield(Int, isnokw(search_radius_y) ? rad.Y : search_radius_y, x, :search_radius_y)
 
+    # The chip extents and the chip-size bounds are read-only, so a scalar stays one value. On a
+    # Landsat-sized grid that is four 34 MiB arrays replaced by 96 bytes.
     cs = extent(chip_size)
-    csx = _tofield(Int, isnokw(chip_size_x) ? cs.X : chip_size_x, x, :chip_size_x)
-    csy = _tofield(Int, isnokw(chip_size_y) ? cs.Y : chip_size_y, x, :chip_size_y)
+    csx = _toconstfield(Int, isnokw(chip_size_x) ? cs.X : chip_size_x, x, :chip_size_x)
+    csy = _toconstfield(Int, isnokw(chip_size_y) ? cs.Y : chip_size_y, x, :chip_size_y)
 
     dx = _tofield(Float64, dx_prior, x, :dx_prior)
     dy = _tofield(Float64, dy_prior, x, :dy_prior)
 
     # Zero means unbounded in both, so the default admits every level and a caller who sets
     # neither keyword gets the behaviour they had before these fields existed.
-    cmin = _tofield(Int, chip_size_min_x, x, :chip_size_min_x)
-    cmax = _tofield(Int, chip_size_max_x, x, :chip_size_max_x)
+    cmin = _toconstfield(Int, chip_size_min_x, x, :chip_size_min_x)
+    cmax = _toconstfield(Int, chip_size_max_x, x, :chip_size_max_x)
 
     return PointSet(xs, ys, rx, ry, dx, dy, csx, csy, cmin, cmax)
 end
@@ -214,6 +262,13 @@ pointset(idx::AbstractVector{<:CartesianIndex{2}}; kw...) =
 # shape of the coordinates.
 _tofield(::Type{T}, v::Real, like::AbstractArray, ::Symbol) where {T} =
     fill(_exactly(T, v), size(like))
+
+# A scalar for a field nothing writes, kept as one value rather than materialized. Separate from
+# `_tofield` rather than a keyword on it, because which fields may take it is a property of the
+# *field*, not of the call: see [`AutoRIFT.Uniform`](@ref) for why `radius_x` cannot.
+_toconstfield(::Type{T}, v::Real, like::AbstractArray, ::Symbol) where {T} =
+    Uniform(_exactly(T, v), size(like))
+_toconstfield(::Type{T}, v, like::AbstractArray, name) where {T} = _tofield(T, v, like, name)
 function _tofield(::Type{T}, v::AbstractArray, like::AbstractArray, name) where {T}
     size(v) == size(like) || throw(DimensionMismatch(
         "`$name` has shape $(size(v)) but there are $(size(like)) points"))

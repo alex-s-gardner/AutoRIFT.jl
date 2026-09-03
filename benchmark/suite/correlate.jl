@@ -13,16 +13,23 @@
 #     cache behaviour and on FFTW's plan quality, so `DIRECT_THRESHOLD` is set from
 #     these numbers rather than derived from operation counts.
 #
-#   * Quantifying subpixel refinement. At 128x upsampling a 5x5 patch becomes
-#     640x640 — 1.6 MB materialised to locate one maximum. If that dominates,
-#     evaluating the composite interpolant directly is the M8 optimisation with the
-#     largest expected payoff, and this is the baseline that claim is measured
-#     against.
+#   * Quantifying subpixel refinement, which **does** dominate: 78 us of a 97 us point at chip 16
+#     and radius 20, the geometry ITS_LIVE runs Landsat at, and fixed in chip size because the
+#     cascade upsamples a 5x5 patch to 320x320 whatever the surface was.
 #
-#   * Baselining the integral images. OpenCV rebuilds them per grid point over
-#     windows that overlap ~2.5x in each direction at typical grid spacing;
-#     computing one per pass over the whole padded image is O(N) instead. Also an
-#     M8 item, also measured rather than assumed.
+#     The composite interpolant is what that invites, and it holds up. `pyrup!` is a separable
+#     *linear* map, so `log2(up)` doublings compose into one fixed `(patch*up) x patch` matrix `K`
+#     — depending only on the patch size and the upsampling, hence the same for every point — and
+#     the cascade is `K·P·K'`. Each output column then needs a 5-vector held in registers, so the
+#     upsampled surface is never materialised at all. Prototyped on the device: **5.4x** on the
+#     refinement stage and scratch from 1048 MB to 0.109 MB per 1024-point tile, at 4.2e-7 from
+#     `pyrup!` with identical displacements over 400 real surfaces. Not yet implemented on either
+#     path; `docs/gpu.md` records the measurement.
+#
+#   * Baselining the integral images, against a global table per pass. **Measured and rejected** —
+#     5.42 ms against 5.28 ms, i.e. slightly slower, because a global table costs one pass per
+#     chip-size level whether that level searches 900 points or none. `src/integral.jl` carries the
+#     numbers and the two plausible explanations that turned out wrong.
 
 let g = addgroup!(SUITE, "correlate")
 

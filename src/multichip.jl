@@ -61,24 +61,27 @@
 
 Displacement over the full grid, assembled from all chip-size levels.
 
-`dx`, `dy`, `correlation`, and `peak_snr` are as in [`DisplacementField`](@ref). `chip_size` records
+`dx`, `dy`, `correlation`, and `peak_ratio` are as in [`DisplacementField`](@ref). `chip_size` records
 which level produced each point — `0` where none did — and `interpolated` marks points
 filled from their neighbours rather than measured.
 
-`peak_snr` reports how far the peak stood above the rest of its surface, which is a different question
-from `correlation`, the peak's height. **To gate on reliability use `correlation`**: against disagreement
-with the Python reference it reaches an AUC of 0.842 where `peak_snr` reaches 0.499, and
-[`AutoRIFT.peak_quality`](@ref) records the measurement. `peak_snr` is the diagnostic for an *ambiguous*
-surface — one with rival peaks — and for the search-boundary condition below.
+`peak_ratio` is the correlation peak divided by the best rival peak elsewhere on the same surface, so it
+measures whether the displacement was *unique* where `correlation` measures how strong it was. **To gate
+on reliability use `correlation`**: against disagreement with the Python reference it reaches an AUC of
+0.791 where `peak_ratio` reaches 0.544, and [`AutoRIFT.peak_ratio`](@ref) records both measurements and
+the population they were taken over. `peak_ratio` is the diagnostic for an
+*ambiguous* surface — periodic texture matching at more than one offset — and for the search-boundary
+condition below.
 
 At an `interpolated` point it is the median of the neighbourhood the displacement itself was taken from,
 since that is what stands behind the value; `correlation` is `NaN` there instead, having no surface of its
 own to report.
 
-`peak_snr` is **zero** where the correlation peak lay against the search boundary: the displacement is a
+`peak_ratio` is **zero** where the correlation peak lay against the search boundary: the displacement is a
 lower bound and its sub-pixel part is quantized to whole pixels, so any positive threshold excludes those
-points without the caller needing to know about them. Select them with `peak_snr .== 0` to find where
-`search_radius` is too small — `AutoRIFT.peak_quality` documents the measurements.
+points without the caller needing to know about them, zero being below the 1 a real ratio cannot go under.
+Select them with `peak_ratio .== 0` to find where `search_radius` is too small — `AutoRIFT.peak_ratio`
+documents the measurements.
 
 `chip_size` holds the level's **x** extent. That identifies the level on its own, since the aspect
 is constant across levels, so the y extent is this times a fixed ratio.
@@ -97,7 +100,7 @@ struct MultichipResult
     dx::Matrix{Float32}
     dy::Matrix{Float32}
     correlation::Matrix{Float32}
-    peak_snr::Matrix{Float32}
+    peak_ratio::Matrix{Float32}
     chip_size::Matrix{UInt16}
     interpolated::BitMatrix
 end
@@ -159,14 +162,26 @@ Correlate each pass in one call, over a whole filtered scene. See [`AutoRIFT.Pas
 
 `prepared` is the **filtered** pair — the pair `_prepare` produced. The blocked runner takes an
 unfiltered one instead, and holding the pair here is what keeps the two from being confused.
+
+`okmask` is [`valid`](@ref) of that pair: the pixels usable in both images. Held rather than
+recomputed because it is a property of the pair, which does not change within a run, while
+[`track!`](@ref) needs it once per pass — six times over a three-level run. At a full Landsat
+scene the intersection is 35 MiB a call, so recomputing it is ~208 MiB of churn for an answer
+already in hand. `Blocked` needs no equivalent: its blocks read mask windows into dense buffers
+per block, so there is no whole-scene mask to hold.
 """
-struct WholeScene{P<:ImagePair} <: PassRunner
+struct WholeScene{P<:ImagePair,M<:AbstractMatrix{Bool}} <: PassRunner
     prepared::P
+    okmask::M
 end
+
+# The mask derived from the pair, so every existing construction keeps working and no caller has to
+# know the field exists. `valid` is the one definition of the intersection either way.
+WholeScene(prepared::ImagePair) = WholeScene(prepared, valid(prepared))
 
 run_pass(r::WholeScene, pts::PointSet{2}, p::Params, measure::SimilarityMeasure,
          subpixel::SubpixelMethod) =
-    track(r.prepared, pts, p; subpixel, measure)
+    track(r.prepared, pts, p; subpixel, measure, okmask = r.okmask)
 
 # A whole-scene pass sees every point of whatever set it is given, so a reshaped grid needs no
 # change here: the subset is already expressed in the `PointSet` handed to `run_pass`. Only a
@@ -602,12 +617,12 @@ function _undecimate_level(got, fullsize::Tuple{Int,Int}, rows, cols,
     resample!(out.dx, _fill_level_holes(field.dx, reduce_prior(prior_dx)), Bicubic(); scale = sc)
     resample!(out.dy, _fill_level_holes(field.dy, reduce_prior(prior_dy)), Bicubic(); scale = sc)
     resample!(out.correlation, _fill_nan_nearest(field.correlation), Bicubic(); scale = sc)
-    # `Nearest` for the peak quality, where the displacement gets `Bicubic`. Interpolating it would
-    # invent a quality between two coarse cells, and a quality is a statement about one specific
+    # `Nearest` for the peak ratio, where the displacement gets `Bicubic`. Interpolating it would
+    # invent a ratio between two coarse cells, and a ratio is a statement about one specific
     # correlation surface — there is no surface between them to make the interpolated value a
     # statement about. Every fine point in a coarse cell therefore reports that cell's value
     # verbatim, the same treatment `chip_size` receives for the same reason.
-    resample!(out.peak_snr, _fill_nan_nearest(field.peak_snr), Nearest(); scale = sc)
+    resample!(out.peak_ratio, _fill_nan_nearest(field.peak_ratio), Nearest(); scale = sc)
     # Keyed on `dx` being finite rather than on `searched`: a point can be searched and yield
     # nothing, and only a real measurement may be spread over its cell. `searched` would post a
     # coarse estimate across every hole the level attempted and failed at — measured as 13,118
@@ -628,7 +643,7 @@ function _undecimate_level(got, fullsize::Tuple{Int,Int}, rows, cols,
             out.dx[i] = NaN32
             out.dy[i] = NaN32
             out.correlation[i] = NaN32
-            out.peak_snr[i] = NaN32
+            out.peak_ratio[i] = NaN32
             out.searched[i] = false
         end
     end
@@ -820,7 +835,10 @@ end
 function _expand_coarse_mask(mask::AbstractMatrix{Bool}, gridsize::Tuple{Int,Int}, stride::Int)
     nr, nc = gridsize
     sr, sc = size(mask)
-    lo = stride ÷ 2
+    # The same left margin `_cell_max_radius!` reduces over, from the same helper. This is the
+    # inverse map — fine index to cell — and it agrees with the forward one only if both take their
+    # margin from one place; `test/multichip.jl` pins the round trip.
+    lo, _, _, _ = _window_margins(stride, stride)
     out = Matrix{Bool}(undef, nr, nc)
     @inbounds for j in 1:nc
         cj = clamp(fld(j + lo, stride), 1, sc)
@@ -871,8 +889,10 @@ end
 # reductions use so the two agree at the boundaries.
 function _cell_max_radius!(out, radius, rows, cols, stride::Int)
     nr, nc = size(radius)
-    lo = stride ÷ 2
-    hi = stride - 1 - lo
+    # The cell's extent about its centre, from the one place that convention lives. Writing it out
+    # here would be a third transcription of a rule `window.jl` documents as the easiest in the
+    # package to get backwards.
+    lo, _, hi, _ = _window_margins(stride, stride)
     @inbounds for (jo, j) in enumerate(cols), (io, i) in enumerate(rows)
         m = 0
         for jj in max(j - lo, 1):min(j + hi, nc)
@@ -905,7 +925,7 @@ function _reject_and_fill!(d::DisplacementField, pts::PointSet, p::Params)
             d.dx[i] = NaN32
             d.dy[i] = NaN32
             d.correlation[i] = NaN32
-            d.peak_snr[i] = NaN32
+            d.peak_ratio[i] = NaN32
         end
     end
     return _fill_holes!(d, p)
@@ -928,22 +948,21 @@ end
 # rather than deducing it later from a missing correlation.
 function _fill_holes!(d::DisplacementField, p::Params)
     w = p.fill_window
-    lo = w ÷ 2
-    hi = w - 1 - lo
+    lo, _, hi, _ = _window_margins(w, w)
     # Two thirds of a full window: enough neighbours that the median means something, and
     # strict enough that an isolated point does not seed a fill.
     needed = 2 * w^2 ÷ 3
     nr, nc = size(d.dx)
     bufx = Vector{Float32}(undef, w * w)
     bufy = Vector{Float32}(undef, w * w)
-    # `peak_snr` is filled alongside the displacement, so a point carrying a value always carries a
-    # quality for it — the same rule `chip_size` follows. The filled quality is the neighbourhood's,
+    # `peak_ratio` is filled alongside the displacement, so a point carrying a value always carries a
+    # ratio for it — the same rule `chip_size` follows. The filled ratio is the neighbourhood's,
     # which is the honest description: the displacement came from those neighbours, so their peak
-    # quality is what stands behind it. `interpolated` marks the point either way, so a caller
+    # ratios are what stands behind it. `interpolated` marks the point either way, so a caller
     # wanting only directly measured peaks can exclude them.
     #
     # `correlation` is deliberately *not* filled, and stays `NaN` at a filled point. It is the peak
-    # value of a surface this point has none of, where the median of neighbouring qualities is a
+    # value of a surface this point has none of, where the median of neighbouring ratios is a
     # summary that still means something.
     bufs = Vector{Float32}(undef, w * w)
     filled = Int[]
@@ -964,16 +983,18 @@ function _fill_holes!(d::DisplacementField, p::Params)
                     n += 1
                     bufx[n] = v
                     bufy[n] = d.dy[ii, jj]
-                    # Counted separately: a neighbour can carry a displacement with no quality —
+                    # Counted separately: a neighbour can carry a displacement with no ratio —
                     # it may itself have been filled by an earlier pass, or its surface may have
-                    # been too small to characterize — and mixing `NaN` into the selection would
-                    # poison the median rather than skip the neighbour.
+                    # been too small to compute one on — and mixing `NaN` into the selection would
+                    # poison the median rather than skip the neighbour. `Inf` is kept: it is an
+                    # ordered value that a median handles, and it means an unrivalled peak rather
+                    # than an absent measurement.
                     #
-                    # `peak_quality`'s zero-at-the-search-boundary carries through by majority, since a
+                    # `peak_ratio`'s zero-at-the-search-boundary carries through by majority, since a
                     # median over values including zeros returns zero once half the neighbourhood is
                     # railed. That is the correct reading: a filled displacement is only as trustworthy
                     # as the neighbourhood behind it.
-                    s = d.peak_snr[ii, jj]
+                    s = d.peak_ratio[ii, jj]
                     if !isnan(s)
                         ns += 1
                         bufs[ns] = s
@@ -991,7 +1012,7 @@ function _fill_holes!(d::DisplacementField, p::Params)
         @inbounds for (idx, mx, my, ms) in pending
             d.dx[idx] = mx
             d.dy[idx] = my
-            d.peak_snr[idx] = ms
+            d.peak_ratio[idx] = ms
             push!(filled, idx)
         end
     end
@@ -1027,7 +1048,7 @@ function _merge_level!(result::MultichipResult, level::DisplacementField,
         result.dx[i] = level.dx[i]
         result.dy[i] = level.dy[i]
         result.correlation[i] = level.correlation[i]
-        result.peak_snr[i] = level.peak_snr[i]
+        result.peak_ratio[i] = level.peak_ratio[i]
         result.chip_size[i] = cs
         result.interpolated[i] = wasfilled[i]
     end

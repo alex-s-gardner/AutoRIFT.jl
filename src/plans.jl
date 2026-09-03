@@ -52,6 +52,20 @@ const LIBFFTW3F = libfftw3f_path
 # FFTW.jl's plan machinery; `FFTW.MEASURE` is the same integer.
 const FFTW_MEASURE = UInt32(0)
 const FFTW_ESTIMATE = UInt32(1 << 6)
+const FFTW_PATIENT = UInt32(1 << 5)
+
+# The flag every plan in this file is built with, so the four planners cannot drift apart.
+#
+# `PATIENT` rather than `MEASURE`, and the gap is largest exactly where it matters most. Measured
+# on the real-to-complex forward transform: 1.41x at 28², 1.28x at 84², 1.15x at 128², 1.05x at
+# 192². The smallest sizes are the ones a default run executes most often, since the finest
+# chip-size level searches the most points.
+#
+# The cost is planning time, which `PATIENT` roughly triples, and which the wisdom file above
+# already exists to amortise across processes. `EXHAUSTIVE` was measured alongside and is not
+# worth its planning time: it matched `PATIENT` at every size but 128², where it gained a further
+# 8%.
+const PLAN_FLAGS = FFTW_PATIENT
 
 const PLAN_LOCK = ReentrantLock()
 # `Ptr{Cvoid}`, so a cache hit yields a concrete type and the `ccall` below is a static call.
@@ -274,10 +288,10 @@ function fft_plan(ny::Int, nx::Int)
     p === C_NULL || return p
     return lock(PLAN_LOCK) do
         get!(RFFT_PLANS, key) do
-            # MEASURE rather than ESTIMATE: planning is paid once per size per
-            # process and reused across every grid point, so the extra planning
-            # time is recovered immediately. Wisdom persistence (see `__init__`)
-            # removes even that cost on subsequent runs.
+            # `PLAN_FLAGS` measures rather than estimates: planning is paid once per size
+            # per process and reused across every grid point, so the extra planning time
+            # is recovered immediately. Wisdom persistence (see `__init__`) removes even
+            # that cost on subsequent runs.
             WISDOM_DIRTY[] = true
             # FFTW is row-major and Julia column-major, so an `ny`-by-`nx` Julia array is an
             # `nx`-by-`ny` C array — the dimensions go in reversed. Getting this backwards
@@ -286,7 +300,7 @@ function fft_plan(ny::Int, nx::Int)
             outb = Matrix{ComplexF32}(undef, ny ÷ 2 + 1, nx)
             plan = ccall((:fftwf_plan_dft_r2c_2d, LIBFFTW3F), Ptr{Cvoid},
                          (Cint, Cint, Ptr{Float32}, Ptr{ComplexF32}, Cuint),
-                         nx, ny, inb, outb, FFTW_MEASURE)
+                         nx, ny, inb, outb, PLAN_FLAGS)
             plan == C_NULL && error("FFTW could not plan a $(ny)x$(nx) real-to-complex " *
                                     "transform. This is not a recoverable condition: the " *
                                     "correlator has no fallback for a size FFTW rejects.")
@@ -329,7 +343,7 @@ function ifft_plan(ny::Int, nx::Int)
             outb = Matrix{Float32}(undef, ny, nx)
             plan = ccall((:fftwf_plan_dft_c2r_2d, LIBFFTW3F), Ptr{Cvoid},
                          (Cint, Cint, Ptr{ComplexF32}, Ptr{Float32}, Cuint),
-                         nx, ny, inb, outb, FFTW_MEASURE)
+                         nx, ny, inb, outb, PLAN_FLAGS)
             plan == C_NULL && error("FFTW could not plan a $(ny)x$(nx) complex-to-real " *
                                     "transform.")
             plan
@@ -360,7 +374,7 @@ function cfft_plan(ny::Int, nx::Int)
             outb = Matrix{ComplexF32}(undef, ny, nx)
             plan = ccall((:fftwf_plan_dft_2d, LIBFFTW3F), Ptr{Cvoid},
                          (Cint, Cint, Ptr{ComplexF32}, Ptr{ComplexF32}, Cint, Cuint),
-                         nx, ny, inb, outb, FFTW_FORWARD, FFTW_MEASURE)
+                         nx, ny, inb, outb, FFTW_FORWARD, PLAN_FLAGS)
             plan == C_NULL && error("FFTW could not plan a $(ny)x$(nx) forward complex " *
                                     "transform.")
             plan
@@ -379,7 +393,7 @@ function icfft_plan(ny::Int, nx::Int)
             outb = Matrix{ComplexF32}(undef, ny, nx)
             plan = ccall((:fftwf_plan_dft_2d, LIBFFTW3F), Ptr{Cvoid},
                          (Cint, Cint, Ptr{ComplexF32}, Ptr{ComplexF32}, Cint, Cuint),
-                         nx, ny, inb, outb, FFTW_BACKWARD, FFTW_MEASURE)
+                         nx, ny, inb, outb, FFTW_BACKWARD, PLAN_FLAGS)
             plan == C_NULL && error("FFTW could not plan a $(ny)x$(nx) inverse complex " *
                                     "transform.")
             plan
@@ -439,9 +453,10 @@ most serial. Called once per pass, where the set of sizes is known in advance.
 
 `complex` selects the complex-to-complex pair that [`Coherence`](@ref) executes instead of the
 real-to-complex pair the real measures use. It must match the measure the pass will actually run:
-warming the wrong kind is doubly wrong, since it pays `FFTW_MEASURE` — 116-347 ms per size cold —
-for a plan that is never executed, *and* leaves the plans that are executed to be created inside a
-worker task, which is precisely the planner contention this function exists to prevent. Verified
+warming the wrong kind is doubly wrong, since it pays full `PLAN_FLAGS` planning — hundreds of
+milliseconds per size cold — for a plan that is never executed, *and* leaves the plans that are
+executed to be created inside a worker task, which is precisely the planner contention this
+function exists to prevent. Verified
 against a coherence pass before this argument existed: it warmed `RFFT_PLANS[(72,72)]`, never used
 it, and built `CFFT_PLANS[(72,72)]` lazily under the lock.
 """

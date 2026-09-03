@@ -3,15 +3,11 @@ AutoRIFT = "52cb0ed0-aa80-430c-bd04-c52888a79add"
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
 Chairmarks = "0ca39b1e-fe0b-4e98-acfc-b1656634c4de"
 DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
-# Direct for the same reason as FFTW below: `memory.jl`'s blocked measurements build a windowed
-# input in a subprocess, and an indirect dependency through Rasters is not loadable by name there.
 DiskArrays = "3c3547ce-8d99-4f5e-a174-61eb10b00ae3"
-# A *direct* dependency although nothing here calls it: `memory.jl`'s floor breakdown measures the
-# RSS cost of `using FFTW` on its own, to separate the Julia runtime's share of the memory floor from
-# AutoRIFT's. An indirect dependency through AutoRIFT is not loadable by name in a subprocess.
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 LocalFilters = "085fde7c-5f94-55e4-8448-8bbb5db6dde9"
+Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
 NaNStatistics = "b946abbf-3ea7-4610-9019-9858bfdeaf2d"
 PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"

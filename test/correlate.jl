@@ -30,6 +30,37 @@ using AutoRIFT: workspace, correlate!, prepare_chip!, next_fft_size,
     @test_throws DimensionMismatch AutoRIFT.integral!(zeros(3, 3), A)
 end
 
+@testset "integral_both! is exactly the two separate tables" begin
+    # `integral_both!` traverses four columns at once, which reorders memory access but not
+    # arithmetic: each running sum still accumulates down its own column in row order, and the
+    # writes across a row still chain left to right. So the fused, blocked form must agree with
+    # the one-at-a-time functions *bitwise*, not to a tolerance — a tolerance here would hide
+    # exactly the reassociation the blocking is required not to introduce.
+    #
+    # Widths spanning every remainder mod 4, so the blocked body and its scalar tail are both
+    # exercised, and one width below the block so only the tail runs.
+    for (m, n) in ((3, 3), (7, 8), (8, 9), (9, 10), (16, 11), (27, 27), (32, 81))
+        A = Float32.(sinpi.((1:m) ./ m) .* cospi.(((1:n)') ./ n) .* 37)
+        S = Matrix{Float64}(undef, m + 1, n + 1)
+        S2 = similar(S)
+        AutoRIFT.integral_both!(S, S2, A)
+        @test S == AutoRIFT.integral(A)
+        @test S2 == AutoRIFT.integral_sq(A)
+    end
+
+    # Integer input takes the same path with a widening conversion, and 255² over a large window
+    # is where a narrower accumulator would start losing bits.
+    B = fill(UInt8(255), 64, 64)
+    S = Matrix{Float64}(undef, 65, 65)
+    S2 = similar(S)
+    AutoRIFT.integral_both!(S, S2, B)
+    @test S == AutoRIFT.integral(B)
+    @test S2 == AutoRIFT.integral_sq(B)
+
+    S3 = zeros(3, 3)
+    @test_throws DimensionMismatch AutoRIFT.integral_both!(S3, S3, Float32[1 2 3; 4 5 6; 7 8 9])
+end
+
 @testset "next_fft_size" begin
     @test next_fft_size(1) == 1
 
@@ -81,6 +112,32 @@ end
     @test !ok
 
     @test_throws DimensionMismatch prepare_chip!(ws, zeros(Float32, 16, 16))
+
+    # Four accumulators per column, so the mean-removed copy must still be exactly what a single
+    # running sum produces: the partial sums are combined pairwise, which changes the *norm* at the
+    # last bit but cannot change `Float32(x - mean)` once `mean` is fixed. Heights spanning every
+    # remainder mod 4 exercise the unrolled body and its tail.
+    for h in (1, 2, 3, 4, 5, 7, 8, 13, 32)
+        w = 6
+        ws2 = workspace(Float32, (w, h), 4)
+        c = Float32[i * 3 - j * 7 + i * j for i in 1:h, j in 1:w]
+        nrm, ok = prepare_chip!(ws2, c)
+        @test ok
+        mean = sum(Float64, c) / length(c)
+        @test ws2.chip[1:h, 1:w] == Float32.(Float64.(c) .- mean)
+        @test nrm ≈ sqrt(sum(abs2, Float64.(c) .- mean)) rtol = 1e-13
+    end
+
+    # A strided view, which is what `track!` actually passes: the chip is a window into the
+    # secondary image, so its columns are not adjacent in memory.
+    img = Float32[i + 2j + i * j / 8 for i in 1:40, j in 1:40]
+    ws3 = workspace(Float32, 8, 4)
+    v = @view img[9:16, 21:28]
+    nv, okv = prepare_chip!(ws3, v)
+    @test okv
+    mv = sum(Float64, v) / length(v)
+    @test ws3.chip[1:8, 1:8] == Float32.(Float64.(v) .- mv)
+    @test nv ≈ sqrt(sum(abs2, Float64.(v) .- mv)) rtol = 1e-13
 end
 
 @testset "workspace validation" begin

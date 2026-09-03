@@ -53,15 +53,64 @@
 #     start tiling. There is nothing to tile.
 #
 #   * **A hysteresis clamp on the near-zero denominator**: when `|num|` falls within 12.5% of the
-#     threshold, OpenCV returns ±1 rather than dividing. Measured across all 72 correlation
-#     fixtures, the worst excursion outside [-1, 1] here is 9.0e-5 — 0.009%, three orders of
-#     magnitude inside that band — so the branch would never fire, and adding it would cost a test
-#     per surface element to change nothing.
+#     threshold, OpenCV returns ±1 rather than dividing. Across all 72 correlation fixtures the
+#     worst excursion outside [-1, 1] here is 9.0e-5, so on those the branch would never fire.
+#
+#     **The surface can leave [-1, 1] on input the fixtures do not contain**, and the branch is still
+#     absent. Over an **exactly** constant part of a window — saturated snow, or a fill value that no
+#     validity mask caught — `ΣW² - (ΣW)²/n` cancels to within rounding of zero while the numerator
+#     carries a `Float32` transform's absolute error, and a small error over a ~1e-6 denominator is a
+#     large ratio. Measured on a 640² scene with a saturated 201² block, chip 32 radius 25 and the
+#     default `Highpass`: 1.5% of surfaces exceed 1, worst **7.1**. A near-constant block instead —
+#     one DN of sensor noise — produces **no** excursion at all, so this needs exact constancy rather
+#     than merely low contrast.
+#
+#     It is nonetheless **not reachable in the output**, which is why no clamp is implemented. A
+#     garbage peak from a vanishing denominator is spatially incoherent, and that is precisely what
+#     [`GardnerFilter`](@ref) tests for: through `autorift` at the default settings the same scene
+#     reports **zero** points wrong by more than a pixel and **zero** `correlation` above 1, at one
+#     level and at three. Only `outliers = :none` leaks them — 114 points, of which every one above
+#     0.8 correlation is wrong — and that setting exists for diagnosis rather than production.
+#
+#     If it ever does need fixing, the fix is the clamp and **not** mean-removal. Measured on the
+#     failing scene: clamping a variance below `n * eps * ΣW²` to zero gives 0 surfaces out of range
+#     and 0 wrong peaks against the exact answer, for one comparison per shift. Subtracting the
+#     window mean before the transform is *worse* than doing nothing (100 surfaces out of range,
+#     against 130) — the tables must then be rebuilt on the shifted window to stay consistent with
+#     the transform, which reintroduces the same cancellation in the denominator. That the numerator
+#     alone improves is real but irrelevant, since the denominator is the binding term.
 #
 #   * **`max(sumsq - sum^2/n, 0)` to stop a negative variance**, and returning the whole surface as
 #     1 for a zero-variance template. Both of these we already do — see the clamp in
 #     `_correlate_surface!` and `degenerate`. Arrived at independently, which is reassuring rather
 #     than surprising: it is the only sane way to handle the cancellation.
+#
+# ---------------------------------------------------------------------------
+# Why there is no LoopVectorization dependency
+# ---------------------------------------------------------------------------
+#
+# `@turbo` is the obvious thing to reach for in a file like this, and it was measured on all four of
+# this package's hot-loop shapes rather than argued about. It does not earn a dependency here, and
+# each shape says no for its own reason:
+#
+#   * **The normalisation loops** gained 1.8-2.1x — and plain Julia with `ifelse` in place of the
+#     branch gains the same 1.8-2.1x, indistinguishable at every geometry tried. The win was the
+#     unpredictable branch, not the macro. That form is what the three `_correlate_surface!` methods
+#     use.
+#
+#   * **`integral_both!`** is 3x *slower* under `@turbo`. A summed-area table is a serial prefix
+#     recurrence; restructuring it into two vectorizable phases doubles the memory traffic and loses
+#     more than vectorization returns.
+#
+#   * **`prepare_chip!`** gained 1.15-1.41x over the hand-unrolled form, the smallest gain on the
+#     cheapest stage — and it needs linear indexing, which the strided-view call site in `track.jl`
+#     cannot give.
+#
+#   * **`_numerators_direct!`** is the one genuine fit, at 2.1-6.8x. But `DIRECT_THRESHOLD` sits
+#     below every configuration the public API can reach, so that loop runs only in tests.
+#
+# The transforms are 68-76% of a `correlate!` call and are inside FFTW, where no Julia-level
+# vectorizer reaches at all. Re-measure before adding the dependency, not after.
 
 """
     CorrelationWorkspace
@@ -431,17 +480,60 @@ function prepare_chip!(ws::CorrelationWorkspace, chip::AbstractMatrix)
     # Mean in Float64 regardless of input type: it is subtracted from every
     # element, so an error here biases the whole numerator rather than averaging
     # out.
+    #
+    # Four accumulators down each column rather than one. A single running sum makes each
+    # add wait for the previous one to retire, so the loop runs at the latency of the
+    # floating-point adder — measured ~1.6 ns per element, far off what the memory can
+    # supply. Four independent chains fill those slots and are worth 1.6-1.9x.
+    #
+    # Combined pairwise, which is *more* accurate than sequential summation, not less: the
+    # partial sums are of comparable magnitude, so the final adds lose fewer low bits. The
+    # mean-removed copy this writes is bit-identical to a serial accumulation; the norm
+    # differs at the last bit or two.
+    #
+    # Row-blocked and indexed two-dimensionally, not linearly. `chip` is a strided view into
+    # the search image, whose columns are not adjacent, so it is `IndexCartesian` — linear
+    # indexing would divide and modulo per element and lose more than the unrolling gains.
+    tail = ch - ch % 4
     s = 0.0
-    @inbounds for j in 1:cw, i in 1:ch
-        s += Float64(chip[i, j])
+    @inbounds for j in 1:cw
+        s0 = s1 = s2 = s3 = 0.0
+        for i in 1:4:tail
+            s0 += Float64(chip[i, j])
+            s1 += Float64(chip[i + 1, j])
+            s2 += Float64(chip[i + 2, j])
+            s3 += Float64(chip[i + 3, j])
+        end
+        for i in (tail + 1):ch
+            s0 += Float64(chip[i, j])
+        end
+        s += (s0 + s1) + (s2 + s3)
     end
     mean = s / (ch * cw)
 
     sq = 0.0
-    @inbounds for j in 1:cw, i in 1:ch
-        d = Float64(chip[i, j]) - mean
-        dst[i, j] = Float32(d)
-        sq += d * d
+    @inbounds for j in 1:cw
+        q0 = q1 = q2 = q3 = 0.0
+        for i in 1:4:tail
+            d0 = Float64(chip[i, j]) - mean
+            d1 = Float64(chip[i + 1, j]) - mean
+            d2 = Float64(chip[i + 2, j]) - mean
+            d3 = Float64(chip[i + 3, j]) - mean
+            dst[i, j] = Float32(d0)
+            dst[i + 1, j] = Float32(d1)
+            dst[i + 2, j] = Float32(d2)
+            dst[i + 3, j] = Float32(d3)
+            q0 += d0 * d0
+            q1 += d1 * d1
+            q2 += d2 * d2
+            q3 += d3 * d3
+        end
+        for i in (tail + 1):ch
+            d = Float64(chip[i, j]) - mean
+            dst[i, j] = Float32(d)
+            q0 += d * d
+        end
+        sq += (q0 + q1) + (q2 + q3)
     end
 
     # Zero within rounding, not exactly zero: a chip of nearly-identical values
@@ -596,7 +688,13 @@ function _correlate_surface!(
         # difference slightly negative even in Float64, and `sqrt` of that is NaN.
         wvar = max(s2 - s1 * s1 / n, 0.0)
         den = cnorm * sqrt(wvar)
-        surface[i, j] = den > 0 ? Float32(numerators[i, j] / den) : 0.0f0
+        # `ifelse` rather than a branch, and it is worth 1.8-2.1x on this loop. A branch here is
+        # unpredictable — whether a window has contrast depends on the imagery — and it also
+        # blocks vectorization, so the loop pays a mispredict on top of running one shift at a
+        # time. `ifelse` evaluates both arms and selects, which is safe because the division is
+        # the only cost and `den > 0` is exactly the guard that makes it finite; a zero `den`
+        # yields `Inf` or `NaN` in the discarded arm and the select drops it.
+        surface[i, j] = ifelse(den > 0, Float32(numerators[i, j] / den), 0.0f0)
     end
     return surface
 end
@@ -624,7 +722,8 @@ function _correlate_surface!(
     @inbounds for j in 1:nc, i in 1:nr
         wsq = boxsum(S2, i, j, ch, cw)
         den = cnorm * sqrt(max(wsq, 0.0))
-        surface[i, j] = den > 0 ? Float32(numerators[i, j] / den) : 0.0f0
+        # `ifelse`, for the reason given in the `ZNCC` method.
+        surface[i, j] = ifelse(den > 0, Float32(numerators[i, j] / den), 0.0f0)
     end
     return surface
 end
@@ -676,7 +775,8 @@ function _correlate_surface!(
         # Σ|W - W̄|² = Σ|W|² - |ΣW|²/n. Clamped for the same cancellation reason as `ZNCC`.
         wvar = max(s2 - abs2(s1) / n, 0.0)
         den = cnorm * sqrt(wvar)
-        surface[i, j] = den > 0 ? Float32(abs(numerators[i, j]) / den) : 0.0f0
+        # `ifelse`, for the reason given in the `ZNCC` method.
+        surface[i, j] = ifelse(den > 0, Float32(abs(numerators[i, j]) / den), 0.0f0)
     end
     return surface
 end
@@ -796,15 +896,28 @@ function _numerators!(ws::CorrelationWorkspace, search, cd, nr, nc, ch, cw)
     return out
 end
 
+# `Float32` accumulator, matching the FFT path this one is an alternative to — `_numerators_fft!`
+# transforms in `Float32` throughout, so the two agree on the width the numerator is computed at
+# rather than differing either side of `DIRECT_THRESHOLD`.
+#
+# The numerator tolerates a narrower accumulator than the denominator, and the asymmetry is the point:
+# it is a sum of products of *mean-removed* values, so the terms straddle zero and no large constant
+# accumulates for the sum to cancel against. The variance in `_correlate_surface!` is the opposite
+# shape — `sumsq - sum^2/n` differences two large nearly-equal quantities — which is why the integral
+# images stay `Float64`. See the head of `integral.jl`.
+#
+# `Float32` is also *exact* for the default geometry: a 16x16 `UInt8` chip accumulates to at most
+# 16646400, inside the 2^24 where `Float32` represents every integer. Above that the relative error is
+# ~1e-7, against a peak located to a fraction of a pixel from a 16x-upsampled surface.
 function _numerators_direct!(out, search, cd, nr, nc, ch, cw)
     @inbounds for j in 1:nc
         for i in 1:nr
-            acc = 0.0
+            acc = 0.0f0
             for jj in 1:cw
                 # `search` is column-major, so the inner loop over rows walks
                 # contiguous memory in both arrays.
                 @simd for ii in 1:ch
-                    acc += Float64(cd[ii, jj]) * Float64(search[i + ii - 1, j + jj - 1])
+                    acc += Float32(cd[ii, jj]) * Float32(search[i + ii - 1, j + jj - 1])
                 end
             end
             out[i, j] = acc

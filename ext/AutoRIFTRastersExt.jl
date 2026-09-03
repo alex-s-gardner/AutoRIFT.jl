@@ -57,7 +57,7 @@ const MS_PER_YEAR = 365.25 * 24 * 60 * 60 * 1000
 
 Correlate two rasters, returning a `RasterStack` on the output grid.
 
-Layers are `vx`, `vy`, `correlation`, `peak_snr`, `chip_size`, and `interpolated`, each with its own
+Layers are `vx`, `vy`, `correlation`, `peak_ratio`, `chip_size`, and `interpolated`, each with its own
 `missingval`. The output grid inherits the inputs' CRS and axis order, at `grid_spacing` times
 their pixel size.
 
@@ -138,7 +138,7 @@ function AutoRIFT.autorift(reference::AbstractRaster, secondary::AbstractRaster;
 
     outdims = DDExt.grid_dims(reference, grid)
     vx, vy = _to_velocity(result, reference, dt)
-    layers = (vx = vx, vy = vy, correlation = result.correlation, peak_snr = result.peak_snr,
+    layers = (vx = vx, vy = vy, correlation = result.correlation, peak_ratio = result.peak_ratio,
               chip_size = result.chip_size,
               interpolated = Matrix{Bool}(result.interpolated))
     # Per-layer `missingval`, set at construction rather than left to a caller to discover. `NaN`
@@ -146,7 +146,7 @@ function AutoRIFT.autorift(reference::AbstractRaster, secondary::AbstractRaster;
     # is deliberately distinct from a measured zero; `0` chip size means no level resolved the
     # point; `false` is not missing data but the honest default for a mask.
     return RasterStack(layers, outdims;
-                       missingval = (vx = NaN32, vy = NaN32, correlation = NaN32, peak_snr = NaN32,
+                       missingval = (vx = NaN32, vy = NaN32, correlation = NaN32, peak_ratio = NaN32,
                                      chip_size = UInt16(0), interpolated = false))
 end
 
@@ -167,14 +167,23 @@ _ondisk(r::AbstractRaster) = DiskArrays.isdisk(parent(r))
 #
 #   * **Nodata becomes mask.** A GDAL raster's eltype is `Union{Missing,T}`, which `ImagePair` rejects
 #     — rightly, since `missing` in an FFT poisons the whole surface. `Rasters.replace_missing` swaps
-#     the fill for `zero(T)` *lazily*, and the pixels it swapped are recorded in the mask, so they are
-#     excluded from correlation rather than read as a dark measurement.
+#     the fill for `zero(T)`, and the pixels it swapped are recorded in the mask, so they are excluded
+#     from correlation rather than read as a dark measurement.
 #   * **A caller's own mask is combined**, not overridden. Nodata is a property of the file; a cloud or
 #     shadow mask is a property of the scene, and a caller passing one should not lose the other.
 #
-# The masks stay lazy: `AutoRIFT.ImagePair` passes a supplied mask through without materializing, and
-# `_read_block!` reads windows of it into dense buffers. Materializing here would form exactly the
-# scene-sized array that blocking exists to avoid.
+# Nothing scene-sized is formed for a raster **on disk**: `replace_missing` returns a lazy
+# `BroadcastDiskArray`, the mask is a lazy view over the file's own storage, `AutoRIFT.ImagePair` passes
+# a supplied mask through without materializing, and `_read_block!` reads windows of each into dense
+# buffers. That is what lets blocking bound memory.
+#
+# For a raster **already in memory** the same two calls are not free, and this is the cost of keeping one
+# path rather than two: `replace_missing` returns a fresh `Array`, and `_nodata_mask` wraps the original,
+# so both stay resident. A `Union{Missing,T}` array is also 1.5x the size of its own data, since a union
+# eltype tags every element. Resident input is therefore about 2.6x what the correlator needs, against
+# 1.06x for a single pass producing a plain `Matrix{T}` beside a `BitMatrix`. On a 17121x16961 `UInt16`
+# scene that is 2.34 GiB per image rather than 1.09 — but it does not move peak RSS, which the
+# correlator's own workspaces set some 5 GiB higher, so the second path is not worth its complexity.
 function _lazy_input(r::AbstractRaster, supplied)
     # Keyed on whether the raster *declares* nodata, not on where its data lives. A raster read into
     # memory keeps both its `missingval` and its `Union{Missing,T}` eltype, so gating this on
@@ -189,9 +198,6 @@ end
 
 # "Not the fill value", as a lazy `Bool` array over the raster's own storage.
 #
-# `missing` and a sentinel number are the two forms GDAL reports and they need different tests, so this
-# dispatches on which one the file declared rather than comparing against a value that may be `missing`
-# — `x == missing` is `missing`, not `false`, which would make every pixel indeterminate.
 # `missing` and a sentinel number are the two forms GDAL reports, and one type serves both: `missing`
 # *is* the sentinel in the first case, so `!isequal(x, value)` covers it — `isequal` rather than `!=`
 # because `x == missing` is `missing`, not `false`, which would leave every pixel indeterminate.

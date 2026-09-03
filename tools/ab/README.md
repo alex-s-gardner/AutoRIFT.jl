@@ -29,6 +29,9 @@ julia --project=tools/ab tools/ab/compare.jl chip32
 julia --project=tools/ab tools/ab/stage2_julia.jl 3072 16 64 20
 micromamba run -n arift-ref python tools/ab/stage2_python.py
 julia --project=tools/ab tools/ab/compare2.jl full
+
+# Which quality measure predicts disagreement -- reads the stage-2 dump, no imagery of its own.
+julia --project=tools/ab tools/ab/peak_ratio_skill.jl
 ```
 
 Both stages hand the reference the arrays **AutoRIFT.jl already filtered**, so a preprocessing
@@ -278,9 +281,16 @@ does not fit is the only way to process it at all. That is the whole basis for c
 **The two eager rows read raw planes, not rasters.** Measured through
 `autorift(::AbstractRaster, ...)` the same configuration peaks at **11590 MiB**, not 7148: `read` keeps
 the raster's `missingval`, so a filled copy of each scene is built and the nodata mask is a third array
-over the original — three scene-sized arrays where a plain `Matrix` needs one. An in-memory raster
-therefore costs 1.6× the equivalent array, and the lazy path avoids it because blocking never forms the
-copies.
+over the original — three scene-sized arrays where a plain `Matrix` needs one. The lazy path avoids the
+copies entirely, because blocking never forms them.
+
+That 1.6× is a property of this code path, not of `Raster`. One pass producing a plain `Matrix{T}`
+beside a `BitMatrix` brings resident input from 2.6× the correlator's requirement down to 1.06×, or
+1.09 GiB per image rather than 2.34 on this scene. It is deliberately not implemented: measured before
+and after, peak RSS is unchanged — 11908 against 11904 MiB — because the ceiling is set inside the
+correlator, roughly 5 GiB above where the inputs sit, so shrinking them only widens the headroom
+beneath it. The input arrays are the wrong lever for peak memory on this path; the per-thread
+workspaces and output are where the 12 GiB comes from.
 
 **Block size is nearly free above the halo, and the floor is the grid.** 2048 through 256 px spans
 81 to 4422 blocks and 54× the halo redundancy, yet peak moves by 1.6% and runtime by 16%: what is left
@@ -297,7 +307,7 @@ remains is 7.4% of points beyond 0.25 px, and it is the **pyramid**, not the cor
 |---|---:|---:|
 | chose a different chip-size level | **32.5%** | 5.3% |
 | filled from neighbours on the Julia side | 12.9% | 7.3% |
-| median `peak_snr` | 6.34 | 6.29 |
+| median `peak_ratio` | 1.65 | 1.83 |
 | median displacement | 0.48 px | 0.58 px |
 
 43% of the disagreeing points differ in chip level or were filled — decisions made by the outlier filter
@@ -307,8 +317,9 @@ ground; a point one side measured the other may have filled from neighbours.
 
 Two things this is *not*. It is not concentrated at fast flow: among the top 2% by displacement the rate
 is **4.1%**, lower than the 7.5% elsewhere, and the densest cluster sits at a displacement of 0.8 px.
-And it is not a quality effect — `peak_snr` is the same on both populations to two decimal places, so
-these are not weak-peak points.
+And it is not a quality effect — the disagreeing points are only marginally the more ambiguous, at a
+median `peak_ratio` of 1.65 against 1.83, which is well inside the spread of either population. So
+these are not points where a rival peak beat the right one.
 
 The residual beyond the level and fill differences is tie-breaking at 1/16 px, which no two
 implementations can agree about: below a real correlation peak both are picking from noise.

@@ -720,6 +720,86 @@ same constraint that makes [`measure_at`](@ref)'s result positional.
 abstract type PassRunner end
 
 # ---------------------------------------------------------------------------
+# Compute backend
+# ---------------------------------------------------------------------------
+
+"""
+    AutoRIFT.Backend
+
+Where the correlation kernels run. Concrete subtypes: [`AutoRIFT.CPU`](@ref),
+[`AutoRIFT.MetalGPU`](@ref), [`AutoRIFT.CUDAGPU`](@ref).
+
+Selected with the `backend` keyword, which accepts the `Symbol` naming a backend or an
+instance. `CPU()` is the default and the only one that needs no additional package.
+
+The GPU backends are **experimental and do not currently outperform the CPU**: a device pass is
+2.7-3.2x one CPU core, but slower than a threaded CPU run on a single image pair. They are worth
+selecting where the cores are already committed and the device is idle. See `docs/gpu.md`.
+
+A singleton per backend, carried as a `Params` **type parameter** rather than a field value, so the
+grid loop's choice is resolved at compile time and the unused paths are eliminated — the same
+arrangement `threaded` uses, for the same reason. That is also what keeps `Params` `isbitstype`, and
+what makes the GPU support invisible to a `--trim`ed binary: `app/` builds a `Params` carrying
+`CPU()`, so no GPU method is reachable from `main` and none is compiled in. The kernels themselves
+live in package extensions, so a caller who never loads `Metal` never pays for it either.
+
+The GPU backends are declared here rather than in their extensions because a `Params` type
+parameter must exist before the extension that implements it loads — a caller may construct
+`params(; backend = :metal)` and only then `using Metal`. Selecting a backend whose package is
+absent throws from [`AutoRIFT.required_package`](@ref)'s message rather than a `MethodError`.
+"""
+abstract type Backend end
+
+"""
+    AutoRIFT.CPU()
+
+Run the correlation on the CPU, threaded or not per the `threaded` keyword. The default.
+"""
+struct CPU <: Backend end
+
+"""
+    AutoRIFT.MetalGPU()
+
+Run the correlation on an Apple GPU through Metal.jl. Needs `using Metal`.
+
+Requires Metal.jl 1.10 or later, which is where the batched FFT this depends on landed.
+
+Experimental, and slower than a threaded CPU run on one image pair — see [`AutoRIFT.Backend`](@ref).
+"""
+struct MetalGPU <: Backend end
+
+"""
+    AutoRIFT.CUDAGPU()
+
+Run the correlation on an NVIDIA GPU through CUDA.jl. Needs `using CUDA`.
+
+**Not implemented.** The kernels in `ext/gpu/` are vendor-neutral, written against
+KernelAbstractions.jl, but only the Metal adapter ships — so selecting this backend finds no
+extension to load. Declared here because a `Params` type parameter must exist before the extension
+that implements it, which is what makes adding the adapter a new file rather than a change here.
+"""
+struct CUDAGPU <: Backend end
+
+"""
+    AutoRIFT.isgpu(backend) -> Bool
+
+Whether `backend` executes on a device with its own memory.
+
+A trait rather than an `isa` union at each call site, so a backend added later declares its own
+answer instead of being added to a branch. What it gates is the choices that follow from having a
+separate address space — batching, host/device transfer, and the rejection of intra-pair threading.
+"""
+isgpu(::Backend) = false
+isgpu(::MetalGPU) = true
+isgpu(::CUDAGPU) = true
+
+# Which package carries each backend's kernels. See `required_package` in `src/firstguess.jl`, which
+# documents the function and gives the `FirstGuess` methods; the same error shape serves both, since
+# both name an extension a caller has to load.
+required_package(::MetalGPU) = "Metal"
+required_package(::CUDAGPU) = "CUDA"
+
+# ---------------------------------------------------------------------------
 # Pass geometry
 # ---------------------------------------------------------------------------
 
@@ -945,7 +1025,8 @@ between them — coherence at the finest chip, amplitude above it. A scalar keyw
 of one measure everywhere is the 1-tuple and costs nothing. See [`chip_measures`](@ref).
 """
 struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:PreprocessMethod,
-              R<:SubpixelMethod,O<:OutlierMethod,T<:BoolAsType,W<:RotationMethod}
+              R<:SubpixelMethod,O<:OutlierMethod,T<:BoolAsType,W<:RotationMethod,
+              B<:Backend}
     similarity::S
     preprocess::P
     subpixel::R
@@ -988,7 +1069,26 @@ struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:Preproces
     # Misc.
     rng_seed::UInt64
     progress::Bool
+
+    # Where the kernels run. Last, so the positional constructor every earlier caller wrote keeps
+    # working through the outer method below — see [`AutoRIFT.Backend`](@ref) for why this is a
+    # type parameter rather than a plain field.
+    backend::B
 end
+
+# The positional form without a backend, which is the documented stable API and what `app/` calls.
+# Appends `CPU()`, so an existing 18-argument call is unchanged in meaning.
+#
+# The inner constructor is reached directly with the concrete field types rather than by recursion
+# through the outer one, so there is exactly one place the field order is written.
+Params(similarity, preprocess, subpixel, outliers, threaded, rotation, chip_size_min,
+       chip_size_max, grid_spacing, search_radius, min_search_radius, coarse_stride,
+       coarse_buffer, min_coarse_valid_fraction, dx_prior, dy_prior, fill_window, rng_seed,
+       progress) =
+    Params(similarity, preprocess, subpixel, outliers, threaded, rotation, chip_size_min,
+           chip_size_max, grid_spacing, search_radius, min_search_radius, coarse_stride,
+           coarse_buffer, min_coarse_valid_fraction, dx_prior, dy_prior, fill_window, rng_seed,
+           progress, CPU())
 
 """
     chip_sizes(p::Params) -> Vector{Extent}

@@ -100,15 +100,34 @@ places as it does in the reference.
     it works in one consistent convention.
 """
 @inline function peak_offset(surface::AbstractMatrix, radius::Tuple{Int,Int})
-    rx, ry = radius
     i, j, v = peak(surface)
-    return Float64(j - rx - 1), Float64(i - ry - 1), v
+    return (_offset_at(i, j, radius)..., v)
 end
 
-# How far around the peak is excluded from the background, in surface samples.
+# The displacement a peak at `(i, j)` stands for, for a caller that has already located it.
 #
-# 3 is not delicate: 2 and 5 measure within 0.005 of the same discriminating power, so this is a
-# constant rather than a `Params` field that would imply a tuning decision a caller has to make.
+# The arithmetic of `peak_offset` without its scan, and a separate name rather than a method of it
+# because it takes no surface and returns two values where `peak_offset` returns three.
+@inline function _offset_at(i::Int, j::Int, radius::Tuple{Int,Int})
+    rx, ry = radius
+    return Float64(j - rx - 1), Float64(i - ry - 1)
+end
+
+# How far around the primary peak is excluded when looking for the secondary, in surface samples.
+#
+# This is what separates a rival peak from the primary's own shoulder, and the requirement is
+# one-sided: it must exceed the width of the correlation peak itself. Measured over 4000 real
+# surfaces at chip 16, radius 20, the median ratio by exclusion is
+#
+#   0 -> 1.17    1 -> 1.58    2 -> 1.66    3 -> 1.66    4 -> 1.67    5 -> 1.68    6 -> 1.69
+#
+# so excluding nothing does collapse the measure — the rival is then the sample beside the peak, and
+# 20% of surfaces score below 1.05 where 9% do at any exclusion of 2 or more. Past that it saturates:
+# 2 through 6 rank the same surfaces the same way, at a Spearman correlation above 0.99 against 3.
+# The value sits in the saturated region with margin on the side that matters.
+#
+# A constant rather than a `Params` field: making it tunable would imply a decision the caller has
+# information to make, and above the peak width the choice does not change the answer.
 const PEAK_EXCLUSION = 3
 
 """
@@ -122,92 +141,184 @@ the peak's far side was never sampled. Measured on known translations at chip 16
 a peak is *worse* than keeping the integer one — 1.34 px against 0.40 px at a true shift of −18.6, and
 0.94 px against exact at −19.0.
 
-`track!` therefore reports **both** `correlation` and `peak_snr` as zero at such a point, so any positive
+`track!` therefore reports **both** `correlation` and `peak_ratio` as zero at such a point, so any positive
 threshold on either rejects it without the caller having to know the condition exists. Zero is otherwise
-unreachable for both: a real ZNCC peak is strictly positive, and a real peak stands strictly above its own
-background. The displacement itself is still reported, being the best available bound. Select these points
-with `correlation .== 0` to find where `search_radius` needs raising — at the ITS_LIVE configuration over
-Jakobshavn 4.2% of points that correlate above 0.3 are affected, and 0.12% at chip 32.
+unreachable for both: a real ZNCC peak is strictly positive, and a real ratio is at least 1, the primary
+being the surface maximum. The displacement itself is still reported, being the best available bound.
+Select these points with `correlation .== 0` to find where `search_radius` needs raising — at the
+ITS_LIVE configuration over Jakobshavn 4.2% of points that correlate above 0.3 are affected, and
+0.12% at chip 32.
 
 One function rather than the test written out at each site: the two outputs must agree about which points
 are railed, and a copy of the condition is how they would drift apart.
+
+    peak_at_boundary(surface, i, j) -> Bool
+
+The same test on a peak the caller has already located. `(i, j)` must be what
+[`peak_index`](@ref) would return; the one-argument form is this composed with that call. The
+correlator uses this form, having located the peak once for every quantity it derives.
 """
-@inline function peak_at_boundary(surface::AbstractMatrix)
-    i, j = peak_index(surface)
-    nr, nc = size(surface)
-    return (i == 1) | (j == 1) | (i == nr) | (j == nc)
-end
+@inline peak_at_boundary(surface::AbstractMatrix, i::Int, j::Int) =
+    (i == 1) | (j == 1) | (i == size(surface, 1)) | (j == size(surface, 2))
+
+@inline peak_at_boundary(surface::AbstractMatrix) =
+    peak_at_boundary(surface, peak_index(surface)...)
 
 """
-    peak_quality(surface[, exclusion = $PEAK_EXCLUSION]) -> Float32
+    peak_ratio(surface[, exclusion = $PEAK_EXCLUSION]) -> Float32
 
-How far the correlation peak stands above the background, in background standard deviations.
+The primary-to-secondary peak ratio: the correlation peak divided by the highest rival peak
+elsewhere on the surface.
 
-`NaN32` when the surface is too small to have a background outside the exclusion box, or when the
-background is perfectly flat — both meaning "no quality could be assessed" rather than a low quality.
+The rival — the secondary peak — is the largest sample lying more than `exclusion` samples from the
+primary along either axis. Excluding a box rather than a single sample is what makes the two peaks
+*distinct*: the samples immediately around the primary are its own shoulder, and dividing by those
+would return a number near 1 at every point regardless of how clean the surface was.
 
-A high value means the peak stood well clear of the rest of the surface; a low one means it barely rose
-above the noise. It answers a different question from `correlation`, the peak value alone — a peak of 0.6
-over quiet background is a sharper result than the same 0.6 over noisy background — and the two are
-nearly independent, at a Spearman rank correlation of 0.125 on a Landsat scene.
+The result is `>= 1` by construction, since the primary is the surface maximum. A ratio near 1 means
+some other displacement matched nearly as well, so the reported one is a coin flip between them; a
+large ratio means the chosen displacement was the only candidate. This is the measure of an
+*ambiguous* surface, and ambiguity is the failure mode that a peak height cannot see: periodic
+texture — crevasse fields, dune trains, sea ice floes — produces rival peaks one wavelength apart,
+each as tall as the true one.
+
+`Inf32` when no rival is positive at all, meaning the primary is the only candidate the surface
+offers. `NaN32` when the surface is too small to have anything outside the exclusion box, which says
+"no ratio could be computed" rather than a low ratio. The two are distinct and a caller testing
+`isfinite` separates both from a real value.
 
 # Which measure to gate on
 
-**Use `correlation`, not this, to predict whether a displacement is reliable.** Measured on 82,796
-points of a Jakobshavn pair carrying both quantities, against the independent label "disagrees with
-`autoRIFT.py` by more than 0.25 px":
+**Use `correlation`, not this, to predict whether a displacement is reliable.** The two answer
+different questions — how *strong* the match was against whether it was *unique* — and a gate wants
+the first. Measured over the 80,648 directly measured points of a Jakobshavn pair that both this
+package and `autoRIFT.py` resolved, against the independent label "the two disagree by more than
+0.25 px", which 0.34% of them carry:
 
 | measure | AUC | rate in worst decile | rate in best decile |
 |---|---:|---:|---:|
-| `correlation` | **0.842** | 29.4% | 0.2% |
-| this | 0.499 | 10.2% | 10.7% |
+| `correlation` | **0.791** | 1.2% | 0.0% |
+| this | 0.544 | 0.5% | 0.6% |
 
-`correlation` falls monotonically across its deciles over more than two orders of magnitude.
-`peak_snr` is flat at 5–11% and *not* monotonic — its highest decile is among its worst — so as a
-reliability gate on its own it has essentially no skill. Nor is the flatness an artifact of pooling
-points of differing correlation: within a band of fixed `correlation` the ranking inverts, at an AUC of
-0.36 over 0.2–0.4 and 0.18 over 0.4–0.6, because at a given peak height the sharper-looking peak is the
-one sitting on quieter — less textured, less informative — background.
+`correlation` falls monotonically across its deciles, from 1.2% to zero. This ratio is flat at
+0.1–0.6% and *not* monotonic — its highest decile is its worst — so **as a reliability gate on its
+own it has essentially no skill.** Nor is the flatness an artifact of pooling points of differing
+correlation: within a band of fixed `correlation` the ranking mildly *inverts*, at an AUC of 0.43
+over 0.2–0.4 and 0.50 over 0.4–0.6. The two measures are nearly independent, at a Spearman rank
+correlation of 0.242. `tools/ab/peak_ratio_skill.jl` computes all of it.
 
-That is not a defect in the quantity, it is what the quantity measures. A tall, isolated peak on a
-low-contrast surface earns a high SNR while still being a weak match, and a strong match on textured ice
-carries real structure in its background that depresses the SNR without making the answer worse. What
-`peak_snr` does report, and `correlation` cannot, is how *isolated* the chosen peak was — useful for
-diagnosing an ambiguous surface with rival peaks, and for the search-boundary condition below.
+That is not a defect in the quantity, it is what the quantity measures. Ambiguity and unreliability
+are different failures, and on this scene — a fast outlet glacier whose flow the search radius covers
+— the reference and this package disagree where the match is *weak*, not where it is contested. A
+ratio near 1 does mean two displacements matched nearly equally well; it just does not follow that
+the one chosen was the wrong one.
 
-The background **mean** rather than its median: measured identical to four decimal places (0.7365
-against 0.7364), and a mean accumulates in the same pass with no allocation where a median needs
-selection over every background sample, per point, per level.
+So use this to *diagnose* rather than to threshold. A region of low ratios at otherwise healthy
+correlation is periodic texture matching at more than one offset — crevasse fields, dunes, sea ice —
+and the fix is a chip size that spans more than one wavelength, not a tighter gate.
 
-This is a property of the surface alone. The search-boundary condition — where the reported quality is
-forced to zero — is applied by the caller; see [`AutoRIFT.peak_at_boundary`](@ref).
+`exclusion` is `PEAK_EXCLUSION` by default; see that constant for why it is fixed rather than
+tunable.
+
+This is a property of the surface alone. The search-boundary condition — where the reported ratio is
+forced to zero, below the 1 a real ratio cannot go under — is applied by the caller; see
+[`AutoRIFT.peak_at_boundary`](@ref).
+
+    peak_ratio(surface, i, j[, exclusion = $PEAK_EXCLUSION]) -> Float32
+
+The same measure on a peak the caller has already located. `(i, j)` must be what
+[`peak_index`](@ref) would return; the form without them is this composed with that call.
+
+The correlator uses this form. Every point needs the displacement, the peak value, the boundary
+flag and this ratio, and the four naive calls locate the same peak four times over —
+`peak_index` is the top self-time frame in a profiled pass, so at chip 16 and radius 20, the
+geometry ITS_LIVE runs Landsat at, that is 3.92 us against 2.15 us, 6% of a whole point.
 """
-@inline function peak_quality(surface::AbstractMatrix, exclusion::Int = PEAK_EXCLUSION)
-    i, j = peak_index(surface)
+@inline function peak_ratio(surface::AbstractMatrix, i::Int, j::Int,
+                            exclusion::Int = PEAK_EXCLUSION)
     nr, nc = size(surface)
-    h = Float64(@inbounds surface[i, j])
-    # Sum and sum of squares in one traversal, column-major for the reason `peak_index` documents.
-    # Two passes would read the surface twice for a variance that one pass gives.
-    s1 = 0.0
-    s2 = 0.0
-    n = 0
-    @inbounds for c in 1:nc, r in 1:nr
-        (abs(r - i) <= exclusion && abs(c - j) <= exclusion) && continue
-        v = Float64(surface[r, c])
-        s1 += v
-        s2 += v * v
-        n += 1
+    # `Float32` throughout. A maximum accumulates no error, so there is nothing for a wider type to
+    # protect, and one division in the surface's own precision is what lets the device kernel in
+    # `ext/gpu/kernels.jl` reach the same value from the same surface — promoting to `Float64` and
+    # rounding the quotient back would double-round and put a difference between them that is the
+    # arithmetic's rather than the surface's.
+    h = Float32(@inbounds surface[i, j])
+    # The exclusion box is contiguous along both axes, so how many samples lie outside it follows
+    # from the geometry. Counting them in the loop instead would be per-element work for a number
+    # the extents already determine.
+    rlo, rhi = max(i - exclusion, 1), min(i + exclusion, nr)
+    clo, chi = max(j - exclusion, 1), min(j + exclusion, nc)
+    # Nothing outside the box to compare against.
+    nr * nc - (rhi - rlo + 1) * (chi - clo + 1) == 0 && return NaN32
+
+    # Four independent running maxima rather than one, combined below.
+    #
+    # This is the whole cost of the function, and the reason is latency, not throughput: `second`
+    # depends on the previous iteration's `second`, so a single accumulator serialises the loop on
+    # the comparison's latency however wide the loads are. Four chains give the out-of-order engine
+    # four independent comparisons to overlap. Measured 3.0-3.3x over 32² through 64², and the
+    # two-moment measure this replaced was 35% *faster* than the one-chain form for exactly this
+    # reason -- its sum and sum-of-squares are already two independent chains.
+    #
+    # `ifelse` rather than a branch: the comparison is the same one, so `NaN` is still skipped rather
+    # than propagated as `max` would propagate it, and the result carries no data-dependent branch.
+    # Verified bit-identical to the one-chain form over 4000 surfaces x 5 exclusions including
+    # all-`NaN`, all-zero, all-negative and single-`NaN` cases.
+    #
+    # Traversal stays column-major, along memory, for the reason `peak_index` documents. No
+    # tie-breaking rule is needed where `peak_index` needs one: only the secondary's *value* is used,
+    # never its location, so which of several equal rivals wins does not affect the result -- which
+    # is also what makes splitting the scan across four chains safe.
+    m1 = m2 = m3 = m4 = -Inf32
+    @inbounds for c in 1:nc
+        if c < clo || c > chi
+            # A column clear of the box: every row counts, so the inner loop carries no test at all.
+            r = 1
+            while r + 3 <= nr
+                v1 = Float32(surface[r, c])
+                v2 = Float32(surface[r + 1, c])
+                v3 = Float32(surface[r + 2, c])
+                v4 = Float32(surface[r + 3, c])
+                m1 = ifelse(v1 > m1, v1, m1)
+                m2 = ifelse(v2 > m2, v2, m2)
+                m3 = ifelse(v3 > m3, v3, m3)
+                m4 = ifelse(v4 > m4, v4, m4)
+                r += 4
+            end
+            while r <= nr
+                v = Float32(surface[r, c])
+                m1 = ifelse(v > m1, v, m1)
+                r += 1
+            end
+        else
+            # A column straddling the box: the rows above and below it, each a clean range.
+            for r in 1:(rlo - 1)
+                v = Float32(surface[r, c])
+                m1 = ifelse(v > m1, v, m1)
+            end
+            for r in (rhi + 1):nr
+                v = Float32(surface[r, c])
+                m2 = ifelse(v > m2, v, m2)
+            end
+        end
     end
-    # Too little background to characterize. Eight samples is a floor, not a threshold with a
-    # meaning: below it the standard deviation is dominated by whichever few samples remain.
-    n < 8 && return NaN32
-    mean = s1 / n
-    # `max(…, 0)` because the sum-of-squares form of the variance can go slightly negative through
-    # cancellation when the background is nearly constant — the same guard `_correlate_surface!`
-    # applies for the same reason.
-    sd = sqrt(max(s2 / n - mean * mean, 0.0))
-    return sd > 0 ? Float32((h - mean) / sd) : NaN32
+    a = ifelse(m1 > m2, m1, m2)
+    b = ifelse(m3 > m4, m3, m4)
+    second = ifelse(a > b, a, b)
+    # A ratio of two heights only orders surfaces the way the name promises when the primary is a
+    # peak in the first place. Written `!(h > 0)` so an all-`NaN` surface — where `peak_index`
+    # returns `(1, 1)` having found no candidate at all — lands here rather than falling through
+    # every comparison to a finite-looking answer.
+    !(h > 0) && return NaN32
+    # No positive rival: the primary is unrivalled, not unassessable. `Inf32` says that and keeps
+    # the ordering "larger is less ambiguous" intact, where `NaN` would drop the very cleanest
+    # points out of any comparison a caller makes.
+    second <= 0 && return Inf32
+    return h / second
 end
+
+@inline peak_ratio(surface::AbstractMatrix, exclusion::Int = PEAK_EXCLUSION) =
+    peak_ratio(surface, peak_index(surface)..., exclusion)
 
 # ---------------------------------------------------------------------------
 # Sub-pixel refinement
@@ -241,8 +352,23 @@ end
 # `Vector{NTuple{4,Int}}` indexed per output row yields indices the compiler cannot prove
 # contiguous, so the loop stayed scalar. See `pyrup!` for why that split is exact.
 #
-# The other four were measured and rejected, which is worth recording so they are not retried
+# The other five were measured and rejected, which is worth recording so they are not retried
 # blind:
+#
+#   * **Evaluating the composite interpolant directly.** `pyrup!` is a separable *linear* map, so
+#     `log2(up)` doublings compose into one fixed `(patch*up) x patch` matrix `K` — depending only on
+#     the patch size and the upsampling, hence the same for every point — and the whole cascade is
+#     `K·P·K'`. Verified to 4.2e-7 of the cascade, with identical displacements over 500 real
+#     surfaces, so the factorisation is right. It is nonetheless **1.03-1.06x**, i.e. nothing, from
+#     16x through 128x and through BLAS; a hand-written form and a running-argmax form that never
+#     materialises the surface are both 3x *worse*.
+#
+#     The operation counts say why, and they are the thing to check before trying this again: the
+#     cascade sums level areas, `n² · (1 + 1/4 + 1/16 + …) → n² · 4/3`, where the composite is
+#     `n² · patch`. At 64x that is 520,000 multiplies against 614,250 — a 15% saving, paid back in
+#     access pattern. The same change *does* pay 5.4x on a GPU, and the difference is not the
+#     arithmetic but the traffic: there the cascade writes every level through device memory, where
+#     here 820 kB stays in L2. `docs/gpu.md` records both halves.
 #
 #   * Cropping the cascade around the running peak at each level. The large win in
 #     principle. But the peak's deviation from its own rescaled position was measured at up
@@ -510,11 +636,25 @@ struct RefinementWorkspace
 end
 
 """
-    refinement_workspace(upsampling; patch = 5) -> RefinementWorkspace
+    AutoRIFT.REFINE_PATCH
+
+Side length of the correlation-surface neighbourhood the sub-pixel cascade upsamples.
+
+The reference's 5, and load-bearing rather than a tunable. A 3x3 patch has no interior at all
+under a 5-tap kernel, so every output would depend on reflected border: measured, 155 of 200
+surfaces gave a different answer, by up to 3 pixels.
+
+Named because the cascade is implemented twice — here and as a device kernel — and the two must
+agree about it, since the refined `dx`/`dy` are asserted bit-identical between them.
+"""
+const REFINE_PATCH = 5
+
+"""
+    refinement_workspace(upsampling; patch = AutoRIFT.REFINE_PATCH) -> RefinementWorkspace
 
 Allocate cascade buffers for up to `upsampling`-fold refinement.
 """
-function refinement_workspace(upsampling::Integer; patch::Integer = 5)
+function refinement_workspace(upsampling::Integer; patch::Integer = REFINE_PATCH)
     upsampling >= 1 || throw(ArgumentError(
         "`upsampling` must be >= 1, got $upsampling"))
     ispow2(upsampling) || throw(ArgumentError(
@@ -557,19 +697,35 @@ function.
 
 With `upsampling == 1` this is exactly [`peak_offset`](@ref).
 """
+subpixel_peak(rw::RefinementWorkspace, surface::AbstractMatrix{Float32},
+              radius::Tuple{Int,Int}, upsampling::Integer) =
+    subpixel_peak(rw, surface, radius, upsampling, peak_index(surface)...)
+
+"""
+    subpixel_peak(rw, surface, radius, upsampling, pi, pj) -> (dx, dy, correlation)
+
+[`subpixel_peak`](@ref) refining about an integer peak the caller has already located.
+
+`(pi, pj)` must be what [`peak_index`](@ref) would return for `surface`; the four-argument form
+is this with that call supplied, and is what the tests and benchmarks use. The correlator calls
+this one: it has already located the peak to derive the displacement, the boundary flag and the
+peak ratio, and refining would otherwise scan the surface again for a peak it holds.
+"""
 function subpixel_peak(
     rw::RefinementWorkspace, surface::AbstractMatrix{Float32},
-    radius::Tuple{Int,Int}, upsampling::Integer,
+    radius::Tuple{Int,Int}, upsampling::Integer, pi_::Int, pj::Int,
 )
-    upsampling == 1 && return peak_offset(surface, radius)
+    nr, nc = size(surface)
+    p = size(rw.patch, 1)
+    # No refinement asked for, or a surface too small to refine on: the integer peak is the answer.
+    # Taken from the supplied location rather than re-scanned, which is the whole point of this form.
+    (upsampling == 1 || nr < p || nc < p) &&
+        return (_offset_at(pi_, pj, radius)..., @inbounds surface[pi_, pj])
     upsampling <= rw.max_upsampling || throw(ArgumentError(
         "upsampling $upsampling exceeds the workspace maximum " *
         "$(rw.max_upsampling)"))
 
     rx, ry = radius
-    nr, nc = size(surface)
-    pi_, pj = peak_index(surface)
-    p = size(rw.patch, 1)
 
     # Clamp the patch to the surface. The reference does the same, and the
     # clamping is why the patch origin has to be tracked separately: the peak is
@@ -577,9 +733,6 @@ function subpixel_peak(
     half = p ÷ 2
     i0 = clamp(pi_ - half, 1, max(nr - p + 1, 1))
     j0 = clamp(pj - half, 1, max(nc - p + 1, 1))
-
-    # A surface smaller than the patch cannot be refined; report the integer peak.
-    (nr < p || nc < p) && return peak_offset(surface, radius)
 
     @inbounds for j in 1:p, i in 1:p
         rw.patch[i, j] = surface[i0 + i - 1, j0 + j - 1]
