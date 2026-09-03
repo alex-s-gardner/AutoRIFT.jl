@@ -286,21 +286,15 @@ function render(r)
       <tbody>
     $body
       </tbody></table>
-      <p class="note">* The standalone binary is single-threaded, and by build constraint rather than
-        choice: <code>threaded = true</code> trims without a verifier error and then fails at run time,
-        because the task entry closure is trimmed away. The 12-thread rows above measure the same
-        blocking on the same scene through the library.<br>
-        &dagger; autoRIFT.py has no thread setting to match: its correlation loop is serial, running at
-        one core for 85% of the run and reaching ~11 cores only during the OpenCV filter calls. Its
-        CPU time over its runtime works out to ~2.3 cores, which is what it achieves on a 12-core
-        machine rather than a configuration choice. This OpenCV is built against Grand Central
-        Dispatch, which ignores <code>cv2.setNumThreads</code>, so it cannot be capped either.<br>
-        &Dagger; User plus system time, summed over all threads: the work done, where runtime is that
-        work divided by the parallelism achieved. <b>Compare runs by CPU time, choose a configuration
-        by runtime.</b> A row whose runtime rose while its CPU time held became less parallel rather
-        than more expensive, which on a shared machine is the difference between a real regression and
-        a busy afternoon &mdash; two readings of the threaded rows of this table were wrong before the
-        column was here. Dividing the two gives the mean cores used, so it is not also tabulated.</p>
+      <p class="note">* Single-threaded by build constraint: <code>threaded = true</code> trims clean
+        and fails at run time. See <code>app/README.md</code>.<br>
+        &dagger; No thread setting to match &mdash; autoRIFT.py's correlation loop is serial, and this
+        OpenCV's Grand Central Dispatch ignores <code>cv2.setNumThreads</code>. Its 417 s is real work,
+        not idle spin: <code>OMP_NUM_THREADS=1</code> gives 374 s wall for 371 s CPU, and
+        <code>OMP_WAIT_POLICY=passive</code> moves it 0.3%.<br>
+        &Dagger; User + system, all threads. <b>Compare runs by CPU time; choose a configuration by
+        runtime.</b> Runtime is CPU time divided by the parallelism achieved, so a row that got slower
+        at unchanged CPU time lost parallelism rather than gaining work.</p>
 
       <div class="page">
         <h1>Agreement with autoRIFT.py: displacement</h1>
