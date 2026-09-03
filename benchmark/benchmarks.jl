@@ -98,5 +98,8 @@ include("suite/track.jl")
 include("suite/multichip.jl")
 include("suite/endtoend.jl")
 include("suite/throughput.jl")
+# Last, and it adds its group only when a device answers: the CPU groups above must be present in
+# every run for a baseline to be comparable across machines.
+include("suite/gpu.jl")
 
 SUITE

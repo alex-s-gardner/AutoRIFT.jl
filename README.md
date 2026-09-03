@@ -93,3 +93,9 @@ including why peak RSS and live heap answer different questions.
 For small instances, [`app/`](app/README.md) builds a trimmed standalone binary:
 bit-identical displacements at **27.2 MiB peak RSS against 424.2 MiB**, since 97% of an
 ordinary process's memory floor is the Julia runtime rather than AutoRIFT.
+
+The correlation can also run on a GPU — `autorift(a, b; backend = :metal)` after `using Metal`,
+measured **2.7–3.2× a CPU core** on the pass and 2.4× end to end, with `dx`/`dy` bit-identical.
+[`docs/gpu.md`](docs/gpu.md) covers what agrees and what does not, when the device is worth using
+(it does *not* beat a threaded CPU on a single pair), and how the kernels avoid needing `Float64`
+on hardware that has none.
