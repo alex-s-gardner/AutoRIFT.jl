@@ -53,10 +53,28 @@
 #     start tiling. There is nothing to tile.
 #
 #   * **A hysteresis clamp on the near-zero denominator**: when `|num|` falls within 12.5% of the
-#     threshold, OpenCV returns ±1 rather than dividing. Measured across all 72 correlation
-#     fixtures, the worst excursion outside [-1, 1] here is 9.0e-5 — 0.009%, three orders of
-#     magnitude inside that band — so the branch would never fire, and adding it would cost a test
-#     per surface element to change nothing.
+#     threshold, OpenCV returns ±1 rather than dividing. Across all 72 correlation fixtures the
+#     worst excursion outside [-1, 1] here is 9.0e-5, so on those the branch would never fire.
+#
+#     **That does not generalise, and this measure is missing.** On a search window that is partly
+#     *constant* — cloud, saturated snow, a fill-valued region — `ΣW² - (ΣW)²/n` cancels to near zero
+#     at some shifts while `_numerators_fft!` transforms the **raw** window in `Float32` and so
+#     carries an absolute error set by its DC magnitude. Measured on a 640² scene with an interior
+#     constant patch, chip 32 radius 25: 2.0% of points reach a `correlation` above 1, worst **3.94**,
+#     and the reported peak lands 26 px from the true one. At that point the numerator's *relative*
+#     error is a healthy 1.6e-7 — the denominator is 1.97e-6. An exactly-evaluated numerator over the
+#     same `Float64` denominator gives a clean [-0.369, 1.000], which puts the fault in the
+#     raw-window transform rather than in the tables. The fixtures are synthetic texture and contain
+#     nothing like it.
+#
+#     Two fixes, and the second is the better one. A clamp bounds the *symptom*: it would stop the
+#     surface leaving [-1, 1], and OpenCV's own choice suggests it is enough in practice. Subtracting
+#     the window mean before the transform removes the *cause*, since the numerator is invariant to it
+#     (`Σ T'(W - c) = Σ T'W` because `Σ T' = 0`, per rearrangement 2 above) and a centered window puts
+#     no DC term into the transform to set the rounding scale. Measured, that is also strictly more
+#     accurate than what this path does today: 3.88e-5 worst numerator error against 6.05e-5. The GPU
+#     path does it for an unrelated reason — `Float32` tables need it — and `docs/gpu.md` records the
+#     comparison that found this.
 #
 #   * **`max(sumsq - sum^2/n, 0)` to stop a negative variance**, and returning the whole surface as
 #     1 for a zero-variance template. Both of these we already do — see the clamp in
@@ -431,17 +449,60 @@ function prepare_chip!(ws::CorrelationWorkspace, chip::AbstractMatrix)
     # Mean in Float64 regardless of input type: it is subtracted from every
     # element, so an error here biases the whole numerator rather than averaging
     # out.
+    #
+    # Four accumulators down each column rather than one. A single running sum makes each
+    # add wait for the previous one to retire, so the loop runs at the latency of the
+    # floating-point adder — measured ~1.6 ns per element, far off what the memory can
+    # supply. Four independent chains fill those slots and are worth 1.6-1.9x.
+    #
+    # Combined pairwise, which is *more* accurate than sequential summation, not less: the
+    # partial sums are of comparable magnitude, so the final adds lose fewer low bits. The
+    # mean-removed copy this writes is bit-identical to a serial accumulation; the norm
+    # differs at the last bit or two.
+    #
+    # Row-blocked and indexed two-dimensionally, not linearly. `chip` is a strided view into
+    # the search image, whose columns are not adjacent, so it is `IndexCartesian` — linear
+    # indexing would divide and modulo per element and lose more than the unrolling gains.
+    tail = ch - ch % 4
     s = 0.0
-    @inbounds for j in 1:cw, i in 1:ch
-        s += Float64(chip[i, j])
+    @inbounds for j in 1:cw
+        s0 = s1 = s2 = s3 = 0.0
+        for i in 1:4:tail
+            s0 += Float64(chip[i, j])
+            s1 += Float64(chip[i + 1, j])
+            s2 += Float64(chip[i + 2, j])
+            s3 += Float64(chip[i + 3, j])
+        end
+        for i in (tail + 1):ch
+            s0 += Float64(chip[i, j])
+        end
+        s += (s0 + s1) + (s2 + s3)
     end
     mean = s / (ch * cw)
 
     sq = 0.0
-    @inbounds for j in 1:cw, i in 1:ch
-        d = Float64(chip[i, j]) - mean
-        dst[i, j] = Float32(d)
-        sq += d * d
+    @inbounds for j in 1:cw
+        q0 = q1 = q2 = q3 = 0.0
+        for i in 1:4:tail
+            d0 = Float64(chip[i, j]) - mean
+            d1 = Float64(chip[i + 1, j]) - mean
+            d2 = Float64(chip[i + 2, j]) - mean
+            d3 = Float64(chip[i + 3, j]) - mean
+            dst[i, j] = Float32(d0)
+            dst[i + 1, j] = Float32(d1)
+            dst[i + 2, j] = Float32(d2)
+            dst[i + 3, j] = Float32(d3)
+            q0 += d0 * d0
+            q1 += d1 * d1
+            q2 += d2 * d2
+            q3 += d3 * d3
+        end
+        for i in (tail + 1):ch
+            d = Float64(chip[i, j]) - mean
+            dst[i, j] = Float32(d)
+            q0 += d * d
+        end
+        sq += (q0 + q1) + (q2 + q3)
     end
 
     # Zero within rounding, not exactly zero: a chip of nearly-identical values
@@ -596,7 +657,13 @@ function _correlate_surface!(
         # difference slightly negative even in Float64, and `sqrt` of that is NaN.
         wvar = max(s2 - s1 * s1 / n, 0.0)
         den = cnorm * sqrt(wvar)
-        surface[i, j] = den > 0 ? Float32(numerators[i, j] / den) : 0.0f0
+        # `ifelse` rather than a branch, and it is worth 1.8-2.1x on this loop. A branch here is
+        # unpredictable — whether a window has contrast depends on the imagery — and it also
+        # blocks vectorization, so the loop pays a mispredict on top of running one shift at a
+        # time. `ifelse` evaluates both arms and selects, which is safe because the division is
+        # the only cost and `den > 0` is exactly the guard that makes it finite; a zero `den`
+        # yields `Inf` or `NaN` in the discarded arm and the select drops it.
+        surface[i, j] = ifelse(den > 0, Float32(numerators[i, j] / den), 0.0f0)
     end
     return surface
 end
@@ -624,7 +691,8 @@ function _correlate_surface!(
     @inbounds for j in 1:nc, i in 1:nr
         wsq = boxsum(S2, i, j, ch, cw)
         den = cnorm * sqrt(max(wsq, 0.0))
-        surface[i, j] = den > 0 ? Float32(numerators[i, j] / den) : 0.0f0
+        # `ifelse`, for the reason given in the `ZNCC` method.
+        surface[i, j] = ifelse(den > 0, Float32(numerators[i, j] / den), 0.0f0)
     end
     return surface
 end
@@ -676,7 +744,8 @@ function _correlate_surface!(
         # Σ|W - W̄|² = Σ|W|² - |ΣW|²/n. Clamped for the same cancellation reason as `ZNCC`.
         wvar = max(s2 - abs2(s1) / n, 0.0)
         den = cnorm * sqrt(wvar)
-        surface[i, j] = den > 0 ? Float32(abs(numerators[i, j]) / den) : 0.0f0
+        # `ifelse`, for the reason given in the `ZNCC` method.
+        surface[i, j] = ifelse(den > 0, Float32(abs(numerators[i, j]) / den), 0.0f0)
     end
     return surface
 end
