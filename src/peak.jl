@@ -537,11 +537,25 @@ struct RefinementWorkspace
 end
 
 """
-    refinement_workspace(upsampling; patch = 5) -> RefinementWorkspace
+    AutoRIFT.REFINE_PATCH
+
+Side length of the correlation-surface neighbourhood the sub-pixel cascade upsamples.
+
+The reference's 5, and load-bearing rather than a tunable. A 3x3 patch has no interior at all
+under a 5-tap kernel, so every output would depend on reflected border: measured, 155 of 200
+surfaces gave a different answer, by up to 3 pixels.
+
+Named because the cascade is implemented twice — here and as a device kernel — and the two must
+agree about it, since the refined `dx`/`dy` are asserted bit-identical between them.
+"""
+const REFINE_PATCH = 5
+
+"""
+    refinement_workspace(upsampling; patch = AutoRIFT.REFINE_PATCH) -> RefinementWorkspace
 
 Allocate cascade buffers for up to `upsampling`-fold refinement.
 """
-function refinement_workspace(upsampling::Integer; patch::Integer = 5)
+function refinement_workspace(upsampling::Integer; patch::Integer = REFINE_PATCH)
     upsampling >= 1 || throw(ArgumentError(
         "`upsampling` must be >= 1, got $upsampling"))
     ispow2(upsampling) || throw(ArgumentError(
