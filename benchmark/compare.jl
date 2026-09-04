@@ -23,6 +23,13 @@ const REGRESSION_THRESHOLD = 1.10
 # Reported but not failed: worth seeing in the table, not worth blocking on.
 const NOTEWORTHY_THRESHOLD = 1.03
 
+# A ratio needs a measurable baseline to mean anything. Half of this suite runs in
+# under a microsecond, and at a few nanoseconds the timer's own resolution exceeds
+# the threshold: `points/surface_size` clears 1.10x on a 0.2 ns difference. Faster
+# benchmarks are still measured, printed and flagged in the table, but they do not
+# fail the build. Allocation counts are exact at every scale and stay enforced.
+const MIN_GATED_NS = 100
+
 # Benchmarks whose names match these are expected to be allocation-free, so any
 # allocation at all is a failure rather than a slowdown. The per-point correlation
 # path is the case that matters: allocating once per grid point would be invisible
@@ -101,6 +108,7 @@ function main()
     alloc_failures = String[]
     improvements = String[]
     memory_regressions = String[]
+    ungated = String[]
 
     println("| benchmark | baseline | candidate | ratio | allocs |")
     println("|---|---:|---:|---:|---:|")
@@ -134,8 +142,14 @@ function main()
         dalloc = c.allocs - b.allocs
 
         flag = if ratio >= REGRESSION_THRESHOLD
-            push!(regressions, "$name ($(round(ratio, digits = 2))x)")
-            " **SLOWER**"
+            if b.min_ns >= MIN_GATED_NS
+                push!(regressions, "$name ($(round(ratio, digits = 2))x)")
+                " **SLOWER**"
+            else
+                push!(ungated, "$name ($(round(ratio, digits = 2))x, " *
+                               "baseline $(prettytime(b.min_ns)))")
+                " slower (below the gate)"
+            end
         elseif ratio <= 1 / NOTEWORTHY_THRESHOLD
             push!(improvements, "$name ($(round(1 / ratio, digits = 2))x)")
             " faster"
@@ -193,6 +207,13 @@ function main()
         println("\nALLOCATED where none is allowed:")
         foreach(r -> println("  - ", r), alloc_failures)
         failed = true
+    end
+    # Printed whether or not anything failed: these cleared the ratio threshold and
+    # are only unenforced because the baseline is too fast to time reliably. Silence
+    # here would let "No regressions" cover a row the table shows as slower.
+    if !isempty(ungated)
+        println("\nSlower but under $(MIN_GATED_NS) ns, so not gated:")
+        foreach(r -> println("  - ", r), ungated)
     end
     if !failed
         println("\nNo regressions.")
