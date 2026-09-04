@@ -187,9 +187,10 @@ struct CorrelationWorkspace
     cspec_a::Matrix{ComplexF32}
 
     # Maximum extents this workspace was built for, so a mismatched call is an
-    # error rather than a silent out-of-bounds read.
-    max_chip::Tuple{Int,Int}
-    max_radius::Tuple{Int,Int}
+    # error rather than a silent out-of-bounds read. Also the pool key: two workspaces are
+    # interchangeable exactly when these agree.
+    max_chip::Extent
+    max_radius::Extent
 
     # Set by `correlate!` to record whether the last chip carried any signal. A mutable
     # cell so the workspace itself stays immutable and cheap to pass per point; callers
@@ -217,8 +218,13 @@ workspace's separate complex chip buffer.
 workspace(chip_size, search_radius) = workspace(Float32, chip_size, search_radius)
 
 function workspace(::Type{T}, chip_size, search_radius) where {T<:ImageElement}
-    csx, csy = chip_size isa Tuple ? chip_size : (chip_size, chip_size)
-    rx, ry = search_radius isa Tuple ? search_radius : (search_radius, search_radius)
+    # `extent` and not `isa Tuple`: an `Extent` is a `NamedTuple`, so `isa Tuple` is false for one
+    # and the old scalar branch would have taken the whole extent as a single value. `extent`
+    # accepts a scalar, a plain tuple and a named tuple, which is what it exists for.
+    chip = extent(chip_size)
+    rad = extent(search_radius)
+    csx, csy = chip.X, chip.Y
+    rx, ry = rad.X, rad.Y
 
     csx > 0 && csy > 0 || throw(ArgumentError(
         "chip size must be positive, got ($csx, $csy)"))
@@ -255,8 +261,8 @@ function workspace(::Type{T}, chip_size, search_radius) where {T<:ImageElement}
         Matrix{ComplexF32}(undef, fy, fx),
         Matrix{ComplexF32}(undef, fy, fx),
         Matrix{ComplexF32}(undef, fy, fx),
-        (csx, csy),
-        (rx, ry),
+        chip,
+        rad,
         Ref(false),
     )
 end
@@ -297,7 +303,7 @@ const WORKSPACE_LOCK = ReentrantLock()
 # has the image's type — the chip is `Float32` because it is stored mean-removed, the integral
 # images are `Float64` — which is the same reason `CorrelationWorkspace` carries no `T`.
 # `Vector` rather than a single slot because several chunks run concurrently.
-const WORKSPACE_POOL = Dict{Tuple{Tuple{Int,Int},Tuple{Int,Int}},Vector{CorrelationWorkspace}}()
+const WORKSPACE_POOL = Dict{Tuple{Extent,Extent},Vector{CorrelationWorkspace}}()
 
 """
     AutoRIFT.take_workspace!(T, chip_size, search_radius) -> CorrelationWorkspace
@@ -309,9 +315,10 @@ concurrent chunks never share buffers — the same guarantee per-chunk allocatio
 the garbage.
 """
 function take_workspace!(::Type{T}, chip_size, search_radius) where {T<:ImageElement}
-    csx, csy = chip_size isa Tuple ? chip_size : (chip_size, chip_size)
-    rx, ry = search_radius isa Tuple ? search_radius : (search_radius, search_radius)
-    key = ((Int(csx), Int(csy)), (Int(rx), Int(ry)))
+    # Normalized through `extent`, so a scalar, a plain tuple and a named tuple all reach the same
+    # pool entry rather than three. `give_workspace!` keys on the workspace's own fields, which are
+    # extents, so this has to produce the same thing.
+    key = (extent(chip_size), extent(search_radius))
     ws = lock(WORKSPACE_LOCK) do
         pool = get(WORKSPACE_POOL, key, nothing)
         isnothing(pool) || isempty(pool) ? nothing : pop!(pool)
