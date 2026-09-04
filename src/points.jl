@@ -23,6 +23,51 @@
 # free: no copy, no conversion.
 
 """
+    AutoRIFT.Uniform(value, size) <: AbstractArray
+
+One value, indexable at every position of a `size`-shaped array, stored once.
+
+A [`PointSet`](@ref) field the caller gave as a scalar holds this instead of a materialized array.
+The saving is the whole point: on a 2107x2127 grid a dense `Int` field is 34 MiB, and four such fields
+are constant on every grid built from [`params`](@ref) — the two chip extents and the two chip-size
+bounds. `Uniform` stores 24 bytes for each.
+
+Read-only, which is why only those four fields use it. `radius_x`/`radius_y` are written per point by
+the coarse pass (see `AutoRIFT._apply_coarse_mask!`), so they stay dense; a caller supplying any field
+as an array gets that array unchanged.
+
+`IndexLinear`, so `eachindex` and `vec` behave as the correlator expects, and the constant read is
+hoisted out of an inner loop rather than fetched per point.
+"""
+struct Uniform{T,N} <: AbstractArray{T,N}
+    value::T
+    size::NTuple{N,Int}
+end
+
+Base.size(u::Uniform) = u.size
+Base.axes(u::Uniform) = map(Base.OneTo, u.size)
+Base.IndexStyle(::Type{<:Uniform}) = IndexLinear()
+Base.@propagate_inbounds Base.getindex(u::Uniform, ::Int) = u.value
+Base.@propagate_inbounds Base.getindex(u::Uniform{T,N}, ::Vararg{Int,N}) where {T,N} = u.value
+# `vec` and `similar` on a `Uniform` must not silently materialize: `scatter` takes `vec` of every
+# field, and a dense result there would undo the saving at the point the correlator is called.
+Base.vec(u::Uniform) = Uniform(u.value, (length(u),))
+Base.similar(u::Uniform, ::Type{T}, dims::Dims) where {T} = Array{T}(undef, dims)
+
+# Every field of a `PointSet` must share `x`'s axes. Checked by recursion over a
+# `NamedTuple` rather than a loop over a tuple of (name, field) pairs: the fields have ten
+# distinct types, so the loop variable is a `Union` and iterating it allocates. This form is
+# unrolled at compile time, keeping construction free of the heap and O(1) in point count —
+# `scatter` runs it once per chip-size level.
+_check_axes(ax, ::@NamedTuple{}) = nothing
+@inline function _check_axes(ax, fields::NamedTuple)
+    name, field = first(keys(fields)), first(values(fields))
+    axes(field) == ax || throw(DimensionMismatch(
+        "PointSet field `$name` has axes $(axes(field)), expected $ax to match `x`"))
+    return _check_axes(ax, Base.structdiff(fields, NamedTuple{(name,)}))
+end
+
+"""
     PointSet{N}
 
 Where to correlate, and with what geometry. Fields are `N`-dimensional arrays of
@@ -44,32 +89,53 @@ filtering steps are neighbourhood operations.
   centred on the prior rather than on zero, so a modest radius suffices even
   where motion is large.
 - `chip_size_x`, `chip_size_y`: chip extent in pixels, per point.
+- `chip_size_min_x`, `chip_size_max_x`: the range of chip sizes a point may be searched at, in
+  pixels, bounding the multi-chip-size levels rather than any single pass. A level runs at a point
+  only when its chip size falls within them, so a point over thin, fast ice can be restricted to
+  fine chips while smooth ice admits coarse ones. Default to zero, which means unbounded — every
+  level runs everywhere, and a caller who supplies neither sees no change.
+
+Every field carries its own type parameter, because a field is an [`AutoRIFT.Uniform`](@ref) exactly
+when the caller gave *that* field as a scalar, and callers mix freely: `chip_size_x` as a per-point
+array beside a scalar `chip_size_y` is ordinary use. One parameter shared across two fields would make
+such a pair a `MethodError`.
 
 See also [`pointset`](@ref), [`gridpoints`](@ref), [`npoints`](@ref).
 """
-struct PointSet{N,A<:AbstractArray{Float64,N},R<:AbstractArray{Int,N}}
-    x::A
-    y::A
-    radius_x::R
-    radius_y::R
-    dx_prior::A
-    dy_prior::A
-    chip_size_x::R
-    chip_size_y::R
+struct PointSet{N,X<:AbstractArray{Float64,N},Y<:AbstractArray{Float64,N},
+                RX<:AbstractArray{Int,N},RY<:AbstractArray{Int,N},
+                DX<:AbstractArray{Float64,N},DY<:AbstractArray{Float64,N},
+                CX<:AbstractArray{Int,N},CY<:AbstractArray{Int,N},
+                CN<:AbstractArray{Int,N},CM<:AbstractArray{Int,N}}
+    x::X
+    y::Y
+    radius_x::RX
+    radius_y::RY
+    dx_prior::DX
+    dy_prior::DY
+    chip_size_x::CX
+    chip_size_y::CY
+    chip_size_min_x::CN
+    chip_size_max_x::CM
 
-    function PointSet(x::A, y::A, radius_x::R, radius_y::R, dx_prior::A,
-                      dy_prior::A, chip_size_x::R, chip_size_y::R) where {
-                          N,A<:AbstractArray{Float64,N},R<:AbstractArray{Int,N}}
+    function PointSet(x::X, y::Y, radius_x::RX, radius_y::RY, dx_prior::DX,
+                      dy_prior::DY, chip_size_x::CX, chip_size_y::CY,
+                      chip_size_min_x::CN = Uniform(0, size(chip_size_x)),
+                      chip_size_max_x::CM = Uniform(0, size(chip_size_x))) where {
+                          N,X<:AbstractArray{Float64,N},Y<:AbstractArray{Float64,N},
+                          RX<:AbstractArray{Int,N},RY<:AbstractArray{Int,N},
+                          DX<:AbstractArray{Float64,N},DY<:AbstractArray{Float64,N},
+                          CX<:AbstractArray{Int,N},CY<:AbstractArray{Int,N},
+                          CN<:AbstractArray{Int,N},CM<:AbstractArray{Int,N}}
         ax = axes(x)
-        for (name, f) in ((:y, y), (:radius_x, radius_x), (:radius_y, radius_y),
-                          (:dx_prior, dx_prior), (:dy_prior, dy_prior),
-                          (:chip_size_x, chip_size_x), (:chip_size_y, chip_size_y))
-            axes(f) == ax || throw(DimensionMismatch(
-                "PointSet field `$name` has axes $(axes(f)), expected $ax to " *
-                "match `x`"))
-        end
-        return new{N,A,R}(x, y, radius_x, radius_y, dx_prior, dy_prior,
-                          chip_size_x, chip_size_y)
+        _check_axes(ax, (y = y, radius_x = radius_x, radius_y = radius_y,
+                         dx_prior = dx_prior, dy_prior = dy_prior,
+                         chip_size_x = chip_size_x, chip_size_y = chip_size_y,
+                         chip_size_min_x = chip_size_min_x,
+                         chip_size_max_x = chip_size_max_x))
+        return new{N,X,Y,RX,RY,DX,DY,CX,CY,CN,CM}(
+            x, y, radius_x, radius_y, dx_prior, dy_prior,
+            chip_size_x, chip_size_y, chip_size_min_x, chip_size_max_x)
     end
 end
 
@@ -145,6 +211,9 @@ julia> pts.x[2], pts.radius_x[2], pts.chip_size_x[2]
   accept a **per-point array**, which an extent cannot express. That is what they are for: a
   Geogrid-derived search radius varies across the scene.
 - `dx_prior = 0.0`, `dy_prior = 0.0`: a-priori displacement.
+- `chip_size_min_x = 0`, `chip_size_max_x = 0`: the chip sizes this point may be searched at,
+  bounding the multi-chip-size levels. Zero means unbounded. Also accept a per-point array, which
+  is how they are usually supplied — ITS_LIVE ships them as rasters.
 """
 function pointset(
     x::AbstractArray, y::AbstractArray;
@@ -156,6 +225,8 @@ function pointset(
     chip_size_y = nokw,
     dx_prior = 0.0,
     dy_prior = 0.0,
+    chip_size_min_x = 0,
+    chip_size_max_x = 0,
 )
     size(x) == size(y) || throw(DimensionMismatch(
         "`x` and `y` must have the same shape, got $(size(x)) and $(size(y))"))
@@ -170,14 +241,21 @@ function pointset(
     rx = _tofield(Int, isnokw(search_radius_x) ? rad.X : search_radius_x, x, :search_radius_x)
     ry = _tofield(Int, isnokw(search_radius_y) ? rad.Y : search_radius_y, x, :search_radius_y)
 
+    # The chip extents and the chip-size bounds are read-only, so a scalar stays one value. On a
+    # Landsat-sized grid that is four 34 MiB arrays replaced by 96 bytes.
     cs = extent(chip_size)
-    csx = _tofield(Int, isnokw(chip_size_x) ? cs.X : chip_size_x, x, :chip_size_x)
-    csy = _tofield(Int, isnokw(chip_size_y) ? cs.Y : chip_size_y, x, :chip_size_y)
+    csx = _toconstfield(Int, isnokw(chip_size_x) ? cs.X : chip_size_x, x, :chip_size_x)
+    csy = _toconstfield(Int, isnokw(chip_size_y) ? cs.Y : chip_size_y, x, :chip_size_y)
 
     dx = _tofield(Float64, dx_prior, x, :dx_prior)
     dy = _tofield(Float64, dy_prior, x, :dy_prior)
 
-    return PointSet(xs, ys, rx, ry, dx, dy, csx, csy)
+    # Zero means unbounded in both, so the default admits every level and a caller who sets
+    # neither keyword gets the behaviour they had before these fields existed.
+    cmin = _toconstfield(Int, chip_size_min_x, x, :chip_size_min_x)
+    cmax = _toconstfield(Int, chip_size_max_x, x, :chip_size_max_x)
+
+    return PointSet(xs, ys, rx, ry, dx, dy, csx, csy, cmin, cmax)
 end
 
 # Coordinates given as points rather than as parallel arrays.
@@ -193,6 +271,13 @@ pointset(idx::AbstractVector{<:CartesianIndex{2}}; kw...) =
 # shape of the coordinates.
 _tofield(::Type{T}, v::Real, like::AbstractArray, ::Symbol) where {T} =
     fill(_exactly(T, v), size(like))
+
+# A scalar for a field nothing writes, kept as one value rather than materialized. Separate from
+# `_tofield` rather than a keyword on it, because which fields may take it is a property of the
+# *field*, not of the call: see [`AutoRIFT.Uniform`](@ref) for why `radius_x` cannot.
+_toconstfield(::Type{T}, v::Real, like::AbstractArray, ::Symbol) where {T} =
+    Uniform(_exactly(T, v), size(like))
+_toconstfield(::Type{T}, v, like::AbstractArray, name) where {T} = _tofield(T, v, like, name)
 function _tofield(::Type{T}, v::AbstractArray, like::AbstractArray, name) where {T}
     size(v) == size(like) || throw(DimensionMismatch(
         "`$name` has shape $(size(v)) but there are $(size(like)) points"))
@@ -281,7 +366,9 @@ scatter(pts::PointSet) = rebuild(pts;
     x = vec(pts.x), y = vec(pts.y),
     radius_x = vec(pts.radius_x), radius_y = vec(pts.radius_y),
     dx_prior = vec(pts.dx_prior), dy_prior = vec(pts.dy_prior),
-    chip_size_x = vec(pts.chip_size_x), chip_size_y = vec(pts.chip_size_y))
+    chip_size_x = vec(pts.chip_size_x), chip_size_y = vec(pts.chip_size_y),
+    chip_size_min_x = vec(pts.chip_size_min_x),
+    chip_size_max_x = vec(pts.chip_size_max_x))
 
 """
     pts[rows, cols] -> PointSet{2}
@@ -289,7 +376,7 @@ scatter(pts::PointSet) = rebuild(pts;
 Decimate or crop a gridded point set, copying every field.
 
 The coarse pass needs a strided subset of its grid, and doing that by indexing
-eight fields at the call site both repeats the shape and makes it easy to miss one when a
+every field at the call site both repeats the shape and makes it easy to miss one when a
 field is added. A copy rather than a view because the caller then modifies the result — the
 coarse pass overwrites the radii and the chip sizes.
 """
@@ -297,7 +384,8 @@ Base.getindex(pts::PointSet{2}, rows, cols) = PointSet(
     pts.x[rows, cols], pts.y[rows, cols],
     pts.radius_x[rows, cols], pts.radius_y[rows, cols],
     pts.dx_prior[rows, cols], pts.dy_prior[rows, cols],
-    pts.chip_size_x[rows, cols], pts.chip_size_y[rows, cols])
+    pts.chip_size_x[rows, cols], pts.chip_size_y[rows, cols],
+    pts.chip_size_min_x[rows, cols], pts.chip_size_max_x[rows, cols])
 
 """
     rebuild(pts::PointSet; kwargs...) -> PointSet
@@ -305,15 +393,18 @@ Base.getindex(pts::PointSet{2}, rows, cols) = PointSet(
 A copy of `pts` with the named fields replaced, sharing the rest.
 
 Used wherever a point set is derived from another by changing one or two fields — shifting the
-coordinates, overriding the chip size, zeroing a radius. Doing that by listing all eight
-positional arguments means adding a field to `PointSet` silently drops it from every such site,
+coordinates, overriding the chip size, zeroing a radius. Doing that by listing every
+positional argument means adding a field to `PointSet` silently drops it from every such site,
 which is the failure this exists to prevent.
 """
 rebuild(pts::PointSet; x = pts.x, y = pts.y,
         radius_x = pts.radius_x, radius_y = pts.radius_y,
         dx_prior = pts.dx_prior, dy_prior = pts.dy_prior,
-        chip_size_x = pts.chip_size_x, chip_size_y = pts.chip_size_y) =
-    PointSet(x, y, radius_x, radius_y, dx_prior, dy_prior, chip_size_x, chip_size_y)
+        chip_size_x = pts.chip_size_x, chip_size_y = pts.chip_size_y,
+        chip_size_min_x = pts.chip_size_min_x,
+        chip_size_max_x = pts.chip_size_max_x) =
+    PointSet(x, y, radius_x, radius_y, dx_prior, dy_prior, chip_size_x, chip_size_y,
+             chip_size_min_x, chip_size_max_x)
 
 """
     sanitize!(pts::PointSet, min_radius) -> Int

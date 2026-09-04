@@ -23,6 +23,19 @@ const REGRESSION_THRESHOLD = 1.10
 # Reported but not failed: worth seeing in the table, not worth blocking on.
 const NOTEWORTHY_THRESHOLD = 1.03
 
+# A ratio needs a baseline long enough to time reliably. Below a microsecond a shared
+# runner's variation exceeds `REGRESSION_THRESHOLD` on its own: `points/sanitize!` has
+# read 1.03x, 1.11x and 1.18x across three runs of identical code, and
+# `points/surface_size` clears the threshold on a 0.8 ns difference. A ratio there
+# reports the runner, not the code.
+#
+# Around fifteen of the suite's timed benchmarks fall below this. They are still measured,
+# printed, and listed when they slow down — they just do not fail the build. Allocation
+# counts are exact at any duration and stay enforced at every scale, which is what keeps
+# those entries meaningful: for the per-point paths, allocating at all is the regression
+# that matters, and that is caught however short the benchmark.
+const MIN_GATED_NS = 1_000
+
 # Benchmarks whose names match these are expected to be allocation-free, so any
 # allocation at all is a failure rather than a slowdown. The per-point correlation
 # path is the case that matters: allocating once per grid point would be invisible
@@ -101,6 +114,7 @@ function main()
     alloc_failures = String[]
     improvements = String[]
     memory_regressions = String[]
+    ungated = String[]
 
     println("| benchmark | baseline | candidate | ratio | allocs |")
     println("|---|---:|---:|---:|---:|")
@@ -134,8 +148,14 @@ function main()
         dalloc = c.allocs - b.allocs
 
         flag = if ratio >= REGRESSION_THRESHOLD
-            push!(regressions, "$name ($(round(ratio, digits = 2))x)")
-            " **SLOWER**"
+            if b.min_ns >= MIN_GATED_NS
+                push!(regressions, "$name ($(round(ratio, digits = 2))x)")
+                " **SLOWER**"
+            else
+                push!(ungated, "$name ($(round(ratio, digits = 2))x, " *
+                               "baseline $(prettytime(b.min_ns)))")
+                " slower (below the gate)"
+            end
         elseif ratio <= 1 / NOTEWORTHY_THRESHOLD
             push!(improvements, "$name ($(round(1 / ratio, digits = 2))x)")
             " faster"
@@ -193,6 +213,13 @@ function main()
         println("\nALLOCATED where none is allowed:")
         foreach(r -> println("  - ", r), alloc_failures)
         failed = true
+    end
+    # Printed whether or not anything failed: these cleared the ratio threshold and
+    # are only unenforced because the baseline is too fast to time reliably. Silence
+    # here would let "No regressions" cover a row the table shows as slower.
+    if !isempty(ungated)
+        println("\nSlower but under $(prettytime(MIN_GATED_NS)), so not gated:")
+        foreach(r -> println("  - ", r), ungated)
     end
     if !failed
         println("\nNo regressions.")

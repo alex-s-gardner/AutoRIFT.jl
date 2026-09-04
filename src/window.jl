@@ -536,11 +536,82 @@ function _window_sorted(A::AbstractMatrix, w, reduce!::F, ::Val{N} = Val(1)) whe
     return N == 1 ? only(outs) : outs
 end
 
-# Insertion sort of `buf[1:n]`, then the middle. At n <= 25 this beats calling a
-# partial-selection routine, whose setup dominates at that size.
+# The window size above which quickselect beats an insertion sort. Insertion sort is O(n^2) and
+# `partialsort!` O(n) expected, so the crossover is where the latter's setup stops dominating:
+# measured at 0.5x for a 25-element window, 0.92x at 49, 2.4x at 81 and 12x at 289. A 5-wide
+# window gathers 25 values and a 17-wide one 289, so both regimes occur in one run — see
+# `AutoRIFT.rescale`, which widens the window with the grid.
+const SELECT_THRESHOLD = 64
+
+# Median of `buf[1:n]`, by whichever selection is cheaper at that size.
 @inline function _median_of!(buf::Vector{Float32}, n::Int)
-    _insertion_sort!(buf, n)
-    return (_sorted_median(buf, n),)
+    return (_select_median!(buf, n),)
+end
+
+# Median of `buf[1:n]`, reordering `buf`. Both branches leave the median's own value correct;
+# neither leaves the buffer fully sorted, which is why the MAD gathers deviations by a pass over
+# all `n` rather than by walking outward from the centre.
+@inline function _select_median!(buf::Vector{Float32}, n::Int)
+    if n <= SELECT_THRESHOLD
+        _insertion_sort!(buf, n)
+        return _sorted_median(buf, n)
+    end
+    if isodd(n)
+        return _quickselect!(buf, n, (n + 1) >> 1)
+    end
+    # Even count: the mean of the two middle elements, matching the reference. Selection leaves
+    # everything above position k at or above it, so the next order statistic is the minimum of
+    # the upper part rather than a second selection.
+    lo = _quickselect!(buf, n, n >> 1)
+    hi = buf[(n >> 1) + 1]
+    @inbounds for k in ((n >> 1) + 2):n
+        buf[k] < hi && (hi = buf[k])
+    end
+    return (lo + hi) / 2
+end
+
+# The `k`-th smallest of `buf[1:n]`, partitioning in place.
+#
+# Hand-written rather than `partialsort!(view(buf, 1:n), k)`: that allocates about 7 MiB per call
+# on a 289-element window over a 512^2 grid, because each view and its sorting scratch is a fresh
+# object. This is called once per grid point, so allocation there dominates what the better
+# complexity buys.
+#
+# Median-of-three pivoting, which is what keeps the O(n^2) worst case away from sorted and
+# reverse-sorted inputs. Both occur here: a window over uniform ice gathers equal values, and one
+# straddling a shear margin gathers a monotone run.
+@inline function _quickselect!(buf::Vector{Float32}, n::Int, k::Int)
+    lo, hi = 1, n
+    @inbounds while lo < hi
+        # Median of three, moved to `lo` as the pivot.
+        mid = (lo + hi) >> 1
+        if buf[mid] < buf[lo]
+            buf[mid], buf[lo] = buf[lo], buf[mid]
+        end
+        if buf[hi] < buf[lo]
+            buf[hi], buf[lo] = buf[lo], buf[hi]
+        end
+        if buf[hi] < buf[mid]
+            buf[hi], buf[mid] = buf[mid], buf[hi]
+        end
+        pivot = buf[mid]
+        buf[mid], buf[lo] = buf[lo], buf[mid]
+
+        # Hoare partition around `pivot`.
+        i, j = lo, hi
+        while i <= j
+            while buf[i] < pivot; i += 1; end
+            while buf[j] > pivot; j -= 1; end
+            if i <= j
+                buf[i], buf[j] = buf[j], buf[i]
+                i += 1
+                j -= 1
+            end
+        end
+        # `k` is now on one side or already in place.
+        k <= j ? (hi = j) : k >= i ? (lo = i) : return buf[k]
+    end
+    return @inbounds buf[k]
 end
 
 @inline _mad_of!(buf::Vector{Float32}, n::Int) = (_medmad_of!(buf, n)[2],)
@@ -552,14 +623,13 @@ end
 # needs no second scratch array. `_median_of!` and `_mad_of!` are this function with one
 # of the two results dropped, which is why all three are one traversal.
 @inline function _medmad_of!(buf::Vector{Float32}, n::Int)
-    _insertion_sort!(buf, n)
-    m = _sorted_median(buf, n)
+    m = _select_median!(buf, n)
     @inbounds for k in 1:n
         buf[k] = abs(buf[k] - m)
     end
-    # The deviations are not sorted even though the values were, so sort again.
-    _insertion_sort!(buf, n)
-    return (m, _sorted_median(buf, n))
+    # Deviations from the median are in no useful order whichever selection ran, so this is a
+    # second full selection rather than a cheaper update.
+    return (m, _select_median!(buf, n))
 end
 
 @inline function _insertion_sort!(buf::Vector{Float32}, n::Int)

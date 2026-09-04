@@ -50,6 +50,22 @@ Base.IndexStyle(::Type{FiniteMask{T,A}}) where {T,A} = IndexStyle(A)
 Base.@propagate_inbounds Base.getindex(m::FiniteMask, i::Int) = isfinite(m.parent[i])
 Base.@propagate_inbounds Base.getindex(m::FiniteMask, I::Int...) = isfinite(m.parent[I...])
 
+# A windowed read as **one** read of `parent`, then `isfinite` over the result.
+#
+# Without this, `mask[rows, cols]` reaches `Base`'s generic `getindex`, which fills the destination by
+# calling the scalar method above once per element. For an in-memory parent that is merely a slow loop.
+# For a disk-backed one it is a separate read per pixel, and the cost is not subtle: measured on a
+# lazy GeoTIFF window of 369x369, 1.5 ms to read the imagery against 37.3 s through the mask — 25,000x,
+# or 274 us per element. `_read_block!` reads a mask window per block, so a blocked run over a lazy
+# raster spent essentially all of its time here.
+#
+# Indexed with ranges only, which is what a block read uses. A scalar index still takes the methods
+# above, and anything more exotic falls back to `Base` — correct, just not accelerated.
+Base.@propagate_inbounds function Base.getindex(m::FiniteMask, rows::AbstractUnitRange,
+                                                cols::AbstractUnitRange)
+    return map(isfinite, m.parent[rows, cols])
+end
+
 """
     AutoRIFT.resident(mask) -> AbstractMatrix{Bool}
 
@@ -68,7 +84,10 @@ Only the lazy masks this package constructs are recognized. A caller supplying a
 `AbstractMatrix{Bool}` of their own should either materialize it first or add a method here.
 """
 resident(m::AbstractMatrix{Bool}) = m
-resident(m::FiniteMask) = Matrix{Bool}(m)
+# `map` over the parent, not `Matrix{Bool}(m)`. The conversion indexes `m` element by element, which
+# for a disk-backed parent is one read per pixel: the same defect `FiniteMask`'s windowed `getindex`
+# had, on the whole-array path this time. `map` reads the parent once. Same result, same allocation.
+resident(m::FiniteMask) = map(isfinite, m.parent)
 
 # The windowed filters read their mask many times over and begin with a whole-array `all`, so a
 # computed mask is the wrong representation for them: `all` on a `FiniteMask` costs 425 us at 1024²
@@ -688,6 +707,56 @@ function _filtered!(out::AbstractMatrix{Float32}, v::AbstractMatrix{Bool},
     return _filtered_finish!(out, v)
 end
 
+"""
+    AutoRIFT._finishes_nonfinite(method) -> Bool
+
+Whether `method`'s own `preprocess` already zeroed every non-finite output and cleared those pixels
+in the mask.
+
+Every filter that ends in [`AutoRIFT._filtered`](@ref) does, because
+[`AutoRIFT._filtered_finish!`](@ref) is exactly that pass — so running
+[`replace_nonfinite`](@ref) over the result afterwards would allocate two full-size arrays to
+recompute a result it already has. On a 17121×16961 scene that is 1.6 GiB per image.
+
+Declared per method rather than inferred, and defaulting to `false`: a new filter that forgets to
+declare it pays one redundant pass, where a default of `true` would silently pass non-finite values
+into the correlator. [`WallisGapfill`](@ref) is the method that genuinely needs the pass — its random
+fill can leave non-finite values behind — and [`Decibel`](@ref) does its own mask bookkeeping without
+`_filtered`, so neither declares it.
+"""
+_finishes_nonfinite(::PreprocessMethod) = false
+_finishes_nonfinite(::Union{Highpass,Wallis,Sobel,Laplacian}) = true
+
+"""
+    AutoRIFT._slabbable(method) -> Bool
+
+Whether `method` may be applied to row slabs of an image in parallel, giving every pixel the value a
+whole-image call would.
+
+**Currently `false` for every method**, so filtering always runs serially. The trait is kept because
+the property it names is real and the mechanism is written (`AutoRIFT._preprocess_slabbed`); what a
+measurement showed is that the mechanism is a net loss at scene scale.
+
+On the 17121x16961 Landsat pair the benchmark table uses, at 12 threads, slabbing takes filtering from
+2.50 s to 0.89 s — and takes the whole run from 24.24 s to 30.81 s, with peak RSS from 7395 to
+9645 MiB. It wins its own 1.6 s and loses 6.6 s elsewhere. The cause is the shape of
+`_preprocess_slabbed`: each task calls the allocating `preprocess` on its slab and then copies only
+its own rows out, so a 1.08 GiB plane accrues roughly a gigabyte of transient per image, and the
+resulting churn slows the correlation that follows more than the filter gained.
+
+Two conditions would have to hold for a method to be slabbable, and they are why the trait exists
+rather than a bare `false` in the caller. **A bounded reach**, so a slab grown by
+[`filter_reach`](@ref) contains everything its own pixels need — a method whose estimate is global has
+a negative reach and no slab reproduces it. **Per-pixel determinism**: [`WallisGapfill`](@ref) draws
+its fill from one generator in a single scan, so which pixel receives which draw depends on traversal
+order, and slabbing would change the image rather than the schedule.
+
+Re-enabling this means first making `_preprocess_slabbed` write in place — `tile.jl`'s
+`_prepare_block` already filters straight into pooled views, which is the shape that would remove the
+transient. Until then a method declaring `true` here would be slower, and the default says so.
+"""
+_slabbable(::PreprocessMethod) = false
+
 # Shared tail: a filter can produce a non-finite value from finite input, so finiteness of the
 # output is part of validity too.
 function _filtered_finish!(out::AbstractMatrix{Float32}, v::AbstractMatrix{Bool})
@@ -797,9 +866,11 @@ end
 # columns (13 ms — worse, the count-array traffic dominates), and Float32 accumulation
 # (1.37x but changed results by 2e-6, since a running sum drifts across a whole row).
 #
-# A bandwidth estimate puts the floor at 0.4 ms, so what remains is per-element scalar
-# work that cv2 vectorises. Closing it means cache tiling, an M8 item. Filtering runs
-# once per image rather than once per grid point, so this is not on the hot path.
+# A bandwidth estimate puts the floor at 0.4 ms, so what remains is per-element scalar work that
+# cv2 vectorises; closing it would mean cache tiling. Not attempted, and the reason is the
+# denominator rather than the gap: filtering runs once per image where correlation runs once per
+# grid point, so this is a few percent of a run. `benchmark/README.md` carries the changes that were
+# measured, and the ones measured but not implemented.
 _masked_boxmean(img::AbstractMatrix, mask::AbstractMatrix{Bool}, w::Int) =
     _masked_boxmean!(Matrix{Float32}(undef, size(img)), img, mask, w, nothing)
 

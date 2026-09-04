@@ -52,6 +52,8 @@ because only some inputs know which way is north:
 | `AbstractDimArray` | `DimStack` | `dx`, `dy` — as above, with coordinates |
 | `AbstractRaster` | `RasterStack` | `vx`, `vy` — feature motion, `+vy` north |
 
+Every form also carries `correlation`, `peak_ratio`, `chip_size` and `interpolated` per point.
+
 The last two need `DimensionalData` or `Rasters` loaded. The raster path is the only
 one that can orient the result, so it is the only one that reports `vx`/`vy`: the
 sign flip from the correlator's secondary-to-reference offset to actual feature
@@ -164,6 +166,9 @@ docstring. A name absent here is internal and may change in a patch release.
 const PUBLIC_NAMES = (
     # Configuration.
     :params, :Params, :chip_sizes, :chip_measures, :measure_at, :filter_width, :filter_reach,
+    # Where the kernels run. The backends are API because they appear in `Params`' type, so a
+    # caller building one positionally — as `app/` does — needs the names.
+    :Backend, :CPU, :MetalGPU, :CUDAGPU, :isgpu,
     # Geometry is two-dimensional throughout, and `Extent` is how it is spelled. Public because it
     # appears in `Params`' fields and in every geometry keyword, so a caller building one by hand
     # needs the name — and because a C caller's struct layout is derived from it.
@@ -181,7 +186,7 @@ const PUBLIC_NAMES = (
     :FiniteMask, :resident,
     # Post-processing steps a caller may want on their own.
     :reject_outliers, :outlier_filter, :dilate_within, :resample, :resample!,
-    :Nearest, :Area, :Bicubic, :window, :relax,
+    :Nearest, :Area, :Bicubic, :window, :relax, :rescale,
     # Blocked processing: `halo` says how much overlap a block size costs. The layout types are
     # deliberately absent — they are the part free to change.
     :halo,

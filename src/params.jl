@@ -171,6 +171,20 @@ _rotation(x::Union{Tuple{Vararg{Real}},AbstractVector{<:Real},AbstractRange{<:Re
 _rotation(x) = _badtype(:rotation, x,
                        "`nothing`, a `Bool`, a collection of angles, or a `RotationMethod`")
 
+# Backends map to instances, since they are singletons carrying no parameters. `:gpu` is
+# deliberately absent: a machine can have more than one kind of device, and picking one on the
+# package's behalf would be a silent choice about which. Naming the vendor is the whole content of
+# the keyword.
+const SYMBOL2BACKEND = Dict{Symbol,Backend}(
+    :cpu   => CPU(),
+    :metal => MetalGPU(),
+    :cuda  => CUDAGPU(),
+)
+
+_backend(x::Backend) = x
+_backend(x::Symbol) = _resolve(SYMBOL2BACKEND, x, :backend)
+_backend(x) = _badtype(:backend, x, "a Symbol or an `AutoRIFT.Backend`")
+
 _badtype(kw::Symbol, x, expected) =
     throw(ArgumentError("`$kw` must be $expected, got a $(typeof(x))."))
 
@@ -310,9 +324,11 @@ chip_size = (X = 16, Y = 32)   # taller than wide
 - `min_search_radius = 6`: floor applied to non-zero radii, per axis.
 - `dx_prior = 0.0`, `dy_prior = 0.0`: a-priori displacement the search window is
   centred on.
-- `coarse_stride = 4`: decimation factor for the coarse pass.
+- `coarse_stride = 4`: how sparsely the coarse pass samples, as a rate against one point per chip.
+  The step in grid points is this times the chip-to-spacing ratio, so on a grid posted finer than its
+  chips the coarse pass is sparser than this number alone suggests — see `AutoRIFT._sparse_stride`.
 - `coarse_buffer = 8`: dilation radius applied to the coarse validity mask
-  before it restricts the fine search.
+  before it restricts the fine search, in coarse cells.
 - `min_coarse_valid_fraction = 0.01`: skip a chip-size level whose coarse pass
   validates a smaller fraction than this.
 
@@ -343,6 +359,18 @@ already carries its own — that is an error rather than a silent override.
 - `threaded = false`: parallelise over grid points within one image pair. For
   batch processing, leaving this `false` and running one pair per worker is
   usually faster; see the documentation on throughput.
+- `backend = :cpu`: where the correlation kernels run. `:metal` needs `using Metal`, `:cuda`
+  needs `using CUDA`; both correlate every point of a pass in batches on the device. Cannot be
+  combined with `threaded = true`, which parallelises the same loop. The GPU path reports
+  `dx`/`dy` identical to the CPU's and `correlation` to within 1e-5 — see
+  `docs/gpu-feasibility.md` for why that asymmetry is a property of Float32 transforms rather
+  than of the device. There is no `:gpu`: a machine may have more than one kind of device, and
+  naming the vendor is the whole content of the keyword.
+
+  **The GPU backends are experimental and do not currently outperform the CPU.** A device pass is
+  2.7-3.2x one CPU core but *slower* than `threaded = true` on a single pair — 0.65 s against
+  0.26 s at 1024², chip 32, radius 25 on 8 threads. Prefer `threaded = true` unless the cores are
+  already committed and the device is idle, which is the batch-driver case `docs/gpu.md` describes.
 - `progress = false`: show a progress meter.
 - `rng_seed = 0`: seed for the noise [`WallisGapfill`](@ref) fills gaps with, so a run is
   reproducible. Read by that filter alone; every other `preprocess` choice ignores it.
@@ -372,6 +400,7 @@ function params(;
     mad_scale = nokw,
     fill_window = 3,
     threaded = false,
+    backend = :cpu,
     progress = false,
     rng_seed = 0,
 )
@@ -384,6 +413,15 @@ function params(;
     out = _outliers(outliers, (; window = outlier_window, iterations = outlier_iterations,
                                min_agree_fraction, agree_tolerance, mad_scale))
     rot = _rotation(rotation)
+    back = _backend(backend)
+    # Intra-pair threading and a GPU both parallelise the same loop, and on a device they would
+    # contend on one queue rather than compose. Rejected here rather than silently ignoring one:
+    # a caller who asked for both has a wrong expectation about which is in effect.
+    (isgpu(back) && Bool(threaded)) && throw(ArgumentError(
+        "`threaded = true` and `backend = :$(lowercase(string(nameof(typeof(back)))))` cannot " *
+        "be combined: both parallelise the grid loop, and the GPU path already batches every " *
+        "point of a pass onto one device queue. Drop `threaded`, or use `backend = :cpu`. For " *
+        "many pairs, run one pair per process instead — that measures faster than either."))
 
     cmin = _check_chip_size(:chip_size, chip_size)
     cmax = isnokw(chip_size_max) ? (X = 4cmin.X, Y = 4cmin.Y) :
@@ -403,5 +441,6 @@ function params(;
         _check_odd_window(:fill_window, fill_window),
         UInt64(rng_seed),
         Bool(progress),
+        back,
     )
 end

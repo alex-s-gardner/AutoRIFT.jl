@@ -1,0 +1,127 @@
+"""Stage 2 of the A/B: the reference's whole pipeline on the arrays AutoRIFT.jl filtered.
+
+`runAutorift` and not `arImgDisp_s`: this stage compares the machinery *around* the correlator --
+the chip-size pyramid, the sparse/coarse pass, the `DISP_FILT` outlier test, the hole filling and
+the smallest-chip-wins merge. Stage 1 already established that the correlator itself agrees.
+
+The preprocessing is deliberately skipped on this side (`obj.I1`/`obj.I2` are set to the arrays
+AutoRIFT.jl already high-pass filtered, and no `preprocess_filt_*` is called), so a filter
+difference cannot masquerade as a pyramid difference.
+
+    micromamba run -n arift-ref python tools/ab/stage2_python.py
+"""
+
+import os
+import sys
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BUNDLE = os.path.join(HERE, "stage2")
+
+DTYPES = {"Float32": np.float32, "Float64": np.float64, "Int32": np.int32}
+
+
+def read_bundle(path):
+    """The arrays and scalars `stage2_julia.jl` wrote, un-transposed from column-major."""
+    arrays, scalars = {}, {}
+    with open(os.path.join(path, "manifest.txt")) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) == 2:
+                scalars[parts[0]] = int(parts[1])
+                continue
+            name, dtype, shape = parts
+            dims = tuple(int(v) for v in shape.split("x"))
+            raw = np.fromfile(os.path.join(path, name + ".bin"), dtype=DTYPES[dtype])
+            arrays[name] = raw.reshape(dims[::-1]).T
+    return arrays, scalars
+
+
+def main():
+    from autoRIFT import autoRIFT
+
+    arrays, scalars = read_bundle(BUNDLE)
+
+    obj = autoRIFT()
+    # Already high-pass filtered by AutoRIFT.jl, so no preprocessing runs here. `DataType = 1`
+    # keeps the float path: `uniform_data_type` would otherwise requantize to uint8 and the two
+    # sides would no longer be correlating the same numbers.
+    # `I1` holds the *secondary*, which is not what the field names suggest. `runAutorift` correlates
+    # with `arImgDisp_s(self.I2, self.I1)` (`autoRIFT.py:674,747`), and `arImgDisp_s` cuts its chip from
+    # its second argument, so the chip comes from `self.I1`. Putting the secondary there is what makes
+    # the chip sit on the secondary, matching AutoRIFT.jl and stage 1.
+    obj.I1 = np.ascontiguousarray(arrays["filtered_secondary"], dtype=np.float32)
+    obj.I2 = np.ascontiguousarray(arrays["filtered_reference"], dtype=np.float32)
+    obj.DataType = 1
+    obj.zeroMask = None
+
+    # Julia's grid is 1-based pixel centres and the reference's is 0-based, hence the `- 1.0`. The
+    # further `- 0.5` cancels a shift `runAutorift` applies that `arImgDisp_s` does not.
+    #
+    # `runAutorift` snaps an even chip's grid to `round(x + 0.5) - 0.5` (`autoRIFT.py:526-527`) and
+    # `arImgDisp_s` then adds its own `+0.5` internally, so the pair arrives half a pixel past where
+    # stage 1 puts it. Verified by intercepting the call: handing `runAutorift` a grid value of 53.0
+    # makes it correlate at 53.5, where `arImgDisp_s` given 53.0 correlates at 53.0.
+    #
+    # Both implementations attribute an even chip's estimate to the chip centroid, half a pixel below
+    # the grid point — AutoRIFT.jl in `_shift_points` (`src/track.jl`), the reference in the `+0.5`
+    # above. Applying that convention twice on this side would compare ground half a pixel apart, and
+    # since the offset is only visible where the velocity field varies, it would read as a
+    # displacement-dependent disagreement rather than as a grid error.
+    obj.xGrid = np.ascontiguousarray(arrays["grid_x"] - 1.5, dtype=np.float32)
+    obj.yGrid = np.ascontiguousarray(arrays["grid_y"] - 1.5, dtype=np.float32)
+
+    chip = scalars["chip"]
+    obj.ChipSize0X = chip
+    obj.ChipSizeMinX = chip
+    obj.ChipSizeMaxX = scalars["chip_max"]
+    obj.GridSpacingX = scalars["grid_spacing"]
+    obj.SkipSampleX = scalars["grid_spacing"]
+    obj.SkipSampleY = scalars["grid_spacing"]
+    obj.SearchLimitX = scalars["radius"]
+    obj.SearchLimitY = scalars["radius"]
+    obj.OverSampleRatio = scalars["upsampling"]
+    obj.Dx0 = 0
+    obj.Dy0 = 0
+    # `mpflag = 0` is what production runs (REFERENCE.md), and the reference's own note says
+    # threading cannot change results anyway: each grid point writes a distinct output element.
+    obj.MultiThread = 0
+
+    obj.runAutorift()
+
+    shape = obj.Dx.shape
+    dx = np.asarray(obj.Dx, dtype=np.float32)
+    # Undo the reference's final cartesian flip, putting dy back down-rows as AutoRIFT.jl reports it.
+    #
+    # Whether a further negation of both axes is needed depends on the chip/window assignment above, so
+    # it is not applied blind here: the readers establish the sign by scoring both candidates, as
+    # `tools/synth/gate.jl` does. A hardcoded flip paired with a reversed assignment is how a
+    # displacement-dependent residual can look like an accuracy difference.
+    dy = -np.asarray(obj.Dy, dtype=np.float32)
+
+    chip_size = np.asarray(obj.ChipSizeX, dtype=np.int32)
+    interp = np.asarray(obj.InterpMask, dtype=np.int32)
+
+    print("grid            ", shape, " (julia grid was",
+          arrays["grid_x"].shape, ")")
+    finite = np.isfinite(dx)
+    print("python measured ", int(finite.sum()),
+          "({:.1f}%)".format(100.0 * finite.mean()))
+    print("interpolated    ", int(interp.sum()))
+    for cs in sorted(set(chip_size.ravel().tolist())):
+        print("  chip {:>3} -> {} points".format(cs, int((chip_size == cs).sum())))
+
+    for name, A in (("python_dx", dx), ("python_dy", dy),
+                    ("python_chip_size", chip_size), ("python_interpolated", interp)):
+        np.asfortranarray(A).T.tofile(os.path.join(BUNDLE, name + ".bin"))
+    with open(os.path.join(BUNDLE, "python_shape.txt"), "w") as fh:
+        fh.write("{} {}\n".format(shape[0], shape[1]))
+    print("wrote           ", BUNDLE)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

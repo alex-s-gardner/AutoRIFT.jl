@@ -194,13 +194,24 @@ end
     need = widest_level_pad(grid, tight) .+ AutoRIFT.filter_reach(tight.preprocess)
     @test h.X >= need[1] && h.Y >= need[2]
 
-    # The grid `autorift` builds for itself already carries the largest chip size, so nothing above
-    # widens it — the correction is for caller-supplied grids.
+    # The grid `autorift` builds for itself already carries the largest chip size, so the chip-size and
+    # radius corrections above do not widen it — those are for caller-supplied grids. What does widen it
+    # is the cell-centre offset: a decimated level correlates half a cell past its grid point, and the
+    # halo is exactly the grid's own reach plus that.
     pd = params()
     gd = AutoRIFT._build_grid(imagesize, pd)
     gpad = AutoRIFT._pass_geometry(scatter(gd), imagesize)[3]
     w = AutoRIFT.filter_reach(pd.preprocess)
-    @test AutoRIFT.halo(gd, pd, imagesize) == extent((gpad.X + w, gpad.Y + w))
+    ox, oy = AutoRIFT._level_centre_offset(pd)
+    @test AutoRIFT.halo(gd, pd, imagesize) ==
+          extent((gpad.X + w + ox, gpad.Y + w + oy))
+
+    # The offset is a real widening at the defaults, not a no-op the equality above would also pass with.
+    @test all(AutoRIFT._level_centre_offset(pd) .> 0)
+
+    # A single-level run decimates nothing, so there is no offset to cover.
+    flat_p = params(; chip_size = 32, chip_size_max = 32, grid_spacing = 32, search_radius = 25)
+    @test AutoRIFT._level_centre_offset(flat_p) == (0, 0)
 end
 
 @testset "blocks partition the grid and read what they need" begin
@@ -212,8 +223,9 @@ end
     lin = LinearIndices((nr, nc))
 
     # In pixels, at `grid_spacing = 32`: sizes that divide the grid evenly, sizes that do not, and
-    # sizes covering the whole grid at once.
-    for bs in ((256, 256), (224, 160), (128, 352), (32nr, 32nc), (64nr, 64nc))
+    # sizes covering the whole grid at once. Every one is at least the halo — `block_layout` rejects a
+    # smaller block, so a size below it would test the throw rather than the partition.
+    for bs in ((256, 256), (224, 160), (192, 352), (32nr, 32nc), (64nr, 64nc))
         layout = AutoRIFT.block_layout(grid, p, (n, n), bs)
         @test length(layout) >= 1
 
@@ -313,15 +325,20 @@ end
     # Large enough, at this spacing, that the coarse grid clears the outlier filter's window — so
     # the coarse gate, its dilation and its resample are all genuinely exercised rather than
     # short-circuited by the small-grid fallback.
-    n = 1024
+    # Sized so the sparse coarse grid clears the outlier filter's window: the coarse pass samples
+    # every `coarse_stride * oversample` points of the level grid, so the scene has to be several
+    # times that across before the gate runs at all. 1024 leaves only 7 sparse points against a
+    # 9-wide window, which takes the small-grid fallback and exercises none of this.
+    n = 1536
     ref, sec = split_pair(n)
 
-    # The feature seam sits at pixel 512, so a block boundary at half the grid's width falls on the
-    # discontinuity — the case an under-computed halo fails and a boundary in flat texture would not.
+    # The feature seam sits at pixel `n / 2`, so a block boundary at half the grid's width falls on
+    # the discontinuity — the case an under-computed halo fails and a boundary in flat texture would
+    # not.
     base = params(; chip_size = 32, chip_size_max = 32, grid_spacing = 16, search_radius = 12)
     pair0 = AutoRIFT._prepare(ImagePair(ref, sec), base)
     grid0 = AutoRIFT._build_grid(size(pair0), base)
-    @test size(grid0) == (61, 61)
+    @test size(grid0) == (93, 93)
     # The coarse grid really does clear the filter's window, so the gate is exercised.
     @test !isnothing(AutoRIFT._coarse_points(
         AutoRIFT._level_points(grid0, base, AutoRIFT.extent(32), trues(size(grid0))),
@@ -344,11 +361,11 @@ end
         AutoRIFT._warm_grid_plans(grid, p)
         untiled = AutoRIFT.correlate_multichip(pair, grid, p)
 
-        # In pixels, at `grid_spacing = 16` over a 61-point grid. 496 columns puts a boundary at the
+        # In pixels, at `grid_spacing = 16` over a 93-point grid. 752 columns puts a boundary at the
         # feature seam; the next two do not divide the grid evenly; one block covering everything must
-        # agree with the whole-scene path trivially; and 128 pixels makes 64 blocks, many more than
-        # there are threads — the case that catches a threaded run sharing one buffer set across them.
-        for bs in ((976, 496), (976, 400), (320, 320), (208, 704), (976, 976), (128, 128))
+        # agree with the whole-scene path trivially; and 128 pixels makes many more blocks than there
+        # are threads — the case that catches a threaded run sharing one buffer set across them.
+        for bs in ((1488, 752), (1488, 400), (320, 320), (208, 704), (1488, 1488), (128, 128))
             assert_same_result(untiled, AutoRIFT.correlate_tiled(raw, grid, p, bs),
                                "$tag, block $bs")
         end

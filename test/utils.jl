@@ -2,6 +2,7 @@
 
 using Test
 using JSON3
+using Serialization
 
 const FIXTURE_DIR = joinpath(@__DIR__, "fixtures")
 const MANIFEST_PATH = joinpath(FIXTURE_DIR, "manifest.json")
@@ -69,6 +70,28 @@ Whether the fixture corpus is present. Tests that compare against OpenCV are
 skipped when it is not, so a bare clone still runs the truth-based suite.
 """
 has_fixtures() = isfile(MANIFEST_PATH)
+
+# The real-data case: two Landsat scenes and the ITS_LIVE granule covering them, cut to a window
+# by `tools/realdata/prepare.jl`. Outside the repository because the inputs are ~700 MB.
+const REALDATA_PATH = joinpath(get(ENV, "AUTORIFT_TESTDATA",
+                                   joinpath(homedir(), "data", "autorift", "tests")),
+                               "window.jls")
+
+"""
+    has_realdata() -> Bool
+
+Whether the real-imagery test case is cached locally. `test/realdata.jl` is skipped when it is
+not, so a bare clone still runs everything else.
+"""
+has_realdata() = isfile(REALDATA_PATH)
+
+"""
+    realdata() -> NamedTuple
+
+The cached Jakobshavn window: `reference`, `secondary`, the ITS_LIVE `reference_vx`/`reference_vy`
+on the same grid, `date_dt` in days, and `pixel_size` in metres.
+"""
+realdata() = deserialize(REALDATA_PATH)
 
 # ---------------------------------------------------------------------------
 # Assertion macros

@@ -1,0 +1,148 @@
+{
+ "scene": {
+  "rows": 17121,
+  "cols": 16961
+ },
+ "grid": {
+  "rows": 2127,
+  "cols": 2107
+ },
+ "chip": 16,
+ "chip_max": 64,
+ "spacing": 8,
+ "radius": 20,
+ "upsampling": 16,
+ "provenance": {
+  "cpu": "Apple M2 Max",
+  "cores": 12,
+  "ram_gib": 96,
+  "os": "macOS 26.5.2",
+  "julia": "1.12.5",
+  "autorift_jl": "0.1.0",
+  "autorift_py": "2.1.1",
+  "commit": "f88c3a8"
+ },
+ "table": [
+  {
+   "group": "reference",
+   "label": "python autoRIFT v2.1.2\u2020",
+   "threads": "2.4",
+   "lazy": "no",
+   "blocks": 1,
+   "seconds": 173.87,
+   "peak": 6883.546875,
+   "cores": 2.381204348076149,
+   "cpu": 414.02000000000004
+  },
+  {
+   "group": "library",
+   "label": "AutoRIFT.jl, eager, no blocks, 12 threads",
+   "threads": "12",
+   "lazy": "no",
+   "blocks": 1,
+   "seconds": 20.83,
+   "peak": 6984.25,
+   "cores": 3.832453192510802,
+   "cpu": 79.83
+  },
+  {
+   "group": "library",
+   "label": "AutoRIFT.jl, eager, no blocks, 1 thread",
+   "threads": "1",
+   "lazy": "no",
+   "blocks": 1,
+   "seconds": 63.81,
+   "peak": 6701.171875,
+   "cores": 1.0285221752076477,
+   "cpu": 65.63
+  },
+  {
+   "group": "library",
+   "label": "AutoRIFT.jl, lazy, block 2048, 12 threads",
+   "threads": "12",
+   "lazy": "yes",
+   "blocks": 81,
+   "seconds": 42.05,
+   "peak": 3781.015625,
+   "cores": 4.905588585017837,
+   "cpu": 206.28
+  },
+  {
+   "group": "library",
+   "label": "AutoRIFT.jl, lazy, block 4096, 12 threads",
+   "threads": "12",
+   "lazy": "yes",
+   "blocks": 25,
+   "seconds": 59.59,
+   "peak": 9642.96875,
+   "cores": 3.730827320020137,
+   "cpu": 222.32
+  },
+  {
+   "group": "binary",
+   "label": "juliac binary, lazy, no blocks, 1 thread*",
+   "threads": "1",
+   "lazy": "yes",
+   "blocks": 1,
+   "seconds": 65.03,
+   "peak": 6362.46875,
+   "cores": 1.0212209749346455,
+   "cpu": 66.41
+  },
+  {
+   "group": "binary",
+   "label": "juliac binary, lazy, block 4096, 1 thread*",
+   "threads": "1",
+   "lazy": "yes",
+   "blocks": 25,
+   "seconds": 98.92,
+   "peak": 3966.34375,
+   "cores": 1.0142539425798625,
+   "cpu": 100.33
+  },
+  {
+   "group": "binary",
+   "label": "juliac binary, lazy, block 2048, 1 thread*",
+   "threads": "1",
+   "lazy": "yes",
+   "blocks": 81,
+   "seconds": 88.09,
+   "peak": 3395.765625,
+   "cores": 1.0147576342377114,
+   "cpu": 89.39
+  },
+  {
+   "group": "binary",
+   "label": "juliac binary, lazy, block 1024, 1 thread*",
+   "threads": "1",
+   "lazy": "yes",
+   "blocks": 289,
+   "seconds": 91.22,
+   "peak": 3212.390625,
+   "cores": 1.0160052620039466,
+   "cpu": 92.68
+  },
+  {
+   "group": "binary",
+   "label": "juliac binary, lazy, block 512, 1 thread*",
+   "threads": "1",
+   "lazy": "yes",
+   "blocks": 1122,
+   "seconds": 95.79,
+   "peak": 3153.9375,
+   "cores": 1.016076834742666,
+   "cpu": 97.33
+  },
+  {
+   "group": "binary",
+   "label": "juliac binary, lazy, block 256, 1 thread*",
+   "threads": "1",
+   "lazy": "yes",
+   "blocks": 4422,
+   "seconds": 109.15,
+   "peak": 3171.84375,
+   "cores": 1.015116811726981,
+   "cpu": 110.8
+  }
+ ]
+}

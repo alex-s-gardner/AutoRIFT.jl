@@ -210,3 +210,35 @@ end
     t3, t48 = bench(3), bench(48)
     @test t48 < 10 * t3
 end
+
+@testset "median selection agrees with a sort at every size" begin
+    # Two regimes meet in `_select_median!`: an insertion sort at or below `SELECT_THRESHOLD`
+    # and a quickselect above it, and the boundary is where a mistake would hide. Checked
+    # against `Statistics.median` on both sides of it.
+    rng = MersenneTwister(7)
+    for n in (1, 2, 3, 25, 63, 64, 65, 81, 289, 300)
+        v = rand(rng, Float32, n)
+        buf = copy(v)
+        @test AutoRIFT._select_median!(buf, n) ≈ Float32(median(v)) atol = 1e-5
+    end
+
+    # Quickselect's worst case is a sorted or constant input, which a window over uniform ice or
+    # across a shear margin produces routinely. Median-of-three pivoting is what bounds it, and
+    # an unpivoted implementation would still pass the random cases above.
+    for n in (65, 121, 289)
+        for v in (fill(0.5f0, n), Float32.(collect(1:n)), Float32.(collect(n:-1:1)))
+            buf = copy(v)
+            @test AutoRIFT._select_median!(buf, n) ≈ Float32(median(v)) atol = 1e-5
+        end
+    end
+
+    # Randomized, since a hand-picked set cannot cover partition edge cases.
+    worst = 0.0f0
+    for _ in 1:2000
+        n = rand(rng, 1:300)
+        v = rand(rng, Float32, n)
+        buf = copy(v)
+        worst = max(worst, abs(AutoRIFT._select_median!(buf, n) - Float32(median(v))))
+    end
+    @test worst < 1.0f-5
+end

@@ -154,13 +154,16 @@ AKAZEGuess(; kwargs...) = AKAZEGuess(kwargs)
 # BRISK did not. The abstract type is what makes adding one a new method rather than a redesign.
 
 """
-    AutoRIFT.required_package(method::FirstGuess) -> String
+    AutoRIFT.required_package(x) -> String
 
-Which package must be loaded for `method` to work.
+Which package must be loaded for `x` to work: a [`FirstGuess`](@ref) detector or an
+[`AutoRIFT.Backend`](@ref), both of which are implemented in package extensions.
 
 Exists so the "you forgot a dependency" error names the *right* dependency. The first version of that
 error hardcoded `ImageFeatures` for every subtype, so `AKAZEGuess` without `AkazeFeatures` told the
 caller to load a package that would not have helped.
+
+The backend methods are in `src/types.jl`, where the backends themselves are declared.
 """
 required_package(::ORBGuess) = "ImageFeatures"
 required_package(::AKAZEGuess) = "AkazeFeatures"

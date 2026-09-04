@@ -4,3 +4,7 @@ version = "0.1.0"
 
 [deps]
 AutoRIFT = "52cb0ed0-aa80-430c-bd04-c52888a79add"
+Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
+
+[compat]
+Mmap = "1.11.0"

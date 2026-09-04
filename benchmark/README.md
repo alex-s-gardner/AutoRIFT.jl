@@ -74,6 +74,14 @@ Every number below is measured on this machine (Apple M2 Max, 8 threads, Julia 1
 rather than estimated, and each was taken as a minimum over many samples — the machine is
 shared, and single-shot medians at this scale swing by 3x under load.
 
+Two sections at the end carry the rest of the record: **Measured and rejected** for changes tried
+and abandoned, and **Measured, not yet implemented** for ones the numbers favour that nobody has
+landed. A performance claim in a source comment should trace to one of the three.
+
+GPU offload is a separate axis, in [`docs/gpu.md`](../docs/gpu.md): 2.7–3.2x a CPU *core* on the
+correlation pass, and 0.5x eight threads, for reasons that are structural rather than a tuning
+gap.
+
 ### Against the reference
 
 `tools/python_ref/bench_reference.py` runs the real `autoRIFT.runAutorift()` from the
@@ -141,6 +149,24 @@ documented at the relevant source file with its numbers.
 | Global integral images | 5.42 ms vs 5.28 ms | Slower. A global table costs one pass per level whether that level searches 900 points or none, and after the finest level resolves what it can the rest search almost nothing. `src/integral.jl` |
 | One oversized workspace shared across levels | 4.5e-8 from exact | Forces a 192-point FFT where 84 would do: 5x the arithmetic and different rounding. `src/correlate.jl` |
 | Interior/border split on the *horizontal* pyrup pass | 0.29x | 3.4x slower. It would write two columns `2sh` floats apart, destroying the locality the vertical split gains. `src/peak.jl` |
-| OpenCV's template-DFT hoisting, tiling, hysteresis clamp | n/a | Structurally inapplicable: every point has its own chip *and* window; transforms are already below the tiling threshold; the clamp never fires (worst excursion 9.0e-5 against a 12.5% band). `src/correlate.jl` |
+| OpenCV's template-DFT hoisting and tiling | n/a | Structurally inapplicable: every point has its own chip *and* window, and transforms are already below the tiling threshold. `src/correlate.jl` |
+| OpenCV's hysteresis clamp on a near-zero denominator | not reachable in output | The clamp never fires on the fixtures (worst excursion 9.0e-5 against a 12.5% band) — but that is a property of synthetic texture, and an **exactly** constant window sends the surface to 7.1. It is still not implemented, because `GardnerFilter` catches every such point: through `autorift` at defaults, zero points wrong by >1 px and zero correlations above 1. `src/correlate.jl` records the measurement and what the fix would be. |
 | VQ-NNF windowed histograms (Gupta & Sintorn 2024) | ≤1% ceiling | The outlier filter runs on the 27x27 grid, not the image: 975 us of a 99 ms pass. `src/window.jl` |
 | SSD / SAD similarity measures | SAD 8.7–15.7x slower | SAD cannot use the FFT; the normalisation they skip is only 15% of the cost; and both respond to brightness differences ZNCC removes. `src/types.jl` |
+| Composite subpixel interpolant **on the CPU** | 1.03–1.06x | Within noise at 16x through 128x upsampling, through BLAS; hand-written and running-argmax forms are 3x *worse*. The operation counts say why: the cascade sums level areas, `n² · 4/3`, where the composite is `n² · patch`. It saves only 15% of the multiplies (520,000 against 614,250 at 64x) and pays that back in access pattern. **The GPU win was traffic, not arithmetic** — not writing 200,000 elements per point through device memory — and on the CPU that traffic is an L2-resident 820 kB, so there is nothing to save. `src/peak.jl` |
+
+### Measured, not yet implemented
+
+Distinct from the table above: these are prototyped with numbers, and the numbers say do them. They
+are recorded here so the next reader neither re-derives them nor mistakes them for rejected.
+
+| change | measured | where it stands |
+|---|---|---|
+| **Composite subpixel interpolant, on the GPU.** `pyrup!` is a separable linear map, so `log2(up)` doublings compose into one fixed `(patch*up) x patch` matrix `K` and the cascade is `K·P·K'`. Each output column is then a 5-vector in registers, so the upsampled surface is never materialised. | **5.4x** on the refinement stage; device scratch 1048 MB → **0.109 MB** per 1024-point tile; 4.2e-7 from `pyrup!` with **identical displacements** over 400 real surfaces and peak values to 2e-7 | Prototyped, not landed. **GPU only** — see the rejected table for why it does not transfer to the CPU. `docs/gpu.md` |
+| **A per-element `gather`.** The device gather is one workitem per point, reading an 81x81 window serially. | 12.6 us/pt, the largest device stage once the refinement above lands | The same one-workitem-per-point mistake that cost 973 us/pt in the cascade and 113 in its argmax; both were fixed by widening, and this is the third instance. `docs/gpu.md` |
+
+Neither closes the gap to a **threaded** CPU on a single pair, and that is not a tuning matter:
+this workload is thousands of independent problems with an 820 kB working set each, so the CPU
+never leaves cache while the device round-trips every cascade level through memory. Measured, the
+device is also **not additive** — handing one core's work to it buys 1.6%, and oversubscribing costs
+22%. The device's case is one core against it, which is the `app/` shape.

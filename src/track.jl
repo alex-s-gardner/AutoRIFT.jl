@@ -29,10 +29,16 @@
 
 Per-point results of a correlation pass.
 
-`dx` and `dy` are displacements in pixels, `correlation` the peak similarity, and
-`searched` marks the points that were actually correlated. Non-searched and failed points
-are `NaN` in `dx`/`dy` and `false` in `searched` — distinguishing "no measurement" from a
-measurement of zero, which the reference conflates.
+`dx` and `dy` are displacements in pixels, `correlation` the peak similarity, `peak_ratio` how far that
+peak stood above the best rival peak elsewhere on the surface (see [`AutoRIFT.peak_ratio`](@ref)), and
+`searched` marks the points that were actually correlated. Non-searched and failed points are `NaN` in
+`dx`/`dy` and `false` in `searched` — distinguishing "no measurement" from a measurement of zero, which
+the reference conflates.
+
+`correlation` and `peak_ratio` are both quality measures and they are not interchangeable: the first is
+how strong the match was, the second whether it was *unique*. A peak of 0.6 with no rival locates a
+displacement; the same 0.6 with a second peak of 0.58 a wavelength away does not say which of the two
+the feature moved by.
 
 `searched` is a `Matrix{Bool}` rather than a `BitMatrix` deliberately. `BitArray` packs 64
 elements per word, so writing one element is a read-modify-write of that word — and the
@@ -47,6 +53,7 @@ struct DisplacementField{N,A<:AbstractArray{Float32,N},B<:AbstractArray{Bool,N}}
     dx::A
     dy::A
     correlation::A
+    peak_ratio::A
     searched::B
 end
 
@@ -58,7 +65,7 @@ Allocate results for `pts`, initialised to "no measurement".
 function displacement_field(pts::PointSet)
     sz = size(pts.x)
     return DisplacementField(fill(NaN32, sz), fill(NaN32, sz), fill(NaN32, sz),
-                             fill(false, sz))
+                             fill(NaN32, sz), fill(false, sz))
 end
 
 Base.size(d::DisplacementField) = size(d.dx)
@@ -99,6 +106,11 @@ makes correlating a *subset* of a point set give the same answer as correlating 
 reading those points out — see [`AutoRIFT.PassGeometry`](@ref), which explains why those are
 otherwise different computations. It may only widen the pass, never narrow it.
 
+`okmask` is the pixels valid in both images, defaulting to [`valid`](@ref) of the pair. Pass it when
+correlating the same pair repeatedly: the intersection is a property of the pair, so a caller running
+several passes over one — as the chip-size loop does — computes it once instead of per pass. It must
+be `valid(pair)`; a narrower mask silently skips points, which is what the default guards against.
+
 A point is skipped, leaving `NaN`, if its search radius is zero in either axis, if its
 chip lies wholly outside the image, or if its chip contains no valid pixel. The last is
 what keeps zero-padding out of the result: the images are padded so the inner loop needs
@@ -108,7 +120,8 @@ other such chip. See `valid` on [`ImagePair`](@ref).
 function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Params;
                 subpixel::SubpixelMethod = p.subpixel,
                 measure::SimilarityMeasure = first(p.similarity),
-                geometry::Union{Nothing,PassGeometry} = nothing)
+                geometry::Union{Nothing,PassGeometry} = nothing,
+                okmask::AbstractMatrix{Bool} = valid(pair))
     # Interpolating the `Tuple`s directly would be the natural spelling, but showing a `Tuple`
     # reaches `textwidth` and `Base.repeat`, which `--trim` cannot resolve — so this one message
     # would make the whole package untrimmable. Element counts say the same thing here: `out`
@@ -138,18 +151,42 @@ function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Param
     # The half-pixel offset applies either way: it is what makes an even-sized chip's reported
     # position refer to its true centre rather than to a position the chip is not symmetric
     # about.
+    # Each branch hands its own concrete array types to `_dispatch_pass!`, rather than assigning them
+    # to variables the two branches share. Sharing them makes each a `Union` of the padded and
+    # unpadded types, and the call below then dispatches on that union — which is a runtime choice
+    # `--trim=safe` cannot resolve, and which the blocked path reaches with `SubArray`s where the
+    # whole-scene path has `Matrix`. The barrier also lets the loop specialize on the concrete pair
+    # rather than on the union, which is the ordinary reason for one.
     if fits
-        ref, sec = pair.reference, pair.secondary
-        okmask = valid(pair)
-        shifted = _shift_points(flat, extent(0))
+        _dispatch_pass!(out, pair.reference, pair.secondary, okmask,
+                        _shift_points(flat, extent(0)), chip, radius, p, measure, subpixel)
     else
-        ref = _zeropad(pair.reference, pad)
-        sec = _zeropad(pair.secondary, pad)
         # The mask pads to `false`, which is what distinguishes "outside the image" from "dark".
-        okmask = _zeropad(valid(pair), pad)
-        shifted = _shift_points(flat, pad)
+        _dispatch_pass!(out, _zeropad(pair.reference, pad), _zeropad(pair.secondary, pad),
+                        _zeropad(okmask, pad), _shift_points(flat, pad),
+                        chip, radius, p, measure, subpixel)
     end
+    return out
+end
 
+# One pass over `pts`, on whatever concrete array types the caller resolved.
+#
+# Split from `track!` so the padded and unpadded paths each arrive here monomorphic — see the note at
+# the call sites.
+#
+# The backend is a `Params` type parameter, so this dispatches at compile time and a build that only
+# ever constructs `CPU()` contains no other method. `p.backend` is passed positionally for the reason
+# `AutoRIFT.PassRunner` records: a keyword annotated with an abstract type is unresolvable under
+# `--trim`.
+_dispatch_pass!(out::DisplacementField, ref, sec, okmask, pts::PointSet{1},
+                chip::Extent, radius::Extent, p::Params,
+                measure::SimilarityMeasure, subpixel::SubpixelMethod) =
+    _dispatch_pass!(p.backend, out, ref, sec, okmask, pts, chip, radius, p, measure,
+                    subpixel)
+
+function _dispatch_pass!(::CPU, out::DisplacementField, ref, sec, okmask, pts::PointSet{1},
+                        chip::Extent, radius::Extent, p::Params,
+                        measure::SimilarityMeasure, subpixel::SubpixelMethod)
     up = upsampling(subpixel)
     # Plans are built here, on this task, before any spawning. FFTW's planner is not
     # thread-safe, so leaving this to the workers would have every one of them contend on
@@ -157,12 +194,38 @@ function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Param
     # its most serial.
     _warm_pass_plans(chip, radius, measure)
 
-    istrue(p.threaded) ? _track_threaded!(out, ref, sec, okmask, shifted, chip, radius,
+    istrue(p.threaded) ? _track_threaded!(out, ref, sec, okmask, pts, chip, radius,
                                           up, p, measure) :
-                         _track_chunk!(out, ref, sec, okmask, shifted, chip, radius,
-                                       up, p, measure, eachindex(shifted))
+                         _track_chunk!(out, ref, sec, okmask, pts, chip, radius,
+                                       up, p, measure, eachindex(pts))
     return out
 end
+
+# The device pass lives in a package extension, so this is what a caller who selected a GPU backend
+# without loading its package reaches. Defined here, on the abstract backend, for the reason
+# `_detector` is: the alternative is a bare `MethodError` on an internal function, which names
+# neither the keyword that caused it nor the package that would fix it.
+#
+# Not a fallback to the CPU. A caller who asked for a GPU and silently got a CPU run would see only
+# that it was slow, which is the failure mode hardest to diagnose from the outside.
+#
+# `CUDAGPU` is a third case and must not be told to load CUDA: there is no CUDA adapter, so `using
+# CUDA` succeeds and changes nothing, sending the caller after a dependency that was never the
+# problem. It gets its own message naming the actual state.
+_dispatch_pass!(b::Backend, ::DisplacementField, _ref, _sec, _okmask, ::PointSet{1},
+                ::Extent, ::Extent, ::Params, ::SimilarityMeasure, ::SubpixelMethod) =
+    throw(ArgumentError(
+        "`backend = $(nameof(typeof(b)))()` needs $(required_package(b)) to be loaded. Run " *
+        "`using $(required_package(b))` first — the device kernels live in a package extension, " *
+        "so the core stays free of a GPU dependency."))
+
+_dispatch_pass!(::CUDAGPU, ::DisplacementField, _ref, _sec, _okmask, ::PointSet{1},
+                ::Extent, ::Extent, ::Params, ::SimilarityMeasure, ::SubpixelMethod) =
+    throw(ArgumentError(
+        "`backend = :cuda` is not implemented — loading CUDA will not help. The device kernels " *
+        "are vendor-neutral (KernelAbstractions.jl), but only the Metal adapter ships, so there " *
+        "is no CUDA extension to load. Use `backend = :metal` on an Apple GPU, or `threaded = " *
+        "true`, which is faster than either device path on a machine with cores free."))
 
 """
     track(pair, pts, p; subpixel = p.subpixel, measure, geometry) -> DisplacementField
@@ -344,14 +407,32 @@ function _track_chunk!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
             # over masked or featureless terrain is a systematic corner-pinned bias.
             degenerate(ws) && continue
 
-            dx, dy, c = isnothing(rw) ? peak_offset(surface, (prx, pry)) :
-                                        subpixel_peak(rw, surface, (prx, pry), up)
+            # One location of the peak serves all four quantities this point needs — the
+            # displacement, the peak height, the boundary flag and the peak ratio — each of which
+            # has a form taking an already-located peak for exactly this reason. See
+            # `AutoRIFT.peak_ratio` for what the four naive calls cost.
+            #
+            # `c` is the correlation at the peak actually reported, so it comes from the refinement
+            # wherever there is one and from the integer peak otherwise.
+            pi_, pj = peak_index(surface)
+            railed = peak_at_boundary(surface, pi_, pj)
+            ppr = peak_ratio(surface, pi_, pj)
+            dx, dy, c = isnothing(rw) ?
+                (_offset_at(pi_, pj, (prx, pry))..., (@inbounds surface[pi_, pj])) :
+                subpixel_peak(rw, surface, (prx, pry), up, pi_, pj)
 
             # Back to displacement about the grid point: the surface is centred on the window,
             # which is centred on the point, and the chip was offset by the prior.
             out.dx[i] = Float32(dx + pts.dx_prior[i])
             out.dy[i] = Float32(dy + pts.dy_prior[i])
-            out.correlation[i] = c
+            # Both quality outputs are zero where the peak lay against the search boundary: the
+            # displacement is a lower bound with no recoverable sub-pixel part, so neither the peak
+            # height nor its ratio to the best rival describes a usable measurement. Zeroing them means
+            # any positive threshold on either rejects the point without the caller having to know the
+            # condition exists — and zero is below the 1 a real ratio cannot go under. The displacement
+            # itself is still reported — it is the best available bound.
+            out.correlation[i] = railed ? 0.0f0 : c
+            out.peak_ratio[i] = railed ? 0.0f0 : ppr
         end
         return out
     finally

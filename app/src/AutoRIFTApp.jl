@@ -26,6 +26,7 @@ module AutoRIFTApp
 
 using AutoRIFT: AutoRIFT, ZNCC, Highpass, PyramidRefine, GardnerFilter,
                 Params, False, NoRotationSearch, autorift
+using Mmap: Mmap
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -39,12 +40,17 @@ const USAGE = """
 autorift — dense normalized cross-correlation feature tracking
 
   autorift <reference> <secondary> <ny> <nx> <output> [chip_size] [search_radius]
+           [grid_spacing] [block_size] [upsampling] [mmap]
 
   <reference>, <secondary>  headerless raw Float32, column-major, ny*nx*4 bytes
   <ny> <nx>                 image shape in pixels
   <output>                  written as three raw Float32 planes: dx, dy, correlation
   [chip_size]               finest chip size, multiple of 4 (default 32)
   [search_radius]           search half-extent in pixels (default 25)
+  [grid_spacing]            pixels between search points (default chip_size)
+  [block_size]              pixels per block, 0 for one block over the scene (default 0)
+  [upsampling]              subpixel refinement factor, power of 2 (default 64)
+  [mmap]                    1 to memory-map the inputs instead of reading them (default 0)
 """
 
 # `write(Core.stdout, …)` rather than `print`/`println`. `print(x)` forwards to
@@ -66,6 +72,21 @@ function read_image(path::String, ny::Int, nx::Int)
         close(io)
     end
     return a
+end
+
+# The same image, memory-mapped rather than read: the OS demand-loads pages, so a blocked run touches
+# only the pages its block windows cover and the scene is never fully resident.
+#
+# `Mmap` and not a raster reader, which is the difference between lazy input costing nothing and
+# costing the GDAL stack. It is stdlib, it trims with no verifier errors, and the array it returns is
+# an ordinary `Matrix{Float32}` — so every method below it specializes exactly as for a read image, and
+# nothing in the package needs a lazy-array path.
+#
+# The file is deliberately left open. Closing it invalidates the mapping, and the process exits when
+# the run is done, which is when the mapping should go.
+function map_image(path::String, ny::Int, nx::Int)
+    io = open(path, "r")
+    return Mmap.mmap(io, Matrix{Float32}, (ny, nx))
 end
 
 function write_planes(path::String, dx::Matrix{Float32}, dy::Matrix{Float32},
@@ -109,15 +130,15 @@ end
 # The loss is bounded. Threading is a within-pair optimization, and `benchmark/suite/throughput.jl`
 # measures pair-level parallelism at 2.7x intra-pair threading anyway — so the shape this binary
 # wants is many single-threaded processes, which is exactly what it is.
-function app_params(chip_size::Int, search_radius::Int)
+function app_params(chip_size::Int, search_radius::Int, grid_spacing::Int, upsampling::Int)
     # The geometry fields are extents — `(X = …, Y = …)` named tuples. Written as literals rather
     # than through `AutoRIFT.extent`, because a positional `Params` call is the trimmable entry point
     # and every value here is already known to be square.
     return Params(
-        (ZNCC(),), Highpass(), PyramidRefine(), GardnerFilter(), False(),
+        (ZNCC(),), Highpass(), PyramidRefine(upsampling), GardnerFilter(), False(),
         NoRotationSearch(),
         (X = chip_size, Y = chip_size), (X = 4chip_size, Y = 4chip_size),
-        (X = chip_size, Y = chip_size),
+        (X = grid_spacing, Y = grid_spacing),
         (X = search_radius, Y = search_radius), 6,
         4, 8, 0.01,
         0.0, 0.0,
@@ -128,7 +149,7 @@ function app_params(chip_size::Int, search_radius::Int)
 end
 
 function (@main)(args::Vector{String})::Cint
-    if length(args) < 5 || length(args) > 7
+    if length(args) < 5 || length(args) > 11
         say(USAGE)
         return Cint(2)
     end
@@ -160,10 +181,62 @@ function (@main)(args::Vector{String})::Cint
         search_radius = r
     end
 
-    reference = read_image(args[1], ny, nx)
-    secondary = read_image(args[2], ny, nx)
+    # Defaults to the chip size, which is what a grid with no overlap between chips means.
+    grid_spacing = chip_size
+    if length(args) >= 8
+        g = tryparse(Int, args[8])
+        if g === nothing || g < 1
+            say("error: [grid_spacing] must be a positive integer\n")
+            return Cint(2)
+        end
+        grid_spacing = g
+    end
 
-    out = autorift(reference, secondary, app_params(chip_size, search_radius))
+    # Zero rather than a missing argument for "one block over the scene": the alternative is a
+    # `Union{Nothing,Tuple}` reaching `autorift`, and a runtime-typed union is what `--trim` cannot
+    # resolve. Both branches below call a concrete method.
+    block_size = 0
+    if length(args) >= 9
+        b = tryparse(Int, args[9])
+        if b === nothing || b < 0
+            say("error: [block_size] must be a non-negative integer\n")
+            return Cint(2)
+        end
+        block_size = b
+    end
+
+    # `PyramidRefine`'s own default, restated here because a positional `Params` gets no defaults.
+    upsampling = 64
+    if length(args) >= 10
+        u = tryparse(Int, args[10])
+        # The same two conditions `PyramidRefine`'s constructor enforces, checked here so a bad value
+        # is a usage error rather than an exception from inside the library.
+        if u === nothing || u < 2 || (u & (u - 1)) != 0
+            say("error: [upsampling] must be a power of 2 greater than 1\n")
+            return Cint(2)
+        end
+        upsampling = u
+    end
+
+    # Memory-mapped or read. Mapping matters only with a block size: an unblocked run correlates the
+    # whole scene, so every page is touched and the mapping saves nothing but the read.
+    domap = false
+    if length(args) >= 11
+        m = tryparse(Int, args[11])
+        if m === nothing || (m != 0 && m != 1)
+            say("error: [mmap] must be 0 or 1\n")
+            return Cint(2)
+        end
+        domap = m == 1
+    end
+
+    reference = domap ? map_image(args[1], ny, nx) : read_image(args[1], ny, nx)
+    secondary = domap ? map_image(args[2], ny, nx) : read_image(args[2], ny, nx)
+
+    p = app_params(chip_size, search_radius, grid_spacing, upsampling)
+    # Two calls rather than one with a `Union` argument, for the trimming reason above.
+    out = block_size == 0 ? autorift(reference, secondary, p) :
+          autorift(reference, secondary, p, (block_size, block_size))
     write_planes(args[5], out.dx, out.dy, out.correlation)
     return Cint(0)
 end

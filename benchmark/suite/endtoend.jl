@@ -18,10 +18,15 @@
 # the suite's runtime without saying anything the 1024 case does not, since the cost is
 # proportional to grid points and the grid scales with area.
 #
-# Not yet comparable to Python. `bench_python.py` measures the correlation kernels, the
-# filters, and the resampling, but has no whole-pipeline case — so `speedup_vs_python` cannot
-# be computed end-to-end until `obj.runAutorift()` is added there. The per-kernel ratios in
-# `correlate/` and `preprocess/` are what the comparison currently rests on.
+# No Python counterpart here, by design. `bench_python.py` measures kernels against OpenCV, which is
+# what `compare.jl` reports per kernel; the whole-pipeline comparison lives in `tools/ab`, which runs
+# `autoRIFT.runAutorift()` and every AutoRIFT.jl configuration over the same full Landsat scene and
+# publishes the ratio beside an accuracy comparison. A synthetic 256^2 or 1024^2 texture is the wrong
+# scene to state a speedup on anyway: the chip-size loop exits early where the imagery is coherent
+# everywhere, so the levels a real scene spends most of its time in barely run.
+#
+# What this group is for is the *trend* — cost against scene size, sampled cheaply enough to run on
+# every commit, where `tools/ab` takes minutes per row.
 
 let g = addgroup!(SUITE, "endtoend")
 

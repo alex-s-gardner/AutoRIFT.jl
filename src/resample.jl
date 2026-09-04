@@ -57,25 +57,34 @@ Coordinates use the half-sample convention: destination sample `i` maps to sourc
 `(i - 0.5) * scale + 0.5`, so the two grids cover the same extent and neither is offset by
 half a sample relative to the other. Getting this wrong shifts a whole chip-size level by a
 fraction of a grid cell, which is invisible in any single level and accumulates across them.
+
+`scale` is the source samples per destination sample, per axis, and defaults to the size ratio.
+Pass it when the two grids stand in a correspondence the sizes do not determine: a source taken
+as every `stride`-th sample of the destination has a scale of exactly `1/stride`, which the ratio
+`cld(n, stride) / n` only equals when `stride` divides `n`. Where it does not, the ratio drifts
+against the lattice the samples were actually taken on, reaching a full cell of offset at the far
+edge — so a caller that decimated by a stride must say so rather than let the sizes imply it.
 """
-function resample(A::AbstractMatrix, dstsize::Tuple{Int,Int}, method)
+function resample(A::AbstractMatrix, dstsize::Tuple{Int,Int}, method;
+                  scale::Tuple{Real,Real} = (size(A, 1) / dstsize[1], size(A, 2) / dstsize[2]))
     out = similar(A, Float32, dstsize)
-    return resample!(out, A, method)
+    return resample!(out, A, method; scale)
 end
 
-resample(A::AbstractMatrix, dstsize, method) =
-    resample(A, (Int(dstsize[1]), Int(dstsize[2])), method)
+resample(A::AbstractMatrix, dstsize, method; kw...) =
+    resample(A, (Int(dstsize[1]), Int(dstsize[2])), method; kw...)
 
 """
-    resample!(out, A, method) -> out
+    resample!(out, A, method; scale) -> out
 
 In-place [`resample`](@ref), to the size of `out`.
 """
-function resample!(out::AbstractMatrix, A::AbstractMatrix, ::Nearest)
+function resample!(out::AbstractMatrix, A::AbstractMatrix, ::Nearest;
+                   scale::Tuple{Real,Real} = (size(A, 1) / size(out, 1),
+                                              size(A, 2) / size(out, 2)))
     sr, sc = size(A)
     dr, dc = size(out)
-    ys = sr / dr
-    xs = sc / dc
+    ys, xs = Float64(scale[1]), Float64(scale[2])
     @inbounds for j in 1:dc
         # `(j - 0.5) * scale` is the destination sample's centre in 0-based source
         # coordinates; flooring and adding one gives the source sample containing it.
@@ -93,11 +102,12 @@ end
 # weights renormalised, so a partly-missing cell still yields the mean of what is there —
 # which is the behaviour a displacement field needs, and what a plain weighted sum would get
 # wrong by treating missing as zero.
-function resample!(out::AbstractMatrix, A::AbstractMatrix, ::Area)
+function resample!(out::AbstractMatrix, A::AbstractMatrix, ::Area;
+                   scale::Tuple{Real,Real} = (size(A, 1) / size(out, 1),
+                                              size(A, 2) / size(out, 2)))
     sr, sc = size(A)
     dr, dc = size(out)
-    ys = sr / dr
-    xs = sc / dc
+    ys, xs = Float64(scale[1]), Float64(scale[2])
     @inbounds for j in 1:dc
         # Source interval this destination column covers, in continuous coordinates.
         x0 = (j - 1) * xs
@@ -131,21 +141,29 @@ function resample!(out::AbstractMatrix, A::AbstractMatrix, ::Area)
     return out
 end
 
-# Catmull-Rom bicubic, the `a = -0.5` member of the cubic family. OpenCV uses `a = -0.75`;
-# the difference is a slightly different overshoot at edges, and it matters here only as a
-# smoothness choice rather than a fidelity one, because the result feeds the *prior* for the
-# next level rather than the output. Catmull-Rom is chosen for interpolating exactly through
-# the source samples, which keeps a coarse estimate unchanged where it was already known.
+# Bicubic convolution with `a = -0.75`, which is `cv2.INTER_CUBIC` and so the reference's choice
+# (`autoRIFT.py:846-847`). Interpolates exactly through the source samples, keeping a coarse estimate
+# unchanged where it was already known.
+#
+# The parameter is a fidelity choice here, not a smoothness preference, because a decimated
+# chip-size level's interpolated values *are* the output at every point the level owns —
+# `_undecimate_level` writes them into the result. Catmull-Rom (`a = -0.5`) agrees with this at every
+# node and at each cell's centre, and departs from it antisymmetrically in between: opposite signs at
+# a quarter and three quarters across a cell, scaling with the field's local curvature. Across an
+# 8 px step that is ±0.19 px, which is the size of the disagreement it produced along an iceberg
+# margin — visible as a one-cell line of alternating sign on the coarse levels alone, and exactly zero
+# wherever the finest level answered and no interpolation happened.
 #
 # NaN handling is what makes this longer than a textbook bicubic: any of the sixteen taps may
 # be missing, so the weights are renormalised over those present. With more than half
 # missing the estimate is not supportable and the result is NaN — otherwise a single valid
 # corner would be smeared across a whole empty region.
-function resample!(out::AbstractMatrix, A::AbstractMatrix, ::Bicubic)
+function resample!(out::AbstractMatrix, A::AbstractMatrix, ::Bicubic;
+                   scale::Tuple{Real,Real} = (size(A, 1) / size(out, 1),
+                                              size(A, 2) / size(out, 2)))
     sr, sc = size(A)
     dr, dc = size(out)
-    ys = sr / dr
-    xs = sc / dc
+    ys, xs = Float64(scale[1]), Float64(scale[2])
     wx = MVector4()
     wy = MVector4()
     @inbounds for j in 1:dc
@@ -196,14 +214,19 @@ end
     return v.d
 end
 
-# Catmull-Rom basis at fractional offset `t`, for taps at -1, 0, +1, +2.
+# Cubic convolution basis at fractional offset `t`, for taps at -1, 0, +1, +2, with `a = -0.75` —
+# OpenCV's `interpolateCubic`, expanded. The outer taps are the same polynomial evaluated at `t + 1`
+# and `2 - t`, and the inner two are its `|s| <= 1` branch at `t` and `1 - t`; writing them out keeps
+# this to a handful of multiplies per sample.
 @inline function _cubic_weights!(w::MVector4, t::Float64)
+    a = -0.75
     t2 = t * t
     t3 = t2 * t
-    w.a = -0.5t3 + t2 - 0.5t
-    w.b = 1.5t3 - 2.5t2 + 1.0
-    w.c = -1.5t3 + 2.0t2 + 0.5t
-    w.d = 0.5t3 - 0.5t2
+    u = 1.0 - t
+    w.a = a * (t3 - 2t2 + t)
+    w.b = (a + 2.0) * t3 - (a + 3.0) * t2 + 1.0
+    w.c = (a + 2.0) * (u * u * u) - (a + 3.0) * (u * u) + 1.0
+    w.d = a * (u * u * u - 2.0 * (u * u) + u)
     return w
 end
 

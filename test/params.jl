@@ -138,14 +138,84 @@ end
     # Measured, that parameterisation buys 1.000x at chip 32/64/128 — nothing — so the tuple is
     # here for `isbits` and for the trimmed binary, not for speed. `isconcretetype` alone does not
     # catch a regression to `Vector`; `isbitstype` does, which is why both are asserted.
+    # A GPU backend is included because it is a `Params` type parameter: selecting one must not
+    # cost the inline layout the trimmed binary depends on, and the backends are singletons
+    # precisely so it does not.
     for p in (AutoRIFT.params(), AutoRIFT.params(; rotation = true),
-              AutoRIFT.params(; rotation = (-6, -3, 0, 3, 6)))
+              AutoRIFT.params(; rotation = (-6, -3, 0, 3, 6)),
+              AutoRIFT.params(; backend = :metal))
         @test isconcretetype(typeof(p))
         @test isbitstype(typeof(p))
         for name in fieldnames(typeof(p))
             @test isconcretetype(fieldtype(typeof(p), name))
         end
     end
+end
+
+@testset "backend selection" begin
+    @test AutoRIFT.params().backend === AutoRIFT.CPU()
+    @test AutoRIFT.params(; backend = :cpu).backend === AutoRIFT.CPU()
+    @test AutoRIFT.params(; backend = :metal).backend === AutoRIFT.MetalGPU()
+    @test AutoRIFT.params(; backend = :cuda).backend === AutoRIFT.CUDAGPU()
+    # An instance passes through, which is the spelling the trimmable positional path needs.
+    @test AutoRIFT.params(; backend = AutoRIFT.MetalGPU()).backend === AutoRIFT.MetalGPU()
+
+    @test !AutoRIFT.isgpu(AutoRIFT.CPU())
+    @test AutoRIFT.isgpu(AutoRIFT.MetalGPU())
+    @test AutoRIFT.isgpu(AutoRIFT.CUDAGPU())
+
+    # There is deliberately no `:gpu`: a machine may hold more than one kind of device, so naming
+    # the vendor is the whole content of the keyword.
+    @test_throws "is not recognised" AutoRIFT.params(; backend = :gpu)
+    @test_throws "must be a Symbol or an `AutoRIFT.Backend`" AutoRIFT.params(; backend = 1)
+
+    # Threading and a device both parallelise the grid loop, so the combination is rejected rather
+    # than silently resolved one way. A caller who asked for both has a wrong expectation about
+    # which is in effect, and a slow run is the hardest failure to diagnose from outside.
+    @test_throws "cannot be combined" AutoRIFT.params(; backend = :metal, threaded = true)
+    @test_throws "cannot be combined" AutoRIFT.params(; backend = :cuda, threaded = true)
+    # Either alone is fine.
+    @test AutoRIFT.params(; threaded = true).backend === AutoRIFT.CPU()
+    @test !AutoRIFT.istrue(AutoRIFT.params(; backend = :metal).threaded)
+
+    # Selecting a device whose kernels are not loaded must say which package to load — except for
+    # `:cuda`, where no adapter exists, so `using CUDA` would succeed and change nothing. Telling a
+    # caller to load a package that cannot help is the one unhelpful thing this error can do, and
+    # these two cases are why the message is not shared.
+    let a = rand(Float32, 96, 96), kw = (; chip_size = 16, search_radius = 6)
+        @test_throws "is not implemented — loading CUDA will not help" AutoRIFT.autorift(
+            a, copy(a); backend = :cuda, kw...)
+        # Skipped where Metal is loaded and functional, which is the one case this does not throw.
+        if !(isdefined(Main, :Metal) && Main.Metal.functional())
+            @test_throws "needs Metal to be loaded" AutoRIFT.autorift(
+                a, copy(a); backend = :metal, kw...)
+        end
+    end
+
+    # The positional constructor is stable API and predates this field, so the 19-argument form
+    # must still work and must mean the CPU. `app/` calls exactly this.
+    p = AutoRIFT.Params((ZNCC(),), Highpass(), PyramidRefine(), GardnerFilter(),
+               AutoRIFT.False(), AutoRIFT.NoRotationSearch(),
+               (X = 32, Y = 32), (X = 128, Y = 128), (X = 32, Y = 32), (X = 25, Y = 25),
+               6, 4, 8, 0.01, 0.0, 0.0, 3, UInt64(0), false)
+    @test p.backend === AutoRIFT.CPU()
+    # And the 20-argument form selects a device.
+    q = AutoRIFT.Params((ZNCC(),), Highpass(), PyramidRefine(), GardnerFilter(),
+               AutoRIFT.False(), AutoRIFT.NoRotationSearch(),
+               (X = 32, Y = 32), (X = 128, Y = 128), (X = 32, Y = 32), (X = 25, Y = 25),
+               6, 4, 8, 0.01, 0.0, 0.0, 3, UInt64(0), false, AutoRIFT.MetalGPU())
+    @test q.backend === AutoRIFT.MetalGPU()
+
+    # Selecting a backend whose package is absent must name the package. The whole point of
+    # declaring the backends in the core rather than in their extensions is that this error is
+    # reachable at all — a `MethodError` on an internal function would name neither the keyword
+    # nor the fix.
+    @test AutoRIFT.required_package(AutoRIFT.MetalGPU()) == "Metal"
+    @test AutoRIFT.required_package(AutoRIFT.CUDAGPU()) == "CUDA"
+    a = rand(Float32, 150, 150)
+    b = circshift(a, (2, 3))
+    @test_throws "needs Metal to be loaded" autorift(a, b, AutoRIFT.params(;
+        backend = :metal, chip_size = 32, search_radius = 6, chip_size_max = 32))
 end
 
 @testset "booltype" begin

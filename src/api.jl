@@ -252,10 +252,10 @@ Estimate the displacement of surface features between two images of the same sce
 to sub-pixel precision.
 
 Both images must be co-registered to a common grid and the same size. The result carries `dx`
-and `dy` in pixels, the peak `correlation`, the `chip_size` that produced each point, and an
-`interpolated` mask — see [`MultichipResult`](@ref). Points where no scale could produce a
-coherent estimate are `NaN`, which is deliberately distinct from a measured displacement of
-zero.
+and `dy` in pixels, the peak `correlation`, the `peak_ratio` of that peak to the best rival on the
+same surface, the `chip_size` that produced each point, and an `interpolated` mask — see
+[`MultichipResult`](@ref). Points where no scale could produce a coherent estimate are `NaN`, which
+is deliberately distinct from a measured displacement of zero.
 
 # Keywords
 
@@ -349,6 +349,10 @@ out = autorift(image1, image2, p)
 with defaults, and a second spelling of the defaults would be a second place for them to drift.
 The positional form is stable API — the field order is `Params`'s own, in declaration order.
 
+The call above omits the trailing `backend` field, which then defaults to `AutoRIFT.CPU()`. Pass
+`AutoRIFT.MetalGPU()` or `AutoRIFT.CUDAGPU()` as a twentieth argument to select a device; see
+[`AutoRIFT.Backend`](@ref).
+
 Validity masks are not accepted here. They are per-image data rather than configuration, and the
 keyword form or [`ImagePair`](@ref) is where they belong; this overload exists for the case where
 *nothing* is a runtime value.
@@ -358,6 +362,27 @@ function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, p::Param
     grid = _build_grid(size(pair), p)
     _warm_grid_plans(grid, p)
     return correlate_multichip(pair, grid, p)
+end
+
+"""
+    autorift(reference, secondary, p::Params, block_size::Tuple{Int,Int}) -> MultichipResult
+
+Correlate a block at a time, with an already-resolved [`Params`](@ref).
+
+`block_size` is `(X, Y)` pixels per block, as the `process_block_size` keyword takes — see
+[`autorift`](@ref)'s keyword form for what blocking promises and costs. The result is bit-identical
+to the unblocked run.
+
+Positional throughout, for the same reason the three-argument form is: nothing between the call and
+the correlation is a runtime value, so a `--trim`ed binary can reach it. The keyword form resolves
+`process_block_size` through keyword machinery that `--trim` cannot follow.
+"""
+function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, p::Params,
+                  block_size::Tuple{Int,Int})
+    raw = ImagePair(reference, secondary)
+    grid = _build_grid(size(raw), p)
+    _warm_grid_plans(grid, p)
+    return _run(raw, grid, p, block_size)
 end
 
 """
@@ -459,13 +484,97 @@ end
 #
 # A blocked run never reaches here, which is the whole point: it filters per block from raw input, so
 # the untiled path pays one pass over the mask and the blocked path pays nothing, with no branch.
-_prepare(img::AbstractMatrix, mask::AbstractMatrix{Bool}, p::Params) =
-    replace_nonfinite(preprocess(img, resident(mask), p.preprocess, p.rng_seed)...)
+# The `replace_nonfinite` pass is skipped for the filters that already did it. Most of them do —
+# anything ending in `_filtered` finishes with exactly that pass — and repeating it allocates a fresh
+# image and a fresh mask per image to arrive at the arrays already in hand: 1.6 GiB per image on a
+# 17121x16961 scene, against 2.7 GiB of genuinely required filtered output for the pair.
+#
+# By dispatch on `_finishes_nonfinite` rather than a branch here, so a filter answers for itself and a
+# new one that forgets pays a redundant pass rather than leaking non-finite values into the correlator.
+# `WallisGapfill` is the method that still needs it: its random fill can leave them behind.
+function _prepare(img::AbstractMatrix, mask::AbstractMatrix{Bool}, p::Params)
+    m = resident(mask)
+    out, v = _slabbed(p) ? _preprocess_slabbed(img, m, p) :
+                           preprocess(img, m, p.preprocess, p.rng_seed)
+    return _finishes_nonfinite(p.preprocess) ? (out, v) : replace_nonfinite(out, v)
+end
 
 
 _prepare(pair::ImagePair, p::Params) = ImagePair(
     _prepare(pair.reference, pair.reference_valid, p),
     _prepare(pair.secondary, pair.secondary_valid, p))
+
+# Whether filtering this run's images may be split across tasks. The method's own
+# `AutoRIFT._slabbable` answers whether splitting reproduces the whole-image result; this adds only
+# the run's threading choice.
+#
+# Unlike `process_block_size`, threading is not something the caller asked for, so a filter that
+# cannot be split takes the serial path rather than raising — the alternative would turn a working
+# configuration into an error for a scheduling decision the caller never made.
+_slabbed(p::Params) = istrue(p.threaded) && _slabbable(p.preprocess)
+
+# `preprocess` over row slabs, one task each, with the whole-image result.
+#
+# Each task filters a slab grown by `filter_reach` on both sides and keeps only the rows it owns, so
+# every pixel is filtered from the same neighbourhood a whole-image call would give it. That makes
+# the values agree; what makes them agree *bit for bit* is the alignment below.
+#
+# The windowed means in `src/window.jl` already work in `_BAND_ROWS`-tall bands and **reseed each
+# band's running sum** from the window its first row sees — which is what makes their banding exact
+# rather than approximate. Snapping slab starts to a multiple of `_BAND_ROWS` therefore lands each
+# task's internal band grid on the same rows the serial call would have used, so no value is the
+# result of a differently-ordered accumulation. Verified on a 3072² Landsat window: 0 of 9,437,184
+# elements differ. **A slab boundary off that lattice reassociates the sums** and the output moves in
+# the last bits, so this coupling is load-bearing: a change to `_BAND_ROWS` or to the banding must
+# keep it.
+#
+# Measured 5.1x on 12 threads at 3072², which matters because `_prepare` is otherwise the whole
+# serial fraction of a threaded run — 12% at 3072² and, extrapolated by pixel count, ~20% of a
+# full-scene Landsat pair.
+function _preprocess_slabbed(img::AbstractMatrix, mask::AbstractMatrix{Bool}, p::Params)
+    nr, nc = size(img)
+    reach = filter_reach(p.preprocess)
+    rows = _slab_rows(nr, reach)
+    # One slab is the whole image, so take the path that does not copy through a view.
+    rows >= nr && return preprocess(img, mask, p.preprocess, p.rng_seed)
+
+    out = Matrix{Float32}(undef, nr, nc)
+    v = Matrix{Bool}(undef, nr, nc)
+    tasks = map(1:rows:nr) do lo
+        StableTasks.@spawn begin
+            hi = min(lo + rows - 1, nr)
+            # The slab this task reads, and where its own rows sit inside it.
+            rlo, rhi = max(lo - reach, 1), min(hi + reach, nr)
+            # `_read_block`, not a view. A view defers the read, so a lazy array is then walked one
+            # element at a time — measured at 444 s against 0.6 s for a single 512² window, which is
+            # the pathology that helper exists to avoid. `_prepare` is reachable with a disk-backed
+            # pair on any non-blocked run, so this path has to take the same care the blocked one does.
+            slab = rlo:rhi
+            cols = axes(img, 2)
+            sout, sv = preprocess(_read_block(img, slab, cols),
+                                  _read_block(mask, slab, cols),
+                                  p.preprocess, p.rng_seed)
+            keep = (lo:hi) .- (rlo - 1)     # this task's own rows, in slab coordinates
+            copyto!(view(out, lo:hi, :), view(sout, keep, :))
+            copyto!(view(v, lo:hi, :), view(sv, keep, :))
+        end
+    end
+    foreach(wait, tasks)
+    return out, v
+end
+
+# Rows per slab: the image split across the available threads, but never so thin that a slab is
+# mostly the halo it reads, and always a whole number of `_BAND_ROWS` bands.
+#
+# The band multiple is the load-bearing part and the reason this is a named function rather than two
+# expressions at the call site — see `_preprocess_slabbed` for why the alignment is what makes the
+# result bit-identical. A result of `nr` or more means one slab, i.e. do not thread.
+function _slab_rows(nr::Int, reach::Int)
+    # `2 * reach` is what a slab reads beyond its own rows, so a slab that short would read more
+    # overlap than data. `_BAND_ROWS` floors it, since a slab below one band cannot align anyway.
+    nslabs = clamp(fld(nr, max(2 * reach, _BAND_ROWS)), 1, Threads.nthreads())
+    return cld(cld(nr, _BAND_ROWS), nslabs) * _BAND_ROWS
+end
 
 # Prepare `img`, unless the cache already holds it prepared — in which case reuse that.
 #
