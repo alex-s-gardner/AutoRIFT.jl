@@ -287,34 +287,46 @@ function outputs_page(d; path = joinpath(FIG_PLOTS, "fig_outputs.png"))
     hm = heatmap!(axc, mapshow(blank(j.corr, measured)); colormap = :magma, colorrange = (0, 1))
     barof((1, 2), hm, "ZNCC peak", axc)
 
-    # `peak_ratio` is zero where the peak lay against the search boundary, so the count of railed points is
-    # stated in the title rather than mapped separately: on a scene whose flow the radius covers there
-    # are none, and an all-one-colour panel reads as a broken plot rather than as an empty set.
+    # `peak_ratio` is zero where the peak lay against the search boundary. Those points are left to the
+    # colour scale rather than counted in the title: on a scene whose flow the radius covers there are
+    # none, and a title that reports "0 of N" spends the reader's attention on an empty set.
     pprok = jok .& .!isnan.(j.ppr)
     ppr = map((v, k) -> k ? Float64(v) : NaN, j.ppr, pprok)
     finite = filter(isfinite, vec(ppr))
-    hi = isempty(finite) ? 1.0 : quantile(finite, 0.99)
+    # The scale starts at 1, not 0: the primary peak is the surface maximum, so the ratio cannot fall
+    # below 1 and a scale reaching 0 spends half its range on values no point can take. 1 is also the
+    # value that means something — a rival exactly as tall as the peak — so it belongs at the end of the
+    # bar rather than in the middle of it. The upper end is the 99th percentile, which keeps a few
+    # unrivalled peaks from flattening everything else.
+    hi = isempty(finite) ? 2.0 : max(quantile(finite, 0.99), 1.01)
+    axs = mapax((1, 3), "peak ratio (primary / secondary peak height)")
+    # `track!` reports zero where the peak lay against the search boundary, which is now below the
+    # scale. Left to itself Makie paints that at the bottom colour, making a railed point
+    # indistinguishable from a ratio of exactly 1 — opposite readings, since the first is a point whose
+    # displacement is only a lower bound. So `lowclip` marks them red, but only when the scene has any:
+    # the clip swatch draws a triangle on the bar whether or not it is used, and one pointing at an
+    # empty set reads as a condition the map contains.
     nrail = count(iszero, finite)
-    axs = mapax((1, 3), @sprintf("peak ratio; %d of %d at the search boundary",
-                                 nrail, length(finite)))
-    hm2 = heatmap!(axs, mapshow(ppr); colormap = :viridis, colorrange = (0, hi))
-    barof((1, 4), hm2, "primary / secondary peak", axs)
+    hm2 = heatmap!(axs, mapshow(ppr); colormap = :viridis, colorrange = (1, hi),
+                   (nrail > 0 ? (; lowclip = :red) : (;))...)
+    barof((1, 4), hm2, "ratio", axs)
 
-    # Two categories, so a legend of two swatches rather than a colour bar. A bar implies an ordered
-    # range between its ends and sizes itself to the map's height, which for a Boolean leaves a tall
-    # gradient labelled `true`/`false` — and those labels name the field rather than what it says about
-    # the point. Named swatches state the two conditions, and the fraction interpolated goes in the
-    # title, which is the number a reader wants and no legend can carry.
+    # Two categories, so a legend of two swatches rather than a colour bar: a bar implies an ordered
+    # range between its ends and sizes itself to the map's height, neither of which fits a Boolean. The
+    # panel is titled for the field it draws and the swatches carry its two values, so the reader maps
+    # the picture onto `interpolated` in the result rather than onto a phrase that appears nowhere in
+    # the API. The fraction stays in the title, being the number a reader wants and one no legend can
+    # carry.
     interp = map((v, k) -> k ? Float64(v != 0) : NaN, j.interp, jok)
     nint = count(i -> jok[i] && j.interp[i] != 0, eachindex(j.interp))
-    hm4 = heatmap!(mapax((1, 5), @sprintf("how each point got its displacement (%.1f%% filled)",
+    hm4 = heatmap!(mapax((1, 5), @sprintf("interpolated (%.1f%%)",
                                           100 * nint / max(count(jok), 1))),
                    mapshow(interp);
                    colormap = cgrad([:gray80, :dodgerblue]; categorical = true),
                    colorrange = (-0.5, 1.5))
     Legend(fig[1, 6],
            [PolyElement(; color = :gray80), PolyElement(; color = :dodgerblue)],
-           ["measured on its own\ncorrelation surface", "filled from\nits neighbours"];
+           ["false", "true"];
            framevisible = false, patchsize = (20, 20), rowgap = 12, labelsize = 15,
            halign = :left, valign = :center, tellheight = false, tellwidth = true)
 
