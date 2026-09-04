@@ -23,12 +23,18 @@ const REGRESSION_THRESHOLD = 1.10
 # Reported but not failed: worth seeing in the table, not worth blocking on.
 const NOTEWORTHY_THRESHOLD = 1.03
 
-# A ratio needs a measurable baseline to mean anything. Half of this suite runs in
-# under a microsecond, and at a few nanoseconds the timer's own resolution exceeds
-# the threshold: `points/surface_size` clears 1.10x on a 0.2 ns difference. Faster
-# benchmarks are still measured, printed and flagged in the table, but they do not
-# fail the build. Allocation counts are exact at every scale and stay enforced.
-const MIN_GATED_NS = 100
+# A ratio needs a baseline long enough to time reliably. Below a microsecond a shared
+# runner's variation exceeds `REGRESSION_THRESHOLD` on its own: `points/sanitize!` has
+# read 1.03x, 1.11x and 1.18x across three runs of identical code, and
+# `points/surface_size` clears the threshold on a 0.8 ns difference. A ratio there
+# reports the runner, not the code.
+#
+# Around fifteen of the suite's timed benchmarks fall below this. They are still measured,
+# printed, and listed when they slow down — they just do not fail the build. Allocation
+# counts are exact at any duration and stay enforced at every scale, which is what keeps
+# those entries meaningful: for the per-point paths, allocating at all is the regression
+# that matters, and that is caught however short the benchmark.
+const MIN_GATED_NS = 1_000
 
 # Benchmarks whose names match these are expected to be allocation-free, so any
 # allocation at all is a failure rather than a slowdown. The per-point correlation
@@ -212,7 +218,7 @@ function main()
     # are only unenforced because the baseline is too fast to time reliably. Silence
     # here would let "No regressions" cover a row the table shows as slower.
     if !isempty(ungated)
-        println("\nSlower but under $(MIN_GATED_NS) ns, so not gated:")
+        println("\nSlower but under $(prettytime(MIN_GATED_NS)), so not gated:")
         foreach(r -> println("  - ", r), ungated)
     end
     if !failed
