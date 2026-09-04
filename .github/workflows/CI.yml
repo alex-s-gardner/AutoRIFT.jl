@@ -55,16 +55,18 @@ jobs:
         if: matrix.version == 'lts'
         run: |
           julia -e '
-            path = "Project.toml"
-            out = String[]
-            section = ""
-            for line in eachline(path)
-                startswith(line, "[") && (section = strip(line))
-                section == "[extras]" && startswith(line, "ImagePairGeometry ") && continue
-                section == "[targets]" && (line = replace(line, ", \"ImagePairGeometry\"]" => "]"))
-                push!(out, line)
+            function strip_entry(path)
+                out = String[]
+                section = ""
+                for line in eachline(path)
+                    startswith(line, "[") && (section = strip(line))
+                    section == "[extras]" && startswith(line, "ImagePairGeometry ") && continue
+                    section == "[targets]" && (line = replace(line, ", \"ImagePairGeometry\"]" => "]"))
+                    push!(out, line)
+                end
+                write(path, join(out, "\n") * "\n")
             end
-            write(path, join(out, "\n") * "\n")'
+            strip_entry("Project.toml")'
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
       - uses: julia-actions/julia-processcoverage@v1
