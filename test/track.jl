@@ -1,5 +1,5 @@
 using AutoRIFT: ImagePair, PointSet, pointset, gridpoints, params, track, track!,
-                displacement_field, nmeasured, DisplacementField, Highpass
+                displacement_field, nmeasured, DisplacementField, Highpass, extent
 
 # Recovered displacement is secondary-to-reference, the negative of feature motion; see
 # `peak_offset`'s docstring. Negating here keeps the tests reading in the same direction
@@ -409,12 +409,12 @@ end
     @test all(isequal.(full.correlation, track(pair, grid, p).correlation))
 
     geom = AutoRIFT.pass_geometry(grid)
-    @test geom == AutoRIFT.PassGeometry(32, 32, 25, 25)
+    @test geom == AutoRIFT.PassGeometry(extent(32), extent(25))
 
     # A sub-block wholly inside the small-radius half, so its own maxima are genuinely smaller.
     rows, cols = 3:8, (nc ÷ 2 + 2):(nc ÷ 2 + 7)
     sub = grid[rows, cols]
-    @test AutoRIFT.pass_geometry(sub) == AutoRIFT.PassGeometry(32, 32, 10, 10)
+    @test AutoRIFT.pass_geometry(sub) == AutoRIFT.PassGeometry(extent(32), extent(10))
 
     with = track(pair, sub, p; geometry = geom)
     @test all(isequal.(full.dx[rows, cols], with.dx))
@@ -440,5 +440,5 @@ end
     # surface as a `DimensionMismatch` about workspace extents from deep inside `correlate!`,
     # which does not mention the argument that caused it.
     @test_throws "may widen a pass but never narrow it" track(
-        pair, pts, params(); geometry = AutoRIFT.PassGeometry(32, 32, 4, 4))
+        pair, pts, params(); geometry = AutoRIFT.PassGeometry(extent(32), extent(4)))
 end

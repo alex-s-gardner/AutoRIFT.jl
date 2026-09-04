@@ -1,7 +1,7 @@
 using AutoRIFT: workspace, correlate!, prepare_chip!, next_fft_size,
                 integral, integral_sq, boxsum, peak_index, peak, peak_offset,
                 pyrup!, reflect101, refinement_workspace, subpixel_peak,
-                clear_workspaces!, ImagePair, gridpoints, params, track
+                clear_workspaces!, ImagePair, gridpoints, params, track, extent
 
 @testset "integral images" begin
     A = Float32[1 2 3; 4 5 6; 7 8 9]
@@ -300,6 +300,26 @@ end
     w8 = AutoRIFT.take_workspace!(UInt8, 32, 25)
     AutoRIFT.give_workspace!(w8)
     @test AutoRIFT.take_workspace!(Float32, 32, 25) === w8
+
+    # A scalar, a plain tuple and an `Extent` name the same geometry, so all three must key the
+    # same pool entry. `Extent isa Tuple` is `false`, so normalizing by a tuple test would send an
+    # extent down the scalar branch — a workspace sized from `(x, x)` where `x` is the whole pair,
+    # and a key that never matches the other two.
+    clear_workspaces!()
+    s = AutoRIFT.take_workspace!(Float32, 32, 25)
+    AutoRIFT.give_workspace!(s)
+    @test AutoRIFT.take_workspace!(Float32, (32, 32), (25, 25)) === s
+    AutoRIFT.give_workspace!(s)
+    @test AutoRIFT.take_workspace!(Float32, extent(32), extent(25)) === s
+    AutoRIFT.give_workspace!(s)
+    @test length(AutoRIFT.WORKSPACE_POOL) == 1
+    @test s.max_chip === extent(32)
+    @test s.max_radius === extent(25)
+
+    # And a non-square extent is read as the pair it is, not as its first component.
+    ws = workspace(Float32, extent((X = 32, Y = 16)), extent((X = 25, Y = 10)))
+    @test size(ws.chip) == (16, 32)
+    @test size(ws.surface) == (20, 50)
 
     # Refinement workspaces pool on `upsampling` alone, since that and the fixed 5x5 patch
     # determine every extent.

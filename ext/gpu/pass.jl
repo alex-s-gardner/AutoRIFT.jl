@@ -22,7 +22,8 @@ _gpu_worth_it(nsearch::Int) = nsearch >= GPU_MIN_BATCH
 # gather reads windows out of them. They are uploaded once per pass rather than once per batch,
 # since every batch reads from the same pair.
 function _gpu_pass!(backend_obj, out::AutoRIFT.DisplacementField, ref, sec, okmask,
-                    pts::AutoRIFT.PointSet{1}, chipx::Int, chipy::Int, rx::Int, ry::Int,
+                    pts::AutoRIFT.PointSet{1}, chip::AutoRIFT.Extent,
+                    radius::AutoRIFT.Extent,
                     up::Int, p::AutoRIFT.Params, measure::AutoRIFT.SimilarityMeasure)
     measure isa AutoRIFT.ZNCC || throw(ArgumentError(
         "the GPU path implements `ZNCC` only, but this pass uses " *
@@ -44,6 +45,10 @@ function _gpu_pass!(backend_obj, out::AutoRIFT.DisplacementField, ref, sec, okma
     dref = _to_device(backend_obj, ref)
     dsec = _to_device(backend_obj, sec)
 
+    # The pool keys on plain tuples, so the extents are unwrapped here rather than at every
+    # kernel launch below, which takes the two axes as separate `Int32`s regardless.
+    chipx, chipy = chip.X, chip.Y
+    rx, ry = radius.X, radius.Y
     batch = gpu_batch_size((chipx, chipy), (rx, ry))
     ws = take_gpu_workspace!(dref, (chipx, chipy), (rx, ry), batch)
     try

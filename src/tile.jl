@@ -52,20 +52,20 @@ end
 How a scene is divided for tiled processing: the blocks, and the halo every block reads beyond
 what it writes.
 
-`blocks` is a vector of [`AutoRIFT.Block`](@ref) in column-major order over the grid. `halo` is in
-pixels, `(x, y)`.
+`blocks` is a vector of [`AutoRIFT.Block`](@ref) in column-major order over the grid. `halo` is an
+[`AutoRIFT.Extent`](@ref) in pixels.
 """
 struct BlockLayout
     blocks::Vector{Block}
-    halo::Tuple{Int,Int}
+    halo::Extent
 end
 
 Base.length(l::BlockLayout) = length(l.blocks)
 
 """
-    AutoRIFT.halo(grid::PointSet, p::Params, imagesize) -> (hx, hy)
+    AutoRIFT.halo(grid::PointSet, p::Params, imagesize) -> Extent
 
-Pixels a block must read beyond what it writes, in `(x, y)`.
+Pixels a block must read beyond what it writes, as an [`AutoRIFT.Extent`](@ref).
 
 The sum of the correlation reach — `chip/2 + radius + ceil(abs(prior))`, which
 `_pass_geometry` already computes and which this does not re-derive — and the preprocessing
@@ -89,13 +89,13 @@ function halo(grid::PointSet, p::Params, imagesize::Tuple{Int,Int})
     w = _filter_halo(p)
     # `_pass_geometry`'s pad is exactly the correlation reach plus the reference's 2-pixel slack
     # for the half-pixel grid offset and index truncation.
-    _, _, _, _, pad, _ = _pass_geometry(_worst_level_points(grid, p), imagesize)
+    _, _, pad, _ = _pass_geometry(_worst_level_points(grid, p), imagesize)
     ox, oy = _level_centre_offset(p)
-    return (pad[1] + w + ox, pad[2] + w + oy)
+    return Extent((pad.X + w + ox, pad.Y + w + oy))
 end
 
 """
-    AutoRIFT.halo(p::Params) -> (hx, hy)
+    AutoRIFT.halo(p::Params) -> Extent
 
 The halo for a grid [`AutoRIFT.gridpoints`](@ref) would build from `p`, without building it.
 
@@ -120,7 +120,7 @@ function halo(p::Params)
     # A decimated level correlates at its cells' centres, which reach further than the grid points the
     # rest of this arithmetic is derived from.
     ox, oy = _level_centre_offset(p)
-    return (hx + w + ox, hy + w + oy)
+    return Extent((hx + w + ox, hy + w + oy))
 end
 
 # The preprocessing filter's contribution to the halo, and the one configuration that has none.
@@ -220,12 +220,17 @@ The trailing block in each direction is short when the grid does not divide even
 Throws if a block would be smaller than the halo it reads, since such a block is all overlap.
 """
 function block_layout(grid::PointSet{2}, p::Params, imagesize::Tuple{Int,Int},
-                      block_size::Tuple{Int,Int})
-    px, py = block_size
+                      block_size)
+    # Normalized by the same helper the `process_block_size` keyword uses, rather than by `extent`
+    # directly: this is public API in its own right, and `extent` would read a scalar as a square
+    # block — which is exactly what that helper exists to refuse.
+    bs = _block_size(block_size)
+    px, py = bs.X, bs.Y
     (px > 0 && py > 0) || throw(ArgumentError(
         "`process_block_size` must be positive in both axes, got $px by $py pixels"))
 
-    hx, hy = halo(grid, p, imagesize)
+    h = halo(grid, p, imagesize)
+    hx, hy = h.X, h.Y
     # A block narrower than its own halo reads more overlap than data, so it is a configuration
     # error rather than something to silently widen. Compared directly, both being pixels.
     (px >= hx && py >= hy) || throw(ArgumentError(
@@ -254,7 +259,7 @@ function block_layout(grid::PointSet{2}, p::Params, imagesize::Tuple{Int,Int},
                             max(rlo - hy, 1):min(rhi + hy, nrows),
                             max(clo - hx, 1):min(chi + hx, ncols)))
     end
-    return BlockLayout(blocks, (hx, hy))
+    return BlockLayout(blocks, h)
 end
 
 # The index each block starts at along one axis, so no block's coordinates span more than `want`
@@ -576,8 +581,7 @@ decision that looks at more than one point is taken once, on the assembled grid,
 block; and a block's filtered values and eroded mask agree with a whole-scene filter everywhere the
 block writes, which is what the filter term in [`AutoRIFT.halo`](@ref) buys.
 """
-function correlate_tiled(raw::ImagePair, grid::PointSet{2}, p::Params,
-                         block_size::Tuple{Int,Int})
+function correlate_tiled(raw::ImagePair, grid::PointSet{2}, p::Params, block_size)
     layout = block_layout(grid, p, size(raw), block_size)
     # One set for the whole run. `block_buffers` sizes from the layout's largest read window, which
     # no level changes, so allocating per pass would allocate the same nine arrays twice per level.
@@ -603,8 +607,7 @@ function _run_blocked(raw::ImagePair, pts::PointSet{2}, p::Params, layout::Block
     out = displacement_field(pts)
     # Every block shares the geometry, so one warm-up serves all of them — and it must happen here,
     # on this task, rather than inside a block.
-    _warm_pass_plans(geometry.chip_x, geometry.chip_y, geometry.radius_x, geometry.radius_y,
-                     measure)
+    _warm_pass_plans(geometry.chip, geometry.radius, measure)
 
     serial = _serial_params(p)
     if istrue(p.threaded)

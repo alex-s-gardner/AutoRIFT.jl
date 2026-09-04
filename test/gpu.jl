@@ -84,7 +84,7 @@ end
 # to disagree — see the header.
 function cpu_in_range(pair, pts, chip, radius)
     ws = workspace(eltype(pair.reference), chip, radius)
-    sh = AutoRIFT._shift_points(pts, (0, 0))
+    sh = AutoRIFT._shift_points(pts, extent(0))
     ok = trues(length(pts))
     for i in eachindex(sh)
         AutoRIFT.issearchable(sh, i) || continue

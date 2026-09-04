@@ -131,15 +131,15 @@ function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Param
         "output has $(length(out)) points but the point set has $(length(pts))"))
 
     flat = scatter(pts)          # free: shares memory, discards only the layout
-    ownx, owny, ownrx, ownry, pad, fits = _pass_geometry(flat, size(pair))
+    ownchip, ownradius, pad, fits = _pass_geometry(flat, size(pair))
     # Nothing searchable: skip the padding, the planning, and the task spawning entirely.
     # Later chip-size levels hit this, since their coarse pass zeroes most radii.
-    ownx == 0 && return out
+    ownchip.X == 0 && return out
 
     # A supplied geometry replaces this pass's own maxima, so a subset executes the transform the
     # whole set would have. It may only ever *widen* them: a workspace narrower than a point needs
     # cannot hold its surface, and `correlate!` would throw deep in the loop rather than here.
-    chipx, chipy, rx, ry = _resolve_geometry(geometry, ownx, owny, ownrx, ownry)
+    chip, radius = _resolve_geometry(geometry, ownchip, ownradius)
 
     # `pad` stays this pass's own, and deliberately so: it is what makes *these* points' windows
     # in bounds, which depends on where they sit rather than on how large the transform is.
@@ -159,12 +159,12 @@ function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Param
     # rather than on the union, which is the ordinary reason for one.
     if fits
         _dispatch_pass!(out, pair.reference, pair.secondary, okmask,
-                        _shift_points(flat, (0, 0)), chipx, chipy, rx, ry, p, measure, subpixel)
+                        _shift_points(flat, extent(0)), chip, radius, p, measure, subpixel)
     else
         # The mask pads to `false`, which is what distinguishes "outside the image" from "dark".
         _dispatch_pass!(out, _zeropad(pair.reference, pad), _zeropad(pair.secondary, pad),
                         _zeropad(okmask, pad), _shift_points(flat, pad),
-                        chipx, chipy, rx, ry, p, measure, subpixel)
+                        chip, radius, p, measure, subpixel)
     end
     return out
 end
@@ -179,25 +179,25 @@ end
 # `AutoRIFT.PassRunner` records: a keyword annotated with an abstract type is unresolvable under
 # `--trim`.
 _dispatch_pass!(out::DisplacementField, ref, sec, okmask, pts::PointSet{1},
-                chipx::Int, chipy::Int, rx::Int, ry::Int, p::Params,
+                chip::Extent, radius::Extent, p::Params,
                 measure::SimilarityMeasure, subpixel::SubpixelMethod) =
-    _dispatch_pass!(p.backend, out, ref, sec, okmask, pts, chipx, chipy, rx, ry, p, measure,
+    _dispatch_pass!(p.backend, out, ref, sec, okmask, pts, chip, radius, p, measure,
                     subpixel)
 
 function _dispatch_pass!(::CPU, out::DisplacementField, ref, sec, okmask, pts::PointSet{1},
-                        chipx::Int, chipy::Int, rx::Int, ry::Int, p::Params,
+                        chip::Extent, radius::Extent, p::Params,
                         measure::SimilarityMeasure, subpixel::SubpixelMethod)
     up = upsampling(subpixel)
     # Plans are built here, on this task, before any spawning. FFTW's planner is not
     # thread-safe, so leaving this to the workers would have every one of them contend on
     # the planner lock at its first point — turning the most parallel part of the run into
     # its most serial.
-    _warm_pass_plans(chipx, chipy, rx, ry, measure)
+    _warm_pass_plans(chip, radius, measure)
 
-    istrue(p.threaded) ? _track_threaded!(out, ref, sec, okmask, pts, chipx, chipy,
-                                          rx, ry, up, p, measure) :
-                         _track_chunk!(out, ref, sec, okmask, pts, chipx, chipy,
-                                       rx, ry, up, p, measure, eachindex(pts))
+    istrue(p.threaded) ? _track_threaded!(out, ref, sec, okmask, pts, chip, radius,
+                                          up, p, measure) :
+                         _track_chunk!(out, ref, sec, okmask, pts, chip, radius,
+                                       up, p, measure, eachindex(pts))
     return out
 end
 
@@ -213,14 +213,14 @@ end
 # CUDA` succeeds and changes nothing, sending the caller after a dependency that was never the
 # problem. It gets its own message naming the actual state.
 _dispatch_pass!(b::Backend, ::DisplacementField, _ref, _sec, _okmask, ::PointSet{1},
-                ::Int, ::Int, ::Int, ::Int, ::Params, ::SimilarityMeasure, ::SubpixelMethod) =
+                ::Extent, ::Extent, ::Params, ::SimilarityMeasure, ::SubpixelMethod) =
     throw(ArgumentError(
         "`backend = $(nameof(typeof(b)))()` needs $(required_package(b)) to be loaded. Run " *
         "`using $(required_package(b))` first — the device kernels live in a package extension, " *
         "so the core stays free of a GPU dependency."))
 
 _dispatch_pass!(::CUDAGPU, ::DisplacementField, _ref, _sec, _okmask, ::PointSet{1},
-                ::Int, ::Int, ::Int, ::Int, ::Params, ::SimilarityMeasure, ::SubpixelMethod) =
+                ::Extent, ::Extent, ::Params, ::SimilarityMeasure, ::SubpixelMethod) =
     throw(ArgumentError(
         "`backend = :cuda` is not implemented — loading CUDA will not help. The device kernels " *
         "are vendor-neutral (KernelAbstractions.jl), but only the Metal adapter ships, so there " *
@@ -256,23 +256,26 @@ function pass_geometry(pts::PointSet)
         rx = max(rx, pts.radius_x[i])
         ry = max(ry, pts.radius_y[i])
     end
-    return PassGeometry(cx, cy, rx, ry)
+    return PassGeometry(Extent((cx, cy)), Extent((rx, ry)))
 end
 
 # A supplied geometry wins, after checking it covers what this pass actually needs. Rejecting a
 # too-narrow one here names the mistake; letting it through produces a `DimensionMismatch` from
 # `correlate!` about workspace extents, which does not mention the argument that caused it.
-_resolve_geometry(::Nothing, cx::Int, cy::Int, rx::Int, ry::Int) = (cx, cy, rx, ry)
+_resolve_geometry(::Nothing, chip::Extent, radius::Extent) = (chip, radius)
 
-function _resolve_geometry(g::PassGeometry, cx::Int, cy::Int, rx::Int, ry::Int)
-    (g.chip_x >= cx && g.chip_y >= cy && g.radius_x >= rx && g.radius_y >= ry) ||
+# Components are interpolated rather than the extents themselves: showing a `NamedTuple` reaches
+# `Base.repeat` via `textwidth`, which `--trim` cannot resolve.
+function _resolve_geometry(g::PassGeometry, chip::Extent, radius::Extent)
+    (g.chip.X >= chip.X && g.chip.Y >= chip.Y &&
+     g.radius.X >= radius.X && g.radius.Y >= radius.Y) ||
         throw(ArgumentError(
             "the supplied `geometry` is smaller than this point set needs: chip " *
-            "$(g.chip_x)x$(g.chip_y) and radius $(g.radius_x)x$(g.radius_y) against a " *
-            "required chip $(cx)x$(cy) and radius $(rx)x$(ry). A pass geometry may widen a " *
-            "pass but never narrow it, since the workspace must hold every point's surface. " *
-            "Build it from the whole point set with `pass_geometry`."))
-    return (g.chip_x, g.chip_y, g.radius_x, g.radius_y)
+            "$(g.chip.X)x$(g.chip.Y) and radius $(g.radius.X)x$(g.radius.Y) against a " *
+            "required chip $(chip.X)x$(chip.Y) and radius $(radius.X)x$(radius.Y). A pass " *
+            "geometry may widen a pass but never narrow it, since the workspace must hold every " *
+            "point's surface. Build it from the whole point set with `pass_geometry`."))
+    return (g.chip, g.radius)
 end
 
 # Everything about a pass that is a summary over its points: the largest chip and radius
@@ -305,7 +308,12 @@ function _pass_geometry(pts::PointSet, imagesize::Tuple{Int,Int})
     end
     # The +2 is the reference's slack: it absorbs the half-pixel grid offset and any
     # rounding in the index truncations.
-    return cx, cy, rx, ry, (px + 2, py + 2), fits
+    #
+    # `pad` is an `Extent` like the other two, so every geometry this returns is axis-named. It is
+    # kept separate from them rather than folded into `PassGeometry`, because a caller may supply
+    # that to widen the transform while `pad` must stay this pass's own — it is what makes *these*
+    # points' windows in bounds, which depends on where they sit.
+    return Extent((cx, cy)), Extent((rx, ry)), Extent((px + 2, py + 2)), fits
 end
 
 # Translate points into padded-image coordinates, plus the half-pixel offset. A zero pad is
@@ -316,13 +324,13 @@ end
 # its true centre half a pixel past it. Adding 0.5 makes the displacement refer to that
 # centre, and makes every index truncation exact, since the coordinates become integers
 # plus one.
-function _shift_points(pts::PointSet, pad::Tuple{Int,Int})
-    px, py = pad
+function _shift_points(pts::PointSet, pad::Extent)
+    px, py = pad.X, pad.Y
     return rebuild(pts; x = pts.x .+ (px + 0.5), y = pts.y .+ (py + 0.5))
 end
 
-function _zeropad(A::AbstractMatrix{T}, pad::Tuple{Int,Int}) where {T}
-    px, py = pad
+function _zeropad(A::AbstractMatrix{T}, pad::Extent) where {T}
+    px, py = pad.X, pad.Y
     nr, nc = size(A)
     out = zeros(T, nr + 2py, nc + 2px)
     @inbounds for j in 1:nc, i in 1:nr
@@ -337,11 +345,13 @@ end
 # The measure decides *which kind* of transform to warm — `Coherence` executes complex-to-complex
 # plans and the real measures real-to-complex ones, so warming without knowing the measure warms
 # the wrong pair half the time.
-function _warm_pass_plans(chipx::Int, chipy::Int, rx::Int, ry::Int,
-                          measure::SimilarityMeasure)
-    (chipx == 0 || rx == 0) && return nothing
-    fy = next_fft_size(chipy + 2ry - 1)
-    fx = next_fft_size(chipx + 2rx - 1)
+function _warm_pass_plans(chip::Extent, radius::Extent, measure::SimilarityMeasure)
+    (chip.X == 0 || radius.X == 0) && return nothing
+    # `(fy, fx)` and not `(fx, fy)`: an FFT buffer is a matrix, so its size follows Julia's
+    # row-first convention rather than the extent's x-first one. Naming the axes on the way in is
+    # what makes that transposition visible here instead of silent.
+    fy = next_fft_size(chip.Y + 2radius.Y - 1)
+    fx = next_fft_size(chip.X + 2radius.X - 1)
     warm_plans!(((fy, fx),); complex = _wants_complex_plans(measure))
     return nothing
 end
@@ -359,10 +369,10 @@ _wants_complex_plans(::Coherence) = true
 # driver so the serial path is the same code with a single chunk — the two must agree
 # bitwise, and sharing the body is how that is guaranteed rather than tested for.
 function _track_chunk!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
-                       chipx::Int, chipy::Int, rx::Int, ry::Int, up::Int,
+                       chip::Extent, radius::Extent, up::Int,
                        p::Params, measure::SimilarityMeasure, idx)
     T = eltype(ref)
-    ws = take_workspace!(T, (chipx, chipy), (rx, ry))
+    ws = take_workspace!(T, chip, radius)
     rw = up > 1 ? take_refinement!(up) : nothing
     try
 
@@ -559,14 +569,14 @@ end
 # where a searched one costs microseconds — so an even split of the index range leaves some
 # tasks with almost nothing to do. Oversubscribing lets the scheduler even that out.
 function _track_threaded!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
-                          chipx::Int, chipy::Int, rx::Int, ry::Int, up::Int, p::Params,
+                          chip::Extent, radius::Extent, up::Int, p::Params,
                           measure::SimilarityMeasure)
     n = length(pts)
     nchunks = min(n, max(1, 2 * Threads.nthreads()))
     chunk = cld(n, nchunks)
     tasks = map(Iterators.partition(eachindex(pts), chunk)) do range
-        StableTasks.@spawn _track_chunk!(out, ref, sec, okmask, pts, chipx, chipy,
-                                         rx, ry, up, p, measure, range)
+        StableTasks.@spawn _track_chunk!(out, ref, sec, okmask, pts, chip, radius,
+                                         up, p, measure, range)
     end
     foreach(wait, tasks)
     return out

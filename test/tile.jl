@@ -1,5 +1,6 @@
 using AutoRIFT: ImagePair, gridpoints, params, scatter, issearchable,
-                chip_bounds, search_bounds, Highpass, Wallis, NoPreprocess, Deramp
+                chip_bounds, search_bounds, Highpass, Wallis, NoPreprocess, Deramp, extent,
+                autorift
 
 @testset "filter_reach is the measured reach" begin
     # The trait exists to size a block's halo, so it has to equal what the filter actually needs
@@ -129,7 +130,7 @@ end
     # so the grid's is not what the reach is built from. Holding `chip_size_max` at the grid's own
     # chip size is what keeps this testset about the *filter* term.
     p0 = params(; preprocess = :none, chip_size = 32, chip_size_max = 32, search_radius = 25)
-    pad = AutoRIFT._pass_geometry(AutoRIFT._worst_level_points(grid, p0), (n, n))[5]
+    pad = AutoRIFT._pass_geometry(AutoRIFT._worst_level_points(grid, p0), (n, n))[3]
     @test AutoRIFT.halo(grid, p0, (n, n)) == pad
 
     # Same geometry throughout, varying only the filter, so each difference from `pad` is the
@@ -137,20 +138,21 @@ end
     filtered(m, w) = AutoRIFT.halo(grid, params(; preprocess = m, filter_width = w,
                                                 chip_size = 32, chip_size_max = 32,
                                                 search_radius = 25), (n, n))
+    grew(m, w, by) = filtered(m, w) == extent((pad.X + by, pad.Y + by))
 
     # A 5-wide highpass adds 2 in each direction; a 21-wide one adds 10.
-    @test filtered(:highpass, 5) == (pad[1] + 2, pad[2] + 2)
-    @test filtered(:highpass, 21) == (pad[1] + 10, pad[2] + 10)
+    @test grew(:highpass, 5, 2)
+    @test grew(:highpass, 21, 10)
 
     # And `Wallis` adds twice that, because its window is applied twice. Taking `filter_width ÷ 2`
     # here would under-halo every block by half the filter's reach.
-    @test filtered(:wallis, 5) == (pad[1] + 4, pad[2] + 4)
-    @test filtered(:wallis, 21) == (pad[1] + 20, pad[2] + 20)
+    @test grew(:wallis, 5, 4)
+    @test grew(:wallis, 21, 20)
 
     # A wider search radius widens the halo through the correlation term.
     wide = gridpoints((n, n), 32; chip_size = 32, search_radius = 40)
-    @test all(AutoRIFT.halo(wide, params(), (n, n)) .>
-              AutoRIFT.halo(grid, params(), (n, n)))
+    hw, hn = AutoRIFT.halo(wide, params(), (n, n)), AutoRIFT.halo(grid, params(), (n, n))
+    @test hw.X > hn.X && hw.Y > hn.Y
 end
 
 @testset "halo covers every level, not the grid as supplied" begin
@@ -165,8 +167,8 @@ end
         worst = (0, 0)
         for cs in AutoRIFT.chip_sizes(p)
             lp = AutoRIFT._level_points(grid, p, cs, trues(size(grid)))
-            pad = AutoRIFT._pass_geometry(scatter(lp), imagesize)[5]
-            worst = (max(worst[1], pad[1]), max(worst[2], pad[2]))
+            pad = AutoRIFT._pass_geometry(scatter(lp), imagesize)[3]
+            worst = (max(worst[1], pad.X), max(worst[2], pad.Y))
         end
         return worst
     end
@@ -179,7 +181,8 @@ end
         grid = gridpoints(imagesize, 32; chip_size = gridchip, search_radius = 25)
         w = AutoRIFT.filter_reach(p.preprocess)
         need = widest_level_pad(grid, p) .+ w
-        @test all(AutoRIFT.halo(grid, p, imagesize) .>= need)
+        h = AutoRIFT.halo(grid, p, imagesize)
+        @test h.X >= need[1] && h.Y >= need[2]
     end
 
     # `sanitize!` floors a searched point's radius at `min_search_radius`, so a grid whose radii
@@ -187,8 +190,9 @@ end
     tight = params(; chip_size = 32, chip_size_max = 32, grid_spacing = 32,
                    search_radius = 3, min_search_radius = 6)
     grid = gridpoints(imagesize, 32; chip_size = 32, search_radius = 3)
-    @test all(AutoRIFT.halo(grid, tight, imagesize) .>=
-              widest_level_pad(grid, tight) .+ AutoRIFT.filter_reach(tight.preprocess))
+    h = AutoRIFT.halo(grid, tight, imagesize)
+    need = widest_level_pad(grid, tight) .+ AutoRIFT.filter_reach(tight.preprocess)
+    @test h.X >= need[1] && h.Y >= need[2]
 
     # The grid `autorift` builds for itself already carries the largest chip size, so the chip-size and
     # radius corrections above do not widen it — those are for caller-supplied grids. What does widen it
@@ -196,9 +200,11 @@ end
     # halo is exactly the grid's own reach plus that.
     pd = params()
     gd = AutoRIFT._build_grid(imagesize, pd)
+    gpad = AutoRIFT._pass_geometry(scatter(gd), imagesize)[3]
+    w = AutoRIFT.filter_reach(pd.preprocess)
+    ox, oy = AutoRIFT._level_centre_offset(pd)
     @test AutoRIFT.halo(gd, pd, imagesize) ==
-          AutoRIFT._pass_geometry(scatter(gd), imagesize)[5] .+
-          AutoRIFT.filter_reach(pd.preprocess) .+ AutoRIFT._level_centre_offset(pd)
+          extent((gpad.X + w + ox, gpad.Y + w + oy))
 
     # The offset is a real widening at the defaults, not a no-op the equality above would also pass with.
     @test all(AutoRIFT._level_centre_offset(pd) .> 0)
@@ -288,6 +294,28 @@ end
 
     @test_throws "must be positive in both axes" AutoRIFT.block_layout(grid, p, (n, n), (0, 8))
     @test_throws "must be positive in both axes" AutoRIFT.block_layout(grid, p, (n, n), (8, -1))
+end
+
+@testset "a block size is a pair at every entry point" begin
+    # A scalar is refused rather than read as square, because a full-width band costs halo on two
+    # sides where a square block pays four. Asserted on the two public functions as well as on the
+    # keyword: they take the size directly, so nothing else would stop `extent` from reading a
+    # scalar as square there — the opposite of what the keyword promises.
+    n = 512
+    p = params(; chip_size = 32, search_radius = 25)
+    grid = gridpoints((n, n), 32; chip_size = 32, search_radius = 25)
+    raw = ImagePair(synthetic_texture(n; seed = 1), synthetic_texture(n; seed = 2))
+
+    @test_throws "scalar is not accepted" AutoRIFT.block_layout(grid, p, (n, n), 256)
+    @test_throws "scalar is not accepted" AutoRIFT.correlate_tiled(raw, grid, p, 256)
+    @test_throws "scalar is not accepted" autorift(raw.reference, raw.secondary;
+                                                  process_block_size = 256)
+
+    # A plain tuple and an `Extent` are the same request, and both name the same halo.
+    a = AutoRIFT.block_layout(grid, p, (n, n), (256, 256))
+    b = AutoRIFT.block_layout(grid, p, (n, n), extent((X = 256, Y = 256)))
+    @test length(a) == length(b)
+    @test a.halo === b.halo
 end
 
 @testset "a blocked run equals an untiled one" begin

@@ -66,8 +66,9 @@ _to_device(::AutoRIFT.MetalGPU, a::MtlArray) = a
 # CPU method rather than a flag threaded through the device code: below a few hundred points the
 # batched transform loses to FFTW, and a coarse pass routinely has that few.
 function AutoRIFT._dispatch_pass!(b::AutoRIFT.MetalGPU, out::AutoRIFT.DisplacementField, ref,
-                                  sec, okmask, pts::AutoRIFT.PointSet{1}, chipx::Int,
-                                  chipy::Int, rx::Int, ry::Int, p::AutoRIFT.Params,
+                                  sec, okmask, pts::AutoRIFT.PointSet{1},
+                                  chip::AutoRIFT.Extent, radius::AutoRIFT.Extent,
+                                  p::AutoRIFT.Params,
                                   measure::AutoRIFT.SimilarityMeasure,
                                   subpixel::AutoRIFT.SubpixelMethod)
     Metal.functional() || throw(ArgumentError(
@@ -76,10 +77,10 @@ function AutoRIFT._dispatch_pass!(b::AutoRIFT.MetalGPU, out::AutoRIFT.Displaceme
         "`backend = :cpu`."))
 
     if !_gpu_worth_it(AutoRIFT.nsearchable(pts))
-        return AutoRIFT._dispatch_pass!(AutoRIFT.CPU(), out, ref, sec, okmask, pts, chipx,
-                                        chipy, rx, ry, p, measure, subpixel)
+        return AutoRIFT._dispatch_pass!(AutoRIFT.CPU(), out, ref, sec, okmask, pts, chip,
+                                        radius, p, measure, subpixel)
     end
-    return _gpu_pass!(b, out, ref, sec, okmask, pts, chipx, chipy, rx, ry,
+    return _gpu_pass!(b, out, ref, sec, okmask, pts, chip, radius,
                       AutoRIFT.upsampling(subpixel), p, measure)
 end
 

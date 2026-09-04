@@ -808,11 +808,13 @@ required_package(::CUDAGPU) = "CUDA"
 
 The largest chip and search radius any point in a pass uses.
 
+Two [`AutoRIFT.Extent`](@ref)s: the largest `chip` and the largest `radius`.
+
 These size the correlation workspace, and a workspace sizes its own FFT buffers from its extents
 — so they set the **transform length** every point in the pass executes, not merely how much
-memory it takes. A pass whose maxima are `(32, 32, 25, 25)` runs an 84-point transform where one
-with `(32, 32, 10, 10)` runs a 56-point one, and the two agree only to about 4e-7. Pooling depends
-on the same property; see `take_workspace!`.
+memory it takes. A pass whose maxima are `chip = (X=32, Y=32)`, `radius = (X=25, Y=25)` runs an
+84-point transform where one with `radius = (X=10, Y=10)` runs a 56-point one, and the two agree
+only to about 4e-7. Pooling depends on the same property; see `take_workspace!`.
 
 That is why this is a value a caller can supply rather than only something derived per pass. A
 subset of a point set has its own, generally smaller, maxima — so correlating a subset computes a
@@ -823,10 +825,8 @@ differs on 46% of the points of a sub-block, and `dx`/`dy` can flip a subpixel s
 Build one with [`AutoRIFT.pass_geometry`](@ref).
 """
 struct PassGeometry
-    chip_x::Int
-    chip_y::Int
-    radius_x::Int
-    radius_y::Int
+    chip::Extent
+    radius::Extent
 end
 
 # ---------------------------------------------------------------------------
