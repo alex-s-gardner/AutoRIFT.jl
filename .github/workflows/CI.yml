@@ -17,7 +17,11 @@ jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # The suite runs in ~23 minutes on Julia 1.12 against ~9 on LTS, after 5-7
+    # minutes of precompilation under the coverage flags. 30 minutes left the
+    # 1.12 jobs finishing inside the final seconds, so they failed on the
+    # timeout rather than on a test.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
