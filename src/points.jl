@@ -54,6 +54,19 @@ Base.@propagate_inbounds Base.getindex(u::Uniform{T,N}, ::Vararg{Int,N}) where {
 Base.vec(u::Uniform) = Uniform(u.value, (length(u),))
 Base.similar(u::Uniform, ::Type{T}, dims::Dims) where {T} = Array{T}(undef, dims)
 
+# Every field of a `PointSet` must share `x`'s axes. Checked by recursion over a
+# `NamedTuple` rather than a loop over a tuple of (name, field) pairs: the fields have ten
+# distinct types, so the loop variable is a `Union` and iterating it allocates. This form is
+# unrolled at compile time, keeping construction free of the heap and O(1) in point count —
+# `scatter` runs it once per chip-size level.
+_check_axes(ax, ::@NamedTuple{}) = nothing
+@inline function _check_axes(ax, fields::NamedTuple)
+    name, field = first(keys(fields)), first(values(fields))
+    axes(field) == ax || throw(DimensionMismatch(
+        "PointSet field `$name` has axes $(axes(field)), expected $ax to match `x`"))
+    return _check_axes(ax, Base.structdiff(fields, NamedTuple{(name,)}))
+end
+
 """
     PointSet{N}
 
@@ -115,15 +128,11 @@ struct PointSet{N,X<:AbstractArray{Float64,N},Y<:AbstractArray{Float64,N},
                           CX<:AbstractArray{Int,N},CY<:AbstractArray{Int,N},
                           CN<:AbstractArray{Int,N},CM<:AbstractArray{Int,N}}
         ax = axes(x)
-        for (name, f) in ((:y, y), (:radius_x, radius_x), (:radius_y, radius_y),
-                          (:dx_prior, dx_prior), (:dy_prior, dy_prior),
-                          (:chip_size_x, chip_size_x), (:chip_size_y, chip_size_y),
-                          (:chip_size_min_x, chip_size_min_x),
-                          (:chip_size_max_x, chip_size_max_x))
-            axes(f) == ax || throw(DimensionMismatch(
-                "PointSet field `$name` has axes $(axes(f)), expected $ax to " *
-                "match `x`"))
-        end
+        _check_axes(ax, (y = y, radius_x = radius_x, radius_y = radius_y,
+                         dx_prior = dx_prior, dy_prior = dy_prior,
+                         chip_size_x = chip_size_x, chip_size_y = chip_size_y,
+                         chip_size_min_x = chip_size_min_x,
+                         chip_size_max_x = chip_size_max_x))
         return new{N,X,Y,RX,RY,DX,DY,CX,CY,CN,CM}(
             x, y, radius_x, radius_y, dx_prior, dy_prior,
             chip_size_x, chip_size_y, chip_size_min_x, chip_size_max_x)
