@@ -68,6 +68,15 @@ Statistics = "1"
 Test = "1"
 julia = "1.10"
 
+# `ImagePairGeometry` is unregistered, so the test environment cannot resolve it by name alone. This
+# names where it comes from, which is what lets the geogrid handoff tests run rather than be skipped.
+#
+# Julia 1.11 and later only: `Pkg.Types.Project` gained a `sources` field there, and 1.10 ignores this
+# table entirely — which is why the `lts` job skips that one testset. See `.github/workflows/CI.yml`.
+# Both this and the skip go away once ImagePairGeometry is registered.
+[sources]
+ImagePairGeometry = {url = "https://github.com/alex-s-gardner/ImagePairGeometry.jl"}
+
 [extras]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
 ArchGDAL = "c9ce4bd3-c3d5-55b8-8973-c0e20141b8c3"

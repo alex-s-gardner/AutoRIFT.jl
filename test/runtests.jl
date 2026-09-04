@@ -94,11 +94,11 @@ include("utils.jl")
         include("gpu.jl")
     end
 
-    # The geogrid handoff. `ImagePairGeometry` is unregistered, so it cannot be named in `[targets]`
-    # on every Julia — see the note in `.github/workflows/CI.yml` — and these run wherever it is
-    # resolvable. To run them locally:
-    #
-    #     julia --project=. -e 'import Pkg; Pkg.add(url = "https://github.com/alex-s-gardner/ImagePairGeometry.jl")'
+    # The geogrid handoff, run wherever `ImagePairGeometry` is resolvable. It is unregistered and
+    # reached through `[sources]`, which Julia 1.10 does not implement, so on the LTS it is absent and
+    # this is skipped — see the note in `.github/workflows/CI.yml`. Guarded rather than assumed
+    # present, because a skip that announces itself is better than a `MethodError` that does not say
+    # why.
     if Base.identify_package("ImagePairGeometry") !== nothing
         @testset "ImagePairGeometry handoff" begin
             include("imagepairgeometry.jl")

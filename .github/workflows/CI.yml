@@ -42,23 +42,30 @@ jobs:
         with:
           version: ${{ matrix.version }}
       - uses: julia-actions/cache@v2
-      - uses: julia-actions/julia-buildpkg@v1
-      # `ImagePairGeometry` is unregistered, so adding it from its repository is what lets the geogrid
-      # handoff tests run rather than be skipped; without it the extension is never loaded.
+      # The geogrid handoff tests need `ImagePairGeometry`, which is unregistered. `[sources]` in
+      # `Project.toml` names where it comes from, and Julia 1.11 and later resolve it from there.
       #
-      # Skipped on `lts`, where `Pkg.test` cannot sandbox it. A URL-added package is a *fixed* manifest
-      # entry, and Julia 1.10's sandbox copies each fixed entry's whole dependency subgraph into the
-      # merged manifest, erroring with "can not merge projects" if any of it is already there.
-      # ImagePairGeometry's closure shares stdlibs with this package, so the collision is unavoidable.
-      # Julia 1.11 removed that check, and `[sources]` — the registration-free way to name the
-      # dependency instead — is also 1.11+. So the extension is exercised on 1.11 and later, and the
-      # `lts` job tests the core package only. Both go away once ImagePairGeometry is registered.
-      - name: Add unregistered test dependencies
-        if: matrix.version != 'lts'
+      # Julia 1.10 has no `sources` field in `Pkg.Types.Project`, so it ignores that table, sees an
+      # unregistered name in `[extras]`, and refuses to build a test environment at all — the whole
+      # suite fails, not just the one testset. Dropping the `[extras]` entry is what lets the rest of
+      # the suite run there; `test/runtests.jl` then finds the package absent and skips the handoff
+      # testset with a message. Removing this step and the `[extras]` edit is the first thing to do
+      # once ImagePairGeometry is registered.
+      - name: Drop the unregistered test dependency on Julia LTS
+        if: matrix.version == 'lts'
         run: |
-          julia --project=. -e '
-            import Pkg
-            Pkg.add(url = "https://github.com/alex-s-gardner/ImagePairGeometry.jl")'
+          julia -e '
+            path = "Project.toml"
+            out = String[]
+            section = ""
+            for line in eachline(path)
+                startswith(line, "[") && (section = strip(line))
+                section == "[extras]" && startswith(line, "ImagePairGeometry ") && continue
+                section == "[targets]" && (line = replace(line, ", \"ImagePairGeometry\"]" => "]"))
+                push!(out, line)
+            end
+            write(path, join(out, "\n") * "\n")'
+      - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
       - uses: julia-actions/julia-processcoverage@v1
       - uses: codecov/codecov-action@v4
