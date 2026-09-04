@@ -93,4 +93,17 @@ include("utils.jl")
     @testset "gpu" begin
         include("gpu.jl")
     end
+
+    # The geogrid handoff. `ImagePairGeometry` is unregistered, so it cannot be named in `[targets]`
+    # on every Julia — see the note in `.github/workflows/CI.yml` — and these run wherever it is
+    # resolvable. To run them locally:
+    #
+    #     julia --project=. -e 'import Pkg; Pkg.add(url = "https://github.com/alex-s-gardner/ImagePairGeometry.jl")'
+    if Base.identify_package("ImagePairGeometry") !== nothing
+        @testset "ImagePairGeometry handoff" begin
+            include("imagepairgeometry.jl")
+        end
+    else
+        @info "Skipping the ImagePairGeometry handoff tests: it is not in this environment."
+    end
 end
