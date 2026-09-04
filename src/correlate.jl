@@ -209,6 +209,14 @@ struct CorrelationWorkspace
     fspec_a::Matrix{ComplexF32}
     fspec_b::Matrix{ComplexF32}
 
+    # The search window's spectrum, held across the angles of a `RotationSearch`. The window does
+    # not change with the angle, so transforming it once per angle repeats a third of the work: the
+    # forward transform is 23% of a `correlate!` and the integral tables another 10%, and both are
+    # functions of the window alone. `prepare_window!` fills this and the tables; `correlate_prepared!`
+    # reads them. Same extent as `fspec_a`; untouched when rotation search is off, which is the
+    # default.
+    wspec::Matrix{ComplexF32}
+
     # Complex FFT scratch, for `Coherence`. Full-size rather than the real path's half-spectrum: a
     # complex transform has no conjugate symmetry to exploit.
     #
@@ -305,6 +313,7 @@ function workspace(::Type{T}, chip_size, search_radius) where {T<:ImageElement}
         Matrix{ComplexF32}(undef, 2ry, 2rx),
         Matrix{Float32}(undef, fy, fx),
         Matrix{Float32}(undef, fy, fx),
+        Matrix{ComplexF32}(undef, fy ÷ 2 + 1, fx),
         Matrix{ComplexF32}(undef, fy ÷ 2 + 1, fx),
         Matrix{ComplexF32}(undef, fy ÷ 2 + 1, fx),
         Matrix{ComplexF32}(undef, fy, fx),
@@ -659,6 +668,41 @@ correlate!(ws, search, chip, radius::Integer; kw...) =
     correlate!(ws, search, chip, (Int(radius), Int(radius)); kw...)
 
 """
+    correlate_prepared!(ws, search, chip, radius; measure) -> surface
+
+[`AutoRIFT.correlate!`](@ref) for a window [`AutoRIFT.prepare_window!`](@ref) has already been
+called on with the same `search` and `measure`.
+
+Skips the window's forward transform and its integral tables, which is a third of the work and
+none of it dependent on the chip. The result is bit-identical to `correlate!`: the same
+spectrum and the same tables, computed once instead of once per chip.
+
+Correctness is the caller's to maintain — passing a `search` that `prepare_window!` did not see
+reads a stale spectrum and returns a surface for the wrong window. Only
+`_correlate_rotations!` uses this, where the two calls sit in one function.
+"""
+function correlate_prepared!(
+    ws::CorrelationWorkspace, search::AbstractMatrix, chip::AbstractMatrix,
+    radius::Tuple{Int,Int}; measure::SimilarityMeasure = ZNCC(),
+)
+    ch, cw = size(chip)
+    rx, ry = radius
+    nr, nc = 2ry, 2rx
+    surface = @view ws.surface[1:nr, 1:nc]
+    cnorm, ok = prepare_chip!(ws, chip)
+    ws.was_degenerate[] = !ok
+    if !ok
+        fill!(surface, 0.0f0)
+        return surface
+    end
+    _correlate_surface!(surface, ws, search, ch, cw, cnorm, measure, Val(true))
+    return surface
+end
+
+correlate_prepared!(ws, search, chip, radius::Integer; kw...) =
+    correlate_prepared!(ws, search, chip, (Int(radius), Int(radius)); kw...)
+
+"""
     degenerate(ws::CorrelationWorkspace) -> Bool
 
 Whether the last [`correlate!`](@ref) on `ws` was given a chip with no signal.
@@ -669,11 +713,40 @@ displacement, and this is how a caller tells the two apart without scanning the 
 """
 @inline degenerate(ws::CorrelationWorkspace) = ws.was_degenerate[]
 
+# Everything a measure derives from the search window alone, computed once for a window that
+# several chips will be correlated against.
+#
+# A third of a `correlate!` is this: the window's forward transform is 23% and the integral tables
+# another 10%, and neither depends on the chip. Only `_correlate_rotations!` has more than one chip
+# per window, so only it calls this; `correlate!` still does the work inline, where the split would
+# buy a caller with one chip nothing.
+#
+# Dispatched on the measure because the tables differ — `NCC` needs no plain sum, and `Coherence`
+# needs a complex one.
+function prepare_window!(ws::CorrelationWorkspace, search::AbstractMatrix, ::ZNCC)
+    S = @view ws.isum[1:(size(search, 1) + 1), 1:(size(search, 2) + 1)]
+    S2 = @view ws.isqsum[1:(size(search, 1) + 1), 1:(size(search, 2) + 1)]
+    integral_both!(S, S2, search)
+    _window_spectrum!(ws, search)
+    return nothing
+end
+
+function prepare_window!(ws::CorrelationWorkspace, search::AbstractMatrix, ::NCC)
+    S2 = @view ws.isqsum[1:(size(search, 1) + 1), 1:(size(search, 2) + 1)]
+    integral_sq!(S2, search)
+    _window_spectrum!(ws, search)
+    return nothing
+end
+
 # Dispatch on the measure so each formula compiles to its own kernel with no
 # runtime branch in the inner loop.
+#
+# `prepared` says the window-derived work is already done — `ws.wspec` holds its spectrum and the
+# integral tables are filled — so this must not recompute either. It is a compile-time `Bool` type
+# parameter rather than a runtime flag so that the branch vanishes in both directions.
 function _correlate_surface!(
     surface, ws::CorrelationWorkspace, search::AbstractMatrix,
-    ch::Int, cw::Int, cnorm::Float64, ::ZNCC,
+    ch::Int, cw::Int, cnorm::Float64, ::ZNCC, prepared::Val = Val(false),
 )
     nr, nc = size(surface)
     n = ch * cw
@@ -683,9 +756,9 @@ function _correlate_surface!(
     S2 = @view ws.isqsum[1:(size(search, 1) + 1), 1:(size(search, 2) + 1)]
     # One traversal for both tables: every caller needing the sum needs the squares too, and fusing
     # is 1.5-1.66x on the pair — 6-8% of a whole correlation. Bit-identical to two calls.
-    integral_both!(S, S2, search)
+    prepared === Val(false) && integral_both!(S, S2, search)
 
-    numerators = _numerators!(ws, search, cd, nr, nc, ch, cw)
+    numerators = _numerators_or_prepared!(ws, search, cd, nr, nc, ch, cw, prepared)
 
     @inbounds for j in 1:nc, i in 1:nr
         s1 = boxsum(S, i, j, ch, cw)
@@ -708,7 +781,7 @@ end
 
 function _correlate_surface!(
     surface, ws::CorrelationWorkspace, search::AbstractMatrix,
-    ch::Int, cw::Int, cnorm::Float64, ::NCC,
+    ch::Int, cw::Int, cnorm::Float64, ::NCC, prepared::Val = Val(false),
 )
     # NCC differs from ZNCC only in the denominator: the raw sum of squares rather
     # than the variance about the window mean. The numerator is the same
@@ -722,9 +795,9 @@ function _correlate_surface!(
     cd = @view ws.chip[1:ch, 1:cw]
 
     S2 = @view ws.isqsum[1:(size(search, 1) + 1), 1:(size(search, 2) + 1)]
-    integral_sq!(S2, search)
+    prepared === Val(false) && integral_sq!(S2, search)
 
-    numerators = _numerators!(ws, search, cd, nr, nc, ch, cw)
+    numerators = _numerators_or_prepared!(ws, search, cd, nr, nc, ch, cw, prepared)
 
     @inbounds for j in 1:nc, i in 1:nr
         wsq = boxsum(S2, i, j, ch, cw)
@@ -933,16 +1006,28 @@ function _numerators_direct!(out, search, cd, nr, nc, ch, cw)
     return out
 end
 
-function _numerators_fft!(out, ws::CorrelationWorkspace, search, cd, nr, nc, ch, cw)
+# The search window's forward transform, into `ws.wspec`.
+#
+# Split from `_numerators_fft!` so a caller correlating several chips against one window — the
+# angles of a `RotationSearch` — transforms it once. `wspec` stays valid until the next call with a
+# different window.
+function _window_spectrum!(ws::CorrelationWorkspace, search)
     sh, sw = size(search)
     fy, fx = size(ws.fbuf_a)
-
-    a, b = ws.fbuf_a, ws.fbuf_b
+    a = ws.fbuf_a
     fill!(a, 0.0f0)
-    fill!(b, 0.0f0)
     @inbounds for j in 1:sw, i in 1:sh
         a[i, j] = Float32(search[i, j])
     end
+    fft_execute!(fft_plan(fy, fx), a, ws.wspec)
+    return ws.wspec
+end
+
+# The numerators, given a window spectrum already in `ws.wspec`.
+function _numerators_fft_prepared!(out, ws::CorrelationWorkspace, cd, nr, nc, ch, cw)
+    fy, fx = size(ws.fbuf_a)
+    b = ws.fbuf_b
+    fill!(b, 0.0f0)
     # Correlation is convolution with a reflected kernel, so the chip goes in
     # reversed. Placed at the origin, which puts the valid output at offset
     # (ch, cw) — see the read below.
@@ -951,18 +1036,38 @@ function _numerators_fft!(out, ws::CorrelationWorkspace, search, cd, nr, nc, ch,
     end
 
     plan = fft_plan(fy, fx)
-    fft_execute!(plan, a, ws.fspec_a)
     fft_execute!(plan, b, ws.fspec_b)
     @inbounds for k in eachindex(ws.fspec_a)
-        ws.fspec_a[k] *= ws.fspec_b[k]
+        ws.fspec_a[k] = ws.wspec[k] * ws.fspec_b[k]
     end
     iplan = ifft_plan(fy, fx)
     # `ifft_execute!` applies the 1/n scaling FFTW omits, and destroys `ws.fspec_a` in the
     # process — nothing reads it afterwards.
-    ifft_execute!(iplan, ws.fspec_a, a)
+    ifft_execute!(iplan, ws.fspec_a, b)
 
     @inbounds for j in 1:nc, i in 1:nr
-        out[i, j] = Float64(a[i + ch - 1, j + cw - 1])
+        out[i, j] = Float64(b[i + ch - 1, j + cw - 1])
+    end
+    return out
+end
+
+function _numerators_fft!(out, ws::CorrelationWorkspace, search, cd, nr, nc, ch, cw)
+    _window_spectrum!(ws, search)
+    return _numerators_fft_prepared!(out, ws, cd, nr, nc, ch, cw)
+end
+
+# The numerators, taking the window spectrum from `ws.wspec` when a caller has already computed it.
+# The direct path ignores the distinction: it reads the window itself and holds no spectrum.
+function _numerators_or_prepared!(ws, search, cd, nr, nc, ch, cw, ::Val{false})
+    return _numerators!(ws, search, cd, nr, nc, ch, cw)
+end
+
+function _numerators_or_prepared!(ws, search, cd, nr, nc, ch, cw, ::Val{true})
+    out = @view ws.numerator[1:nr, 1:nc]
+    if nr * nc * ch * cw <= DIRECT_THRESHOLD
+        _numerators_direct!(out, search, cd, nr, nc, ch, cw)
+    else
+        _numerators_fft_prepared!(out, ws, cd, nr, nc, ch, cw)
     end
     return out
 end

@@ -355,3 +355,41 @@ end
     @test all(isequal.(cold.dy, par.dy))
     @test all(isequal.(cold.correlation, par.correlation))
 end
+
+@testset "a prepared window changes no result" begin
+    # `correlate_prepared!` skips the window's transform and its integral tables, reading what
+    # `prepare_window!` left in the workspace. Bit-identical to `correlate!` is the whole claim:
+    # the same spectrum and the same tables, computed once rather than once per chip. Equality
+    # rather than a tolerance, because nothing here is reordered — only reused.
+    img = synthetic_texture(400; seed = 23)
+    for measure in (ZNCC(), NCC()), (cs, r) in ((16, 20), (32, 25), (64, 25), (32, 6))
+        chip, search = chip_and_window(img, (200, 200), cs, r)
+
+        ws = workspace(Float32, cs, r)
+        plain = copy(correlate!(ws, search, chip, r; measure))
+
+        ws2 = workspace(Float32, cs, r)
+        AutoRIFT.prepare_window!(ws2, search, measure)
+        prepared = copy(AutoRIFT.correlate_prepared!(ws2, search, chip, r; measure))
+        @test plain == prepared
+    end
+
+    # Through the rotation search, which is the only caller: every angle after the first reads a
+    # spectrum computed for the first, so a stale-window bug would show up here and nowhere else.
+    # Compared against the same loop driven by `correlate!`, which recomputes everything per angle.
+    chip, search = chip_and_window(img, (200, 200), 32, 25)
+    rot = AutoRIFT.RotationSearch((-4.0, -2.0, 0.0, 2.0, 4.0), 0.0)
+    ws = workspace(Float32, 32, 25)
+    hoisted = copy(AutoRIFT._correlate_rotations!(ws, search, chip, (25, 25), ZNCC(), rot))
+
+    ws2 = workspace(Float32, 32, 25)
+    best, found, unhoisted = -Inf32, false, zeros(Float32, 50, 50)
+    for a in AutoRIFT.angles(rot)
+        s = correlate!(ws2, search, AutoRIFT._rotate_chip(ws2, chip, a), (25, 25); measure = ZNCC())
+        AutoRIFT.degenerate(ws2) && continue
+        pk = maximum(s)
+        pk > best && (best = pk; copyto!(unhoisted, s); found = true)
+    end
+    @test found
+    @test hoisted == unhoisted
+end
