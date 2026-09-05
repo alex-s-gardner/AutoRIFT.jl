@@ -63,8 +63,13 @@ measured — two runs of one granule differ only in the fields that cannot be de
 `threads` sets `OMP_NUM_THREADS` for the correlator's OpenMP loop. It does not affect results: each
 grid point writes a distinct output element with no reduction (`REFERENCE.md`), so this is a runtime
 choice only.
+
+`prune` deletes the regenerable filtered and reprojected scene copies once the run succeeds — see
+[`prune_run`](@ref). On by default because they are ~93% of a Landsat run's footprint and nothing
+here reads them; pass `false` to inspect what the driver handed the correlator.
 """
-function run_reference(c::GoldenCase; n::Integer = 1, threads::Integer = 8, force = false)
+function run_reference(c::GoldenCase; n::Integer = 1, threads::Integer = 8, force = false,
+                       prune::Bool = true)
     image_present() || error("$IMAGE is not pulled; run `docker pull --platform $PLATFORM $IMAGE`")
 
     dir = run_dir(c, n)
@@ -105,6 +110,11 @@ function run_reference(c::GoldenCase; n::Integer = 1, threads::Integer = 8, forc
             error("container run failed; see $log\n$(last_lines(log, 25))")
         end
     end
+    # Only after the run succeeded: a failed run's scene copies are exactly what a diagnosis needs.
+    if prune
+        freed = prune_run(dir)
+        freed > 0 && @info "pruned regenerable scene copies" freed_GiB=round(freed / 2^30; digits=2)
+    end
     return dir
 end
 
@@ -113,6 +123,39 @@ function last_lines(path, n)
     ls = readlines(path)
     return join(ls[max(1, end - n + 1):end], "\n")
 end
+
+# Intermediate scene copies the driver writes beside its outputs. Landsat 4/5/7 are filtered and,
+# when the pair straddles two UTM zones, reprojected — and each copy is an uncompressed Float32
+# raster of a whole scene, so one L7 run holds ~4.9 GiB of them against ~380 MiB of everything else.
+#
+# They are inputs rather than results: `process.py` rebuilds them from the requester-pays scenes on
+# the next run. Nothing in this directory reads them, and a nine-case phase would need 44 GiB to keep
+# them.
+const REGENERABLE = ("filtered", "reprojected")
+
+"""
+    prune_run(dir; dry_run = false) -> Int
+
+Delete the regenerable scene copies under `dir` and return the bytes freed.
+
+Keeps everything a comparison or a diagnosis needs: the product, `autoRIFT_intermediate.nc`, the
+geogrid rasters, `offset.tif`/`velocity.tif`, the browse images and the log. Only the filtered and
+reprojected scene copies go, and only those — a run stays fully comparable after pruning.
+"""
+function prune_run(dir::AbstractString; dry_run::Bool = false)
+    freed = 0
+    for name in REGENERABLE
+        path = joinpath(dir, name)
+        isdir(path) || continue
+        for (root, _, files) in walkdir(path), f in files
+            freed += filesize(joinpath(root, f))
+        end
+        dry_run || rm(path; recursive = true)
+    end
+    return freed
+end
+
+prune_run(c::GoldenCase, n::Integer; kw...) = prune_run(run_dir(c, n); kw...)
 
 """
     run_product(dir) -> String
