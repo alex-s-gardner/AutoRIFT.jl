@@ -54,17 +54,28 @@ Base.@propagate_inbounds Base.getindex(u::Uniform{T,N}, ::Vararg{Int,N}) where {
 Base.vec(u::Uniform) = Uniform(u.value, (length(u),))
 Base.similar(u::Uniform, ::Type{T}, dims::Dims) where {T} = Array{T}(undef, dims)
 
-# Every field of a `PointSet` must share `x`'s axes. Checked by recursion over a
-# `NamedTuple` rather than a loop over a tuple of (name, field) pairs: the fields have ten
-# distinct types, so the loop variable is a `Union` and iterating it allocates. This form is
-# unrolled at compile time, keeping construction free of the heap and O(1) in point count —
+# Every field of a `PointSet` must share `x`'s axes.
+#
+# `map` over the names, not a `for` over a tuple of (name, field) pairs: the fields have ten
+# distinct types, so the loop variable is a `Union` and each iteration boxes. `map` over a tuple of
+# `Val`s specializes per field, keeping construction off the heap and O(1) in point count —
 # `scatter` runs it once per chip-size level.
-_check_axes(ax, ::@NamedTuple{}) = nothing
-@inline function _check_axes(ax, fields::NamedTuple)
-    name, field = first(keys(fields)), first(values(fields))
+#
+# Not recursion over `Base.structdiff` either, which is equally unrolled and equally allocation-free
+# but leaves `--trim=safe` with an unresolved self-invoke it cannot prove terminates.
+@inline function _check_axes(ax, fields::NamedTuple{names}) where {names}
+    map(map(Val, names)) do vname
+        _check_axis(ax, vname, fields[_unval(vname)])
+    end
+    return nothing
+end
+
+_unval(::Val{N}) where {N} = N
+
+@inline function _check_axis(ax, ::Val{name}, field) where {name}
     axes(field) == ax || throw(DimensionMismatch(
         "PointSet field `$name` has axes $(axes(field)), expected $ax to match `x`"))
-    return _check_axes(ax, Base.structdiff(fields, NamedTuple{(name,)}))
+    return nothing
 end
 
 """
