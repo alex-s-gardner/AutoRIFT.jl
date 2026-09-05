@@ -17,10 +17,10 @@ jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    # The suite runs in ~23 minutes on Julia 1.12 against ~9 on LTS, after 5-7
-    # minutes of precompilation under the coverage flags. 30 minutes left the
-    # 1.12 jobs finishing inside the final seconds, so they failed on the
-    # timeout rather than on a test.
+    # Generous because the one coverage-instrumented job is several times the length of the rest
+    # (see the note on `julia-runtest` below), and because the Windows runners vary by more than
+    # 20 minutes on identical code. A job hitting this limit means something hung, not that the
+    # suite grew.
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -68,9 +68,26 @@ jobs:
             end
             strip_entry("Project.toml")'
       - uses: julia-actions/julia-buildpkg@v1
+      # Coverage on one job, not all seven, and it is the dominant cost of this workflow:
+      # `test/tile.jl` takes 47.5 s uninstrumented and 469.9 s instrumented on 1.12, a 9.9x
+      # penalty. Uninstrumented, every Julia version runs the suite in about the same time — the
+      # gap that made the 1.12 jobs three times the LTS ones, and had them failing on the job
+      # timeout rather than on a test, was this and not the compiler.
+      #
+      # One Linux job reports what seven did. There are no `Sys.iswindows`-style branches, so a
+      # line covered on ubuntu is covered on every OS, and what the other six upload is six copies
+      # of one report. `1` rather than `lts` because it runs the whole suite plus the tests that
+      # need Julia 1.11 or later, which an LTS-only measurement would report as uncovered.
+      #
+      # The other six still run the full suite. Only the instrumentation is dropped, so a
+      # platform-specific or version-specific *failure* is caught exactly as before.
       - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: ${{ matrix.version == '1' && matrix.os == 'ubuntu-latest' }}
       - uses: julia-actions/julia-processcoverage@v1
+        if: matrix.version == '1' && matrix.os == 'ubuntu-latest'
       - uses: codecov/codecov-action@v4
+        if: matrix.version == '1' && matrix.os == 'ubuntu-latest'
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
