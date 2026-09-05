@@ -316,6 +316,18 @@ end
     b = AutoRIFT.block_layout(grid, p, (n, n), extent((X = 256, Y = 256)))
     @test length(a) == length(b)
     @test a.halo === b.halo
+
+    # The positional four-argument form, which takes the block size as a plain `Tuple{Int,Int}` and
+    # must normalize it like every other entry point. It had not been exercised: `_run` dispatches on
+    # `Extent`, so the unconverted tuple reached it as a `MethodError` on an internal function. This
+    # is the form the trimmed binary calls, and there a `MethodError` has no method table to print
+    # from — it recursed inside Julia's error printer and spun at 100% CPU rather than failing, so the
+    # break read as a hung correlation. Equality against the unblocked run is what pins it.
+    blocked = autorift(raw.reference, raw.secondary, p, (256, 256))
+    whole = autorift(raw.reference, raw.secondary, p)
+    @test all(isequal.(blocked.dx, whole.dx))
+    @test all(isequal.(blocked.dy, whole.dy))
+    @test all(isequal.(blocked.correlation, whole.correlation))
 end
 
 @testset "a blocked run equals an untiled one" begin

@@ -382,7 +382,12 @@ function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, p::Param
     raw = ImagePair(reference, secondary)
     grid = _build_grid(size(raw), p)
     _warm_grid_plans(grid, p)
-    return _run(raw, grid, p, block_size)
+    # Through `_block_size`, as every other entry point is: `_run` dispatches on `Extent`, so handing
+    # it the plain tuple this method accepts is a `MethodError` at the innermost call rather than a
+    # named error here. The trimmed binary is where that surfaced — with no method table to print
+    # from, its `MethodError` recursed inside Julia's error printer and spun at 100% CPU instead of
+    # failing, which is why this path looked like a slow correlation rather than a broken one.
+    return _run(raw, grid, p, _block_size(block_size))
 end
 
 """
