@@ -1,0 +1,161 @@
+# Running the reference container that produced the golden data.
+#
+#   julia --project=tools/golden tools/golden/reference.jl S2B_MSIL1C_20200612
+#   julia --project=tools/golden tools/golden/reference.jl S2B_MSIL1C_20200612 --run 2
+#
+# `ghcr.io/asfhyp3/hyp3-autorift:0.28.4` is the exact version recorded in every golden product's
+# `source` attribute, and an arm64 manifest exists, so the chain that made the golden data runs here
+# unmodified — filter, reproject, geogrid, correlate, package, crop.
+#
+# Two reasons to run it rather than only read its output:
+#
+#   **Tolerances need a measured basis.** Three fields cannot match between two runs of the reference
+#   itself (see `compare.jl`), and asserting that claim is different from believing it. Running the
+#   same granule twice and diffing the two products measures the reference's own reproducibility
+#   floor, which is the only defensible tolerance for every other field.
+#
+#   **The intermediate is the diagnostic.** `testautoRIFT.py` writes `autoRIFT_intermediate.nc`
+#   holding `Dx`, `Dy`, `InterpMask`, `ChipSizeX`, `SearchLimitX/Y` and `noDataMask` — the correlator
+#   output before any conversion to velocity. Keeping it, together with the filtered scenes and the
+#   geogrid rasters, is what makes a later product disagreement attributable to the correlator or to
+#   the packaging rather than to one of them by elimination.
+#
+# The working directory is deliberately not cleaned. Everything the container computed stays on disk
+# under `runs/<product>/<n>/`, because re-deriving it costs minutes of compute and, for Landsat,
+# money.
+#
+# A run needs credentials for its inputs, which differ by platform: Sentinel-2 needs none, Sentinel-1
+# and NISAR need Earthdata (mounted `~/.netrc`), and Landsat needs an AWS identity that can read
+# requester-pays `s3://usgs-landsat`. `fetch.jl --check` reports which are reachable.
+
+include("manifest.jl")
+
+const IMAGE = "ghcr.io/asfhyp3/hyp3-autorift:0.28.4"
+const PLATFORM = "linux/arm64"
+
+runs_dir(c::GoldenCase) = joinpath(CACHE, "runs", c.product)
+run_dir(c::GoldenCase, n::Integer) = joinpath(runs_dir(c), string(n))
+
+"""
+    image_present() -> Bool
+
+Whether the reference image is pulled. Checked before a run so a missing image is reported as such
+rather than as a container failure.
+"""
+function image_present()
+    try
+        # stderr is discarded: "No such image" is the expected answer here, not an error to report.
+        out = read(pipeline(`docker image inspect $IMAGE --format "{{.Id}}"`; stderr = devnull), String)
+        return !isempty(strip(out))
+    catch
+        return false
+    end
+end
+
+"""
+    run_reference(c::GoldenCase; n = 1, threads = 8, force = false) -> String
+
+Run the reference container on `c` and return the directory holding its output.
+
+`n` distinguishes repeated runs of the same case, which is how the reference's own reproducibility is
+measured — two runs of one granule differ only in the fields that cannot be deterministic.
+
+`threads` sets `OMP_NUM_THREADS` for the correlator's OpenMP loop. It does not affect results: each
+grid point writes a distinct output element with no reduction (`REFERENCE.md`), so this is a runtime
+choice only.
+"""
+function run_reference(c::GoldenCase; n::Integer = 1, threads::Integer = 8, force = false)
+    image_present() || error("$IMAGE is not pulled; run `docker pull --platform $PLATFORM $IMAGE`")
+
+    dir = run_dir(c, n)
+    if isdir(dir) && !isempty(readdir(dir)) && !force
+        @info "run already present; pass force = true to redo it" dir
+        return dir
+    end
+    mkpath(dir)
+
+    netrc = joinpath(homedir(), ".netrc")
+    awsdir = joinpath(homedir(), ".aws")
+
+    mounts = ["-v", "$dir:/home/ubuntu/work"]
+    isfile(netrc) && append!(mounts, ["-v", "$netrc:/home/ubuntu/.netrc:ro"])
+    isdir(awsdir) && append!(mounts, ["-v", "$awsdir:/home/ubuntu/.aws:ro"])
+
+    args = ["--reference", c.reference..., "--secondary", c.secondary...]
+    c.frame_id === nothing || append!(args, ["--frame-id", c.frame_id])
+
+    cmd = `docker run --rm --platform $PLATFORM
+           $mounts -w /home/ubuntu/work
+           -e OMP_NUM_THREADS=$threads
+           $IMAGE ++process hyp3_autorift $args`
+
+    log = joinpath(dir, "container.log")
+    @info "running reference" product=c.product run=n log
+    open(log, "w") do io
+        try
+            run(pipeline(cmd; stdout = io, stderr = io))
+        catch e
+            # The log is the diagnosis, so point at it rather than reproducing a wall of output.
+            error("container run failed; see $log\n$(last_lines(log, 25))")
+        end
+    end
+    return dir
+end
+
+function last_lines(path, n)
+    isfile(path) || return ""
+    ls = readlines(path)
+    return join(ls[max(1, end - n + 1):end], "\n")
+end
+
+"""
+    run_product(dir) -> String
+
+The product `.nc` a container run wrote into `dir`.
+
+The intermediate and the geogrid rasters are also `.nc`/`.tif` files in the same directory, so this
+selects on the product naming scheme rather than on the extension alone.
+"""
+function run_product(dir::AbstractString)
+    isdir(dir) || error("no such run directory: $dir")
+    hits = filter(readdir(dir)) do f
+        endswith(f, ".nc") && occursin("_G0120V02_P", f)
+    end
+    isempty(hits) && error("no product in $dir; the run may have failed — see container.log")
+    length(hits) == 1 || error("$(length(hits)) products in $dir: $(join(hits, ", "))")
+    return joinpath(dir, only(hits))
+end
+
+"""
+    run_intermediate(dir) -> Union{String,Nothing}
+
+The `autoRIFT_intermediate.nc` a run left behind, or `nothing`.
+
+This is the correlator's output before conversion to velocity: `Dx`, `Dy`, `InterpMask`,
+`ChipSizeX`, `SearchLimitX/Y`, `noDataMask`. Its presence in the working directory makes
+`testautoRIFT.py` skip correlation entirely on a subsequent run, which is worth knowing before
+reusing a directory.
+"""
+function run_intermediate(dir::AbstractString)
+    p = joinpath(dir, "autoRIFT_intermediate.nc")
+    return isfile(p) ? p : nothing
+end
+
+function main(args)
+    isempty(args) && error("usage: reference.jl <product-name-fragment> [--run N] [--threads N] [--force]")
+
+    c = only(cases(args[1]))
+    n = 1
+    i = findfirst(==("--run"), args); i === nothing || (n = parse(Int, args[i + 1]))
+    t = 8
+    j = findfirst(==("--threads"), args); j === nothing || (t = parse(Int, args[j + 1]))
+
+    dir = run_reference(c; n, threads = t, force = "--force" in args)
+    println("run directory: ", dir)
+    println("product:       ", try run_product(dir) catch e; "(none — $(e.msg))" end)
+    ip = run_intermediate(dir)
+    println("intermediate:  ", ip === nothing ? "(none)" : ip)
+    return nothing
+end
+
+abspath(PROGRAM_FILE) == abspath(@__FILE__) && main(ARGS)
