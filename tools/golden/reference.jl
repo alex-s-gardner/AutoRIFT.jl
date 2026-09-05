@@ -81,12 +81,18 @@ function run_reference(c::GoldenCase; n::Integer = 1, threads::Integer = 8, forc
     isfile(netrc) && append!(mounts, ["-v", "$netrc:/home/ubuntu/.netrc:ro"])
     isdir(awsdir) && append!(mounts, ["-v", "$awsdir:/home/ubuntu/.aws:ro"])
 
+    # Landsat inputs are requester-pays on `s3://usgs-landsat`, and `process.py` reaches them through
+    # `boto3.client('s3')` and GDAL's `/vsis3/` — both of which read the default profile unless told
+    # otherwise. `AWS_PROFILE` names which set of credentials in the mounted `~/.aws` to use, so a
+    # machine whose keys live under a named profile needs no edit to that file.
+    profile = get(ENV, "AWS_PROFILE", "itslive")
+
     args = ["--reference", c.reference..., "--secondary", c.secondary...]
     c.frame_id === nothing || append!(args, ["--frame-id", c.frame_id])
 
     cmd = `docker run --rm --platform $PLATFORM
            $mounts -w /home/ubuntu/work
-           -e OMP_NUM_THREADS=$threads
+           -e OMP_NUM_THREADS=$threads -e AWS_PROFILE=$profile
            $IMAGE ++process hyp3_autorift $args`
 
     log = joinpath(dir, "container.log")
