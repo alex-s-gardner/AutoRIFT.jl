@@ -34,7 +34,7 @@ timestamp identifies `img1`.
 
 | phase | cases | platforms | blocked on |
 |---|---|---|---|
-| 3 | 9 | Landsat 7/8/9, Sentinel-2 | the post-correlation chain; Landsat input credentials |
+| 3 | 9 | Landsat 7/8/9, Sentinel-2 | the post-correlation chain |
 | 4 | 3 | Landsat 4/5 | an FFT destripe filter |
 | 5 | 8 | Sentinel-1 SLC and OPERA bursts | the radar geogrid path and ISCE3 detection |
 | 6 | 2 | NISAR L1 RSLC, L2 GSLC | as phase 5 |
@@ -88,7 +88,7 @@ without downloading — which keeps a credential failure distinguishable from an
 | Sentinel-2 L1C | 2 | Google Cloud `.SAFE` mirror | anonymous |
 | Sentinel-1 SLC and bursts | 8 | CMR + ASF, `~/.netrc` | works |
 | NISAR RSLC/GSLC | 2 | CMR + ASF, `~/.netrc` | works |
-| Landsat C2 L1 | 9 | see below | needs credentials |
+| Landsat C2 L1 | 9 | requester-pays S3, via `AWS_PROFILE` | works |
 
 **Landsat is not in CMR.** The `Landsat Level-1 Collection 2` collection is registered
 (`C3442493460-USGS_EROS`) but indexes **zero granules**; its only data link points at the landsatlook
@@ -180,10 +180,41 @@ on `vx`, `vy`, `v`, `v_error`, `chip_size_width`, `chip_size_height` and `interp
 coordinate and every other attribute equal — across a different architecture (arm64 here) and four
 months. Both `.nc` files are also the same size to the byte.
 
-So there is no measurement noise to hide behind. **Exact equality is the gate**, and any difference
-AutoRIFT.jl shows is a difference in AutoRIFT.jl. That is a considerably harder target than a
-tolerance table, and a much more useful one: a tolerance wide enough to absorb a rounding difference
-is also wide enough to absorb a bug.
+So on this case there is no measurement noise to hide behind. **Exact equality is the gate**, and any
+difference AutoRIFT.jl shows is a difference in AutoRIFT.jl. That is a considerably harder target
+than a tolerance table, and a much more useful one: a tolerance wide enough to absorb a rounding
+difference is also wide enough to absorb a bug.
+
+### Landsat 7 is the exception, and the reference does not reproduce itself there
+
+The same measurement on `LE07_L1TP_061018_20120428` gives a completely different answer. Two runs of
+unchanged code on identical inputs:
+
+| comparison | `vx` exact | median \|Δ\| | p95 | max | bias |
+|---|---:|---:|---:|---:|---:|
+| run 1 vs run 2 | **3.4%** | 9 m/yr | 34 | 96 | −0.15 |
+| run 1 vs golden | 3.3% | 9 m/yr | 35 | 101 | −0.24 |
+| run 2 vs golden | 3.3% | 9 m/yr | 34 | 111 | −0.03 |
+
+The rows are statistically indistinguishable: **a local run differs from ASF's golden product by
+exactly as much as two local runs differ from each other.** The product name changes too — `P010`,
+`P011`, `P010` — because coverage moves, and with it `stable_shift`, `stable_count` and all four
+`error` attributes on both components.
+
+The cause is `_wallis_filter_fill` (`autoRIFT.py:113-125`): Landsat 7's Scan Line Corrector gaps are
+filled with `rng.normal` from an **unseeded** `np.random.default_rng()`, so the *input imagery* is
+different on every run and the correlator faithfully reports different displacements. The driver
+selects the filter by scene name — `wallis_fill` for `L[EO]07_`, `fft` for `LT0[45]_`, `hps`
+otherwise (`testautoRIFT.py:718-723`) — which is why S2 is exact and L7 is not.
+
+So **the golden L7 product is one draw from a distribution, not a fixed target**, and its own
+generator lands ±9 m/yr median away from it. Those cases have to be gated against the reference's own
+run-to-run envelope, measured per case by running the container twice; only the `hps` cases — L8, L9
+and S2 — can be gated exactly.
+
+`REFERENCE.md` already recorded that this RNG is unseeded and that AutoRIFT.jl's `WallisGapfill` is
+seeded and therefore reproducible. What this measures is the consequence: 3.4% rather than 100%, and
+which of the 22 cases it reaches.
 
 Working directories are kept, not cleaned, under `runs/<product>/<n>/`. They hold the filtered
 scenes, the geogrid rasters, and `autoRIFT_intermediate.nc` — `Dx`, `Dy`, `InterpMask`, `ChipSizeX`,
@@ -276,11 +307,46 @@ implementations can agree about — below a real peak both are choosing from noi
 symmetric about zero, median signed difference exactly 0 with the ±1/16 tails within 1% of each
 other, so it is not bias.
 
-The coarse levels are a **different mechanism**, not a worse version of the same one: only 0.01–0.04%
-of their residuals land on the quantization grid at all, so their values are not two roundings of one
-number. Both sides interpolate rather than repeat — aligned 2×2 and 4×4 blocks are constant 0.00% of
-the time on both — so the difference is in *how* a decimated level is resampled back onto the full
-grid, which is the pyramid residual `REFERENCE.md` already describes. Not yet localized further.
+### The coarse levels are not a quantized comparison at all
+
+"0% exact" at chips 48 and 96 reads like a failure and is not one. Four measurements, in the order
+they rule things out:
+
+**Neither side's coarse values sit on any quantization grid.** Multiples of 1/16, 1/32, 1/64 and
+1/128 account for 0.01–0.03% of the reference's own chip-48 values and the same of AutoRIFT.jl's. A
+level whose values are not quantized cannot agree *exactly* except by coincidence, so `exact` is the
+wrong statistic above the base level — unlike chip 24, where 99.4% of values are on the 1/16 grid.
+
+**Because both sides replace the measurement with an interpolated value.** `autoRIFT.py:811` says so
+in its own comment — "replacing the valid estimates with the bicubic filtered values for robust and
+accurate estimation" — and `:856-866` does it: `DxF` is `cv2.resize(..., INTER_CUBIC)` of the
+decimated field, and `Dx[idxRaw | idxFill] = DxF[idxRaw | idxFill]` overwrites even the
+directly-measured points. `_undecimate_level` does the same. A bicubic weighted sum lands anywhere.
+
+**It is not a lattice or interpolant difference.** At a coarse *node* — a fine point coinciding with a
+coarse sample — Catmull-Rom reproduces its sample exactly, so a lattice error would show up as nodes
+agreeing much better than off-nodes. They agree *identically*: median 0.0980 on nodes against 0.0980
+off them at chip 48. The interpolant is pinned bit-exact by 12 `INTER_CUBIC` fixtures in
+`test/fixtures/resize/`, and for this case the reference's `int(shape/Scale)` ratio is exactly 2 and
+4, so the lattice-drift trap `src/multichip.jl` documents is not active either. One level run in
+isolation through `chipsize_level`, with no merge and no prior, reproduces the same 0.00% — so it is
+not the merge.
+
+**What remains is small and unbiased:**
+
+| level | axis | points | bias | median | within 0.1 px | p95 | corr |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 48 | `dx` | 80,122 | +0.0009 | 0.098 | 50.7% | 0.459 | +0.972 |
+| 48 | `dy` | 80,122 | +0.0031 | 0.098 | 50.8% | 0.428 | +0.958 |
+| 96 | `dx` | 20,229 | −0.0015 | 0.094 | 52.5% | 0.466 | +0.921 |
+| 96 | `dy` | 20,229 | +0.0079 | 0.104 | 48.8% | 0.542 | +0.978 |
+
+Bias under 0.01 px on both axes at both levels, and half the points within a tenth of a pixel. The
+residual is the accumulated difference between two independent implementations of a chain that
+decimates, median-filters, area-resizes a prior, hole-fills and bicubic-resizes — each step matched in
+kind but not, at Float32, in the last bits. Exact agreement above the base level is not a reachable
+target for that chain, so **bias and the within-one-step fraction are the headline there, not
+`exact`**.
 
 ## Measured results
 
@@ -291,23 +357,27 @@ produced it.
 |---|---|
 | harness self-diff, 22 products | **22/22 identical** |
 | injected-fault detection, 5 kinds | **5/5 caught** |
-| reference reproducibility floor, S2 | **exact** — 7/7 planes, 615,146 px, `time` only |
+| reference reproducibility floor, S2 (`hps`) | **exact** — 7/7 planes, 615,146 px, `time` only |
 | container vs ASF golden, S2 | **exact** — bit-identical across arch and four months |
+| reference reproducibility floor, L7 (`wallis_fill`) | **±9 m/yr median**, 3.4% exact — unseeded gap-fill RNG |
+| container vs ASF golden, L7 | indistinguishable from that floor, so golden is one draw |
 | correlator vs reference `Dx`/`Dy`, S2 | corr 0.995/0.992, bias < 0.01 px; base level 50% exact and 99.4% on-grid |
 | AutoRIFT.jl product against golden | needs the post-correlation chain (phase 2) |
 
 ### Open, in priority order
 
-1. **Coarse-level resampling** — chips 48 and 96 agree on 0% of points and only 0.01–0.04% of their
-   residuals are multiples of the quantization step, so the two are not rounding one number
-   differently. How a decimated level is resampled back onto the full grid is the remaining
-   difference. The base level, by contrast, is 99.4% on-grid and 50% exact.
-2. **Chip-size selection** — 27% of points pick a different level, and those agree on 0.16%.
+1. **Chip-size selection** — 27% of points pick a different level, and those agree on 0.16%.
    `tools/ab` sees 0.7% level disagreement on its window, so something about the production
-   configuration widens this considerably.
-3. **Coverage** — 16,892 points AutoRIFT.jl answers alone against 25,268 the reference does. Partly
+   configuration widens this considerably. Now the largest unexplained effect.
+2. **Coverage** — 16,892 points AutoRIFT.jl answers alone against 25,268 the reference does. Partly
    the deliberate degenerate-chip difference in `REFERENCE.md`, but the split is not yet accounted
    for.
+3. **The post-correlation chain** — nothing downstream of `correlate` exists in Julia, so no product
+   comparison has run.
 
-Per-level upsampling is done, and is *not* on this list: it was measured, fixed, and found to account
-for 0.01 percentage points.
+Two items came off this list by being measured rather than by being fixed:
+
+- **Per-level upsampling** was a real gap, is implemented, and accounts for 0.01 percentage points.
+- **Coarse-level resampling** is not a defect: neither implementation's coarse values are quantized,
+  because both replace the measurement with a bicubic-interpolated value, so exact agreement is
+  unreachable there. Bias is under 0.01 px.

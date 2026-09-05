@@ -102,6 +102,22 @@ distance-transform dilation, the hole filling, the smallest-chip-wins merge, the
 Still **no correlation-peak output**: `minMaxLoc`'s value is discarded at all four
 call sites. AutoRIFT.jl returns it.
 
+**Above the base chip size, a reported displacement is not the measured one.** For any
+level where `ChipSizeUniX[i] != ChipSize0X` the reference decimates the field, mean- and
+median-filters it, resizes it with `INTER_CUBIC` back to the full grid, and then writes
+that interpolated value over *every* point the level owns — including the ones it
+measured directly: `Dx[idxRaw | idxFill] = DxF[idxRaw | idxFill]`
+(`autoRIFT.py:856-866`, and its own comment at `:811` says "replacing the valid
+estimates with the bicubic filtered values"). Only the base level reports raw
+measurements.
+
+The consequence is worth stating because it looks like a defect in a comparison: a
+coarse level's values are **not quantized to `1/upsampling`**, since a bicubic weighted
+sum lands anywhere, so two implementations cannot agree exactly there however correct
+both are. Measured against AutoRIFT.jl, which does the same thing: 0.01–0.03% of either
+side's chip-48 values fall on any of the 1/16, 1/32, 1/64 or 1/128 grids, against 99.4%
+at the base level. Bias is under 0.01 px. `tools/golden/README.md` has the numbers.
+
 **The subpixel upsampling factor varies per chip size.** `OverSampleRatio` may be a
 scalar or a dict, and when it is a dict the factor is looked up per level —
 `overSampleRatio = self.OverSampleRatio[ChipSizeUniX[i]]`
@@ -167,10 +183,28 @@ set for the Python implementation, publicly readable. `tools/golden/` compares
 against them, and the container that produced them runs locally, which makes the
 whole production chain reproducible rather than merely readable.
 
-That comparison is **exact, not tolerance-based**. Two runs of the reference on one
-granule agree bit for bit on every plane, and so does a local run against ASF's
-product, so there is no measurement noise for a tolerance to absorb. Only the `time`
-coordinate moves, by `crop.py::numeric_hash` under a per-process hash salt.
+That comparison is **exact wherever the reference is deterministic**, which is every case
+whose preprocessing is `hps`. Two runs on a Sentinel-2 granule agree bit for bit on every
+plane, and so does a local run against ASF's product; only the `time` coordinate moves,
+by `crop.py::numeric_hash` under a per-process hash salt.
+
+**Landsat 7 and Landsat 4/5 are not deterministic**, and the reference does not reproduce
+itself there. The driver selects the filter by scene name — `wallis_fill` for `L[EO]07_`,
+`fft` for `LT0[45]_`, `hps` otherwise (`vend/testautoRIFT.py:718-723`) — and
+`_wallis_filter_fill` fills Landsat 7's Scan Line Corrector gaps with `rng.normal` from
+an **unseeded** `np.random.default_rng()` (`autoRIFT.py:113-125`). The input imagery
+therefore differs on every run, and the correlator faithfully reports different
+displacements.
+
+Measured on `LE07_L1TP_061018_20120428`: two runs agree on **3.4%** of `vx`, at a median
+difference of 9 m/yr and a p95 of 34, and coverage moves enough to change the product's
+own `P<nn>` name. A local run differs from ASF's golden product by statistically the same
+amount, so **that golden product is one draw from a distribution rather than a fixed
+target**. Those cases have to be gated against the reference's own run-to-run envelope,
+measured by running the container twice.
+
+AutoRIFT.jl's `WallisGapfill` seeds its generator and so is reproducible; that is a
+deliberate difference, and it means AutoRIFT.jl cannot match any single draw exactly.
 
 Consequences for how AutoRIFT.jl is validated:
 
