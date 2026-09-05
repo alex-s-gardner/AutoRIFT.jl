@@ -1,0 +1,168 @@
+# Capture the correlator's inputs and outputs from a reference run, and read them into Julia.
+#
+#   julia --project=tools/golden tools/golden/intermediate.jl S2B_MSIL1C_20200612
+#
+# This runs the container with `capture.py` in place of the ordinary entry point, so the pipeline is
+# the real one but `runAutorift` dumps the arrays it is handed and the arrays it returns. See
+# `capture.py` for why the arrays are taken at that boundary rather than reconstructed from the scene
+# files: reconstructing them would mean reimplementing the code under test.
+#
+# What comes back is everything needed to run AutoRIFT.jl on the identical problem — the filtered
+# pair, the snapped grid, the per-point search limits and chip bounds, the priors — plus the
+# reference's own answer to diff against.
+
+include("manifest.jl")
+include("reference.jl")
+
+using JSON3
+
+# `xchg` is the A/B harness's array exchange: element type and both dimensions travel in the file, so
+# a reader cannot be handed the wrong shape. Reused rather than reinvented, and the format is
+# asserted round-trip by `tools/ab/xchg_test.sh`.
+include(joinpath(@__DIR__, "..", "ab", "xchg.jl"))
+
+const AB_DIR = normpath(joinpath(@__DIR__, "..", "ab"))
+
+capture_dir(c::GoldenCase, n::Integer) = joinpath(run_dir(c, n), "capture")
+
+"""
+    capture_reference(c::GoldenCase; n = 100, threads = 8, force = false) -> String
+
+Run the reference under `capture.py` and return the directory holding the dumped arrays.
+
+`n` defaults to 100 so a capture run does not collide with the plain runs 1 and 2 that measure
+reproducibility: a capture is the same pipeline, but its working directory accumulates extra files
+and its stdout differs, and keeping the two kinds separate makes each reproducible on its own.
+"""
+function capture_reference(c::GoldenCase; n::Integer = 100, threads::Integer = 8, force = false)
+    image_present() || error("$IMAGE is not pulled; run `docker pull --platform $PLATFORM $IMAGE`")
+
+    dir = run_dir(c, n)
+    cap = capture_dir(c, n)
+    if isdir(cap) && !isempty(readdir(cap)) && !force
+        @info "capture already present; pass force = true to redo it" cap
+        return cap
+    end
+    mkpath(dir)
+
+    netrc = joinpath(homedir(), ".netrc")
+    awsdir = joinpath(homedir(), ".aws")
+
+    mounts = ["-v", "$dir:/home/ubuntu/work",
+              # `capture.py` and the `xchg` module it writes through, read-only.
+              "-v", "$(joinpath(@__DIR__, "capture.py")):/opt/capture/capture.py:ro",
+              "-v", "$(joinpath(AB_DIR, "xchg.py")):/opt/capture/xchg.py:ro"]
+    isfile(netrc) && append!(mounts, ["-v", "$netrc:/home/ubuntu/.netrc:ro"])
+    isdir(awsdir) && append!(mounts, ["-v", "$awsdir:/home/ubuntu/.aws:ro"])
+
+    args = ["--reference", c.reference..., "--secondary", c.secondary...]
+    c.frame_id === nothing || append!(args, ["--frame-id", c.frame_id])
+
+    # `pixi run` is how the container's entry point reaches the environment holding autoRIFT and
+    # hyp3_autorift; invoking python directly would miss it. It has to run from the pixi project
+    # directory, so the working directory is restored explicitly before the pipeline starts —
+    # otherwise every relative output path the driver writes (the geogrid rasters, the intermediate,
+    # the product itself) lands inside the container and is discarded with it, leaving only the
+    # capture directory that `CAPTURE_DIR` names absolutely.
+    inner = "cd /hyp3-autorift && pixi run --manifest-path /hyp3-autorift/pyproject.toml " *
+            "bash -c 'cd /home/ubuntu/work && exec python /opt/capture/capture.py " *
+            join(args, " ") * "'"
+    cmd = `docker run --rm --platform $PLATFORM
+           $mounts -w /home/ubuntu/work
+           -e OMP_NUM_THREADS=$threads -e CAPTURE_DIR=/home/ubuntu/work/capture
+           -e PYTHONPATH=/opt/capture
+           --entrypoint /bin/bash
+           $IMAGE -lc $inner`
+
+    log = joinpath(dir, "capture.log")
+    @info "capturing correlator arrays" product=c.product run=n log
+    open(log, "w") do io
+        try
+            run(pipeline(cmd; stdout = io, stderr = io))
+        catch
+            error("capture run failed; see $log\n$(last_lines(log, 30))")
+        end
+    end
+    isdir(cap) || error("run finished but wrote no capture directory; see $log")
+    # The capture is only trustworthy if the run it came from produced the product too. A capture
+    # directory alone means the pipeline wrote its outputs somewhere else, and the arrays would then
+    # belong to a run whose result cannot be checked against golden.
+    try
+        run_product(dir)
+    catch
+        error("capture wrote arrays but the run produced no product in $dir — the pipeline's " *
+              "outputs went elsewhere, so this capture cannot be tied to a verified result. " *
+              "See $log")
+    end
+    return cap
+end
+
+"""
+    Capture
+
+One `runAutorift` call's arrays and scalars, as Julia values.
+
+`arrays` is keyed as the manifest writes them — `in_I1`, `out_Dx`, and so on — holding each in the
+orientation the reference had it. `scalars` carries every attribute that affects the result, so
+`Params` can be configured from what the reference used rather than from what the driver is believed
+to set.
+"""
+struct Capture
+    call::Int
+    arrays::Dict{String,Matrix}
+    scalars::Dict{String,Any}
+    skipped::Dict{String,String}
+end
+
+"""
+    read_capture(dir; call = 1) -> Capture
+
+Read one captured call from `dir`.
+
+A pipeline run calls `runAutorift` once, so `call = 1` is the usual case; the argument exists because
+a driver that retried would produce more, and silently reading the first of several would compare
+against the wrong one.
+"""
+function read_capture(dir::AbstractString; call::Integer = 1)
+    mpath = joinpath(dir, "call$call.json")
+    isfile(mpath) || error("no call$call.json in $dir; captured calls: " *
+                           join(filter(f -> startswith(f, "call"), readdir(dir)), ", "))
+    m = JSON3.read(read(mpath, String))
+
+    arrays = Dict{String,Matrix}()
+    for (name, info) in pairs(m.arrays)
+        arrays[String(name)] = xread(joinpath(dir, String(name)))
+    end
+    scalars = Dict{String,Any}(String(k) => v for (k, v) in pairs(m.scalars))
+    skipped = Dict{String,String}(String(k) => String(v) for (k, v) in pairs(get(m, :skipped, (;))))
+    return Capture(m.call, arrays, scalars, skipped)
+end
+
+read_capture(c::GoldenCase; n::Integer = 100, call::Integer = 1) =
+    read_capture(capture_dir(c, n); call)
+
+function main(args)
+    isempty(args) && error("usage: intermediate.jl <product-name-fragment> [--run N] [--force]")
+    c = only(cases(args[1]))
+    n = 100
+    i = findfirst(==("--run"), args); i === nothing || (n = parse(Int, args[i + 1]))
+
+    cap = capture_reference(c; n, force = "--force" in args)
+    println("capture directory: ", cap)
+
+    k = read_capture(cap)
+    println("\ncall ", k.call)
+    println("arrays:")
+    for name in sort!(collect(keys(k.arrays)))
+        a = k.arrays[name]
+        println("  ", rpad(name, 18), rpad(string(eltype(a)), 10), size(a))
+    end
+    isempty(k.skipped) || println("skipped: ", k.skipped)
+    println("\nscalars:")
+    for name in sort!(collect(keys(k.scalars)))
+        println("  ", rpad(name, 24), k.scalars[name])
+    end
+    return nothing
+end
+
+abspath(PROGRAM_FILE) == abspath(@__FILE__) && main(ARGS)
