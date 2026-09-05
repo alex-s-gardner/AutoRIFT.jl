@@ -226,8 +226,8 @@ S2 case, 10980² `UInt8` pair, 1,018,081 grid points, chips 24/48/96 at spacing 
 
 | axis | sign | both measured | only jl | only ref | exact | median | p99 | corr |
 |---|:---:|---:|---:|---:|---:|---:|---:|---:|
-| `dx` | + | 593,734 | 17,796 | 24,146 | 27.4% | 0.0625 | 0.75 | **+0.9953** |
-| `dy` | − | 593,734 | 17,796 | 24,146 | 30.3% | 0.0625 | 0.82 | **+0.9916** |
+| `dx` | + | 592,612 | 16,892 | 25,268 | 27.4% | 0.0625 | 0.88 | **+0.9954** |
+| `dy` | − | 592,612 | 16,892 | 25,268 | 30.3% | 0.0625 | 0.82 | **+0.9917** |
 
 Bias is under 0.01 px on both axes and the median disagreement is exactly one upsampling step, so the
 two agree about position. Exact agreement at 27–30% against the 77% `tools/ab` measures on a hand-cut
@@ -235,10 +235,10 @@ window is the finding, and decomposing it says why:
 
 | population | points | exact `dx` |
 |---|---:|---:|
-| all both-measured | 593,734 | 27.4% |
+| all both-measured | 592,612 | 27.4% |
 | same chip size chosen | 433,781 | 37.5% |
 | same chip size, not interpolated by the reference | 404,172 | 39.5% |
-| **chip 24 only** (matched upsampling) | 319,519 | **50.0%** |
+| **chip 24 only**, the base level | 319,521 | **50.0%** |
 
 **27% of points chose a different chip size**, and those agree on 0.16% — a point answered at chip 24
 by one side and 48 by the other describes a different footprint of ground, so this is not a
@@ -247,18 +247,40 @@ better kept.
 
 ### Finding: the reference varies upsampling per chip size
 
-Chips 48 and 96 agree on **exactly none** of their points while chip 24 agrees on half. The cause is
 `autoRIFT.py:652-653`: `OverSampleRatio` may be a dict, and when it is, the factor is looked up per
 level. The driver always passes one — `{24: 16, 48: 32, 96: 64, 192: 64}` here — so the reference
-quantizes to 1/16 px at the base chip size and 1/32 and 1/64 at the coarser ones.
+quantizes to 1/16 px at the base chip size and 1/32 and 1/64 at the coarser ones. `PyramidRefine`
+held a single factor, so AutoRIFT.jl quantized every level to 1/16.
 
-`PyramidRefine` holds a single factor, so AutoRIFT.jl quantizes every level to 1/16 and the two are
-rounding to different grids above the base level. Recorded in `REFERENCE.md`; supporting a per-level
-factor is the fix.
+Fixed: `Params.subpixel` is now a tuple, one method per level, on the same rule `similarity` uses.
+`REFERENCE.md` records the reference behaviour.
 
-Residuals on matched levels are symmetric about zero — median signed difference exactly 0, ±1/16
-tails within 1% of each other — so what remains after the level and upsampling effects is
-tie-breaking at the quantization step, not bias.
+**It was not the dominant cause.** With the reference's own ladder in place, exact agreement moved
+from 27.42% to 27.43% — the plumbing is verified (`subpixel_at` returns 16/32/64 across the three
+levels) and the effect is real but small. The fix stands on its own: without it a production
+configuration cannot be expressed at all.
+
+### What the base level and the coarse levels each say
+
+Per chip size, over points where both chose that level and the reference did not interpolate:
+
+| chip | step | points | exact | within one step | on the step grid | median |
+|---|---|---:|---:|---:|---:|---:|
+| 24 | 1/16 | 319,521 | **49.96%** | 84.1% | **99.4%** | 0.031 |
+| 48 | 1/32 | 67,606 | 0.00% | 19.2% | **0.01%** | 0.096 |
+| 96 | 1/64 | 16,541 | 0.00% | 10.2% | **0.04%** | 0.089 |
+
+The base level behaves as a quantized comparison should: 99.4% of its residuals are exact multiples
+of the step, and half are zero. What remains there is tie-breaking at 1/16 px, which no two
+implementations can agree about — below a real peak both are choosing from noise. Residuals are
+symmetric about zero, median signed difference exactly 0 with the ±1/16 tails within 1% of each
+other, so it is not bias.
+
+The coarse levels are a **different mechanism**, not a worse version of the same one: only 0.01–0.04%
+of their residuals land on the quantization grid at all, so their values are not two roundings of one
+number. Both sides interpolate rather than repeat — aligned 2×2 and 4×4 blocks are constant 0.00% of
+the time on both — so the difference is in *how* a decimated level is resampled back onto the full
+grid, which is the pyramid residual `REFERENCE.md` already describes. Not yet localized further.
 
 ## Measured results
 
@@ -271,15 +293,21 @@ produced it.
 | injected-fault detection, 5 kinds | **5/5 caught** |
 | reference reproducibility floor, S2 | **exact** — 7/7 planes, 615,146 px, `time` only |
 | container vs ASF golden, S2 | **exact** — bit-identical across arch and four months |
-| correlator vs reference `Dx`/`Dy`, S2 | corr 0.995/0.992, bias < 0.01 px, 50% exact at matched upsampling |
+| correlator vs reference `Dx`/`Dy`, S2 | corr 0.995/0.992, bias < 0.01 px; base level 50% exact and 99.4% on-grid |
 | AutoRIFT.jl product against golden | needs the post-correlation chain (phase 2) |
 
 ### Open, in priority order
 
-1. **Per-level upsampling** — the reference's factor varies by chip size and AutoRIFT.jl's does not,
-   which costs every point above the base chip size its exact agreement.
-2. **Chip-size selection** — 27% of points pick a different level. `tools/ab` sees 0.7% on its
-   window, so something about the production configuration widens this considerably.
-3. **Coverage** — 17,796 points AutoRIFT.jl answers alone against 24,146 the reference does. Partly
+1. **Coarse-level resampling** — chips 48 and 96 agree on 0% of points and only 0.01–0.04% of their
+   residuals are multiples of the quantization step, so the two are not rounding one number
+   differently. How a decimated level is resampled back onto the full grid is the remaining
+   difference. The base level, by contrast, is 99.4% on-grid and 50% exact.
+2. **Chip-size selection** — 27% of points pick a different level, and those agree on 0.16%.
+   `tools/ab` sees 0.7% level disagreement on its window, so something about the production
+   configuration widens this considerably.
+3. **Coverage** — 16,892 points AutoRIFT.jl answers alone against 25,268 the reference does. Partly
    the deliberate degenerate-chip difference in `REFERENCE.md`, but the split is not yet accounted
    for.
+
+Per-level upsampling is done, and is *not* on this list: it was measured, fixed, and found to account
+for 0.01 percentage points.

@@ -84,21 +84,29 @@ function pointset_from_capture(k::Capture)
 end
 
 """
-    upsampling_from_capture(k::Capture) -> Int
+    subpixel_from_capture(k::Capture) -> Tuple{Vararg{PyramidRefine}}
 
-The subpixel denominator the reference used at its base chip size.
+The subpixel methods the reference used, one per chip-size level, finest first.
 
 `OverSampleRatio` is a per-chip-size dictionary the driver assembles at run time
-(`testautoRIFT.py:488-510`) rather than a scalar, so the entry for the base chip size is the one that
-applies to the finest level. Both forms are handled because the driver sets a scalar when the chip
-bounds are absent.
+(`testautoRIFT.py:488-510`) rather than a scalar, and `autoRIFT.py:652` looks it up per level. So the
+quantization step is a property of the level: 1/16 px at the base chip size and 1/32 or 1/64 above
+it for optical input. A scalar is also handled, because the driver sets one when the chip bounds are
+absent.
+
+Entries are ordered by chip size and truncated to the levels this run will use, since a tuple longer
+than the level list is a configuration error rather than something to ignore.
 """
-function upsampling_from_capture(k::Capture)
+function subpixel_from_capture(k::Capture)
     osr = k.scalars["OverSampleRatio"]
-    osr isa Number && return Int(osr)
     chip0 = Int(k.scalars["ChipSize0X"])
+    maxchip = Int(maximum(k.arrays["in_ChipSizeMaxX"]))
+    # The levels this run will actually correlate: chip0 * 2^j up to the largest bound present.
+    chips = [chip0 << j for j in 0:floor(Int, log2(maxchip / chip0))]
+
+    osr isa Number && return (PyramidRefine(Int(osr)),)
     # JSON object keys arrive as symbols, and the driver keys them by chip size.
-    return Int(osr[Symbol(chip0)])
+    return Tuple(PyramidRefine(Int(osr[Symbol(c)])) for c in chips)
 end
 
 """
@@ -123,7 +131,7 @@ function kwargs_from_capture(k::Capture)
     return (; chip_size = (X = chip0, Y = round(Int, chip0 * scale_y)),
             chip_size_max = (X = maxchip, Y = maxchip),
             grid_spacing = (X = spacing, Y = spacing),
-            upsampling = upsampling_from_capture(k),
+            subpixel = subpixel_from_capture(k),
             preprocess = :none)
 end
 
@@ -147,7 +155,7 @@ function compare_correlator(c::GoldenCase; n::Integer = 100)
     # Argument order. `arImgDisp_s(a, b)` cuts its chip from `b` and its window from `a`; the
     # reference calls it as `arImgDisp_s(self.I2, self.I1)`, so `I1` supplies the chip. AutoRIFT.jl's
     # `autorift(reference, secondary)` cuts its chip from `secondary`, so `I1` binds to `secondary`.
-    @info "correlating" scene=size(a) npoints=length(grid.x) upsampling=kw.upsampling
+    @info "correlating" scene=size(a) npoints=length(grid.x) subpixel=kw.subpixel
     t = @elapsed out = autorift(b, a, grid; kw...)
 
     rdx = k.arrays["out_Dx"]
