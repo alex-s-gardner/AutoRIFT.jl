@@ -195,13 +195,34 @@ end
     identical(d::ProductDiff) -> Bool
 
 Whether the two products agree completely: every shared variable bit-exact with no coverage
-difference, identical coordinates, no differing attribute, and no variable present in only one.
+difference, identical coordinates, identical time, no differing attribute, and no variable present in
+only one.
 
-This is what a product compared against itself must satisfy. It deliberately does not accept a
+This is what a product compared against *itself* must satisfy. It deliberately does not accept a
 tolerance — a tolerance belongs to a specific measured comparison, not to the definition of
-agreement.
+agreement. Two separate runs of the reference do not satisfy it, because the time coordinate is
+jittered per process; [`agrees_on_data`](@ref) is the question to ask of those.
 """
 identical(d::ProductDiff) =
     isempty(d.missing_vars) && all(agrees, d.vars) &&
     d.x_max == 0 && d.y_max == 0 && isempty(d.attrib_diffs) &&
     (d.time_delta === nothing || d.time_delta == 0)
+
+# The time coordinate and the attribute recording its own jitter. Both are `crop.py::numeric_hash`
+# of the filename under a per-process hash salt, so they differ between any two runs — including two
+# runs of the reference on one granule.
+const VOLATILE_TIME = ("time.microseconds_added",)
+
+"""
+    agrees_on_data(d::ProductDiff) -> Bool
+
+Whether the two products agree on everything a correlator controls: every plane bit-exact with no
+coverage difference, identical coordinates, and every attribute equal except the time jitter.
+
+This is the gate for comparing two *different* runs or two implementations. It differs from
+[`identical`](@ref) only in ignoring the time coordinate, which no implementation can reproduce.
+"""
+agrees_on_data(d::ProductDiff) =
+    isempty(d.missing_vars) && all(agrees, d.vars) &&
+    d.x_max == 0 && d.y_max == 0 &&
+    all(k -> k in VOLATILE_TIME, keys(d.attrib_diffs))

@@ -72,6 +72,9 @@ function as_dict(d::ProductDiff)
         "attrib_diffs" => Dict(k => [string(v[1]), string(v[2])] for (k, v) in d.attrib_diffs),
         "missing_vars" => d.missing_vars,
         "identical" => identical(d),
+        # The one to read: `identical` also requires the time coordinate to match, which no two runs
+        # of anything can manage.
+        "agrees_on_data" => agrees_on_data(d),
     )
 end
 

@@ -1,0 +1,191 @@
+{
+    "provenance": {
+        "julia": "1.12.5",
+        "ncores": 8,
+        "cpu": "apple-m2",
+        "image": "ghcr.io/asfhyp3/hyp3-autorift:0.28.4",
+        "autorift_commit": "1b8c444-dirty",
+        "machine": "arm64-apple-darwin24.0.0",
+        "recorded": "2026-09-05T11:05:22.663"
+    },
+    "comparison": {
+        "vs_golden": {
+            "time_delta_s": 0.482,
+            "variables": [
+                {
+                    "name": "chip_size_height",
+                    "n_both": 615146,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "chip_size_width",
+                    "n_both": 615146,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "interp_mask",
+                    "n_both": 49052,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "v",
+                    "n_both": 615146,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "v_error",
+                    "n_both": 615146,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "vx",
+                    "n_both": 615146,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "vy",
+                    "n_both": 615146,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                }
+            ],
+            "identical": false,
+            "x_max": 0,
+            "b": "S2B_MSIL1C_20200612T150759_N0209_R025_T22WEB_20200612T184700_X_S2A_MSIL1C_20200627T150921_N0209_R025_T22WEB_20200627T170912_G0120V02_P078.nc",
+            "missing_vars": [
+            ],
+            "agrees_on_data": true,
+            "y_max": 0,
+            "attrib_diffs": {
+                "time.microseconds_added": [
+                    "493883",
+                    "975776"
+                ]
+            },
+            "a": "S2B_MSIL1C_20200612T150759_N0209_R025_T22WEB_20200612T184700_X_S2A_MSIL1C_20200627T150921_N0209_R025_T22WEB_20200627T170912_G0120V02_P078_IL_ASF_OD.nc"
+        },
+        "floor": {
+            "time_delta_s": 0.254,
+            "variables": [
+                {
+                    "name": "chip_size_height",
+                    "n_both": 615146,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "chip_size_width",
+                    "n_both": 615146,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "interp_mask",
+                    "n_both": 49052,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "v",
+                    "n_both": 615146,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "v_error",
+                    "n_both": 615146,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "vx",
+                    "n_both": 615146,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "vy",
+                    "n_both": 615146,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                }
+            ],
+            "identical": false,
+            "x_max": 0,
+            "b": "S2B_MSIL1C_20200612T150759_N0209_R025_T22WEB_20200612T184700_X_S2A_MSIL1C_20200627T150921_N0209_R025_T22WEB_20200627T170912_G0120V02_P078_IL_ASF_OD.nc",
+            "missing_vars": [
+            ],
+            "agrees_on_data": true,
+            "y_max": 0,
+            "attrib_diffs": {
+                "time.microseconds_added": [
+                    "493883",
+                    "240108"
+                ]
+            },
+            "a": "S2B_MSIL1C_20200612T150759_N0209_R025_T22WEB_20200612T184700_X_S2A_MSIL1C_20200627T150921_N0209_R025_T22WEB_20200627T170912_G0120V02_P078_IL_ASF_OD.nc"
+        }
+    }
+}

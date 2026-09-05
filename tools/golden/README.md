@@ -141,15 +141,20 @@ Attributes are compared alongside the pixels. `stable_shift`, the four `error` e
 `stable_count` carry as much of the answer as the planes do — a product whose `vx` matched and whose
 `stable_shift` did not has not matched.
 
-Three fields cannot match between two runs of the reference *itself*, and are excluded rather than
-tolerated. All three are properties of the reference, not of either implementation:
+Two fields cannot match between two runs of the reference *itself*, and are excluded rather than
+tolerated. Both are properties of the reference, not of either implementation:
 
-- **`v_error` where `v == 0`** — `netcdf_output.py::v_error_cal` draws 10⁶ samples from an unseeded
-  `default_rng()`.
 - **the `time` coordinate** — `crop.py::numeric_hash` jitters it by `hash(filename) % 10⁶`
   microseconds, and with `PYTHONHASHSEED` unset Python salts `hash()` per process. Documented as
-  deterministic; is not.
+  deterministic; is not. Measured: two runs land 0.25 s apart, and the amount is recorded in the
+  product's own `time:microseconds_added` attribute.
 - **`date_created`** — wall clock.
+
+**`v_error` is not a third**, though `netcdf_output.py::v_error_cal` does draw 10⁶ samples from an
+unseeded `default_rng()`. Measured on the S2 case: 8,356 pixels have `v == 0` and so take the Monte
+Carlo value, and it is `27` in both runs and in golden. The standard deviation of 10⁶ draws is stable
+to well within the `int16` rounding the product applies, so the sampling noise does not survive into
+the file. The draw is still irreproducible; the *product* is not affected by it.
 
 ## The reference container
 
@@ -162,9 +167,23 @@ docker pull --platform linux/arm64 ghcr.io/asfhyp3/hyp3-autorift:0.28.4
 julia --project=tools/golden tools/golden/run.jl --reproducibility S2B_MSIL1C_20200612
 ```
 
-Run twice on one granule, the two products differ only in the three fields above. That is the
-**reproducibility floor**: produced by unchanged code on identical inputs, so no tolerance below it
-can be attributed to any implementation. Every other tolerance in this file is measured against it.
+Run twice on one granule, the two products differ only in the `time` jitter. That is the
+**reproducibility floor**, and measured on `S2B_MSIL1C_20200612` it is **exact**:
+
+| comparison | planes | pixels | exact | differing |
+|---|---|---|---|---|
+| container run 1 vs run 2 | 7/7 | 615,146 | **100%** | `time` only, 0.254 s |
+| container run 1 vs **golden** | 7/7 | 615,146 | **100%** | `time` only, 0.482 s |
+
+The second row is the significant one: this machine reproduces ASF's golden product **bit for bit**,
+on `vx`, `vy`, `v`, `v_error`, `chip_size_width`, `chip_size_height` and `interp_mask`, with every
+coordinate and every other attribute equal — across a different architecture (arm64 here) and four
+months. Both `.nc` files are also the same size to the byte.
+
+So there is no measurement noise to hide behind. **Exact equality is the gate**, and any difference
+AutoRIFT.jl shows is a difference in AutoRIFT.jl. That is a considerably harder target than a
+tolerance table, and a much more useful one: a tolerance wide enough to absorb a rounding difference
+is also wide enough to absorb a bug.
 
 Working directories are kept, not cleaned, under `runs/<product>/<n>/`. They hold the filtered
 scenes, the geogrid rasters, and `autoRIFT_intermediate.nc` — `Dx`, `Dy`, `InterpMask`, `ChipSizeX`,
@@ -175,9 +194,25 @@ packaging, rather than to one by elimination.
 Note that a stale `autoRIFT_intermediate.nc` in the working directory makes `testautoRIFT.py` skip
 correlation entirely (`vend/testautoRIFT.py:693-706`), so a reused directory does not re-correlate.
 
+## What a run leaves behind
+
+A full S2 production run takes about three minutes on 8 threads and writes, besides the product:
+
+| file | what it is |
+|---|---|
+| `autoRIFT_intermediate.nc` | `Dx`, `Dy`, `InterpMask`, `ChipSizeX`, `SearchLimitX/Y`, `noDataMask` |
+| `offset.tif`, `velocity.tif` | displacement and velocity as rasters |
+| `window_*.tif` (9 files) | the geogrid: location, search range, chip bounds, the two off2vel vectors, scale factors, stable-surface mask |
+
+For the S2 case the intermediate is a 1008² grid at spacing 12 with chips 24/48/96, against an
+`origSize` of 1009² — the reference truncates its grid by one point, which `tools/ab/README.md`
+records as costing it 1.6% of the points on a different scene.
+
+That set is what makes Phase 1 possible without re-deriving anything: the same filtered inputs, the
+same geogrid, and the reference's own `Dx`/`Dy` to diff AutoRIFT.jl's against directly.
+
 ## Measured results
 
-Nothing is measured against AutoRIFT.jl yet. This section records numbers as each phase lands;
 `results/<product>.<kind>.json` holds each comparison with the machine, versions and commit that
 produced it.
 
@@ -185,5 +220,6 @@ produced it.
 |---|---|
 | harness self-diff, 22 products | **22/22 identical** |
 | injected-fault detection, 5 kinds | **5/5 caught** |
-| reference reproducibility floor | not yet measured |
+| reference reproducibility floor, S2 | **exact** — 7/7 planes, 615,146 px, `time` only |
+| container vs ASF golden, S2 | **exact** — bit-identical across arch and four months |
 | AutoRIFT.jl against golden | not yet run |
