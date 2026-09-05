@@ -94,13 +94,37 @@ function _preprocess(x::Symbol, width)
 end
 _preprocess(x, _width) = _badtype(:preprocess, x, "a Symbol or a `PreprocessMethod`")
 
-_subpixel(x::SubpixelMethod, _upsampling) = x
-function _subpixel(x::Symbol, up)
+# `subpixel` resolves to a *tuple*, one method per chip-size level, on the same rule as
+# `similarity`: a scalar becomes a 1-tuple whose last entry applies to every level, so the
+# single-method case — nearly every call — is unchanged and stays concretely typed.
+#
+# A tuple is what expresses the reference's per-chip-size `OverSampleRatio`; see `subpixel_at`.
+_subpixel(x::SubpixelMethod, _upsampling) = (x,)
+_subpixel(x::Symbol, up) = (_one_subpixel(x, up),)
+# `map` rather than a comprehension, so `R` stays a concrete `Tuple{PyramidRefine,PyramidRefine}`
+# that the refinement kernel can specialize on. `upsampling` is not forwarded to the elements: a
+# tuple names its methods, and each carries its own factor, so a loose keyword alongside would have
+# two sources for one number.
+function _subpixel(x::Tuple, up)
+    isempty(x) && throw(ArgumentError(
+        "`subpixel` cannot be an empty tuple; name at least one method."))
+    isnokw(up) || throw(ArgumentError(
+        "`upsampling` cannot be combined with a tuple of `subpixel` methods, which already carry " *
+        "their own factors. Drop `upsampling`, or pass a single method."))
+    return map(_one_subpixel, x)
+end
+_subpixel(x, _upsampling) = _badtype(:subpixel, x,
+                                    "a Symbol, a `SubpixelMethod`, or a tuple of either")
+
+# One element of a subpixel tuple. Separate from `_subpixel` because that returns a tuple and this
+# must not, or nesting would compound.
+_one_subpixel(x::SubpixelMethod, _up = nokw) = x
+function _one_subpixel(x::Symbol, up = nokw)
     T = _resolve(SYMBOL2SUBPIXEL, x, :subpixel)
     return T === NoRefine ? NoRefine() :
            isnokw(up) ? T() : T(; upsampling = up)
 end
-_subpixel(x, _upsampling) = _badtype(:subpixel, x, "a Symbol or a `SubpixelMethod`")
+_one_subpixel(x, _up = nokw) = _badtype(:subpixel, x, "a Symbol or a `SubpixelMethod`")
 
 # An instance already carries its own parameters, so the loose keywords would have nothing to
 # apply to. Passing both is a contradiction rather than a merge, and saying so beats silently

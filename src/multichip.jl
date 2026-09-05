@@ -137,6 +137,7 @@ function _level_sizes(p::Params)
     @assert !isempty(sizes) "no chip-size levels between $(p.chip_size_min.X)x$(p.chip_size_min.Y) " *
                             "and $(p.chip_size_max.X)x$(p.chip_size_max.Y)"
     _check_measures(p, length(sizes))
+    _check_subpixels(p, length(sizes))
     return sizes
 end
 
@@ -238,7 +239,8 @@ function _multichip(runner::PassRunner, grid::PointSet{2}, p::Params)
         any(wanted) || break                     # every point resolved
         # `result.dx`/`result.dy` are passed in as the finer levels' standing answer, which a
         # decimated level fills its holes from before interpolating — see `_undecimate_level`.
-        level = chipsize_level(runner, grid, p, cs, wanted, measure_at(p, k), result.dx, result.dy)
+        level = chipsize_level(runner, grid, p, cs, wanted, measure_at(p, k),
+                               subpixel_at(p, k), result.dx, result.dy)
         isnothing(level) && continue              # level found nothing coherent
         _merge_level!(result, level.field, level.filled, cs)
     end
@@ -255,9 +257,12 @@ Returns `(; field, filled)` — the displacement field, and the linear indices t
 from neighbours rather than measured — or `nothing` if the level found nothing worth
 continuing.
 
-`measure` is the similarity measure for this level. Positional rather than a keyword because
-`p.similarity` is a tuple and a keyword carrying an abstract `SimilarityMeasure` is unresolvable
-under `--trim` — see [`measure_at`](@ref).
+`measure` is the similarity measure for this level, and `subpixel` its refinement method. Positional
+rather than keywords because `p.similarity` and `p.subpixel` are tuples and a keyword carrying an
+abstract type is unresolvable under `--trim` — see [`measure_at`](@ref) and [`subpixel_at`](@ref).
+
+`subpixel` is per level because the reference's subpixel denominator is a function of chip size: a
+coarse level locates its peak to a finer fraction of a pixel than the base level does.
 
 `wanted` marks the points this level should attempt — in the loop, those no finer level
 resolved. Returns `nothing` if the coarse pass found too little to be worth continuing,
@@ -278,9 +283,10 @@ Separately callable so a caller can run one chip size without the loop.
 chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size,
                wanted::AbstractMatrix{Bool},
                measure::SimilarityMeasure = first(p.similarity),
+               subpixel::SubpixelMethod = first(p.subpixel),
                prior_dx::Union{Nothing,AbstractMatrix} = nothing,
                prior_dy::Union{Nothing,AbstractMatrix} = nothing) =
-    chipsize_level(WholeScene(pair), grid, p, extent(chip_size), wanted, measure,
+    chipsize_level(WholeScene(pair), grid, p, extent(chip_size), wanted, measure, subpixel,
                    prior_dx, prior_dy)
 
 # One chip-size level, however its passes are executed.
@@ -298,12 +304,13 @@ chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size,
 function chipsize_level(runner::PassRunner, grid::PointSet{2}, p::Params,
                         chip_size::Extent, wanted::AbstractMatrix{Bool},
                         measure::SimilarityMeasure,
+                        subpixel::SubpixelMethod = first(p.subpixel),
                         prior_dx::Union{Nothing,AbstractMatrix} = nothing,
                         prior_dy::Union{Nothing,AbstractMatrix} = nothing)
     # The grid this level runs on. A chip wider than the finest one gets a proportionally coarser
     # grid, so every level posts one estimate per chip rather than several per chip.
     decim = _level_decimation(p, chip_size)
-    decim == 1 && return _level_on_grid(runner, grid, p, chip_size, wanted, measure)
+    decim == 1 && return _level_on_grid(runner, grid, p, chip_size, wanted, measure, subpixel)
 
     sub = _decimate_level(grid, wanted, decim)
     isnothing(sub) && return nothing
@@ -316,7 +323,7 @@ function chipsize_level(runner::PassRunner, grid::PointSet{2}, p::Params,
     # result again, in the decimated space — which composes because `restrict` derives from the
     # runner's current blocks rather than from the full layout.
     got = _level_on_grid(restrict(runner, sub, size(grid)), sub.grid, p, chip_size,
-                         sub.wanted, measure)
+                         sub.wanted, measure, subpixel)
     isnothing(got) && return nothing
     return _undecimate_level(got, size(grid), sub.rows, sub.cols, prior_dx, prior_dy)
 end
@@ -328,17 +335,17 @@ end
 # whether its caller decimated. The caller owns that.
 function _level_on_grid(runner::PassRunner, grid::PointSet{2}, p::Params,
                         chip_size::Extent, wanted::AbstractMatrix{Bool},
-                        measure::SimilarityMeasure)
+                        measure::SimilarityMeasure, subpixel::SubpixelMethod)
     # A level's points: the requested ones, at this level's chip size.
     pts = _level_points(grid, p, chip_size, wanted)
     nsearchable(pts) == 0 && return nothing
 
-    coarse_mask = _coarse_mask(runner, pts, p, chip_size, measure)
+    coarse_mask = _coarse_mask(runner, pts, p, chip_size, measure, subpixel)
     isnothing(coarse_mask) && return nothing
     _apply_coarse_mask!(pts, coarse_mask) == 0 && return nothing
 
-    fine = run_pass(runner, pts, p, measure, p.subpixel)
-    filled = _reject_and_fill!(fine, pts, p)
+    fine = run_pass(runner, pts, p, measure, subpixel)
+    filled = _reject_and_fill!(fine, pts, p, subpixel)
     return (; field = fine, filled)
 end
 
@@ -789,12 +796,13 @@ end
 # Every operation here is a neighbourhood or a whole-grid reduction, which is why this must see the
 # assembled coarse grid rather than one block of it.
 function _coarse_decide(cd::DisplacementField, coarse::PointSet{2}, p::Params,
-                        filt::OutlierMethod, gridsize::Tuple{Int,Int}, stride::Int)
+                        filt::OutlierMethod, gridsize::Tuple{Int,Int}, stride::Int,
+                        subpixel::SubpixelMethod)
     measured = map(!isnan, cd.dx)
     any(measured) || return nothing
 
     keep = reject_outliers(cd.dx, cd.dy, coarse.radius_x, coarse.radius_y,
-                           measured, upsampling(p.subpixel), filt)
+                           measured, upsampling(subpixel), filt)
     @inbounds for i in eachindex(keep)
         measured[i] || (keep[i] = false)
     end
@@ -859,7 +867,7 @@ end
 # `measure` is positional and has no default: the one caller always knows the level's measure, and a
 # default here would be a second spelling of `chipsize_level`'s that could silently diverge from it.
 function _coarse_mask(runner::PassRunner, pts::PointSet{2}, p::Params, chip_size::Extent,
-                      measure::SimilarityMeasure)
+                      measure::SimilarityMeasure, subpixel::SubpixelMethod)
     setup = _coarse_points(pts, p, chip_size)
     if isnothing(setup)
         # Too few coarse points to judge consistency against their neighbours, so there is no
@@ -882,7 +890,11 @@ function _coarse_mask(runner::PassRunner, pts::PointSet{2}, p::Params, chip_size
     # The whole-grid half, once.
     # The same stride `_coarse_points` sliced with, so the mask expands back onto the lattice the
     # evidence was gathered on.
-    return _coarse_decide(cd, coarse, p, setup.filt, size(pts), _sparse_stride(p))
+    #
+    # `subpixel` is this level's *fine* method even though the pass above ran `NoRefine`: the outlier
+    # threshold is expressed in units of the quantization step the level's estimates will carry
+    # (`reject_outliers`), which is the fine method's, not the coarse pass's.
+    return _coarse_decide(cd, coarse, p, setup.filt, size(pts), _sparse_stride(p), subpixel)
 end
 
 # Maximum radius over each coarse cell, matching the left-biased window convention the sliding
@@ -915,10 +927,11 @@ end
 # Filling is worth doing at this stage rather than at the end: a hole filled here can be
 # resampled coherently into the next level's prior, whereas a hole left open forces that
 # level to search blind.
-function _reject_and_fill!(d::DisplacementField, pts::PointSet, p::Params)
+function _reject_and_fill!(d::DisplacementField, pts::PointSet, p::Params,
+                          subpixel::SubpixelMethod = first(p.subpixel))
     measured = map(!isnan, d.dx)
     keep = reject_outliers(d.dx, d.dy, pts.radius_x, pts.radius_y,
-                           measured, upsampling(p.subpixel),
+                           measured, upsampling(subpixel),
                            rescale(p.outliers, _oversample(p)))
     @inbounds for i in eachindex(keep)
         if !keep[i]

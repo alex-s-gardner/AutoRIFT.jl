@@ -205,7 +205,7 @@ end
         # Nothing a finer level already owns may be attempted.
         @test !any(wanted .& (result.chip_size .!= 0))
         lvl = chipsize_level(AutoRIFT.WholeScene(pair), grid, p, cs, wanted,
-                             AutoRIFT.measure_at(p, k))
+                             AutoRIFT.measure_at(p, k), AutoRIFT.subpixel_at(p, k))
         isnothing(lvl) && continue
         answered[cs.X] = .!isnan.(lvl.field.dx)
         before = copy(result.chip_size)
@@ -447,6 +447,44 @@ end
     @test count(!isnan, lvl.field.dx) <= 9
     # Nothing wanted at all is not an error, just no work.
     @test isnothing(chipsize_level(pair, grid, p, 32, falses(size(grid))))
+end
+
+@testset "each level quantizes at its own upsampling" begin
+    # The point of a per-level subpixel method is that the level's *answer* is quantized by it, so
+    # this asserts the quantization rather than the plumbing: displacements from a level run at
+    # `upsampling = n` are exact multiples of `1/n`.
+    #
+    # A fractional true shift is what makes the test discriminating — an integer one lands on every
+    # grid and would pass whatever the factor was.
+    ref, sec = shifted_pair(512, (5.3, -3.7); T = Float32)
+    pair = ImagePair(ref, sec)
+    grid = gridpoints((512, 512), 32; chip_size = 32, search_radius = 25)
+
+    quantized(v, n) = all(x -> abs(x * n - round(x * n)) < 1e-4, filter(!isnan, v))
+
+    for n in (8, 16, 64)
+        p = params(; chip_size = 32, chip_size_max = 32, subpixel = (PyramidRefine(n),))
+        lvl = chipsize_level(pair, grid, p, 32, trues(size(grid)), first(p.similarity),
+                             AutoRIFT.subpixel_at(p, 1))
+        @test !isnothing(lvl)
+        @test quantized(vec(lvl.field.dx), n)
+        @test quantized(vec(lvl.field.dy), n)
+        # The shift is still recovered, so a finer grid is not being bought with accuracy.
+        @test med(filter(!isnan, -lvl.field.dx)) ≈ 5.3 atol = 0.2
+    end
+
+    # Two levels with different factors: each obeys its own, which one shared factor could not
+    # produce. Run through the whole loop rather than level by level, since that is where
+    # `subpixel_at` is consulted.
+    p2 = params(; chip_size = 32, chip_size_max = 64,
+                subpixel = (PyramidRefine(8), PyramidRefine(64)))
+    out = autorift(ref, sec, p2)
+    fine = [out.dx[i] for i in eachindex(out.dx) if out.chip_size[i] == 32 && !isnan(out.dx[i])]
+    coarse = [out.dx[i] for i in eachindex(out.dx) if out.chip_size[i] == 64 && !isnan(out.dx[i])]
+    isempty(fine) || @test quantized(fine, 8)
+    # A multiple of 1/64 need not be a multiple of 1/8, and on a fractional shift some are not —
+    # which is what shows the two levels used different factors rather than one.
+    isempty(coarse) || @test quantized(coarse, 64)
 end
 
 @testset "a level that finds nothing is skipped" begin

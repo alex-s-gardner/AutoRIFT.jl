@@ -1023,10 +1023,14 @@ filtering kernels specialize on them.
 between them — coherence at the finest chip, amplitude above it. A scalar keyword resolves to a
 1-tuple, and a tuple shorter than the level list has its last entry repeated, so the common case
 of one measure everywhere is the 1-tuple and costs nothing. See [`chip_measures`](@ref).
+
+`subpixel` is a tuple for the same reason and with the same rule: the reference's subpixel
+denominator is a function of chip size rather than of the run, so a level's displacement may be
+quantized to 1/16 px at the base chip and 1/32 or 1/64 above it. See [`chip_subpixels`](@ref).
 """
 struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:PreprocessMethod,
-              R<:SubpixelMethod,O<:OutlierMethod,T<:BoolAsType,W<:RotationMethod,
-              B<:Backend}
+              R<:Tuple{SubpixelMethod,Vararg{SubpixelMethod}},O<:OutlierMethod,T<:BoolAsType,
+              W<:RotationMethod,B<:Backend}
     similarity::S
     preprocess::P
     subpixel::R
@@ -1184,6 +1188,38 @@ the correlation kernel specializes and `--trim` can resolve the call.
 @inline measure_at(p::Params, level::Integer) =
     p.similarity[min(level, length(p.similarity))]
 
+"""
+    chip_subpixels(p::Params, nlevels = length(chip_sizes(p))) -> Tuple
+
+The subpixel method each chip-size level will use, finest first, with the last tuple entry
+repeating.
+
+The counterpart of [`chip_measures`](@ref), and for inspecting a configuration rather than running
+one — the chip-size loop calls [`subpixel_at`](@ref), which allocates nothing.
+"""
+function chip_subpixels(p::Params, nlevels::Integer = length(chip_sizes(p)))
+    _check_subpixels(p, nlevels)
+    return ntuple(k -> subpixel_at(p, k), nlevels)
+end
+
+"""
+    subpixel_at(p::Params, level::Integer) -> SubpixelMethod
+
+The subpixel method for chip-size level `level` (1 = finest), with the last tuple entry repeating.
+
+Per level because the reference's subpixel denominator is a function of chip size, not of the run:
+`OverSampleRatio` may be a dict, and the production driver always passes one — `{16, 32, 64, 64}`
+keyed by `ChipSize0X * [1,2,4,8]` for optical input and `{32, 64, 128, 128}` for radar
+(`autoRIFT.py:652-653`, `testautoRIFT.py:488-510`). So a coarse level locates its peak more finely
+than the base level does, and a single denominator cannot express that.
+
+Indexed rather than iterated for the same reason as [`measure_at`](@ref): `p.subpixel` is a tuple, so
+the result keeps its concrete type, the refinement kernel specializes, and `--trim` can resolve the
+call.
+"""
+@inline subpixel_at(p::Params, level::Integer) =
+    p.subpixel[min(level, length(p.subpixel))]
+
 # Shared by `chip_measures` and the chip-size loop. A tuple longer than the level list means the
 # extra measures would silently never run, which is a configuration error rather than something to
 # quietly ignore.
@@ -1193,6 +1229,16 @@ function _check_measures(p::Params, nlevels::Integer)
         "`similarity` names $n measures but there are only $nlevels chip-size levels. Widen " *
         "the `chip_size_min`/`chip_size_max` range, or name fewer measures — the last one " *
         "applies to every remaining level."))
+    return nothing
+end
+
+# As `_check_measures`, for the subpixel tuple.
+function _check_subpixels(p::Params, nlevels::Integer)
+    n = length(p.subpixel)
+    n <= nlevels || throw(ArgumentError(
+        "`subpixel` names $n methods but there are only $nlevels chip-size levels. Widen the " *
+        "`chip_size_min`/`chip_size_max` range, or name fewer methods — the last one applies to " *
+        "every remaining level."))
     return nothing
 end
 
