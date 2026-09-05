@@ -55,9 +55,16 @@ subtracts 1. Stage 2 subtracts **1.5**: `runAutorift` snaps an even chip's grid 
 the bare correlator. Verified by interception — handing `runAutorift` 53.0 makes it correlate at 53.5.
 
 **Sign.** With the chip on the secondary on both sides, both report the offset from secondary back to
-reference, so no flip is needed beyond undoing the reference's own cartesian `Dy = -Dy`. The comparison
-scripts *measure* the sign rather than asserting it, scoring all four combinations and reporting the
-best, so a convention change surfaces as a printed sign instead of a figure full of apparent error.
+reference, so no flip is needed beyond undoing the reference's own cartesian `Dy = -Dy`. That one flip
+is applied by the *writer*: `stage1_python.py` and `stage2_python.py` negate `Dy` and leave `Dx` alone,
+so the planes on disk are already in this package's convention and every reader takes them as written.
+
+`bench_figures.jl` goes further and *measures* the sign, scoring all four combinations and keeping the
+best, which is the form to copy in a new diagnostic — a hardcoded flip is only correct as long as the
+writer's convention holds, and it fails silently when that changes. Four readers did hardcode one, and
+negating an already-negated plane cost `dx` a 0.75 px median bias and `corr dx` of −0.9996 on results
+that agree to the bit. `corr` is printed for exactly that reason: a near-perfect *anti*-correlation is
+a flipped sign and nothing else.
 
 **Array layout.** Julia is column-major and NumPy row-major, so a 2-D array moved between them is
 transposed unless the reader says otherwise — and for a square array that is silent. A transposed
@@ -79,13 +86,23 @@ displacement — indistinguishable at a glance from a real disagreement concentr
 layout error is worse: it fabricates a defect at a location that has nothing to do with the code being
 diagnosed.
 
-## Why agreement is reported against a correlation gate
+## What agreement is measured against
 
-A 0.2 px target is a claim about sub-pixel *matching noise*, which presupposes a match. Where the
-correlation surface has no dominant peak both implementations pick from noise, and they are then
-being asked to agree about something neither one measured — unreachable for any two
-implementations, including two builds of the reference itself. The comparison therefore reports the
-residual as a function of peak strength; that ladder is the informative form of the answer.
+**Exact agreement, and one upsampling step.** At `upsampling = 16` the finest difference either side
+can express is 1/16 = 0.0625 px, so a residual below that is not a disagreement about position — it is
+which of two adjacent representable values a peak rounded to. The headline number is therefore the
+fraction agreeing *to the bit*, with "within one step" beside it.
+
+A 0.2 px tolerance was the threshold here and it measured nothing: stage 2's p95 is 0.017 px, so every
+correlation gate from 0.0 to 0.5 passed between 99.4% and 100%. A threshold everything clears reports
+the threshold, not the code. The exact fraction moves — it falls the moment the two stop matching
+bit-for-bit, which is what a regression does.
+
+**Gated by peak strength**, because sub-pixel agreement presupposes a match. Where the correlation
+surface has no dominant peak both implementations pick from noise, and they are then being asked to
+agree about something neither one measured — unreachable for any two implementations, including two
+builds of the reference itself. The gate says at what peak strength the two become interchangeable,
+which is the informative form of the answer.
 
 ## Measured agreement
 
@@ -93,19 +110,32 @@ Jakobshavn Landsat 8/9 pair, 15 m panchromatic, chips 16/32/64 on a grid spaced 
 
 Stage 1, the correlator, one level at a time on a 512² window:
 
-| chip | points | median \|ddx\| | p95 | max | within 0.2 px |
+| chip | points | exact | median | p99 | max |
 |---|---:|---:|---:|---:|---:|
-| 16 | 841 | 0.0000 | 0.0000 | **0.0000** | 100% |
-| 32 | 196 | 0.0000 | 0.0000 | **0.0000** | 100% |
-| 64 | 49 | 0.0000 | 0.0000 | **0.0000** | 100% |
+| 16 | 841 | **100%** | 0.0000 | 0.0000 | **0.0000** |
+| 32 | 196 | **100%** | 0.0000 | 0.0000 | **0.0000** |
+| 64 | 49 | **100%** | 0.0000 | 0.0000 | **0.0000** |
 
 The correlator is **bit-identical** — not merely close — at every chip size, on both axes, at every
-point. Same for `dy`.
+point. Same for `dy`, and at every correlation gate.
 
-Stage 2, the whole pipeline on the full 3072² window, 85,505 shared points: median radial
-**0.0000 px**, bias `+0.0000` on both axes, 89.1% within 0.2 px. Points answered per level:
-16 → 55,678 / 55,182, 32 → 18,693 / 18,942, 64 → 15,608 / 14,092, and the two pick the **same level at
-92.7%** of shared points.
+Stage 2, the whole pipeline on the full 3072² window, 87,814 shared points: **77.4% exact**, 97.3%
+within one step, median radial 0.0000 px, bias `+0.0000` on both axes, p99 0.1411 px. Exact agreement
+rises with peak strength, which is the shape to expect — a weak peak is where a tie can break either
+way:
+
+| correlation gate | points | exact | within step | p99 | max |
+|---|---:|---:|---:|---:|---:|
+| ≥ 0.0 | 85,098 | 77.3% | 97.5% | 0.1363 | 6.3408 |
+| ≥ 0.2 | 69,337 | 86.1% | 98.3% | 0.1029 | 2.3138 |
+| ≥ 0.4 | 39,142 | 96.0% | 99.4% | 0.0319 | 1.0923 |
+| ≥ 0.5 | 17,516 | **97.6%** | 99.7% | 0.0113 | 0.3653 |
+
+The `≥ 0.0` row is 85,098 against the 87,814 above because a gate on correlation drops the points an
+interpolated fill answered: those carry a displacement but no peak of their own.
+
+Points answered per level: 16 → 55,022 / 55,182, 32 → 19,162 / 18,942, 64 → 14,075 / 14,092, and the
+two pick the **same level at 99.3%** of shared points.
 
 **Use 3072², not a smaller window.** Below it the reference silently resolves nothing above chip 16:
 its coarse grid for a level is the fine grid decimated by `sparseSearchSampleRate × ChipSize0/spacing`,
@@ -252,9 +282,9 @@ faster implementation that disagrees is not faster at the same job.
 Whole-process wall clock and peak RSS from `/usr/bin/time -l`, one fresh process per row: `ru_maxrss`
 is a high-water mark, so two configurations measured in one process both report the larger.
 
-Apple M2 Max, 12 cores, 96 GiB, macOS 26.5.2 · Julia 1.12.5 · AutoRIFT.jl 0.1.0 (`f88c3a8`) ·
+Apple M2 Max, 12 cores, 96 GiB, macOS 26.5.2 · Julia 1.12.5 · AutoRIFT.jl 0.1.0 (`11920b9`) ·
 reference autoRIFT 2.1.1, Python 3.10.20 with NumPy 1.26.4 and OpenCV 4.13.0 · Rasters 0.15.0,
-ArchGDAL 0.10.12, DiskArrays 0.4.22. Load average 2.0 during the run, so absolute times are a few
+ArchGDAL 0.10.12, DiskArrays 0.4.22. Load average 2.1 during the run, so absolute times are a few
 percent pessimistic — equally for every row, so the ratios hold.
 
 CPU time beside wall clock because the two answer different questions: wall clock is what a user
@@ -263,17 +293,17 @@ clock was not competing with anything, which is the check that a row is worth re
 
 | configuration | lazy | blocks | runtime | CPU time | peak RSS |
 |---|:---:|---:|---:|---:|---:|
-| python autoRIFT v2.1.2† | no | 1 | 173.9 s | 414.0 s | 6884 MiB |
-| AutoRIFT.jl, eager, no blocks, 12 threads | no | 1 | 20.8 s | 79.8 s | 6984 MiB |
-| AutoRIFT.jl, lazy, block 2048, 12 threads | yes | 81 | 42.0 s | 206.3 s | 3781 MiB |
-| AutoRIFT.jl, lazy, block 4096, 12 threads | yes | 25 | 59.6 s | 222.3 s | 9643 MiB |
-| AutoRIFT.jl, eager, no blocks, 1 thread | no | 1 | 63.8 s | 65.6 s | 6701 MiB |
-| juliac binary, lazy, no blocks, 1 thread\* | yes | 1 | 65.0 s | 66.4 s | 6362 MiB |
-| juliac binary, lazy, block 2048, 1 thread\* | yes | 81 | 88.1 s | 89.4 s | 3396 MiB |
-| juliac binary, lazy, block 1024, 1 thread\* | yes | 289 | 91.2 s | 92.7 s | 3212 MiB |
-| juliac binary, lazy, block 512, 1 thread\* | yes | 1122 | 95.8 s | 97.3 s | 3154 MiB |
-| juliac binary, lazy, block 4096, 1 thread\* | yes | 25 | 98.9 s | 100.3 s | 3966 MiB |
-| juliac binary, lazy, block 256, 1 thread\* | yes | 4422 | 109.2 s | 110.8 s | 3172 MiB |
+| python autoRIFT v2.1.2† | no | 1 | 176.5 s | 414.3 s | 6883 MiB |
+| AutoRIFT.jl, eager, no blocks, 12 threads | no | 1 | 21.3 s | 79.3 s | 7247 MiB |
+| AutoRIFT.jl, lazy, block 2048, 12 threads | yes | 81 | 45.5 s | 211.2 s | 3663 MiB |
+| AutoRIFT.jl, lazy, block 4096, 12 threads | yes | 25 | 56.6 s | 222.1 s | 9800 MiB |
+| AutoRIFT.jl, eager, no blocks, 1 thread | no | 1 | 64.7 s | 66.2 s | 6702 MiB |
+| juliac binary, lazy, no blocks, 1 thread\* | yes | 1 | 63.8 s | 65.3 s | 6361 MiB |
+| juliac binary, lazy, block 2048, 1 thread\* | yes | 81 | 89.5 s | 90.5 s | 3363 MiB |
+| juliac binary, lazy, block 1024, 1 thread\* | yes | 289 | 90.9 s | 92.5 s | 3215 MiB |
+| juliac binary, lazy, block 512, 1 thread\* | yes | 1122 | 94.5 s | 95.9 s | 3135 MiB |
+| juliac binary, lazy, block 4096, 1 thread\* | yes | 25 | 99.9 s | 101.3 s | 3957 MiB |
+| juliac binary, lazy, block 256, 1 thread\* | yes | 4422 | 109.3 s | 110.8 s | 3134 MiB |
 
 † The reference's correlation loop is serial, but OpenCV's own threading is not: it uses 2.4 cores'
 worth over the run, which is why its CPU time exceeds its wall clock. `cv2.setNumThreads` does not
@@ -288,13 +318,13 @@ thread against 12, and the binary at each block size against its own unblocked r
 
 Four things this table says that the windowed ones cannot:
 
-**Lazy trades time for memory, and the trade is not free.** 42.0 s against 20.8 s for a 46% lower
-peak. Blocking a scene that fits in memory costs 2.0× the runtime and buys nothing; blocking one that
+**Lazy trades time for memory, and the trade is not free.** 45.5 s against 21.3 s for a 49% lower
+peak. Blocking a scene that fits in memory costs 2.1× the runtime and buys nothing; blocking one that
 does not fit is the only way to process it at all. That is the whole basis for choosing.
 
-**Block 4096 is the exception, and it is not a memory saving at all.** 9643 MiB against 6984 for the
+**Block 4096 is the exception, and it is not a memory saving at all.** 9800 MiB against 7247 for the
 unblocked row: a block that large holds more per-block buffer than the whole scene costs eagerly, so
-blocking there pays 2.9× the runtime to raise peak memory by 38%. The useful range is 2048 and below.
+blocking there pays 2.7× the runtime to raise peak memory by 35%. The useful range is 2048 and below.
 
 **The two eager rows read raw planes, not rasters.** Measured through
 `autorift(::AbstractRaster, ...)` the same configuration peaks at **11590 MiB**, not 7148: `read` keeps
@@ -318,26 +348,27 @@ fitting on a small instance and not.
 
 ## Where the two still differ, and why
 
-The correlator is bit-identical and the pipeline agrees to a median of 0.0000 px with zero bias. What
-remains is 7.4% of points beyond 0.25 px, and it is the **pyramid**, not the correlator:
+The correlator is bit-identical and 77.4% of pipeline points agree to the bit. What remains is 2.7% of
+points beyond one upsampling step, and it is the **pyramid**, not the correlator:
 
 | | disagreeing points | agreeing points |
 |---|---:|---:|
-| chose a different chip-size level | **32.5%** | 5.3% |
-| filled from neighbours on the Julia side | 12.9% | 7.3% |
-| median `peak_ratio` | 1.65 | 1.83 |
-| median displacement | 0.48 px | 0.58 px |
+| chose a different chip-size level | **23.0%** | 0.1% |
+| filled from neighbours on the Julia side | **31.8%** | 7.5% |
+| median `peak_ratio` | 1.76 | 1.83 |
+| median displacement | 0.48 px | 0.56 px |
 
-43% of the disagreeing points differ in chip level or were filled — decisions made by the outlier filter
-and the smallest-chip-wins merge, not values returned by the correlator. A point one side answered at
-chip 16 the other may have answered at 32, and the two estimates then describe different footprints of
-ground; a point one side measured the other may have filled from neighbours.
+**51.9%** of the disagreeing points differ in chip level or were filled — decisions made by the outlier
+filter and the smallest-chip-wins merge, not values returned by the correlator. A point one side
+answered at chip 16 the other may have answered at 32, and the two estimates then describe different
+footprints of ground; a point one side measured the other may have filled from neighbours. Both
+conditions are far rarer among the agreeing points, 0.1% and 7.5%, which is what makes them the
+explanation rather than a coincidence.
 
 Two things this is *not*. It is not concentrated at fast flow: among the top 2% by displacement the rate
-is **4.1%**, lower than the 7.5% elsewhere, and the densest cluster sits at a displacement of 0.8 px.
-And it is not a quality effect — the disagreeing points are only marginally the more ambiguous, at a
-median `peak_ratio` of 1.65 against 1.83, which is well inside the spread of either population. So
-these are not points where a rival peak beat the right one.
+is **2.0%**, lower than the 2.7% elsewhere. And it is not a quality effect — the disagreeing points are
+only marginally the more ambiguous, at a median `peak_ratio` of 1.76 against 1.83, well inside the
+spread of either population. So these are not points where a rival peak beat the right one.
 
 The residual beyond the level and fill differences is tie-breaking at 1/16 px, which no two
 implementations can agree about: below a real correlation peak both are picking from noise.
