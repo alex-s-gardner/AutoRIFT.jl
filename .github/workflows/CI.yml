@@ -42,6 +42,31 @@ jobs:
         with:
           version: ${{ matrix.version }}
       - uses: julia-actions/cache@v2
+      # The geogrid handoff tests need `ImagePairGeometry`, which is unregistered. `[sources]` in
+      # `Project.toml` names where it comes from, and Julia 1.11 and later resolve it from there.
+      #
+      # Julia 1.10 has no `sources` field in `Pkg.Types.Project`, so it ignores that table, sees an
+      # unregistered name in `[extras]`, and refuses to build a test environment at all — the whole
+      # suite fails, not just the one testset. Dropping the `[extras]` entry is what lets the rest of
+      # the suite run there; `test/runtests.jl` then finds the package absent and skips the handoff
+      # testset with a message. Removing this step and the `[extras]` edit is the first thing to do
+      # once ImagePairGeometry is registered.
+      - name: Drop the unregistered test dependency on Julia LTS
+        if: matrix.version == 'lts'
+        run: |
+          julia -e '
+            function strip_entry(path)
+                out = String[]
+                section = ""
+                for line in eachline(path)
+                    startswith(line, "[") && (section = strip(line))
+                    section == "[extras]" && startswith(line, "ImagePairGeometry ") && continue
+                    section == "[targets]" && (line = replace(line, ", \"ImagePairGeometry\"]" => "]"))
+                    push!(out, line)
+                end
+                write(path, join(out, "\n") * "\n")
+            end
+            strip_entry("Project.toml")'
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
       - uses: julia-actions/julia-processcoverage@v1

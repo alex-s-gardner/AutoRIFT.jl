@@ -93,4 +93,17 @@ include("utils.jl")
     @testset "gpu" begin
         include("gpu.jl")
     end
+
+    # The geogrid handoff, run wherever `ImagePairGeometry` is resolvable. It is unregistered and
+    # reached through `[sources]`, which Julia 1.10 does not implement, so on the LTS it is absent and
+    # this is skipped — see the note in `.github/workflows/CI.yml`. Guarded rather than assumed
+    # present, because a skip that announces itself is better than a `MethodError` that does not say
+    # why.
+    if Base.identify_package("ImagePairGeometry") !== nothing
+        @testset "ImagePairGeometry handoff" begin
+            include("imagepairgeometry.jl")
+        end
+    else
+        @info "Skipping the ImagePairGeometry handoff tests: it is not in this environment."
+    end
 end
