@@ -113,6 +113,33 @@ directions: `FFTW.libfftw3f` is a `FakeLazyLibrary` resolved by a load-time call
 binary does not have, so the `ccall` dies with a `TypeError` *at run time*; and a bare soname works
 in the binary but fails in an ordinary session where the artifact is not on the loader path.
 
+## A `MethodError` here spins instead of failing
+
+**A `MethodError` reaching the top level of this binary did not terminate.** Observed once, and
+directly: every one of 2289 samples from the hung process sat in Julia's error printer, `jl_no_exc_handler`
+into `jl_static_show_next_` and `jl_static_show_x_` mutually, at 100% CPU with no output and no exit.
+Formatting a `MethodError` wants the method table the trim removed. `sample <pid>` is what showed it:
+
+```
+julia_autorift_1152
+  jl_f_throw_methoderror
+    jl_method_error → ijl_throw → ijl_no_exc_handler
+      jl_static_show_next_ ⇄ jl_static_show_x_
+```
+
+So a dispatch break in this app presents as a **hang**, not a crash, and the hang looks like slow work.
+`autorift(reference, secondary, p, (bs, bs))` handed `_run` a plain tuple where it dispatches on
+`Extent`, and every blocked row of `tools/ab/bench_table.jl` ran for an hour instead of a minute and a
+half — read as a memory-pressure problem for two full measurement rounds before anyone sampled it.
+
+Two consequences worth acting on. **Any call this app makes is a build-time dependency of that app
+running at all**, so an overload used only here needs a test in the library that pins its signature —
+the positional four-argument `autorift` had none, and the break survived on `main` until a benchmark
+happened to exercise it. And when a
+row of a benchmark is inexplicably slow rather than merely slower, **sample it before profiling it**:
+an infinite loop inside Julia's error printer is indistinguishable from hot numerical code by every
+metric except the stack.
+
 ## Threading does not work yet, and the failure is silent
 
 `threaded = true` **trims with zero verifier errors and then fails at run time**: the spawned closure
