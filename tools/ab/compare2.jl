@@ -12,7 +12,16 @@ using CairoMakie, Statistics, Printf
 const D = joinpath(@__DIR__, "stage2")
 const PLOTS = joinpath(@__DIR__, "plots")
 const TAG = length(ARGS) >= 1 ? ARGS[1] : "stage2"
-const TOL = 0.2
+
+# One upsampling step at `upsampling = 16`: the smallest difference either side can express, so a
+# disagreement below it is not a disagreement about position but about which of two adjacent
+# representable values a peak rounded to.
+#
+# 0.2 px was the threshold here and it no longer discriminates: p95 is 0.017 px, and every gate from
+# 0 to 0.5 correlation passes between 99.4% and 100%. A tolerance that everything clears measures the
+# tolerance, not the code. At one step the same comparison separates 97.3% from 98.8%, and the
+# statistic worth reading is the one below — the fraction agreeing *exactly*, which is 77.4%.
+const TOL = 1 / 16
 
 function manifest()
     shapes = Dict{String,Tuple{Int,Int}}()
@@ -47,8 +56,13 @@ function main()
     jc_f = read_bin("julia_correlation", Float32, jsz)
     jcs_f = read_bin("julia_chip_size", Int32, jsz)
 
-    pdx = .-read_bin("python_dx", Float32, psz)
-    pdy = .-read_bin("python_dy", Float32, psz)
+    # Read as written. `stage2_python.py` has already put both axes in AutoRIFT.jl's convention —
+    # it negates `Dy` there to undo the reference's final cartesian flip and leaves `Dx` alone.
+    # Negating again here flips both back: it turns a bit-identical `dx` into a 0.75 px median bias
+    # and a correlation of -0.9996, which reads as an accuracy difference rather than as the
+    # convention error it is.
+    pdx = read_bin("python_dx", Float32, psz)
+    pdy = read_bin("python_dy", Float32, psz)
     pcs = read_bin("python_chip_size", Int32, psz)
 
     # The reference's grid is the top-left sub-block of the one it was given, so this is a crop
@@ -81,8 +95,11 @@ function main()
         for (nm, v) in (("|ddx|", abs.(jdx[both] .- pdx[both])),
                         ("|ddy|", abs.(jdy[both] .- pdy[both])),
                         ("radial", e))
-            @printf("%-7s median %7.4f  p95 %8.4f  max %9.4f  within %.1f px %5.1f%%\n",
-                    nm, median(v), quantile(v, 0.95), maximum(v), TOL, 100 * mean(v .<= TOL))
+            # `exact` first, because it is the statistic that still moves: most points agree to the
+            # bit, and what a change to the correlator does is move points out of that column.
+            @printf("%-7s exact %5.1f%%  within step %5.1f%%  median %7.4f  p99 %8.4f  max %9.4f\n",
+                    nm, 100 * mean(iszero, v), 100 * mean(v .<= TOL),
+                    median(v), quantile(v, 0.99), maximum(v))
         end
         @printf("bias   dx %+.4f   dy %+.4f  (julia - reference, signed median)\n",
                 median(jdx[both] .- pdx[both]), median(jdy[both] .- pdy[both]))
@@ -91,13 +108,14 @@ function main()
 
         # Gated by peak strength, for the reason compare.jl records: below a real peak the two are
         # being asked to agree about something neither measured.
-        println("\n  gate      n   median      p95   within $(TOL) px")
+        println("\n  gate      n    exact   within step      p99      max")
         for g in (0.0, 0.1, 0.2, 0.3, 0.4, 0.5)
             sel = both .& (jc .>= g)
             count(sel) == 0 && continue
             v = er[sel]
-            @printf("  >=%.1f  %5d  %7.4f  %7.4f  %6.1f%%\n",
-                    g, count(sel), median(v), quantile(v, 0.95), 100 * mean(v .<= TOL))
+            @printf("  >=%.1f  %5d  %6.1f%%       %6.1f%%  %7.4f  %7.4f\n",
+                    g, count(sel), 100 * mean(iszero, v), 100 * mean(v .<= TOL),
+                    quantile(v, 0.99), maximum(v))
         end
         # Restricted to points both sides answered at the same chip size: a level difference
         # changes how much the estimate is smoothed, so comparing across levels measures that
@@ -105,8 +123,9 @@ function main()
         same = both .& (jcs .== pcs)
         if count(same) > 2
             v = er[same]
-            @printf("\nsame level only (%d points): median %.4f  within %.1f px %.1f%%\n",
-                    count(same), median(v), TOL, 100 * mean(v .<= TOL))
+            @printf("\nsame level only (%d points): exact %.1f%%  within step %.1f%%  p99 %.4f\n",
+                    count(same), 100 * mean(iszero, v), 100 * mean(v .<= TOL),
+                    quantile(v, 0.99))
         end
     end
 
@@ -128,12 +147,16 @@ function main()
         ax1 = Axis(fig[1, col]; title = "AutoRIFT.jl $nm", aspect = DataAspect())
         hm = heatmap!(ax1, nanify(J, jok); colormap = :balance, colorrange = dlim)
         Colorbar(fig[1, col], hm; label = "px", halign = :right, width = 12, tellwidth = false)
-        ax2 = Axis(fig[2, col]; title = "reference $nm (negated)", aspect = DataAspect())
+        ax2 = Axis(fig[2, col]; title = "reference $nm", aspect = DataAspect())
         heatmap!(ax2, nanify(P, pok); colormap = :balance, colorrange = dlim)
     end
 
+    # Scaled to one upsampling step, so the map distinguishes exact agreement from a tie broken the
+    # other way rather than washing both out against a whole-pixel outlier. `highclip` marks the few
+    # points past a step, which at 0.6% of the grid would otherwise be invisible.
     axd = Axis(fig[1, 3]; title = "radial |difference|", aspect = DataAspect())
-    hmd = heatmap!(axd, nanify(er, both); colormap = :inferno, colorrange = (0, max(TOL * 2, 0.01)))
+    hmd = heatmap!(axd, nanify(er, both); colormap = :inferno, colorrange = (0, max(TOL, 0.01)),
+                   highclip = :cyan)
     Colorbar(fig[1, 3], hmd; label = "px", halign = :right, width = 12, tellwidth = false)
 
     # Where each side has an answer and the other does not, which is the coverage question the

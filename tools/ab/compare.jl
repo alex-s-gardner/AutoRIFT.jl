@@ -4,10 +4,15 @@
 # convention, and writes one PNG per iteration to `tools/ab/plots/`.
 #
 # **Convention.** AutoRIFT.jl reports displacement secondary-to-reference; the reference reports
-# feature motion, which is its negative. Both axes flip together, so the comparison negates the
-# reference's pair rather than either component alone. A one-axis flip would be a bug in one of the
-# two implementations; a both-axis flip is the documented difference, and `test/realdata.jl` already
-# applies it when forming velocities.
+# feature motion, which is its negative. Both axes flip together, and `stage1_python.py` has
+# **already applied** that flip by the time it writes the bundle — it negates `dy` to undo the
+# reference's cartesian flip, and its chip/window assignment accounts for the rest. So the planes on
+# disk are already in AutoRIFT.jl's convention and this reads them as written.
+#
+# Negating here as well flips both axes back, which turns a bit-identical result into a whole-pixel
+# median bias and a correlation of -0.9996. That reads as an accuracy difference rather than as the
+# convention error it is, which is why `stage1_python.py` also compares in-process: two independent
+# paths to the same number, and a disagreement between them means the sign is wrong here.
 #
 #   julia --project=tools/ab tools/ab/compare.jl [tag]
 
@@ -17,8 +22,14 @@ const D = joinpath(@__DIR__, "stage1")
 const PLOTS = joinpath(@__DIR__, "plots")
 const TAG = length(ARGS) >= 1 ? ARGS[1] : "stage1"
 
-# The tolerance the comparison is judged against: sub-pixel matching noise for this correlator.
-const TOL = 0.2
+# One upsampling step at `upsampling = 16`, the smallest difference either side can express. A
+# disagreement below it is about which of two adjacent representable values a peak rounded to, not
+# about position.
+#
+# 0.2 px was the threshold and it no longer discriminates: stage 1 is bit-identical at every chip
+# size, so any tolerance above zero reports 100%. Reading the *exact* fraction is what makes a
+# regression visible — it drops off 100% the moment the two stop matching to the bit.
+const TOL = 1 / 16
 
 function manifest()
     shapes = Dict{String,Tuple{Int,Int}}()
@@ -48,9 +59,9 @@ function main()
     jdx = read_bin("julia_dx", Float32, sz)
     jdy = read_bin("julia_dy", Float32, sz)
     jc = read_bin("julia_correlation", Float32, sz)
-    # Negated into AutoRIFT.jl's convention, per the note above.
-    pdx = .-read_bin("python_dx", Float32, sz)
-    pdy = .-read_bin("python_dy", Float32, sz)
+    # Already in AutoRIFT.jl's convention when written, per the note above.
+    pdx = read_bin("python_dx", Float32, sz)
+    pdy = read_bin("python_dy", Float32, sz)
 
     ok = .!isnan.(jdx) .& .!isnan.(jdy) .& .!isnan.(pdx) .& .!isnan.(pdy)
     ex = abs.(jdx .- pdx)
@@ -66,8 +77,9 @@ function main()
     @printf("comparable        %d / %d\n", count(ok), length(ok))
     @printf("coverage  julia %d  python %d\n", count(!isnan, jdx), count(!isnan, pdx))
     for (nm, e) in (("|ddx|", exo), ("|ddy|", eyo), ("radial", ero))
-        @printf("%-7s median %7.4f  p95 %7.4f  max %8.4f  within %.1f px %5.1f%%\n",
-                nm, median(e), quantile(e, 0.95), maximum(e), TOL, 100 * mean(e .<= TOL))
+        @printf("%-7s exact %5.1f%%  within step %5.1f%%  median %7.4f  p99 %7.4f  max %8.4f\n",
+                nm, 100 * mean(iszero, e), 100 * mean(e .<= TOL),
+                median(e), quantile(e, 0.99), maximum(e))
     end
     # One upsampling step is the finest distinction either side can draw, so a residual at that
     # scale is a tie broken differently rather than a disagreement about the peak.
@@ -85,14 +97,15 @@ function main()
     # match: where the surface has no dominant peak both sides pick from noise, and they are then
     # being asked to agree about something neither one measured. The gate says at what peak
     # strength the two become interchangeable, which is the useful form of the answer.
-    println("\n  gate      n   median      p95   within $(TOL) px")
+    println("\n  gate      n    exact   within step      p99      max")
     for g in (0.0, 0.1, 0.2, 0.3, 0.4, 0.5)
         sel = ok .& (jc .>= g)
         n = count(sel)
         n == 0 && continue
         e = er[sel]
-        @printf("  >=%.1f  %5d  %7.4f  %7.4f  %6.1f%%\n",
-                g, n, median(e), quantile(e, 0.95), 100 * mean(e .<= TOL))
+        @printf("  >=%.1f  %5d  %6.1f%%       %6.1f%%  %7.4f  %7.4f\n",
+                g, n, 100 * mean(iszero, e), 100 * mean(e .<= TOL),
+                quantile(e, 0.99), maximum(e))
     end
 
     fig = Figure(; size = (1500, 950))
@@ -114,13 +127,15 @@ function main()
         ax1 = Axis(fig[1, col]; title = "AutoRIFT.jl $nm", aspect = DataAspect())
         hm = heatmap!(ax1, nanify(J); colormap = :balance, colorrange = dlim)
         Colorbar(fig[1, col], hm; label = "px", halign = :right, width = 12, tellwidth = false)
-        ax2 = Axis(fig[2, col]; title = "reference $nm (negated)", aspect = DataAspect())
+        ax2 = Axis(fig[2, col]; title = "reference $nm", aspect = DataAspect())
         heatmap!(ax2, nanify(P); colormap = :balance, colorrange = dlim)
     end
 
-    # The difference, on a scale centred at the tolerance so "inside 0.2 px" reads at a glance.
+    # Scaled to one upsampling step, so the map distinguishes exact agreement from a tie broken the
+    # other way rather than washing both out against a whole-pixel outlier.
     axd = Axis(fig[1, 3]; title = "radial |difference|", aspect = DataAspect())
-    hmd = heatmap!(axd, nanify(er); colormap = :inferno, colorrange = (0, max(TOL * 2, 0.01)))
+    hmd = heatmap!(axd, nanify(er); colormap = :inferno, colorrange = (0, max(TOL, 0.01)),
+                   highclip = :cyan)
     Colorbar(fig[1, 3], hmd; label = "px", halign = :right, width = 12, tellwidth = false)
 
     axs = Axis(fig[2, 3]; title = "AutoRIFT.jl vs reference", xlabel = "reference px",

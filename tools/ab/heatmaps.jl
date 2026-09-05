@@ -11,10 +11,12 @@ using CairoMakie, Statistics, Printf
 const D = joinpath(@__DIR__, "stage2")
 const PLOTS = joinpath(@__DIR__, "plots")
 const TAG = length(ARGS) >= 1 ? ARGS[1] : "heatmaps"
-const TOL = 0.2
+# One upsampling step at `upsampling = 16`, the finest difference either side can express. 0.2 px was
+# the threshold and no longer discriminates — see the note in `compare2.jl`.
+const TOL = 1 / 16
 
 # This pair, from the granule: 15 m panchromatic pixels and an 8.0-day separation. One pixel of
-# displacement is therefore ~685 m/yr, which is what makes a 0.2 px tolerance a ~137 m/yr claim.
+# displacement is therefore ~685 m/yr, which makes one upsampling step a ~43 m/yr claim.
 const PIXEL_SIZE = 15.0
 const DATE_DT = 8.000149841122685
 const TO_MYR = PIXEL_SIZE * 365.25 / DATE_DT
@@ -51,10 +53,10 @@ function main()
     jdx = crop(read_bin("julia_dx", Float32, jsz))
     jdy = crop(read_bin("julia_dy", Float32, jsz))
     jcs = crop(read_bin("julia_chip_size", Int32, jsz))
-    # Negated into AutoRIFT.jl's convention: the reference reports feature motion, this package
-    # reports secondary-to-reference. Both axes together -- see tools/ab/README.md.
-    pdx = crop(.-read_bin("python_dx", Float32, psz))
-    pdy = crop(.-read_bin("python_dy", Float32, psz))
+    # Read as written. `stage2_python.py` has already put both axes in AutoRIFT.jl's convention, so
+    # negating here flips them back — see the note in `compare2.jl`.
+    pdx = crop(read_bin("python_dx", Float32, psz))
+    pdy = crop(read_bin("python_dy", Float32, psz))
     pcs = crop(read_bin("python_chip_size", Int32, psz))
 
     jok, pok = .!isnan.(jdx), .!isnan.(pdx)
@@ -84,9 +86,11 @@ function main()
     ax2 = Axis(fig[1, 2]; title = "reference speed", aspect = DataAspect())
     heatmap!(ax2, show_(psp, pok); colormap = :viridis, colorrange = splim)
 
-    # Centred at the tolerance, so "inside 0.2 px" reads as dark at a glance.
-    ax3 = Axis(fig[1, 3]; title = "|difference| (0.2 px = tolerance)", aspect = DataAspect())
-    hm3 = heatmap!(ax3, show_(er, both); colormap = :inferno, colorrange = (0, TOL * 2))
+    # Scaled to one upsampling step, so exact agreement reads as dark and a tie broken the other way
+    # is visible rather than washed out against a whole-pixel outlier.
+    ax3 = Axis(fig[1, 3]; title = "|difference| (1/16 px = one step)", aspect = DataAspect())
+    hm3 = heatmap!(ax3, show_(er, both); colormap = :inferno, colorrange = (0, TOL),
+                   highclip = :cyan)
     Colorbar(fig[1, 3], hm3; label = "px", halign = :right, width = 13, tellwidth = false)
 
     dlim = let v = filter(isfinite, vcat(vec(show_(jdx, jok)), vec(show_(pdx, pok)),
@@ -120,8 +124,9 @@ function main()
             nr, nc, 100 * mean(jok), 100 * mean(pok))
     if count(both) > 0
         e = er[both]
-        @printf("difference median %.4f px (%.0f m/yr)   p95 %.4f px   within %.1f px %.1f%%\n",
-                median(e), median(e) * TO_MYR, quantile(e, 0.95), TOL, 100 * mean(e .<= TOL))
+        @printf("difference exact %.1f%%  within step %.1f%%  median %.4f px (%.0f m/yr)  p99 %.4f px\n",
+                100 * mean(iszero, e), 100 * mean(e .<= TOL),
+                median(e), median(e) * TO_MYR, quantile(e, 0.99))
         @printf("bias dx %+.4f px   dy %+.4f px\n",
                 median(jdx[both] .- pdx[both]), median(jdy[both] .- pdy[both]))
         @printf("speed: julia median %.0f m/yr   reference median %.0f m/yr\n",

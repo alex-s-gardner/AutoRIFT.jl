@@ -56,14 +56,14 @@ function main()
     jdx = crop(read_bin("julia_dx", Float32, jsz))
     jdy = crop(read_bin("julia_dy", Float32, jsz))
     jc = crop(read_bin("julia_correlation", Float32, jsz))
-    pdx = crop(.-read_bin("python_dx", Float32, psz))
-    pdy = crop(.-read_bin("python_dy", Float32, psz))
+    pdx = crop(read_bin("python_dx", Float32, psz))
+    pdy = crop(read_bin("python_dy", Float32, psz))
 
     both = .!isnan.(jdx) .& .!isnan.(pdx)
 
-    # Speed is sign-convention-free, so the negation above cannot affect it -- a useful property:
-    # this panel would look the same had the sign been got wrong, which is why it is not the panel
-    # to check a convention with.
+    # Speed is a magnitude, so the sign convention cannot affect it -- a useful property, and a trap:
+    # this panel looks the same whether the sign is right or wrong, which is why it is not the panel
+    # to check a convention with. `compare2.jl`'s `corr` is.
     jsp = sqrt.(jdx .^ 2 .+ jdy .^ 2) .* TO_MYR
     psp = sqrt.(pdx .^ 2 .+ pdy .^ 2) .* TO_MYR
     dsp = jsp .- psp
