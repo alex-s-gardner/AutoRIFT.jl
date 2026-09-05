@@ -101,7 +101,10 @@ function cpu_in_range(pair, pts, chip, radius)
 end
 
 # One subpixel step: the quantization of the refinement, and the bound on exception 1.
-substep(p) = 1 / AutoRIFT.upsampling(p.subpixel)
+#
+# These tests all run a single pass, which uses the finest level's method — `p.subpixel` is a tuple,
+# one entry per chip-size level.
+substep(p) = 1 / AutoRIFT.upsampling(first(p.subpixel))
 
 # Compare a CPU and a GPU pass over the same points, and assert the gate.
 function check_pass(pair, pts, pc, pg, chip, radius; label = "")
