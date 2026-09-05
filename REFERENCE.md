@@ -102,6 +102,22 @@ distance-transform dilation, the hole filling, the smallest-chip-wins merge, the
 Still **no correlation-peak output**: `minMaxLoc`'s value is discarded at all four
 call sites. AutoRIFT.jl returns it.
 
+**The subpixel upsampling factor varies per chip size.** `OverSampleRatio` may be a
+scalar or a dict, and when it is a dict the factor is looked up per level —
+`overSampleRatio = self.OverSampleRatio[ChipSizeUniX[i]]`
+(`autoRIFT.py:652-653`, and again at the fine-search call site). The production
+driver always passes a dict, keyed by the four chip sizes `ChipSize0X * [1,2,4,8]`:
+`{16, 32, 64, 64}` for optical and `{32, 64, 128, 128}` for radar
+(`testautoRIFT.py:488-510`). So a level's displacement is quantized to `1/16` px at
+the base chip size but `1/32` and `1/64` at the coarser ones, and the quantization
+step is a property of the level rather than of the run.
+
+*AutoRIFT.jl applies one `upsampling` to every level*, since `PyramidRefine` holds a
+single factor. On a golden comparison that shows up sharply: at matched chip sizes
+the base level agrees exactly on half its points, while the coarser levels agree on
+**none** of them, because the two sides are rounding to different grids. Supporting
+a per-level factor is the fix; `tools/golden/README.md` records the measurement.
+
 ---
 
 ## What the production drivers change
@@ -141,9 +157,20 @@ comparing against production output.
 
 ## Validation
 
-There is no golden data anywhere: neither repository has a test that exercises the
-correlator, and hyp3-autorift's one committed product has zero valid pixels
-(`P000`) and is useful only as a schema reference.
+Neither repository has a test that exercises the correlator, and hyp3-autorift's one
+committed product has zero valid pixels (`P000`), useful only as a schema reference.
+
+**Golden data does exist, outside both repositories.**
+`s3://its-live-data/test-space/golden/` holds 22 ITS_LIVE products built by
+`hyp3_autorift` 0.28.4 across Landsat 4–9, Sentinel-1/2 and NISAR — the acceptance
+set for the Python implementation, publicly readable. `tools/golden/` compares
+against them, and the container that produced them runs locally, which makes the
+whole production chain reproducible rather than merely readable.
+
+That comparison is **exact, not tolerance-based**. Two runs of the reference on one
+granule agree bit for bit on every plane, and so does a local run against ASF's
+product, so there is no measurement noise for a tolerance to absorb. Only the `time`
+coordinate moves, by `crop.py::numeric_hash` under a per-process hash salt.
 
 Consequences for how AutoRIFT.jl is validated:
 
@@ -155,10 +182,9 @@ Consequences for how AutoRIFT.jl is validated:
    surface, pyramid upsampling, peak tie-breaking. Generated on a current stack:
    v2.1.2 runs on NumPy ≥ 2.0 and Python ≥ 3.10, so the pinned-legacy-environment
    requirement that v1.5.0 imposed is gone.
-3. **Whole-pipeline comparison is tolerance-based**, against output captured from
-   the production container. Three things make exact comparison impossible
-   regardless of implementation: an unseeded 10⁶-draw Monte Carlo in
-   `v_error_cal`, wall-clock timestamps and version strings in global attributes,
-   and a time coordinate jittered by Python's per-process-salted `hash()`
-   (`crop.py::numeric_hash`, with `PYTHONHASHSEED` unset — documented as
-   deterministic but not).
+3. **Whole-pipeline comparison is against the golden products**, and is exact on
+   everything except the time coordinate and the wall-clock and version strings in
+   the global attributes. The unseeded 10⁶-draw Monte Carlo in `v_error_cal` does
+   *not* prevent exact comparison: the standard deviation of that many draws is
+   stable well inside the `int16` rounding the product applies, so the sampling
+   noise does not reach the file. `tools/golden/README.md` has the measurements.

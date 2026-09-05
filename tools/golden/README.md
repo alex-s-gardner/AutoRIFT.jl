@@ -211,6 +211,55 @@ records as costing it 1.6% of the points on a different scene.
 That set is what makes Phase 1 possible without re-deriving anything: the same filtered inputs, the
 same geogrid, and the reference's own `Dx`/`Dy` to diff AutoRIFT.jl's against directly.
 
+## The correlator, on production imagery
+
+```bash
+julia --project=tools/golden -t 8 tools/golden/correlator.jl S2B_MSIL1C_20200612
+```
+
+A diagnostic rather than the gate: when the product comparison disagrees, this says whether the
+correlator or the packaging is responsible. Both sides get the *same* arrays — the filtered pair,
+grid, priors and per-point limits `capture.py` took at the reference's own `runAutorift` boundary — so
+a preprocessing difference cannot appear here as a correlator difference.
+
+S2 case, 10980² `UInt8` pair, 1,018,081 grid points, chips 24/48/96 at spacing 12, 139 s on 8 threads:
+
+| axis | sign | both measured | only jl | only ref | exact | median | p99 | corr |
+|---|:---:|---:|---:|---:|---:|---:|---:|---:|
+| `dx` | + | 593,734 | 17,796 | 24,146 | 27.4% | 0.0625 | 0.75 | **+0.9953** |
+| `dy` | − | 593,734 | 17,796 | 24,146 | 30.3% | 0.0625 | 0.82 | **+0.9916** |
+
+Bias is under 0.01 px on both axes and the median disagreement is exactly one upsampling step, so the
+two agree about position. Exact agreement at 27–30% against the 77% `tools/ab` measures on a hand-cut
+window is the finding, and decomposing it says why:
+
+| population | points | exact `dx` |
+|---|---:|---:|
+| all both-measured | 593,734 | 27.4% |
+| same chip size chosen | 433,781 | 37.5% |
+| same chip size, not interpolated by the reference | 404,172 | 39.5% |
+| **chip 24 only** (matched upsampling) | 319,519 | **50.0%** |
+
+**27% of points chose a different chip size**, and those agree on 0.16% — a point answered at chip 24
+by one side and 48 by the other describes a different footprint of ground, so this is not a
+correlator disagreement at all. The `dy` sign is measured, not assumed: both signs are scored and the
+better kept.
+
+### Finding: the reference varies upsampling per chip size
+
+Chips 48 and 96 agree on **exactly none** of their points while chip 24 agrees on half. The cause is
+`autoRIFT.py:652-653`: `OverSampleRatio` may be a dict, and when it is, the factor is looked up per
+level. The driver always passes one — `{24: 16, 48: 32, 96: 64, 192: 64}` here — so the reference
+quantizes to 1/16 px at the base chip size and 1/32 and 1/64 at the coarser ones.
+
+`PyramidRefine` holds a single factor, so AutoRIFT.jl quantizes every level to 1/16 and the two are
+rounding to different grids above the base level. Recorded in `REFERENCE.md`; supporting a per-level
+factor is the fix.
+
+Residuals on matched levels are symmetric about zero — median signed difference exactly 0, ±1/16
+tails within 1% of each other — so what remains after the level and upsampling effects is
+tie-breaking at the quantization step, not bias.
+
 ## Measured results
 
 `results/<product>.<kind>.json` holds each comparison with the machine, versions and commit that
@@ -222,4 +271,15 @@ produced it.
 | injected-fault detection, 5 kinds | **5/5 caught** |
 | reference reproducibility floor, S2 | **exact** — 7/7 planes, 615,146 px, `time` only |
 | container vs ASF golden, S2 | **exact** — bit-identical across arch and four months |
-| AutoRIFT.jl against golden | not yet run |
+| correlator vs reference `Dx`/`Dy`, S2 | corr 0.995/0.992, bias < 0.01 px, 50% exact at matched upsampling |
+| AutoRIFT.jl product against golden | needs the post-correlation chain (phase 2) |
+
+### Open, in priority order
+
+1. **Per-level upsampling** — the reference's factor varies by chip size and AutoRIFT.jl's does not,
+   which costs every point above the base chip size its exact agreement.
+2. **Chip-size selection** — 27% of points pick a different level. `tools/ab` sees 0.7% on its
+   window, so something about the production configuration widens this considerably.
+3. **Coverage** — 17,796 points AutoRIFT.jl answers alone against 24,146 the reference does. Partly
+   the deliberate degenerate-chip difference in `REFERENCE.md`, but the split is not yet accounted
+   for.
