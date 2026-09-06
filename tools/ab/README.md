@@ -145,6 +145,15 @@ evenly: they cluster where the correlation surface has competing maxima, which i
 block of a golden scene can score 18% while the scene averages 55%, and why a bad point at the base
 level propagates into its neighbours through the prior.
 
+**The arithmetic is `Float32` on both sides, so this is not byte precision.** OpenCV's `matchTemplate`
+on a `CV_8UC1` input computes in float and returns `CV_32FC1` (the C++ stores the imagery as
+`CV_8UC1` and only the result as `CV_32FC1`), and AutoRIFT.jl promotes at the multiply and before the
+forward transform. What quantizing changes is the *surface*: collapsing a filtered float field onto 256
+levels creates ties and near-ties that the float field does not have, and a tie broken differently at a
+plateau puts the peak far away rather than one step away. That is the mechanism the 36-pixel maximum
+points at, and it predicts the failures concentrate where contrast is small relative to one
+quantization level.
+
 **Quantizing to `UInt8` is a version-matching requirement, not a claim that it is correct.** Throwing
 a filtered float field down to 256 levels before correlating discards precision the correlator could
 otherwise use, and AutoRIFT.jl has no need to do it. It is reproduced because agreement with the
