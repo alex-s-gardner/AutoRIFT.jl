@@ -410,10 +410,19 @@ produced it.
 
 ### Open, in priority order
 
-1. **The remaining 32%** — the difference map is now blank except for a thin dipole along the
-   fast-flow margin and scattered speckle. A dipole on a gradient is what a *smaller* sub-pixel
-   difference looks like, but the offset scan is flat below 1/16 px, so it is not a grid shift. Next
-   suspects, in order: the outlier filter's neighbourhood decisions, and hole filling.
+1. **The remaining 32%, which is mostly the coarse levels.** Decomposed on the aligned grid:
+
+   | population | points | exact | within 1/16 |
+   |---|---:|---:|---:|
+   | all both-measured | 598,718 | 67.6% | 82.3% |
+   | same chip level | 582,010 | 69.5% | 83.8% |
+   | same level, neither side filled | 533,535 | 72.5% | 85.9% |
+   | **base level, neither filled** | 450,367 | **85.9%** | **94.5%** |
+
+   The base level is close to the `tools/ab` result and the shortfall is concentrated above it, where
+   the reference overwrites measurements with a bicubic resize and exact agreement is unreachable by
+   construction (below). Level agreement is now 97.2%. What is left to chase, in order: the outlier
+   filter's neighbourhood decisions, hole filling, and the 14% of base-level points beyond one step.
 2. **Coverage** — 16,893 points AutoRIFT.jl answers alone against 19,162 the reference does. Partly
    the deliberate degenerate-chip difference in `REFERENCE.md`; the rest is unaccounted for.
 3. **The post-correlation chain** — nothing downstream of `correlate` exists in Julia, so no product
