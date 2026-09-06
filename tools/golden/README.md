@@ -452,6 +452,50 @@ produced it.
    `_oversample` is **capped at 2** (`src/multichip.jl:697`) where the reference's ratio is uncapped.
    It does not bind on this case — the ratio *is* 2 — so it cannot explain these numbers, but it will
    bind wherever grid spacing divides the chip size more than twice.
+
+   **The disagreement is bidirectional and co-located, which changes what it is.** Mapping the two
+   exclusive sets side by side, they are the *same picture*: both are speckle along the same feature
+   margins, and neither is at the grid border (8 of 19,162 `only_ref` points fall in the outer 8-pixel
+   frame, against 3.1% of the grid by area). A systematic over-rejection would put one set where the
+   other is not. Two sets of marginal decisions straddling the same threshold in opposite directions
+   look exactly like this — and the counts are nearly balanced, 16,893 against 19,162.
+
+   So the earlier reading, that "the filter over-rejects", is too strong. What the filter-disabled test
+   established is that these points *are* filter decisions rather than measurement failures; it does
+   not establish a bias, and the map argues against one.
+
+   The reference's captured `InterpMask` splits them further:
+
+   | population | points | reference interpolated it |
+   |---|---:|---:|
+   | reference answers, AutoRIFT.jl does not | 19,162 | **4,258 (22.2%)** |
+   | both answer | 598,718 | 44,937 (7.5%) |
+   | reference answers at all | 617,880 | 49,195 (8.0%) |
+
+   A 2.8× enrichment against the baseline, so **hole filling owns about 4,258 of the gap and rejection
+   owns the other ~14,900.** Those are different mechanisms and want separate fixes.
+
+### The fill criteria differ, and one is missing
+
+Reading `autoRIFT.py:792-808` against `_fill_holes!`, the reference fills a point on **either** of two
+conditions, three passes each:
+
+- a 3×3 area closing — `filter2D(foo, ones(3,3)) >= 6`, six of nine neighbours valid;
+- **or** `!bwareaopen(!foo1, 5)` — the point's *connected component of invalid points* is smaller than
+  5 pixels, whatever the neighbour count.
+
+Both then require `MM`, that a 3×3 median exists at all.
+
+AutoRIFT.jl implements the first and not the second. At `fill_window = 3` its `needed = 2*9÷3 = 6`
+matches the area closing exactly, but nothing corresponds to the connected-component test. A 2×2 hole
+is the discriminating case: each of its four points has five valid neighbours, one short of the
+threshold, so AutoRIFT.jl leaves it open — while its component is size 4 < 5, so the reference fills
+it. That is the right shape to produce a fill-only deficit concentrated in small holes, which is what
+the 22.2% enrichment measures.
+
+This is a genuine gap rather than a matched-not-endorsed choice, and the connected-component criterion
+is defensible on its own terms: a small hole surrounded by coherent motion is exactly what should be
+interpolated, and neighbour-counting misses the ones with awkward shapes.
 3. **The post-correlation chain** — nothing downstream of `correlate` exists in Julia, so no product
    comparison has run.
 
@@ -509,7 +553,10 @@ contradicts the old one, not by the reasoning that motivated it the first time.
 | The golden L7 product is a fixed target | Two container runs agree on 3.4% of `vx`, median 9 m/yr, and coverage moves enough to change the product's own `P<nn>` name | **It is one draw from a distribution.** Gate against the reference's own run-to-run envelope, measured by running the container twice. |
 | A median residual of one quantization step is benign tie-breaking | It was a half-pixel grid offset. Invisible in the median; obvious in a heatmap | **See below.** This one nearly closed the investigation at the wrong answer. |
 | The outlier filter's *parameters* are mis-derived | Computed the reference's `FiltWidth` and `FracValid` from the captured scalars and compared: 9 and 0.41 fine / 0.32 coarse on both sides, `agree_tolerance` 0.2, `mad_scale` 4, 3/2 iterations. `rescale`/`relax` reproduce `autoRIFT.py:484-505` exactly | Not the parameters. The disagreement is in *when* the filter runs and in reducer semantics, so look there. |
-| The coverage gap is mostly the deliberate degenerate-chip difference | Disabling the filter drops `only_ref` from 19,162 to **672** | **It is the outlier filter over-rejecting**, not the degenerate-chip choice, which accounts for at most 672 points. Corrects an earlier claim in this file. |
+| The coverage gap is mostly the deliberate degenerate-chip difference | Disabling the filter drops `only_ref` from 19,162 to **672** | **It is filter and fill decisions**, not the degenerate-chip choice, which accounts for at most 672 points. Corrects an earlier claim in this file. |
+| The filter is systematically *over*-rejecting | Mapped both exclusive sets: same speckle along the same margins, counts nearly balanced (16,893 vs 19,162), and only 8 of 19,162 at the grid border against 3.1% by area | **Bidirectional and co-located, so not a bias** — marginal decisions straddling one threshold in both directions. A systematic over-rejection would put one set where the other is not. |
+| The whole coverage gap is one mechanism | Reference `InterpMask` on the `only_ref` points: 22.2% interpolated against a 8.0% baseline | **Two mechanisms.** Hole filling owns ~4,258; rejection owns ~14,900. They want separate fixes. |
+| Border/reducer semantics explain the gap | 8 of 19,162 `only_ref` points lie in the outer 8-pixel frame; `count_agreeing` and `windowmedmad` were read against `colfilt` options 5 and 6 and are equivalent on NaN centres, NaN neighbours and odd-window margins | Not the borders, not the reducers |
 
 ### The lesson that generalizes: plot before reasoning
 
