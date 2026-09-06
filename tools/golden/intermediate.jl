@@ -40,7 +40,13 @@ function capture_reference(c::GoldenCase; n::Integer = 100, threads::Integer = 8
     dir = run_dir(c, n)
     cap = capture_dir(c, n)
     if isdir(cap) && !isempty(readdir(cap)) && !force
-        @info "capture already present; pass force = true to redo it" cap
+        # A capture taken before per-level recording existed is complete for the correlator
+        # comparison and silently missing the level diagnostic, so say which one is on disk rather
+        # than letting a later `length(k.levels) == 0` look like the reference measured no levels.
+        haslevels = any(startswith("lvl"), readdir(cap))
+        @info "capture already present; pass force = true to redo it" cap levels = haslevels
+        haslevels || @warn "this capture has no per-level records; redo it with force = true to " *
+                           "attribute a disagreement to a pyramid level" cap
         return cap
     end
     mkpath(dir)
