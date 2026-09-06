@@ -724,6 +724,13 @@ end
 # mask with `colfilt(..., 0)`, a maximum over `6 / Scale` cells (`:534-539`), which `_decimate_level`
 # reproduces on the `wanted` mask.
 #
+# **This asymmetry is matched, not endorsed.** A parameter file that sets `chip_size_min_x` to 480 m at
+# a point is asking for no smaller chip there, and honouring that at every level except the finest is
+# hard to defend on its own terms — the finest level is where a too-small chip does the most damage.
+# It is reproduced here because agreeing with the reference is a prerequisite for telling a real
+# difference from a bug, and diverging deliberately before that point makes every later comparison
+# ambiguous. `REFERENCE.md` records it as a candidate to revisit once the two agree.
+#
 # Zero in either bound means unbounded, which is the default, so a grid carrying no bounds admits
 # every level exactly as it did before the fields existed.
 function _level_points(grid::PointSet{2}, p::Params, chip_size::Extent,

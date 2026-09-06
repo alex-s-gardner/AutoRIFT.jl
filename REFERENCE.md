@@ -60,6 +60,25 @@ carries no information about displacement, so reporting the search-window corner
 as an answer is worse than reporting nothing. The reference's behaviour is
 available for comparison via a compatibility flag.
 
+**The per-point chip-size bounds do not apply at the base chip size.** The `M0`
+gate — `(ChipSizeMinX <= ChipSizeUniX[i]) & (ChipSizeMaxX >= ChipSizeUniX[i])` —
+sits inside `if self.ChipSize0X != ChipSizeUniX[i]` (`autoRIFT.py:509-539`), and
+the `else` branch taken at the base chip size copies the search limits with no
+bounds test at all (`:587-593`). So a point whose parameter file asks for no chip
+smaller than 480 m is still correlated at the base chip size; the bounds restrict
+only the coarser levels, where the mask is additionally dilated by a `6 / Scale`
+maximum filter (`:534-539`).
+
+The effect is large because the bounds cluster spatially: on the golden
+Sentinel-2 case 136,800 points are answered at the base chip size against their
+own `ChipSizeMinX` of 48, 96 or 192.
+
+*AutoRIFT.jl matches this*, because agreeing with the reference is what makes a
+real difference distinguishable from a bug. It is **not** obviously correct — the
+finest level is where a chip smaller than the parameter file allows does the most
+damage — and it is a candidate to revisit once the two agree, alongside the
+degenerate-chip difference above.
+
 **`colfilt` was rewritten** with numba reducers behind
 `scipy.ndimage.generic_filter`, which changes three things:
 
