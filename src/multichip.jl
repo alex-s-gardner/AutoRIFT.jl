@@ -414,7 +414,32 @@ function _decimate_level(grid::PointSet{2}, wanted::AbstractMatrix{Bool}, stride
     # reaching the merge at all.
     want = windowmax(map(w -> w ? 1.0f0 : 0.0f0, wanted), 6 * stride)
     keep = [want[i, j] > 0.5f0 for i in rows, j in cols]
-    return (; grid = _cell_centres(grid[rows, cols], grid, rows, cols, stride),
+
+    # A decimated point stands for a whole cell, so its search window has to cover every fine point
+    # in that cell — both the widest radius any of them asked for and the spread of their priors,
+    # since two fine points with different priors search around different centres. The reference adds
+    # exactly those two terms, over `1 / Scale` cells:
+    #
+    #     SearchLimitX0 = colfilt(SearchLimitX, (1/Scale, 1/Scale), 0)   # 0 = max
+    #                   + colfilt(Dx0,          (1/Scale, 1/Scale), 4)   # 4 = range
+    #     Dx00          = colfilt(Dx0,          (1/Scale, 1/Scale), 2)   # 2 = mean
+    #
+    # (`autoRIFT.py:546-578`.) Sampling the radius at the node instead — its own value, for fifteen
+    # neighbours it speaks for — under-covers a cell whose prior varies across it, and the level then
+    # rails out or misses the peak at exactly the points where the prior was doing useful work.
+    rx = windowmax(grid.radius_x, stride) .+ windowrange(grid.dx_prior, stride)
+    ry = windowmax(grid.radius_y, stride) .+ windowrange(grid.dy_prior, stride)
+    mx = windowmean(grid.dx_prior, stride)
+    my = windowmean(grid.dy_prior, stride)
+    # `ceil` as the reference does, so a fractional widening never shrinks the window. A `NaN` mean —
+    # a cell whose priors are all missing — carries through as the missing prior it is.
+    sub = rebuild(grid[rows, cols];
+                  radius_x = [ceil(Int, rx[i, j]) for i in rows, j in cols],
+                  radius_y = [ceil(Int, ry[i, j]) for i in rows, j in cols],
+                  dx_prior = [Float64(mx[i, j]) for i in rows, j in cols],
+                  dy_prior = [Float64(my[i, j]) for i in rows, j in cols])
+
+    return (; grid = _cell_centres(sub, grid, rows, cols, stride),
             wanted = keep, rows, cols)
 end
 
