@@ -59,17 +59,20 @@ The reference's search grid as a `PointSet`.
 Coordinates become 1-based, and a point the reference skipped — search limit zero — keeps a zero
 radius, which is how `PointSet` marks a point to skip.
 
-**The captured grid already carries the reference's own `+0.5`.** `runAutorift` sets
+**The grid needs `+1`, not `+0.5`, and this was measured rather than reasoned.** `runAutorift` sets
 `xGrid = round(xGrid) + 0.5` before correlating (`autoRIFT.py:890-891`) and `capture.py` dumps the
-arrays after that, so the values arriving here are half-integers in 0-based pixel coordinates. Adding
-1 for 1-based indexing would therefore land half a pixel past the point AutoRIFT.jl means, because
-`_shift_points` adds its own `0.5` for the even-chip centroid at correlation time. Subtracting the
-reference's half pixel and adding the index base — `x + 1 - 0.5` — puts the two on one grid.
+arrays after that, so the values arriving here are half-integers in 0-based pixel coordinates. The
+tempting move is to subtract that half pixel while adding the index base, on the grounds that
+`_shift_points` adds AutoRIFT.jl's own `0.5` for the even-chip centroid — but scanning the offset says
+otherwise: at `+1.0` exact agreement is **85.0%** with a median residual of 0, and at `+0.5` it is
+49.2% with a median of 1/32. The two half pixels do not cancel; they are the same convention counted
+once on each side.
 
-Getting this wrong is invisible in a median: a half-pixel offset produces no residual under uniform
-motion and one proportional to the local velocity gradient, so it shows up only as a
-gradient-correlated difference map. Measured before the fix, exact agreement fell from 66.5% in the
-flattest gradient decile to 5.6% in the steepest.
+Getting this wrong is invisible in a median over the whole scene, because a half-pixel offset produces
+no residual under uniform motion and one proportional to the local velocity gradient. Before the fix,
+exact agreement fell from 66.5% in the flattest gradient decile to 5.6% in the steepest, and the
+difference map showed structure only along the fast-flow margins. Scan the offset before believing any
+argument about which convention applies — including this one.
 """
 function pointset_from_capture(k::Capture)
     xg = k.arrays["in_xGrid"]
@@ -85,7 +88,7 @@ function pointset_from_capture(k::Capture)
     scale_y = Float64(k.scalars["ScaleChipSizeY"])
 
     return PointSet(
-        Float64.(xg) .+ 0.5, Float64.(yg) .+ 0.5,
+        Float64.(xg) .+ 1, Float64.(yg) .+ 1,
         Int.(srx), Int.(sry),
         Float64.(dx0), Float64.(dy0),
         fill(chip0, size(xg)), fill(round(Int, chip0 * scale_y), size(xg)),
