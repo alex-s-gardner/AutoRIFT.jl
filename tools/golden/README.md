@@ -421,8 +421,10 @@ produced it.
 
    The base level is close to the `tools/ab` result and the shortfall is concentrated above it, where
    the reference overwrites measurements with a bicubic resize and exact agreement is unreachable by
-   construction (below). Level agreement is now 97.2%. What is left to chase, in order: the outlier
-   filter's neighbourhood decisions, hole filling, and the 14% of base-level points beyond one step.
+   construction (below). Level agreement is now 97.2%. What is left to chase, in order: **level
+   agreement**, which carries a 6.55x enrichment in the residual tail and is the one part of that tail
+   not explained by the coarse-level bicubic; then the 14% of base-level points beyond one step. Hole
+   filling is done, and the outlier filter's parameters and reducers are ruled out.
 2. **Coverage, and it is the outlier filter.** 16,893 points AutoRIFT.jl answers alone against 19,162
    the reference does. Disabling the filter and changing nothing else settles which side owns it:
 
@@ -474,6 +476,41 @@ produced it.
 
    A 2.8× enrichment against the baseline, so **hole filling owns about 4,258 of the gap and rejection
    owns the other ~14,900.** Those are different mechanisms and want separate fixes.
+
+### The residual tail is the coarse levels, not an edge artifact
+
+The p99 is 1.19 px against the benchmark's 0.1411, so a small population carries it. Mapping the 6,000
+points above the 99th percentile against the things that could plausibly cause it:
+
+| population | share of tail | base rate | enrichment |
+|---|---:|---:|---:|
+| levels disagree | 15.7% | 2.4% | **6.55x** |
+| coarse level (reference chip > 24) | 40.1% | 19.9% | 2.02x |
+| reference interpolated | 12.2% | 7.6% | 1.59x |
+| base level on both sides | 55.4% | 79.7% | 0.69x |
+
+The tail lives where the ice is fast and the search window widest — median `|dx|` 2.75 px against 0.38
+elsewhere, median search radius 20 against 7 — and it is **not** railing against the search limit
+(9.7% of the tail within 1.5 px of it, against 21.1% of the rest), so it is not a window-size failure.
+The base level is *under*-represented at 0.69x.
+
+So the tail is the coarse-level bicubic regime, which the gate already excludes, plus one actionable
+part: the 6.55x on level disagreement, 942 points where the two picked different chip sizes and so
+describe different footprints.
+
+**Nodata is not the cause, and the heatmap misleads here.** Level disagreement *falls* toward nodata —
+0.62% within one grid cell, rising monotonically to 2.72% beyond sixteen, against a 2.40% base — so the
+enrichment runs the wrong way for an edge artifact. What looks like nodata outlines in a mask heatmap is
+the surrounding valid region being where the points are, not a signal. Only 0.1% of grid points sit on
+nodata at all, because the driver zeroes `xGrid`, `yGrid`, `Dx0`, `Dy0`, `SearchLimit*` and the chip
+bounds there before `runAutorift` (`testautoRIFT.py:394-403`), and the capture takes those arrays after
+that.
+
+The nodata *buffer* is a separate mechanism and is present on both sides. `_wallis_filter_fill` grows
+both the missing-data and the low-variance masks with a `distanceTransform` before treating them as
+missing (`autoRIFT.py:84-91,104-110`), by `buff = sqrt(2 * ((w-1)/2)^2) + 0.01`; `_gapfill_buffer` in
+`src/types.jl` is that expression and `wallis_gapfill` applies it to both masks. It only runs for
+`wallis_fill`, so it cannot affect an `hps` case either way.
 
 ### The fill criteria differ, and one is missing
 
@@ -562,6 +599,14 @@ against 97.3%, p99 is 1.19 px against 0.14, and level agreement is 97.2% against
 the work, and the p99 gap in particular says the residual is not uniformly small — there is a tail the
 benchmark does not have.
 
+**The gate is similar statistics, not identical ones.** Each pair is a different scene: the fraction
+of interpolated points, the spread of chip sizes and the amount of fast flow all vary, so a pair with
+more interpolation legitimately scores lower on `exact` than one with less. What has to hold is that
+the numbers sit in the benchmark's neighbourhood and that no pair shows a *structured* residual — a
+gradient-correlated difference map, an edge artifact, a bias, a level disagreement well above 1%. A
+pair that misses 77.4% by a few points with a structureless residual passes; one that hits it with a
+dipole along the flow margin does not.
+
 Two cases need the gate stated differently, and both for reasons that are properties of the reference:
 
 - **`wallis_fill` pairs (L7).** The reference does not reproduce *itself* there — two runs agree on
@@ -619,6 +664,7 @@ contradicts the old one, not by the reasoning that motivated it the first time.
 | The coverage gap is mostly the deliberate degenerate-chip difference | Disabling the filter drops `only_ref` from 19,162 to **672** | **It is filter and fill decisions**, not the degenerate-chip choice, which accounts for at most 672 points. Corrects an earlier claim in this file. |
 | The filter is systematically *over*-rejecting | Mapped both exclusive sets: same speckle along the same margins, counts nearly balanced (16,893 vs 19,162), and only 8 of 19,162 at the grid border against 3.1% by area | **Bidirectional and co-located, so not a bias** — marginal decisions straddling one threshold in both directions. A systematic over-rejection would put one set where the other is not. |
 | The whole coverage gap is one mechanism | Reference `InterpMask` on the `only_ref` points: 22.2% interpolated against a 8.0% baseline | **Two mechanisms**, but not additively. Implementing the fill criterion closed 1,192 of the predicted ~4,258 and *added* 345 the other way, because a hole can only be filled where that side's own rejection created one and the two rejection sets differ. Coverage is joint, not a sum of independent deficits — do not size a fix from an enrichment ratio alone. |
+| A matching bicubic interpolator would close the coarse-level residual | The interpolant is already matched: 12 `INTER_CUBIC` fixtures in `test/fixtures/resize/` pin it bit-exact, and the node test settles it independently — at a coarse node Catmull-Rom reproduces its own sample, so a kernel or lattice error would make nodes agree better than off-nodes, and they agree *identically* (median 0.0980 both) | **Writing one would not help.** What differs is the interpolation's *input*, not the interpolation: the chain is decimate → median filter → area-resize → hole-fill → bicubic, and the rejection and fill sets differ slightly upstream, so both sides interpolate slightly different fields. The same interpolator on different inputs gives different outputs. Spend the effort on level agreement (97.2% against the benchmark's 99.3%), which carries a 6.55x tail enrichment. |
 | Border/reducer semantics explain the gap | 8 of 19,162 `only_ref` points lie in the outer 8-pixel frame; `count_agreeing` and `windowmedmad` were read against `colfilt` options 5 and 6 and are equivalent on NaN centres, NaN neighbours and odd-window margins | Not the borders, not the reducers |
 
 ### The lesson that generalizes: plot before reasoning
