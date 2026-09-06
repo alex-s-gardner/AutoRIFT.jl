@@ -496,6 +496,32 @@ the 22.2% enrichment measures.
 This is a genuine gap rather than a matched-not-endorsed choice, and the connected-component criterion
 is defensible on its own terms: a small hole surrounded by coherent motion is exactly what should be
 interpolated, and neighbour-counting misses the ones with awkward shapes.
+
+`small_components` implements it, 8-connected as the reference's `connectivity=2` demands, and
+`fill_min_hole = 5` is the default. Two details are load-bearing and were taken from the Python rather
+than inferred: eight-connectivity, because under four-connectivity a diagonal pair of holes is two
+components of one instead of one of two and the size test then answers differently; and the components
+are sized on the hole set *after* the neighbour-count criterion has closed what it can — the
+reference's `!foo1` (`autoRIFT.py:803`) — since sizing the raw hole set would judge a large hole by a
+size it only has before its edge is filled.
+
+**Measured on the golden S2 case, it closes 1,192 points, not the ~4,258 the `InterpMask` enrichment
+predicted:**
+
+| `fill_min_hole` | both | only jl | only ref | exact |
+|---|---:|---:|---:|---:|
+| 0 (disabled) | 598,718 | 16,893 | 19,162 | 67.58% |
+| 5 (reference) | 599,910 | 17,238 | 17,970 | 67.92% |
+
+So about 28% of the predicted deficit, and `only_jl` rises by 345 at the same time — the criterion
+fills points the reference does not, as well as the other way. The prediction was too high because it
+assumed the two sides' holes have the same *shape*: `InterpMask` counts what the reference interpolated,
+but AutoRIFT.jl can only fill a hole its own rejection set actually creates, and those sets differ.
+Coverage is a joint function of rejection and filling rather than a sum of two independent deficits.
+
+Exact agreement moves 67.58% → 67.92%, which is real and small. The fix stands on its own — the
+criterion is right and the reference has it — but the remaining coverage difference is dominated by
+rejection, and the fill side is now close to exhausted as an explanation.
 3. **The post-correlation chain** — nothing downstream of `correlate` exists in Julia, so no product
    comparison has run.
 
@@ -505,6 +531,43 @@ Two items came off this list by being measured rather than by being fixed:
 - **Coarse-level resampling** is not a defect: neither implementation's coarse values are quantized,
   because both replace the measurement with a bicubic-interpolated value, so exact agreement is
   unreachable there. Bias is under 0.01 px.
+
+## The gate: the L8/L9 benchmark's level of agreement, on every golden pair
+
+Exact agreement everywhere is not the target, because above the base chip size it is unreachable on
+both sides — the reference overwrites its own measurements with a bicubic resize, so neither field is
+quantized and two independent implementations of that chain cannot land on the same value (measured
+below). The bicubic step is the thing that will not agree between versions, and no amount of work on
+AutoRIFT.jl changes that.
+
+So the gate is the agreement the pre-existing L8/L9 benchmark already achieves, reached on all 22
+golden pairs. From `tools/ab/README.md`, stage 2, the whole pipeline on a 3072² window, 87,814 shared
+points:
+
+| statistic | L8/L9 benchmark | golden S2, base level | golden S2, all levels |
+|---|---:|---:|---:|
+| exact | **77.4%** | 85.9% | 67.6% |
+| within one upsampling step | **97.3%** | 94.5% | 82.3% |
+| median radial | **0.0000 px** | 0 | 0.079 |
+| bias, both axes | **+0.0000** | ~0 | < 0.02 px |
+| p99 | **0.1411 px** | — | 1.19 |
+| same chip level | **99.3%** | — | 97.2% |
+
+and, gated on peak strength, 97.6% exact at correlation ≥ 0.5 — the shape to expect, since a weak peak
+is where a tie breaks either way.
+
+Read against that, the golden S2 case is **already at benchmark quality on the base level** (85.9%
+exact against 77.4%) and short of it overall, on three specific counts: within-one-step is 82.3%
+against 97.3%, p99 is 1.19 px against 0.14, and level agreement is 97.2% against 99.3%. Those three are
+the work, and the p99 gap in particular says the residual is not uniformly small — there is a tail the
+benchmark does not have.
+
+Two cases need the gate stated differently, and both for reasons that are properties of the reference:
+
+- **`wallis_fill` pairs (L7).** The reference does not reproduce *itself* there — two runs agree on
+  3.4% of `vx` — so the comparison is against its own run-to-run envelope, measured by running the
+  container twice, rather than against a single product.
+- **Coarse levels.** Bias and within-one-step, not `exact`, for the reason above.
 
 ## Matched for agreement, not endorsed
 
@@ -555,7 +618,7 @@ contradicts the old one, not by the reasoning that motivated it the first time.
 | The outlier filter's *parameters* are mis-derived | Computed the reference's `FiltWidth` and `FracValid` from the captured scalars and compared: 9 and 0.41 fine / 0.32 coarse on both sides, `agree_tolerance` 0.2, `mad_scale` 4, 3/2 iterations. `rescale`/`relax` reproduce `autoRIFT.py:484-505` exactly | Not the parameters. The disagreement is in *when* the filter runs and in reducer semantics, so look there. |
 | The coverage gap is mostly the deliberate degenerate-chip difference | Disabling the filter drops `only_ref` from 19,162 to **672** | **It is filter and fill decisions**, not the degenerate-chip choice, which accounts for at most 672 points. Corrects an earlier claim in this file. |
 | The filter is systematically *over*-rejecting | Mapped both exclusive sets: same speckle along the same margins, counts nearly balanced (16,893 vs 19,162), and only 8 of 19,162 at the grid border against 3.1% by area | **Bidirectional and co-located, so not a bias** — marginal decisions straddling one threshold in both directions. A systematic over-rejection would put one set where the other is not. |
-| The whole coverage gap is one mechanism | Reference `InterpMask` on the `only_ref` points: 22.2% interpolated against a 8.0% baseline | **Two mechanisms.** Hole filling owns ~4,258; rejection owns ~14,900. They want separate fixes. |
+| The whole coverage gap is one mechanism | Reference `InterpMask` on the `only_ref` points: 22.2% interpolated against a 8.0% baseline | **Two mechanisms**, but not additively. Implementing the fill criterion closed 1,192 of the predicted ~4,258 and *added* 345 the other way, because a hole can only be filled where that side's own rejection created one and the two rejection sets differ. Coverage is joint, not a sum of independent deficits — do not size a fix from an enrichment ratio alone. |
 | Border/reducer semantics explain the gap | 8 of 19,162 `only_ref` points lie in the outer 8-pixel frame; `count_agreeing` and `windowmedmad` were read against `colfilt` options 5 and 6 and are equivalent on NaN centres, NaN neighbours and odd-window margins | Not the borders, not the reducers |
 
 ### The lesson that generalizes: plot before reasoning

@@ -1067,8 +1067,11 @@ struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:Preproces
     dx_prior::Float64
     dy_prior::Float64
 
-    # Hole filling.
+    # Hole filling. A hole is closed if it has `fill_window`-neighbourhood support or if it is a
+    # connected region smaller than `fill_min_hole`; the two criteria are independent, and
+    # `fill_min_hole = 0` disables the second.
     fill_window::Int
+    fill_min_hole::Int
 
     # Misc.
     rng_seed::UInt64
@@ -1079,6 +1082,10 @@ struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:Preproces
     # type parameter rather than a plain field.
     backend::B
 end
+
+# Holes of one to four points are closed on size alone. The reference's `bwareaopen(..., 5)`
+# threshold (`autoRIFT.py:803`), and exclusive: a five-point hole is not small enough.
+const _DEFAULT_FILL_MIN_HOLE = 5
 
 # The positional form without a backend, which is the documented stable API and what `app/` calls.
 # Appends `CPU()`, so an existing 18-argument call is unchanged in meaning.
@@ -1091,8 +1098,20 @@ Params(similarity, preprocess, subpixel, outliers, threaded, rotation, chip_size
        progress) =
     Params(similarity, preprocess, subpixel, outliers, threaded, rotation, chip_size_min,
            chip_size_max, grid_spacing, search_radius, min_search_radius, coarse_stride,
-           coarse_buffer, min_coarse_valid_fraction, dx_prior, dy_prior, fill_window, rng_seed,
-           progress, CPU())
+           coarse_buffer, min_coarse_valid_fraction, dx_prior, dy_prior, fill_window,
+           _DEFAULT_FILL_MIN_HOLE, rng_seed, progress, CPU())
+
+# The form without `fill_min_hole`, which the 18-argument one above also routes through. Kept so a
+# caller written against the field list before hole size was a criterion still compiles, and gets
+# the reference's threshold rather than a silently disabled one.
+Params(similarity, preprocess, subpixel, outliers, threaded, rotation, chip_size_min,
+       chip_size_max, grid_spacing, search_radius, min_search_radius, coarse_stride,
+       coarse_buffer, min_coarse_valid_fraction, dx_prior, dy_prior, fill_window, rng_seed,
+       progress, backend) =
+    Params(similarity, preprocess, subpixel, outliers, threaded, rotation, chip_size_min,
+           chip_size_max, grid_spacing, search_radius, min_search_radius, coarse_stride,
+           coarse_buffer, min_coarse_valid_fraction, dx_prior, dy_prior, fill_window,
+           _DEFAULT_FILL_MIN_HOLE, rng_seed, progress, backend)
 
 """
     chip_sizes(p::Params) -> Vector{Extent}

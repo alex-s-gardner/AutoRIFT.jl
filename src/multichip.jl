@@ -991,12 +991,44 @@ function _reject_and_fill!(d::DisplacementField, pts::PointSet, p::Params,
     return _fill_holes!(d, p)
 end
 
-# Fill points surrounded by enough measured neighbours with the neighbourhood median.
+# The holes that the neighbour-count criterion leaves open: `NaN` in `dx` with fewer than
+# `needed` measured neighbours in a `w`-wide window.
 #
-# Three passes, because each fills only points that are already well surrounded: filling one
-# ring makes the next ring well surrounded in turn, so a small hole closes from its edge
-# inward while a large one is left alone. A single pass with a looser threshold would instead
-# invent values in the middle of genuinely empty regions.
+# This is the set whose connected components are sized, so the size test judges what actually
+# remains rather than what the count is about to close. The reference's equivalent is
+# `!foo1 = !((filter2D(foo, ones(3,3)) >= 6) | foo)` (`autoRIFT.py:798-803`).
+function _open_after_count(dx::AbstractMatrix, w::Integer, needed::Integer)
+    lo, _, hi, _ = _window_margins(w, w)
+    nr, nc = size(dx)
+    open = falses(nr, nc)
+    @inbounds for j in 1:nc, i in 1:nr
+        isnan(dx[i, j]) || continue
+        n = 0
+        for jj in max(j - lo, 1):min(j + hi, nc), ii in max(i - lo, 1):min(i + hi, nr)
+            isnan(dx[ii, jj]) || (n += 1)
+        end
+        open[i, j] = n < needed
+    end
+    return open
+end
+
+# Fill a hole with the median of its neighbourhood, on either of two criteria.
+#
+# A point is filled if it has enough measured neighbours, *or* if it belongs to a connected hole
+# smaller than `fill_min_hole` — matching the reference, which tests both
+# (`autoRIFT.py:792-808`). The two are not redundant, and a 2x2 hole is where they part: each of
+# its points has five of nine neighbours measured, one short of the count, while the hole itself
+# is four points and so small enough to close. Neither criterion alone fills it.
+#
+# What each expresses: the count asks whether there is enough local evidence to interpolate from,
+# and the size asks whether the gap is small enough that interpolating across it is meaningful at
+# all. A hole's shape can satisfy the second while no point in it satisfies the first, which is
+# why an L-shaped or diagonal hole needs the size test.
+#
+# Three passes, because each fills only points that already qualify: filling one ring makes the
+# next ring well surrounded in turn, so a large hole closes from its edge inward while its
+# interior is left alone. A single pass with a looser threshold would instead invent values in
+# the middle of genuinely empty regions.
 #
 # Visits the holes rather than the grid. Sweeping the whole grid with `windowmedian` cost
 # 0.76 ms per pass on a 118x118 level with 9% holes — and on that level the first pass fills
@@ -1028,6 +1060,16 @@ function _fill_holes!(d::DisplacementField, p::Params)
     filled = Int[]
 
     for _ in 1:3
+        # Which holes are small enough to close regardless of neighbour count. Recomputed each
+        # pass because the previous pass's fills split and shrink the holes that remain.
+        #
+        # Taken on the holes *after* this pass's count criterion would close them, as the
+        # reference does: it labels `!foo1`, the invalid set with the well-surrounded points
+        # already removed (`autoRIFT.py:803`). Labelling the raw hole set instead would judge a
+        # large hole by a size it only has before its edge is filled.
+        small = p.fill_min_hole <= 1 ? nothing :
+                small_components(_open_after_count(d.dx, w, needed), p.fill_min_hole)
+
         # Two-phase: collect this pass's fills before applying any, so every point in a pass
         # sees the same field. Filling in place would let one fill seed the next within a
         # single pass, which is what the three-pass structure exists to control.
@@ -1061,7 +1103,10 @@ function _fill_holes!(d::DisplacementField, p::Params)
                     end
                 end
             end
-            n >= needed || continue
+            # Either criterion admits the point, but a median still needs something to take it
+            # over: a hole small enough to close with no measured neighbour at all stays open.
+            # That is the reference's `MM` term, which requires its 3x3 median to exist.
+            (n >= needed || (small !== nothing && small[i, j])) && n > 0 || continue
             # `_select_median!` rather than a sort here: it picks the cheaper selection for `n`,
             # which at the default 3-wide window is an insertion sort.
             push!(pending, (LinearIndices(d.dx)[i, j],

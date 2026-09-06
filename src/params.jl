@@ -286,6 +286,11 @@ function _check_positive(name::Symbol, v::Real)
     return v
 end
 
+function _check_nonnegative(name::Symbol, v::Real)
+    v >= 0 || throw(ArgumentError("`$name` must be >= 0, got $v"))
+    return v
+end
+
 function _check_odd_window(name::Symbol, w::Integer)
     w >= 1 || throw(ArgumentError("`$name` must be >= 1, got $w"))
     isodd(w) ||
@@ -374,6 +379,10 @@ chip_size = (X = 16, Y = 32)   # taller than wide
 - `agree_tolerance = 0.2`: agreement threshold, as a fraction of search radius.
 - `mad_scale = 4.0`: median-absolute-deviation multiplier.
 - `fill_window = 3`: window for median hole filling. Must be odd.
+- `fill_min_hole = 5`: a connected hole smaller than this is filled whatever its neighbour
+  count, which is what closes a hole whose shape leaves every point short of the window
+  criterion. Exclusive, so the default closes holes of one to four points. `0` disables it and
+  leaves filling to the window criterion alone.
 
 The five keywords after `outliers` are [`GardnerFilter`](@ref)'s own parameters, offered at
 the top level for convenience. They cannot be combined with an `outliers` *instance*, which
@@ -423,6 +432,7 @@ function params(;
     agree_tolerance = nokw,
     mad_scale = nokw,
     fill_window = 3,
+    fill_min_hole = 5,
     threaded = false,
     backend = :cpu,
     progress = false,
@@ -463,6 +473,7 @@ function params(;
         _check_fraction(:min_coarse_valid_fraction, min_coarse_valid_fraction),
         Float64(dx_prior), Float64(dy_prior),
         _check_odd_window(:fill_window, fill_window),
+        Int(_check_nonnegative(:fill_min_hole, fill_min_hole)),
         UInt64(rng_seed),
         Bool(progress),
         back,

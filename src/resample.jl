@@ -260,6 +260,72 @@ function dilate_within(mask::AbstractMatrix{Bool}, radius::Real)
 end
 
 """
+    small_components(mask, minsize) -> BitMatrix
+
+Positions in a connected component of `mask` holding fewer than `minsize` `true`s.
+
+Eight-connected, so two positions touching only at a corner belong to one component. That is
+the reference's `connectivity=2` (`autoRIFT.py:1652`), and it is not a detail: under
+four-connectivity a diagonal pair of holes is two components of one rather than one of two, and
+the size test then gives a different answer.
+
+This selects which holes in a displacement field are interpolated across. A hole small enough to
+be surrounded by coherent motion should be filled whatever its shape, and counting a
+neighbourhood cannot express that — an L-shaped four-pixel hole has positions with too few
+neighbours to pass any count while still being a hole worth closing.
+
+`minsize` is exclusive, matching `bwareaopen(image, size1)`'s `size < size1`: at `minsize = 5`
+components of one to four positions are returned and a five-position component is not.
+
+One union-find pass over the array with union by size and full path compression, so the cost is
+effectively linear and no component is materialised as a separate array.
+"""
+function small_components(mask::AbstractMatrix{Bool}, minsize::Integer)
+    Base.require_one_based_indexing(mask)
+    out = falses(size(mask))
+    minsize <= 1 && return out          # nothing can hold fewer than one position
+
+    nr, nc = size(mask)
+    parent = collect(1:length(mask))
+    csize = ones(Int, length(mask))
+
+    # Path-halving find. Iterative rather than recursive: a component can span the array, and
+    # the recursion depth would follow it.
+    function root(a::Int)
+        while parent[a] != a
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        end
+        return a
+    end
+
+    lin = LinearIndices(mask)
+    @inbounds for j in 1:nc, i in 1:nr
+        mask[i, j] || continue
+        a = root(lin[i, j])
+        # Only the four already-visited neighbours under column-major order — up, and the three
+        # in the previous column. Their mirror images are unioned when this position is itself
+        # the neighbour, so scanning half the ring covers all eight links.
+        for (di, dj) in ((-1, 0), (-1, -1), (0, -1), (1, -1))
+            ii, jj = i + di, j + dj
+            (1 <= ii <= nr && 1 <= jj <= nc) || continue
+            mask[ii, jj] || continue
+            b = root(lin[ii, jj])
+            a == b && continue
+            # Union by size, which is what bounds the tree depth.
+            csize[a] < csize[b] && ((a, b) = (b, a))
+            parent[b] = a
+            csize[a] += csize[b]
+        end
+    end
+
+    @inbounds for i in eachindex(mask)
+        mask[i] && (out[i] = csize[root(i)] < minsize)
+    end
+    return out
+end
+
+"""
     _squared_distance_transform(mask) -> Matrix{Float64}
 
 Squared Euclidean distance from each position to the nearest `true` in `mask`.

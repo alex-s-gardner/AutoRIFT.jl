@@ -163,6 +163,10 @@ end
 
     @test_throws "must be odd" AutoRIFT.params(; outlier_window = 4)
     @test_throws "must be odd" AutoRIFT.params(; fill_window = 2)
+    @test_throws "must be >= 0" AutoRIFT.params(; fill_min_hole = -1)
+    # Zero is the documented way to disable the hole-size criterion, so it must not be rejected.
+    @test AutoRIFT.params(; fill_min_hole = 0).fill_min_hole == 0
+    @test AutoRIFT.params().fill_min_hole == 5
     @test_throws "must be odd" Wallis(; width = 6)
     @test_throws "must be >= 3" Highpass(; width = 1)
 

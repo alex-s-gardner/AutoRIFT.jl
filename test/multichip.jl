@@ -1,6 +1,7 @@
 using AutoRIFT: ImagePair, gridpoints, params, correlate_multichip, chipsize_level,
                 MultichipResult, nmeasured, resample, resample!, Nearest, Area, Bicubic,
-                dilate_within, windowmax
+                dilate_within, small_components, windowmax,
+                DisplacementField, _fill_holes!
 
 # Same convention as track.jl's tests: the correlator returns secondary-to-reference, so the
 # feature motion is its negative.
@@ -119,6 +120,79 @@ end
     @test all(dilate_within(trues(5, 5), 1))
 end
 
+@testset "small_components" begin
+    # Eight-connected, which is the reference's `connectivity=2`: a diagonal pair is one
+    # component of two rather than two of one, and the size test turns on that.
+    m = falses(5, 5)
+    m[2, 2] = true
+    m[3, 3] = true
+    @test all(small_components(m, 3)[[CartesianIndex(2, 2), CartesianIndex(3, 3)]])
+    @test !any(small_components(m, 2))          # the pair is size 2, not < 2
+
+    # `minsize` is exclusive, matching `bwareaopen`'s `size < size1`.
+    row = falses(7, 7)
+    row[3, 2:6] .= true
+    @test !any(small_components(row, 5))        # exactly 5 is not smaller than 5
+    @test count(small_components(row, 6)) == 5
+
+    # Components are sized independently of each other.
+    mixed = falses(9, 9)
+    mixed[2, 2] = true
+    mixed[6:8, 6:8] .= true
+    r = small_components(mixed, 5)
+    @test r[2, 2]
+    @test !any(r[6:8, 6:8])
+
+    @test !any(small_components(falses(5, 5), 5))     # empty stays empty
+    @test !any(small_components(trues(4, 4), 5))      # one component of 16
+    @test !any(small_components(trues(3, 3), 0))      # a threshold of 0 selects nothing
+end
+
+@testset "hole size fills what neighbour count cannot" begin
+    mkfield(dx, dy) = DisplacementField(copy(dx), copy(dy), fill(NaN32, size(dx)),
+                                        fill(0.5f0, size(dx)), trues(size(dx)))
+
+    # A 2x2 hole is where the two criteria part. Each of its points has five of nine measured
+    # neighbours, one short of `fill_window`'s threshold of six, while the hole is four points
+    # and so smaller than `fill_min_hole`. Neither criterion alone closes it.
+    function twobytwo(minhole)
+        dx = fill(1.0f0, 11, 11)
+        dy = fill(2.0f0, 11, 11)
+        dx[5:6, 5:6] .= NaN32
+        dy[5:6, 5:6] .= NaN32
+        d = mkfield(dx, dy)
+        filled = _fill_holes!(d, params(; chip_size = 24, fill_min_hole = minhole))
+        return d, filled
+    end
+    @test count(!isnan, first(twobytwo(5)).dx[5:6, 5:6]) == 4
+    @test count(!isnan, first(twobytwo(0)).dx[5:6, 5:6]) == 0    # window criterion alone leaves it
+
+    # The filled value is the neighbourhood median, so a uniform field fills with its own value
+    # on both axes rather than with the other axis's or with zero.
+    d, filled = twobytwo(5)
+    @test all(d.dx[5:6, 5:6] .== 1.0f0)
+    @test all(d.dy[5:6, 5:6] .== 2.0f0)
+    # The four filled points are reported, so a caller can mark them interpolated.
+    @test length(filled) == 4
+
+    # The size criterion must not run away on a large hole: three passes close at most three
+    # rings, and the interior stays open. A hole judged by its size *before* its edge is filled
+    # would swallow the whole region.
+    dx = fill(1.0f0, 31, 31)
+    dy = fill(2.0f0, 31, 31)
+    dx[10:22, 10:22] .= NaN32
+    dy[10:22, 10:22] .= NaN32
+    big = mkfield(dx, dy)
+    _fill_holes!(big, params(; chip_size = 24, fill_min_hole = 5))
+    @test all(isnan, big.dx[14:18, 14:18])
+
+    # A hole with no measured neighbour at all stays open however small, since there is nothing
+    # for the median to take. This is the reference's `MM` term.
+    lone = mkfield(fill(NaN32, 7, 7), fill(NaN32, 7, 7))
+    _fill_holes!(lone, params(; chip_size = 24, fill_min_hole = 5))
+    @test all(isnan, lone.dx)
+end
+
 @testset "exact recovery through the pyramid" begin
     # End to end: the whole multi-scale machinery must not degrade what a single level gets
     # right. Every point resolved, at the finest chip, with the exact shift.
@@ -164,9 +238,27 @@ end
     @test counts[1] <= counts[2] <= counts[3]
     # Permitting coarser chips must still buy something overall, or the pyramid is pointless.
     @test counts[1] < counts[3]
-    # And the featureless band is not fully resolvable at any scale, so some points remain
-    # honestly unmeasured rather than invented.
-    @test counts[3] < length(gridpoints((n, n), 32; chip_size = 32, search_radius = 25))
+
+    # The finest chip alone cannot resolve the band: a 32-wide chip that fits inside it has zero
+    # variance. That is what the coarser levels are for, and what the counts above measure.
+    fine = correlate_multichip(pair, grid, params(; chip_size = 32, chip_size_max = 32))
+    @test nmeasured(fine) < counts[3]
+    @test count(isnan, fine.dx) >= 40        # the band spans several grid rows
+
+    # With the whole pyramid the band *is* resolvable here, because the eight points the coarse
+    # levels leave open form holes small enough for `fill_min_hole` to close. Filling is part of
+    # the answer rather than a fallback, so this asserts the measurement is right where it fills
+    # — a filled point that invented motion would fail the median checks below.
+    @test counts[3] == length(grid.x)
+    mx, my = motion(correlate_multichip(pair, grid,
+                                        params(; chip_size = 32, chip_size_max = 128)))
+    @test med(filter(!isnan, mx)) ≈ 6 atol = 0.05
+    @test med(filter(!isnan, my)) ≈ -4 atol = 0.05
+
+    # Without the hole-size criterion the same run leaves those eight open, which is what makes
+    # them a fill rather than a measurement.
+    @test nmeasured(correlate_multichip(
+        pair, grid, params(; chip_size = 32, chip_size_max = 128, fill_min_hole = 0))) == 188
 end
 
 @testset "chip_size records the level that won" begin
