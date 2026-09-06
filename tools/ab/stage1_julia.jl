@@ -25,6 +25,15 @@ const RADIUS = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 20
 # Centred on Jakobshavn's trunk, where ITS_LIVE reports 3,000-11,800 m/yr over crevassed ice.
 const CROW = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : 1678
 const CCOL = length(ARGS) >= 5 ? parse(Int, ARGS[5]) : 2495
+
+# Which element type the correlator is handed. `Float32` is the filtered high-pass field; `UInt8` is
+# what *production* correlates, because `uniform_data_type` rescales and quantizes to 256 levels
+# before `runAutorift` is reached (`autoRIFT.py:359-384`). The reference dispatches on it —
+# `arImgDisp_s` for float, `arImgDisp_u` for bytes — so the two are different code paths on both
+# sides, and a comparison on one says nothing about the other.
+const DTYPE = length(ARGS) >= 6 ? ARGS[6] : "Float32"
+DTYPE in ("Float32", "UInt8") ||
+    error("dtype must be Float32 or UInt8, got $DTYPE")
 const OUT = joinpath(@__DIR__, "stage1")
 
 const CACHE = get(ENV, "AUTORIFT_TESTDATA", expanduser("~/data/autorift/tests"))
@@ -36,6 +45,24 @@ function dump_array(dir, name, A)
         write(io, A)
     end
     return (name, string(eltype(A)), size(A))
+end
+
+# `uniform_data_type`'s `DataType == 0` branch (`autoRIFT.py:359-384`): centre on the mean, span six
+# standard deviations, scale to 0-255, round half away from zero, clip.
+#
+# `round` and not `trunc`: NumPy's `np.round` is round-half-to-even, and Julia's `round` defaults to
+# the same (`RoundNearest`), so the tie behaviour matches without an explicit mode. A `trunc` here
+# would bias every value half a level low.
+function _quantize_u8(A::AbstractMatrix{Float32})
+    n = length(A)
+    m = sum(Float64, A) / n
+    s = sqrt(sum(x -> (Float64(x) - m)^2, A) / (n - 1))
+    out = Matrix{UInt8}(undef, size(A))
+    lo = m - 3s
+    @inbounds for i in eachindex(A, out)
+        out[i] = round(UInt8, clamp((Float64(A[i]) - lo) / (6s) * 255, 0, 255))
+    end
+    return out
 end
 
 function main()
@@ -70,6 +97,15 @@ function main()
     fref = Matrix{Float32}(pair.reference)
     fsec = Matrix{Float32}(pair.secondary)
 
+    # Production's quantization, applied here so both sides correlate the same bytes. Each image is
+    # scaled by its *own* mean and standard deviation — the reference uses the sample standard
+    # deviation (`ddof = 1`, written there as `std * sqrt(n/(n-1))`), and using the population form
+    # instead shifts every value by a fraction of a level on a large image but does change some.
+    if DTYPE == "UInt8"
+        fref = _quantize_u8(fref)
+        fsec = _quantize_u8(fsec)
+    end
+
     grid = gridpoints(size(fref), p.grid_spacing;
                       chip_size = p.chip_size_max, search_radius = p.search_radius)
     out = displacement_field(grid)
@@ -99,6 +135,7 @@ function main()
         println(io, "npix ", n)
         println(io, "filter_width 5")
         println(io, "upsampling 16")
+        println(io, "dtype ", DTYPE)
     end
 
     ok = count(!isnan, out.dx)

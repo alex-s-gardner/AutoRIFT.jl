@@ -119,6 +119,40 @@ Stage 1, the correlator, one level at a time on a 512² window:
 The correlator is **bit-identical** — not merely close — at every chip size, on both axes, at every
 point. Same for `dy`, and at every correlation gate.
 
+### The element type is part of the comparison, and `UInt8` is the production path
+
+```bash
+julia --project=tools/ab tools/ab/stage1_julia.jl 1024 16 20 1678 2495 UInt8
+micromamba run -n arift-ref python tools/ab/stage1_python.py
+```
+
+Stage 1 runs on either element type, because the reference has two correlators and production uses the
+one this harness originally never called. `uniform_data_type` rescales each image by its own mean and
+standard deviation and quantizes to 256 levels before `runAutorift` is reached
+(`autoRIFT.py:359-384`), so the C++ entry point is `arImgDisp_u` on bytes rather than `arImgDisp_s` on
+floats. They are separate templates; agreement on one carries no information about the other.
+
+Measured on the same 1024² window at chip 16, 3,721 shared points:
+
+| path | median | p95 | **max** | within 0.2 px |
+|---|---:|---:|---:|---:|
+| `Float32`, `arImgDisp_s` | 0.0000 | 0.0000 | **0.0000** | **100.00%** |
+| `UInt8`, `arImgDisp_u` | 0.0000 | 0.0625 | **35.81** | 98.28% |
+
+The float path is bit-identical at every point. The byte path agrees on 98.3% and the remaining 1.7%
+are wrong by up to 36 pixels — a different match, not a rounded one. Those failures are not spread
+evenly: they cluster where the correlation surface has competing maxima, which is why a high-shear
+block of a golden scene can score 18% while the scene averages 55%, and why a bad point at the base
+level propagates into its neighbours through the prior.
+
+**Quantizing to `UInt8` is a version-matching requirement, not a claim that it is correct.** Throwing
+a filtered float field down to 256 levels before correlating discards precision the correlator could
+otherwise use, and AutoRIFT.jl has no need to do it. It is reproduced because agreement with the
+reference is the current objective, and because a deliberate difference and a bug are
+indistinguishable in a comparison — every difference has to be removed before the remaining ones mean
+anything. Once the two agree, this is a candidate to drop in favour of correlating the float field
+directly; `tools/golden/README.md` keeps that register.
+
 Stage 2, the whole pipeline on the full 3072² window, 88,123 shared points: **81.8% exact** on `dx`
 and 82.2% on `dy`, 98.7% within one step, median 0.0000 px, bias `+0.0000` on both axes, p99 0.0752 px,
 correlation 0.99964. Radial: 79.9% exact, 98.0% within one step. Exact agreement
