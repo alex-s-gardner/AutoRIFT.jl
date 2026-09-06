@@ -423,8 +423,35 @@ produced it.
    the reference overwrites measurements with a bicubic resize and exact agreement is unreachable by
    construction (below). Level agreement is now 97.2%. What is left to chase, in order: the outlier
    filter's neighbourhood decisions, hole filling, and the 14% of base-level points beyond one step.
-2. **Coverage** — 16,893 points AutoRIFT.jl answers alone against 19,162 the reference does. Partly
-   the deliberate degenerate-chip difference in `REFERENCE.md`; the rest is unaccounted for.
+2. **Coverage, and it is the outlier filter.** 16,893 points AutoRIFT.jl answers alone against 19,162
+   the reference does. Disabling the filter and changing nothing else settles which side owns it:
+
+   | outlier filter | both measured | only jl | only ref |
+   |---|---:|---:|---:|
+   | reference-matched `GardnerFilter` | 598,718 | 16,893 | **19,162** |
+   | `NoOutlierFilter` | 617,208 | 186,408 | **672** |
+
+   `only_ref` collapses from 19,162 to 672, and `both` rises by exactly the 18,490 difference. So
+   **almost every point the reference answers alone is one AutoRIFT.jl measured and then rejected** —
+   the filter is over-rejecting relative to the reference, rather than the correlator failing to
+   measure. (The complementary 186,408 confirms the filter is doing real work and must not simply be
+   loosened.)
+
+   This also **corrects a claim previously recorded here**: the deliberate degenerate-chip difference
+   accounts for at most those 672 residual points, not a substantial share of the gap.
+
+   The cause is not the parameters, which were checked against the reference's own derivation from the
+   captured scalars and match exactly — `ChipSize0X/GridSpacingX = 2`, so `FiltWidth` 9 and
+   `FracValid` 0.41 fine / 0.32 coarse on both sides, with `agree_tolerance` 0.2, `mad_scale` 4 and
+   3/2 iterations. `rescale`/`relax` reproduce `autoRIFT.py:484-505` exactly. The remaining suspects
+   are therefore *when* the filter runs relative to the level merge and hole filling, and the
+   `windowmedmad` / `count_agreeing` reducer semantics at window borders and on all-NaN
+   neighbourhoods.
+
+   One structural difference is already visible and is a candidate rather than a conclusion:
+   `_oversample` is **capped at 2** (`src/multichip.jl:697`) where the reference's ratio is uncapped.
+   It does not bind on this case — the ratio *is* 2 — so it cannot explain these numbers, but it will
+   bind wherever grid spacing divides the chip size more than twice.
 3. **The post-correlation chain** — nothing downstream of `correlate` exists in Julia, so no product
    comparison has run.
 
@@ -434,3 +461,85 @@ Two items came off this list by being measured rather than by being fixed:
 - **Coarse-level resampling** is not a defect: neither implementation's coarse values are quantized,
   because both replace the measurement with a bicubic-interpolated value, so exact agreement is
   unreachable there. Bias is under 0.01 px.
+
+## Matched for agreement, not endorsed
+
+**Agreement with the reference is the current objective, and it is not the same objective as being
+correct.** Where the two conflict, this exercise chooses agreement — because a deliberate difference
+and a bug are indistinguishable in a comparison, so every difference has to be removed before the
+remaining ones mean anything. That trade has a cost: each choice below makes AutoRIFT.jl reproduce
+behaviour there is reason to think is wrong.
+
+They are listed so the debt is visible and so re-litigating one is a decision rather than a
+rediscovery. Each names the condition under which it should be revisited. None should be revisited
+before the product comparison passes.
+
+| behaviour | why it is questionable | revisit when |
+|---|---|---|
+| **Per-point chip-size bounds ignored at the base level** (`autoRIFT.py:509` vs `:587`) | A point whose parameter file asks for no chip smaller than 480 m is still correlated at the base chip size. The finest level is where a chip smaller than the parameter file allows does the most damage, and 136,800 points on the golden S2 case are answered against their own `ChipSizeMinX`. The asymmetry reads as an oversight in the reference — the bounds test sits inside an `if` that excludes the base level — rather than a decision. | Product comparison passes. Then measure what honoring the bounds everywhere does to coverage and to `stable_shift`. |
+| **Reference reports a search-window corner for a degenerate chip** | A constant chip carries no information about displacement, so `dx = -radius_x, dy = +radius_y` is a fabricated answer over masked and low-texture ground where v1.5.0 correctly produced none. It also flips `M0C = ~isnan(DxC)` true there, changing which pyramid levels are skipped. | Never adopted as the default. AutoRIFT.jl reports no measurement and **there is currently no flag to reproduce the reference's behaviour** — see below, since the coverage gap may require one. |
+| **Even-kernel `colfilt` chunk seam** (`autoRIFT.py`) | The code assumes a left margin of `(k-1)÷2` where `generic_filter` uses `k÷2`, so the first output column of each chunk after the first reads padding where it should read data — `nchunks - 1` corrupted columns per row. Only the non-base pyramid levels use even kernels. | Only matters if a coarse-level residual is traced to it. Not reproduced in AutoRIFT.jl; recorded so the *reference's* coarse values are not assumed clean. |
+| **Agreement threshold is a fraction of the full window area** | A point at the grid border is held to the same absolute neighbour count as one in the interior, despite having fewer neighbours to corroborate it. Defensible as conservatism, and it is the reference's behaviour, but it is a choice rather than a derivation. | Only if border coverage turns out to matter to the product's cropped extent. |
+
+Two differences run the *other* way — AutoRIFT.jl is more nearly correct and deliberately does not
+match:
+
+- **Wallis variance.** AutoRIFT.jl's about-the-mean form is ~360,000× more accurate than the
+  reference's `E[x²] − E[x]²` against an exact `Float64` truth (reference median error 0.54, max
+  5.79; about-the-mean 1.5e-6, max 9.5e-6). Kept accurate by decision, so `wallis_fill` cases are
+  gated on tolerance rather than on equality.
+- **A seeded gap-fill RNG.** Reproducibility is worth more than matching any single draw, and the
+  reference cannot match itself here either.
+
+## Closed: hypotheses ruled out, with what ruled them out
+
+Every line here cost real time. Recorded so it is spent once. **A closed hypothesis is closed by a
+measurement, not by an argument** — if one is reopened, it should be by a new measurement that
+contradicts the old one, not by the reasoning that motivated it the first time.
+
+| hypothesis | ruled out by | verdict |
+|---|---|---|
+| The correlator disagrees with the reference | `tools/ab` stage 1, re-run: **bit-identical**, 100% exact at chip 32 against `arImgDisp_s` | **The correlator is not the problem, and has never been.** This is the anchor. Any golden disagreement above this floor is the harness or the pipeline around the correlator. Check here *first*. |
+| The coarse-level residual is a lattice or interpolant error | At a coarse node Catmull-Rom reproduces its sample exactly, so a lattice error would make nodes agree better than off-nodes. Median 0.0980 on nodes against 0.0980 off them. 12 `INTER_CUBIC` fixtures pin the interpolant bit-exact. `int(shape/Scale)` is exactly 2 and 4 here, so the lattice-drift trap is not active | Not the lattice, not the interpolant |
+| The coarse-level residual is the multi-level merge | One level run in isolation through `chipsize_level`, no merge and no prior: same 0.00% exact | Not the merge |
+| The coarse levels *should* agree exactly | Multiples of 1/16, 1/32, 1/64, 1/128 account for 0.01–0.03% of **either** side's chip-48 values, against 99.4% at the base level. `autoRIFT.py:856-866` overwrites even directly-measured points with a bicubic resize | **`exact` is the wrong statistic above the base level.** Use bias and within-one-step. Exact agreement is unreachable by construction, on both sides. |
+| Per-level upsampling was the dominant cause | Implemented the reference's own `{24:16, 48:32, 96:64}` ladder: exact agreement moved 27.42% → 27.43% | Real gap, correctly fixed, ~0 effect. A production configuration could not be expressed without it. |
+| The L7 disagreement is the noise fill being reported as signal | The fill *is* rejected — it correlates with nothing and `filtDisp` drops it as designed. Only 9.1% of disagreeing points are flagged `interp_mask` against 5.8% of agreeing ones | **The mechanism is the rejection, not the retention.** A rejected fill point is a missing neighbour for every real point whose `filtDisp` window overlaps it, so a different draw rejects a different set and coverage swings ±3,500 in both directions. |
+| `v_error`'s unseeded 10⁶-draw Monte Carlo prevents exact comparison | The standard deviation of that many draws is stable well inside the `int16` rounding the product applies — 8,356 pixels take the value 27 in every run | **`v_error` is reproducible.** Do not widen a tolerance for it. |
+| The golden L7 product is a fixed target | Two container runs agree on 3.4% of `vx`, median 9 m/yr, and coverage moves enough to change the product's own `P<nn>` name | **It is one draw from a distribution.** Gate against the reference's own run-to-run envelope, measured by running the container twice. |
+| A median residual of one quantization step is benign tie-breaking | It was a half-pixel grid offset. Invisible in the median; obvious in a heatmap | **See below.** This one nearly closed the investigation at the wrong answer. |
+| The outlier filter's *parameters* are mis-derived | Computed the reference's `FiltWidth` and `FracValid` from the captured scalars and compared: 9 and 0.41 fine / 0.32 coarse on both sides, `agree_tolerance` 0.2, `mad_scale` 4, 3/2 iterations. `rescale`/`relax` reproduce `autoRIFT.py:484-505` exactly | Not the parameters. The disagreement is in *when* the filter runs and in reducer semantics, so look there. |
+| The coverage gap is mostly the deliberate degenerate-chip difference | Disabling the filter drops `only_ref` from 19,162 to **672** | **It is the outlier filter over-rejecting**, not the degenerate-chip choice, which accounts for at most 672 points. Corrects an earlier claim in this file. |
+
+### The lesson that generalizes: plot before reasoning
+
+The half-pixel bug presented as a median `|ddx|` of exactly 1/16 — one quantization step, entirely
+plausible as tie-breaking on weak peaks, and consistent with a correlator that was known to be
+bit-identical. Every summary statistic was reassuring. It was found only by looking at the difference
+map, which was blank over flat ice and washed along every fast-flow margin.
+
+That shape *is* the signature of a grid offset, and the reason it hides is structural: a shifted grid
+produces **zero** residual under uniform motion and a residual proportional to the local velocity
+gradient everywhere else. Since most of a scene is slow, the median is dominated by the pixels that
+cannot show the error. Binning residual against gradient made it quantitative — exact agreement fell
+from 66.5% in the flattest decile to 5.6% in the steepest — and scanning the offset settled the value
+empirically rather than by argument: 85.0% at `+1.0` against 49.2% at `+0.5`.
+
+Three habits follow, and they are cheap:
+
+1. **Heatmap the two fields and their difference before computing anything else.** Garbage, an
+   off-by-one, a flipped axis and a transpose are each visually unmistakable and each survives a
+   plausible-looking median.
+2. **Scan the parameter rather than deriving it.** The `+1` vs `+0.5` question had a clean argument on
+   both sides — `_shift_points` adds AutoRIFT.jl's own half pixel, so subtracting the reference's
+   looks right — and the argument was wrong. `residual_maps.jl` keeps the offset scan and the
+   whole-pixel roll test as standing tools.
+3. **Bin the residual against the local gradient.** A gradient-correlated residual is a geometry bug.
+   An uncorrelated one is arithmetic. This distinguishes them in one plot.
+
+The conventions that produce these bugs are worth naming, since three of the four have now cost
+something here: Julia indexes from 1 where Python indexes from 0; Julia is row-major-ish `[row, col]`
+where the reference thinks `[col, row]`; projected y increases *upward* while the row index increases
+downward; and pixel-is-area against pixel-is-point puts a half pixel between two defensible answers.
+`tools/ab/README.md` asserts each of these in code rather than describing them, which is the only form
+that keeps working.

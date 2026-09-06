@@ -57,8 +57,14 @@ coarse-validity fraction and therefore which pyramid levels are skipped.
 
 *AutoRIFT.jl treats a degenerate chip as no measurement* — a constant chip
 carries no information about displacement, so reporting the search-window corner
-as an answer is worse than reporting nothing. The reference's behaviour is
-available for comparison via a compatibility flag.
+as an answer is worse than reporting nothing.
+
+There is **no flag to reproduce the reference's behaviour**; `Params` has no such
+field. That is a gap rather than a decision, because those points enter the
+reference's `stable_count` and not AutoRIFT.jl's, which can flip
+`stable_shift_flag` and shift every velocity in a product by a constant. If the
+golden comparison turns out to need one, it is a compatibility flag and not a
+change of default.
 
 **The per-point chip-size bounds do not apply at the base chip size.** The `M0`
 gate — `(ChipSizeMinX <= ChipSizeUniX[i]) & (ChipSizeMaxX >= ChipSizeUniX[i])` —
