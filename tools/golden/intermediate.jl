@@ -105,6 +105,30 @@ function capture_reference(c::GoldenCase; n::Integer = 100, threads::Integer = 8
 end
 
 """
+    LevelRecord
+
+What one pyramid level did, taken from inside the reference's own loop.
+
+`runAutorift`'s inputs and outputs describe the *merged* answer, so which level a disagreement came
+from otherwise has to be inferred from the reported `ChipSizeX` — and that inference is weakest
+exactly where it matters, at a point the two implementations assign to different levels.
+
+`kind` is `"coarse"` or `"fine"` for a correlator call and `"filtDisp"` for a rejection pass, in the
+order the loop made them. A correlator record carries the level's raw `dx`/`dy` before any filtering
+or merge, so it separates "this level never measured the point" from "this level measured it and the
+merge preferred another".
+"""
+struct LevelRecord
+    seq::Int
+    kind::String
+    chip_size::Tuple{Float64,Float64}
+    oversample::Float64
+    grid_shape::Tuple{Int,Int}
+    counts::Dict{String,Int}
+    arrays::Dict{String,Matrix}
+end
+
+"""
     Capture
 
 One `runAutorift` call's arrays and scalars, as Julia values.
@@ -112,14 +136,16 @@ One `runAutorift` call's arrays and scalars, as Julia values.
 `arrays` is keyed as the manifest writes them — `in_I1`, `out_Dx`, and so on — holding each in the
 orientation the reference had it. `scalars` carries every attribute that affects the result, so
 `Params` can be configured from what the reference used rather than from what the driver is believed
-to set.
+to set. `levels` is the per-level record, empty for a capture taken before it was collected.
 """
 struct Capture
     call::Int
     arrays::Dict{String,Matrix}
     scalars::Dict{String,Any}
     skipped::Dict{String,String}
+    levels::Vector{LevelRecord}
 end
+
 
 """
     read_capture(dir; call = 1) -> Capture
@@ -142,7 +168,27 @@ function read_capture(dir::AbstractString; call::Integer = 1)
     end
     scalars = Dict{String,Any}(String(k) => v for (k, v) in pairs(m.scalars))
     skipped = Dict{String,String}(String(k) => String(v) for (k, v) in pairs(get(m, :skipped, (;))))
-    return Capture(m.call, arrays, scalars, skipped)
+
+    # Absent from a capture taken before per-level recording existed, which is a missing diagnostic
+    # rather than a broken capture — the correlator comparison does not read it.
+    levels = LevelRecord[]
+    for r in get(m, :levels, ())
+        la = Dict{String,Matrix}()
+        for (name, _) in pairs(get(r, :arrays, (;)))
+            la[String(name)] = xread(joinpath(dir, "lvl$(r.seq)_$(name)"))
+        end
+        counts = Dict{String,Int}()
+        for key in (:measured, :in_mask, :kept, :filt_width, :iterations)
+            haskey(r, key) && (counts[String(key)] = Int(r[key]))
+        end
+        push!(levels, LevelRecord(
+            r.seq, String(r.kind),
+            (Float64(get(r, :chip_size_x, NaN)), Float64(get(r, :chip_size_y, NaN))),
+            Float64(get(r, :oversample, NaN)),
+            (Int(r.grid_shape[1]), Int(r.grid_shape[2])),
+            counts, la))
+    end
+    return Capture(m.call, arrays, scalars, skipped, sort!(levels, by = r -> r.seq))
 end
 
 read_capture(c::GoldenCase; n::Integer = 100, call::Integer = 1) =

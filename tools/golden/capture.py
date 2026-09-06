@@ -87,6 +87,98 @@ def _dump(obj, names, prefix, manifest):
         manifest['arrays'][f'{prefix}{name}'] = _write(f'{prefix}{name}', v)
 
 
+def install_levels(module, manifest):
+    """Patch the per-level correlator and filter calls to dump what each pyramid level decided.
+
+    `runAutorift`'s own inputs and outputs describe the *merged* answer, so which level a
+    disagreement came from has to be inferred from the reported `ChipSizeX`. That inference is
+    weakest exactly where it matters — a point the two implementations assign to different levels
+    is the case under investigation, and it is the case where the merged output cannot say which
+    level's decision diverged.
+
+    The pyramid's per-level state is local to `runAutorift`, so it is unreachable from outside. What
+    *is* reachable is the calls that loop makes: `arImgDisp_u`/`arImgDisp_s` once for the coarse pass
+    and once for the fine pass of each level, and `DISP_FILT.filtDisp` once per pass. Wrapping those
+    records each level's raw measurement and each level's rejection mask without reimplementing the
+    loop, so the recorded values are the reference's own rather than a reconstruction.
+
+    Calls are numbered in the order they happen. `ChipSizeX` is an argument to the correlator, so the
+    level is recorded rather than deduced, and the coarse and fine passes are distinguished by
+    `SubPixFlag` — the coarse pass runs with it `False`.
+    """
+    seq = {'n': 0}
+    levels = manifest.setdefault('levels', [])
+
+    def wrap_corr(name):
+        original = getattr(module, name, None)
+        if original is None:
+            return
+
+        def patched(I1, I2, xGrid, yGrid, ChipSizeX, ChipSizeY, SearchLimitX, SearchLimitY,
+                    Dx0, Dy0, SubPixFlag, overSampleRatio, *rest):
+            seq['n'] += 1
+            n = seq['n']
+            dx, dy = original(I1, I2, xGrid, yGrid, ChipSizeX, ChipSizeY, SearchLimitX,
+                              SearchLimitY, Dx0, Dy0, SubPixFlag, overSampleRatio, *rest)
+            rec = {
+                'seq': n,
+                'kind': 'fine' if SubPixFlag else 'coarse',
+                'chip_size_x': float(ChipSizeX),
+                'chip_size_y': float(ChipSizeY),
+                'oversample': float(overSampleRatio),
+                'grid_shape': list(np.shape(xGrid)),
+                'measured': int(np.count_nonzero(~np.isnan(dx))),
+                'arrays': {},
+            }
+            # The grid too: a level's coarse pass runs on a decimated grid, and the decimation is
+            # what places a coarse estimate over the fine points it stands for.
+            for label, arr in (('dx', dx), ('dy', dy), ('xgrid', xGrid), ('ygrid', yGrid),
+                               ('searchx', SearchLimitX), ('searchy', SearchLimitY)):
+                a = np.asarray(arr)
+                if a.ndim != 2 or a.dtype.str not in xchg.TAGS:
+                    continue
+                rec['arrays'][label] = _write(f'lvl{n}_{label}', a)
+            levels.append(rec)
+            print(f'[capture] level call {n}: {rec["kind"]} chip {ChipSizeX} '
+                  f'grid {rec["grid_shape"]} measured {rec["measured"]}', flush=True)
+            return dx, dy
+
+        setattr(module, name, patched)
+
+    wrap_corr('arImgDisp_u')
+    wrap_corr('arImgDisp_s')
+
+    # The rejection mask each pass keeps. Paired with the raw `dx` above, this separates "this level
+    # never measured the point" from "this level measured it and threw it away", which the merged
+    # `ChipSizeX` cannot distinguish.
+    disp_filt = getattr(module, 'DISP_FILT', None)
+    if disp_filt is not None:
+        original_filt = disp_filt.filtDisp
+
+        def patched_filt(self, Dx, Dy, SearchLimitX, SearchLimitY, M, OverSampleRatio):
+            seq['n'] += 1
+            n = seq['n']
+            kept = original_filt(self, Dx, Dy, SearchLimitX, SearchLimitY, M, OverSampleRatio)
+            levels.append({
+                'seq': n,
+                'kind': 'filtDisp',
+                'filt_width': int(self.FiltWidth),
+                'frac_valid': float(self.FracValid),
+                'iterations': int(self.Iter),
+                'oversample': float(OverSampleRatio),
+                'grid_shape': list(np.shape(Dx)),
+                'in_mask': int(np.count_nonzero(M)),
+                'kept': int(np.count_nonzero(kept)),
+                'arrays': {'kept': _write(f'lvl{n}_kept', np.asarray(kept).view(np.uint8))},
+            })
+            print(f'[capture] level call {n}: filtDisp width {self.FiltWidth} '
+                  f'frac {self.FracValid:.4f} kept {np.count_nonzero(kept)} '
+                  f'of {np.count_nonzero(M)}', flush=True)
+            return kept
+
+        disp_filt.filtDisp = patched_filt
+
+
 def install():
     """Patch `autoRIFT.runAutorift` to dump its inputs and outputs around the real call."""
     OUT.mkdir(parents=True, exist_ok=True)
@@ -99,6 +191,13 @@ def install():
         state['n'] += 1
         call = state['n']
         manifest = {'call': call, 'arrays': {}, 'scalars': {}, 'skipped': {}}
+
+        # Per-level patches go on before the call, since they record what happens inside it. They
+        # write into this call's manifest, so a driver that runs the correlator more than once keeps
+        # the levels attributed to the right run.
+        from autoRIFT import autoRIFT as ar_module
+
+        install_levels(ar_module, manifest)
 
         original(self)
         # Inputs are taken *after* the call, not before. `runAutorift` rewrites them as its first
