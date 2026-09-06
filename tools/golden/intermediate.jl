@@ -51,6 +51,16 @@ function capture_reference(c::GoldenCase; n::Integer = 100, threads::Integer = 8
     end
     mkpath(dir)
 
+    # `autoRIFT_intermediate.nc` left by a previous run makes the driver load that instead of
+    # correlating (`testautoRIFT.py:693-706`), so `runAutorift` is never called and `capture.py`'s
+    # patch has nothing to intercept. The run then *succeeds* — a fresh product, a fresh log, no
+    # error — while the capture directory keeps whatever the earlier run put there. A forced
+    # re-capture that silently returns the arrays it was asked to replace is the worst outcome
+    # available, so the file is removed rather than detected.
+    stale = joinpath(dir, "autoRIFT_intermediate.nc")
+    isfile(stale) && (@info "removing stale intermediate so the correlator runs" stale;
+                      rm(stale))
+
     netrc = joinpath(homedir(), ".netrc")
     awsdir = joinpath(homedir(), ".aws")
 
@@ -89,12 +99,24 @@ function capture_reference(c::GoldenCase; n::Integer = 100, threads::Integer = 8
 
     log = joinpath(dir, "capture.log")
     @info "capturing correlator arrays" product=c.product run=n log
+    started = time()
     open(log, "w") do io
         try
             run(pipeline(cmd; stdout = io, stderr = io))
         catch
             error("capture run failed; see $log\n$(last_lines(log, 30))")
         end
+    end
+
+    # The patch printing "patched" only says it was installed; it has to have *fired*. A run that
+    # skipped the correlator writes a product and a log and leaves the capture untouched, so check the
+    # manifest is newer than this run rather than merely present.
+    manifest = joinpath(cap, "call1.json")
+    if !isfile(manifest) || mtime(manifest) < started
+        error("the correlator did not run: `capture/call1.json` is " *
+              (isfile(manifest) ? "older than this run" : "absent") * ".\n" *
+              "`runAutorift` is skipped when an intermediate is present, and the run then " *
+              "succeeds while the capture stays stale. See $log")
     end
     isdir(cap) || error("run finished but wrote no capture directory; see $log")
     # The capture is only trustworthy if the run it came from produced the product too. A capture
