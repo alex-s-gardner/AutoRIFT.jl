@@ -48,19 +48,38 @@ function dump_array(dir, name, A)
 end
 
 # `uniform_data_type`'s `DataType == 0` branch (`autoRIFT.py:359-384`): centre on the mean, span six
-# standard deviations, scale to 0-255, round half away from zero, clip.
+# standard deviations, scale, clip, round.
 #
-# `round` and not `trunc`: NumPy's `np.round` is round-half-to-even, and Julia's `round` defaults to
-# the same (`RoundNearest`), so the tie behaviour matches without an explicit mode. A `trunc` here
-# would bias every value half a level low.
+# Three details each change the output, and each was established by comparing against the reference's
+# own `uniform_data_type` on the same input rather than by reading:
+#
+#   **The scale is 2^8 = 256, not 255.** The reference writes `* (2**8 - 0)`, which reads like a typo
+#   for `2**8 - 1` and is not one. Using 255 matches only **49.7%** of values — the two disagree by one
+#   level across half the image, because a factor of 256/255 shifts most values past a rounding
+#   boundary somewhere in the range.
+#
+#   **The arithmetic is `Float32`.** `self.I1` is `float32`, so NumPy computes the whole expression in
+#   single precision and the `.5` ties fall where `Float32` puts them. In `Float64` two values out of
+#   40,000 land on the other side of a tie: one is exactly `103.5` in `Float32` and `103.4999983` in
+#   `Float64`, which round to 104 and 103.
+#
+#   **Clip before round**, as the reference does — `np.round(np.clip(x, 0, 255))`. Rounding first would
+#   let 255.6 become 256 and wrap to 0 in a `UInt8`.
+#
+# `round` and not `trunc`: NumPy's `np.round` is round-half-to-even and Julia's `round` defaults to the
+# same, so the tie rule matches with no explicit mode. `trunc` would bias every value half a level low.
 function _quantize_u8(A::AbstractMatrix{Float32})
     n = length(A)
-    m = sum(Float64, A) / n
-    s = sqrt(sum(x -> (Float64(x) - m)^2, A) / (n - 1))
+    m = Float32(sum(Float64, A) / n)
+    # The reference's `np.std(temp) * sqrt(n/(n-1))` is the sample standard deviation, computed here
+    # directly. The sum is accumulated in `Float64` because a 3072² `Float32` sum loses digits, then
+    # narrowed so the per-pixel arithmetic below is single precision as NumPy's is.
+    s = Float32(sqrt(sum(x -> (Float64(x) - Float64(m))^2, A) / (n - 1)))
+    lo = m - 3f0 * s
+    span = 6f0 * s
     out = Matrix{UInt8}(undef, size(A))
-    lo = m - 3s
     @inbounds for i in eachindex(A, out)
-        out[i] = round(UInt8, clamp((Float64(A[i]) - lo) / (6s) * 255, 0, 255))
+        out[i] = round(UInt8, clamp((A[i] - lo) / span * 256f0, 0f0, 255f0))
     end
     return out
 end

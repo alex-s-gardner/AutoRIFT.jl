@@ -137,13 +137,21 @@ Measured on the same 1024² window at chip 16, 3,721 shared points:
 | path | median | p95 | **max** | within 0.2 px |
 |---|---:|---:|---:|---:|
 | `Float32`, `arImgDisp_s` | 0.0000 | 0.0000 | **0.0000** | **100.00%** |
-| `UInt8`, `arImgDisp_u` | 0.0000 | 0.0625 | **35.81** | 98.28% |
+| `UInt8`, `arImgDisp_u` | 0.0000 | 0.0625 | **35.81** | 98.60% |
 
 The float path is bit-identical at every point. The byte path agrees on 98.3% and the remaining 1.7%
 are wrong by up to 36 pixels — a different match, not a rounded one. Those failures are not spread
 evenly: they cluster where the correlation surface has competing maxima, which is why a high-shear
 block of a golden scene can score 18% while the scene averages 55%, and why a bad point at the base
 level propagates into its neighbours through the prior.
+
+The quantizer itself is verified against the reference's own `uniform_data_type` rather than against a
+reading of it, because two details in that function are easy to transcribe wrongly and both change the
+answer. The scale is `2**8 - 0` — **256, not 255**, which reads like a typo and is not one; using 255
+matches only 49.7% of values. And the arithmetic is `Float32`, since `self.I1` is single precision.
+With both right, 99.9975% of levels match on a 200² test field, and the one remaining value sits
+1.5e-5 below a `.5` tie that NumPy's pairwise `Float32` accumulation of the mean and standard deviation
+puts on the other side.
 
 **The arithmetic is `Float32` on both sides, so this is not byte precision.** OpenCV's `matchTemplate`
 on a `CV_8UC1` input computes in float and returns `CV_32FC1` (the C++ stores the imagery as
