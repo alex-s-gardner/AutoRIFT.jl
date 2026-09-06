@@ -209,10 +209,34 @@ those the `floor` and `golden` columns are close to each other: *a local run dif
 product by about as much as two local runs differ from each other.*
 
 `_wallis_filter_fill` (`autoRIFT.py:113-125`) fills Landsat 7's Scan Line Corrector gaps with
-`rng.normal` from an **unseeded** `np.random.default_rng()`, so the input imagery differs on every run
-and the correlator faithfully reports different displacements. The driver picks the filter **per
-scene**, not per pair (`testautoRIFT.py:718-723`), which is why `LC08_L1TP_060018_20130330` is
-affected: it is a Landsat 8 reference against a Landsat 7 secondary, and one unseeded scene is enough.
+`rng.normal` from an **unseeded** `np.random.default_rng()`. The driver picks the filter **per scene**,
+not per pair (`testautoRIFT.py:718-723`), which is why `LC08_L1TP_060018_20130330` is affected: it is
+a Landsat 8 reference against a Landsat 7 secondary, and one unseeded scene is enough.
+
+#### That the draw is the cause is a measurement, not an inference
+
+Patching `numpy.random.default_rng` to seed itself and changing nothing else (`seeded.py`) settles it:
+
+| two runs of the reference | `vx` exact | coverage Δ | whole product |
+|---|---:|---:|---|
+| unseeded, as shipped | 3.4% | 30,143 | differs |
+| **seeded, same seed** | **100.000%** | **0** | **identical** |
+
+Same code, same inputs, same container; one call seeded. So the gap-fill noise does reach the output.
+
+**But not by being retained as a measurement** — that part of the mechanism works as designed. The
+fill is white noise against real texture, so it correlates with nothing, and `filtDisp` rejects it.
+The effect is *indirect*, and it is in the rejection rather than the acceptance: `filtDisp` is a
+neighbourhood test, where a point survives only if at least `FracValid * FiltWidth²` of its neighbours
+agree with it (`autoRIFT.py:1600-1626`). A rejected fill point is a **missing neighbour** for every
+real point whose window overlaps it, and a different draw rejects a different set — so different real
+points clear the agreement threshold.
+
+The signature matches: coverage swings by ±3,500 measured points between runs, in **both** directions
+(seeded measures 3,504 more than one unseeded run and 1,371 fewer than the other), and of the 122,945
+disagreeing points only 9.1% are flagged `interp_mask` — barely above the 5.8% among the agreeing
+ones. So this is not the fill being reported as signal; it is real points losing or gaining the
+neighbourhood support they need.
 
 Measured in physical units on `LE07_L1TP_061018_20120428`: two runs land 9 m/yr apart at the median
 and 34 at p95, and coverage moves enough to change the product's own `P<nn>` name — `P010`, `P011`,

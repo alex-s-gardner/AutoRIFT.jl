@@ -190,9 +190,22 @@ by `crop.py::numeric_hash` under a per-process hash salt.
 
 **Any pair with a `wallis_fill` scene is not deterministic**, and the reference does not
 reproduce itself there. `_wallis_filter_fill` fills Landsat 7's Scan Line Corrector gaps
-with `rng.normal` from an **unseeded** `np.random.default_rng()` (`autoRIFT.py:113-125`),
-so the input imagery differs on every run and the correlator faithfully reports different
-displacements.
+with `rng.normal` from an **unseeded** `np.random.default_rng()` (`autoRIFT.py:113-125`).
+
+Seeding that one call and changing nothing else makes two runs **bit-identical** — 100.0%
+of `vx`, zero coverage difference, every attribute equal — where unseeded runs agree on
+3.4%. So the draw is demonstrably the cause, not a coincidence of correlation.
+
+The path it takes is worth stating, because the obvious one is wrong. The fill is *not*
+retained as a measurement: it is white noise against real texture, correlates with nothing,
+and `filtDisp` rejects it as designed. The effect is in the **rejection**. `filtDisp` is a
+neighbourhood test — a point survives only if `FracValid * FiltWidth²` of its neighbours
+agree with it (`autoRIFT.py:1600-1626`) — so a rejected fill point is a missing neighbour
+for every real point whose window overlaps it, and a different draw rejects a different
+set. Coverage therefore swings by ±3,500 measured points between runs in both directions,
+and only 9.1% of the disagreeing points are flagged `interp_mask` against 5.8% of the
+agreeing ones. Real points are losing and gaining neighbourhood support, not reporting
+noise.
 
 The filter is chosen **per scene**, not per pair — `wallis_fill` for `L[EO]07_`, `fft` for
 `LT0[45]_`, `hps` otherwise (`vend/testautoRIFT.py:718-723`) — and **one** unseeded scene
