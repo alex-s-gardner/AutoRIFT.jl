@@ -119,17 +119,18 @@ Stage 1, the correlator, one level at a time on a 512² window:
 The correlator is **bit-identical** — not merely close — at every chip size, on both axes, at every
 point. Same for `dy`, and at every correlation gate.
 
-Stage 2, the whole pipeline on the full 3072² window, 87,814 shared points: **77.4% exact**, 97.3%
-within one step, median radial 0.0000 px, bias `+0.0000` on both axes, p99 0.1411 px. Exact agreement
+Stage 2, the whole pipeline on the full 3072² window, 88,123 shared points: **81.8% exact** on `dx`
+and 82.2% on `dy`, 98.7% within one step, median 0.0000 px, bias `+0.0000` on both axes, p99 0.0752 px,
+correlation 0.99964. Radial: 79.9% exact, 98.0% within one step. Exact agreement
 rises with peak strength, which is the shape to expect — a weak peak is where a tie can break either
 way:
 
 | correlation gate | points | exact | within step | p99 | max |
 |---|---:|---:|---:|---:|---:|
-| ≥ 0.0 | 85,098 | 77.3% | 97.5% | 0.1363 | 6.3408 |
-| ≥ 0.2 | 69,337 | 86.1% | 98.3% | 0.1029 | 2.3138 |
-| ≥ 0.4 | 39,142 | 96.0% | 99.4% | 0.0319 | 1.0923 |
-| ≥ 0.5 | 17,516 | **97.6%** | 99.7% | 0.0113 | 0.3653 |
+| ≥ 0.0 | 85,227 | 79.7% | 98.1% | 0.1082 | 6.3408 |
+| ≥ 0.2 | 69,313 | 88.0% | 98.8% | 0.0721 | 2.3135 |
+| ≥ 0.4 | 39,091 | 96.9% | 99.7% | 0.0123 | 1.0913 |
+| ≥ 0.5 | 17,511 | **98.3%** | 99.9% | 0.0031 | 0.3653 |
 
 The `≥ 0.0` row is 85,098 against the 87,814 above because a gate on correlation drops the points an
 interpolated fill answered: those carry a displacement but no peak of their own.

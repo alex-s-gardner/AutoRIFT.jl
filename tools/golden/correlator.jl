@@ -77,6 +77,23 @@ argument about which convention applies — including this one.
 function pointset_from_capture(k::Capture)
     xg = k.arrays["in_xGrid"]
     yg = k.arrays["in_yGrid"]
+
+    # The grid must be the one the correlator saw, which is `round(xGrid) + 0.5` — half-integer and
+    # `Float32`. An integer grid means the capture was taken *before* `runAutorift` rewrote it, and
+    # comparing against it puts every search centre half a pixel from where the reference put it.
+    #
+    # That failure is worth an error rather than a warning because it is invisible in the result: the
+    # residual is zero under uniform motion and grows with the velocity gradient, so the median stays
+    # small and only a heatmap shows the red/blue dipoles along fast flow. One such capture scored
+    # 22.7% exact where a correct one on the same sensor and glacier scores above 80%.
+    let nz = filter(!iszero, vec(Float64.(xg)))
+        isempty(nz) && error("captured grid is entirely zero for this run")
+        all(≈(0.5), nz .- floor.(nz)) || error(
+            "captured grid is not on the half-integer convention the correlator uses: " *
+            "fractional parts $(unique(nz .- floor.(nz))), eltype $(eltype(xg)). " *
+            "This capture predates the fix that dumps inputs after `runAutorift` rewrites them " *
+            "(`capture.py`); redo it with `intermediate.jl <case> --force`.")
+    end
     srx = k.arrays["in_SearchLimitX"]
     sry = k.arrays["in_SearchLimitY"]
     csmin = k.arrays["in_ChipSizeMinX"]
