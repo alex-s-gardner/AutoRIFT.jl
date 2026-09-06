@@ -294,24 +294,31 @@ S2 case, 10980² `UInt8` pair, 1,018,081 grid points, chips 24/48/96 at spacing 
 
 | axis | sign | both measured | only jl | only ref | exact | median | p99 | corr |
 |---|:---:|---:|---:|---:|---:|---:|---:|---:|
-| `dx` | + | 592,612 | 16,892 | 25,268 | 27.4% | 0.0625 | 0.88 | **+0.9954** |
-| `dy` | − | 592,612 | 16,892 | 25,268 | 30.3% | 0.0625 | 0.82 | **+0.9917** |
+| `dx` | + | 598,718 | 16,893 | 19,162 | **67.6%** | 0.079 | 1.19 | **+0.9965** |
+| `dy` | − | 598,718 | 16,893 | 19,162 | **69.1%** | 0.072 | 1.04 | **+0.9942** |
 
-Bias is under 0.01 px on both axes and the median disagreement is exactly one upsampling step, so the
-two agree about position. Exact agreement at 27–30% against the 77% `tools/ab` measures on a hand-cut
-window is the finding, and decomposing it says why:
+Bias is under 0.02 px on both axes and the median disagreement is under one upsampling step, so the
+two agree about position. Two harness bugs and one package bug had to be found first, and each was
+invisible in the summary statistics that preceded it:
 
-| population | points | exact `dx` |
-|---|---:|---:|
-| all both-measured | 592,612 | 27.4% |
-| same chip size chosen | 433,781 | 37.5% |
-| same chip size, not interpolated by the reference | 404,172 | 39.5% |
-| **chip 24 only**, the base level | 319,521 | **50.0%** |
+| what was wrong | exact `dx` |
+|---|---:|
+| first measurement | 27.4% |
+| the base level ignores per-point chip-size bounds (`autoRIFT.py:509` vs `:587`) | 38.4% |
+| the captured grid needs `+1`, not `+0.5` — a half-pixel offset | **67.6%** |
 
-**27% of points chose a different chip size**, and those agree on 0.16% — a point answered at chip 24
-by one side and 48 by the other describes a different footprint of ground, so this is not a
-correlator disagreement at all. The `dy` sign is measured, not assumed: both signs are scored and the
-better kept.
+**Plot before reasoning.** The half-pixel error showed a median `|ddx|` of exactly 1/16 — one
+quantization step, entirely plausible as tie-breaking — and was found only by looking at
+`tools/golden/residual_maps.jl`: the difference map was blank over flat ice and washed along every
+fast-flow margin. That shape *is* the signature, because a grid offset produces no residual under
+uniform motion and one proportional to the local velocity gradient. Binning residual against gradient
+confirmed it, with exact agreement falling from 66.5% in the flattest decile to 5.6% in the steepest,
+and scanning the offset settled the value: 85.0% at `+1.0` against 49.2% at `+0.5` on the base level.
+
+The independent check that the correlator itself was never at fault: `tools/ab` stage 1 still reports
+it **bit-identical** to `arImgDisp_s`, 100% exact at chip 32 on a Landsat 8/9 pair. Any golden
+disagreement above that floor is the harness or the pipeline around the correlator, and looking there
+first would have saved two rounds.
 
 ### Finding: the reference varies upsampling per chip size
 
@@ -397,17 +404,18 @@ produced it.
 | container vs ASF golden, all 9 optical cases | **5/5 `hps` cases exact**; the 4 with a `wallis_fill` scene cannot be |
 | reference reproducibility floor, `hps` | **exact** — every plane, every pixel, `time` only |
 | reference reproducibility floor, `wallis_fill` | ±9 m/yr median on L7; golden is one draw from it |
-| correlator vs reference `Dx`/`Dy`, S2 | corr 0.995/0.992, bias < 0.01 px; base level 50% exact and 99.4% on-grid |
+| correlator vs reference `Dx`/`Dy`, S2 | **67.6% / 69.1% exact**, corr 0.9965/0.9942, bias < 0.02 px |
+| correlator vs `arImgDisp_s` (`tools/ab` stage 1) | **bit-identical**, 100% exact at chip 32 |
 | AutoRIFT.jl product against golden | needs the post-correlation chain (phase 2) |
 
 ### Open, in priority order
 
-1. **Chip-size selection** — 27% of points pick a different level, and those agree on 0.16%.
-   `tools/ab` sees 0.7% level disagreement on its window, so something about the production
-   configuration widens this considerably. Now the largest unexplained effect.
-2. **Coverage** — 16,892 points AutoRIFT.jl answers alone against 25,268 the reference does. Partly
-   the deliberate degenerate-chip difference in `REFERENCE.md`, but the split is not yet accounted
-   for.
+1. **The remaining 32%** — the difference map is now blank except for a thin dipole along the
+   fast-flow margin and scattered speckle. A dipole on a gradient is what a *smaller* sub-pixel
+   difference looks like, but the offset scan is flat below 1/16 px, so it is not a grid shift. Next
+   suspects, in order: the outlier filter's neighbourhood decisions, and hole filling.
+2. **Coverage** — 16,893 points AutoRIFT.jl answers alone against 19,162 the reference does. Partly
+   the deliberate degenerate-chip difference in `REFERENCE.md`; the rest is unaccounted for.
 3. **The post-correlation chain** — nothing downstream of `correlate` exists in Julia, so no product
    comparison has run.
 
