@@ -1,0 +1,191 @@
+{
+    "provenance": {
+        "julia": "1.12.5",
+        "ncores": 8,
+        "cpu": "apple-m2",
+        "image": "ghcr.io/asfhyp3/hyp3-autorift:0.28.4",
+        "autorift_commit": "397ff7e-dirty",
+        "machine": "arm64-apple-darwin24.0.0",
+        "recorded": "2026-09-05T16:32:12.097"
+    },
+    "comparison": {
+        "vs_golden": {
+            "time_delta_s": 0.613,
+            "variables": [
+                {
+                    "name": "chip_size_height",
+                    "n_both": 470638,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "chip_size_width",
+                    "n_both": 470638,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "interp_mask",
+                    "n_both": 47129,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "v",
+                    "n_both": 470638,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "v_error",
+                    "n_both": 470638,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "vx",
+                    "n_both": 470638,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "vy",
+                    "n_both": 470638,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                }
+            ],
+            "identical": false,
+            "x_max": 0,
+            "b": "LC09_L1GT_215109_20220125_20230430_02_T2_X_LC09_L1GT_215109_20220210_20230428_02_T2_G0120V02_P020.nc",
+            "missing_vars": [
+            ],
+            "agrees_on_data": true,
+            "y_max": 0,
+            "attrib_diffs": {
+                "time.microseconds_added": [
+                    "817491",
+                    "204724"
+                ]
+            },
+            "a": "LC09_L1GT_215109_20220125_20230430_02_T2_X_LC09_L1GT_215109_20220210_20230428_02_T2_G0120V02_P020_IL_ASF_OD.nc"
+        },
+        "floor": {
+            "time_delta_s": 0.117,
+            "variables": [
+                {
+                    "name": "chip_size_height",
+                    "n_both": 470638,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "chip_size_width",
+                    "n_both": 470638,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "interp_mask",
+                    "n_both": 47129,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "v",
+                    "n_both": 470638,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "v_error",
+                    "n_both": 470638,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "vx",
+                    "n_both": 470638,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "vy",
+                    "n_both": 470638,
+                    "only_a": 0,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 0,
+                    "exact_fraction": 1,
+                    "p99": 0
+                }
+            ],
+            "identical": false,
+            "x_max": 0,
+            "b": "LC09_L1GT_215109_20220125_20230430_02_T2_X_LC09_L1GT_215109_20220210_20230428_02_T2_G0120V02_P020_IL_ASF_OD.nc",
+            "missing_vars": [
+            ],
+            "agrees_on_data": true,
+            "y_max": 0,
+            "attrib_diffs": {
+                "time.microseconds_added": [
+                    "817491",
+                    "700155"
+                ]
+            },
+            "a": "LC09_L1GT_215109_20220125_20230430_02_T2_X_LC09_L1GT_215109_20220210_20230428_02_T2_G0120V02_P020_IL_ASF_OD.nc"
+        }
+    }
+}

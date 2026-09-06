@@ -185,36 +185,49 @@ difference AutoRIFT.jl shows is a difference in AutoRIFT.jl. That is a considera
 than a tolerance table, and a much more useful one: a tolerance wide enough to absorb a rounding
 difference is also wide enough to absorb a bug.
 
-### Landsat 7 is the exception, and the reference does not reproduce itself there
+### The whole optical phase, and the one thing that decides reproducibility
 
-The same measurement on `LE07_L1TP_061018_20120428` gives a completely different answer. Two runs of
-unchanged code on identical inputs:
+All nine phase-3 cases, run twice each. `floor` is run 1 against run 2, `golden` is run 1 against
+ASF's product, both on `vx`; `coverage` is how many points one run measured and the other did not.
 
-| comparison | `vx` exact | median \|Δ\| | p95 | max | bias |
-|---|---:|---:|---:|---:|---:|
-| run 1 vs run 2 | **3.4%** | 9 m/yr | 34 | 96 | −0.15 |
-| run 1 vs golden | 3.3% | 9 m/yr | 35 | 101 | −0.24 |
-| run 2 vs golden | 3.3% | 9 m/yr | 34 | 111 | −0.03 |
+| case | filters | floor | golden | coverage |
+|---|---|---:|---:|---:|
+| `LC08_L1TP_009011_20200703` | `hps`, `hps` | **100%** | **100%** | 0 |
+| `LC08_L1TP_062018_20200823` | `hps`, `hps` | **100%** | **100%** | 0 |
+| `LC09_L1GT_215109_20220125` | `hps`, `hps` | **100%** | **100%** | 0 |
+| `S2A_MSIL1C_20200626T204021` | `hps`, `hps` | **100%** | **100%** | 0 |
+| `S2B_MSIL1C_20200612T150759` | `hps`, `hps` | **100%** | **100%** | 0 |
+| `LE07_L1TP_061018_20130314` | `wallis_fill`, `hps` | 36.2% | 35.9% | 50,350 |
+| `LE07_L1TP_063018_20040810` | `wallis_fill`, `wallis_fill` | 29.1% | 25.7% | 109,540 |
+| `LC08_L1TP_060018_20130330` | `hps`, `wallis_fill` | 0.5% | 11.9% | 60,200 |
+| `LE07_L1TP_061018_20120428` | `wallis_fill`, `wallis_fill` | 3.4% | 3.3% | 30,143 |
 
-The rows are statistically indistinguishable: **a local run differs from ASF's golden product by
-exactly as much as two local runs differ from each other.** The product name changes too — `P010`,
-`P011`, `P010` — because coverage moves, and with it `stable_shift`, `stable_count` and all four
-`error` attributes on both components.
+**The split is perfect and has one cause.** Every `['hps','hps']` case reproduces exactly — five of
+nine, across two Landsat sensors and both Sentinel-2 satellites, on tiles in Greenland, Alaska and the
+Antarctic Peninsula. Every case with **at least one** `wallis_fill` scene does not, and in each of
+those the `floor` and `golden` columns are close to each other: *a local run differs from ASF's
+product by about as much as two local runs differ from each other.*
 
-The cause is `_wallis_filter_fill` (`autoRIFT.py:113-125`): Landsat 7's Scan Line Corrector gaps are
-filled with `rng.normal` from an **unseeded** `np.random.default_rng()`, so the *input imagery* is
-different on every run and the correlator faithfully reports different displacements. The driver
-selects the filter by scene name — `wallis_fill` for `L[EO]07_`, `fft` for `LT0[45]_`, `hps`
-otherwise (`testautoRIFT.py:718-723`) — which is why S2 is exact and L7 is not.
+`_wallis_filter_fill` (`autoRIFT.py:113-125`) fills Landsat 7's Scan Line Corrector gaps with
+`rng.normal` from an **unseeded** `np.random.default_rng()`, so the input imagery differs on every run
+and the correlator faithfully reports different displacements. The driver picks the filter **per
+scene**, not per pair (`testautoRIFT.py:718-723`), which is why `LC08_L1TP_060018_20130330` is
+affected: it is a Landsat 8 reference against a Landsat 7 secondary, and one unseeded scene is enough.
 
-So **the golden L7 product is one draw from a distribution, not a fixed target**, and its own
-generator lands ±9 m/yr median away from it. Those cases have to be gated against the reference's own
-run-to-run envelope, measured per case by running the container twice; only the `hps` cases — L8, L9
-and S2 — can be gated exactly.
+Measured in physical units on `LE07_L1TP_061018_20120428`: two runs land 9 m/yr apart at the median
+and 34 at p95, and coverage moves enough to change the product's own `P<nn>` name — `P010`, `P011`,
+`P010` across three runs — carrying `stable_shift`, `stable_count` and all four `error` attributes
+with it.
+
+So the gate has two tiers, decided by the filters a case uses rather than by its platform:
+
+- **`hps` only** — gate on **exact equality**. Five of nine optical cases, and every S2, L8 and L9 pair
+  whose partner is not L7.
+- **any `wallis_fill`** — gate on the reference's own run-to-run envelope, measured per case by
+  running the container twice. The golden product is one draw from a distribution, not a target.
 
 `REFERENCE.md` already recorded that this RNG is unseeded and that AutoRIFT.jl's `WallisGapfill` is
-seeded and therefore reproducible. What this measures is the consequence: 3.4% rather than 100%, and
-which of the 22 cases it reaches.
+seeded and therefore reproducible. What this measures is the consequence, and that it is per-scene.
 
 Working directories are kept, not cleaned, under `runs/<product>/<n>/`. They hold the filtered
 scenes, the geogrid rasters, and `autoRIFT_intermediate.nc` — `Dx`, `Dy`, `InterpMask`, `ChipSizeX`,
@@ -357,10 +370,9 @@ produced it.
 |---|---|
 | harness self-diff, 22 products | **22/22 identical** |
 | injected-fault detection, 5 kinds | **5/5 caught** |
-| reference reproducibility floor, S2 (`hps`) | **exact** — 7/7 planes, 615,146 px, `time` only |
-| container vs ASF golden, S2 | **exact** — bit-identical across arch and four months |
-| reference reproducibility floor, L7 (`wallis_fill`) | **±9 m/yr median**, 3.4% exact — unseeded gap-fill RNG |
-| container vs ASF golden, L7 | indistinguishable from that floor, so golden is one draw |
+| container vs ASF golden, all 9 optical cases | **5/5 `hps` cases exact**; the 4 with a `wallis_fill` scene cannot be |
+| reference reproducibility floor, `hps` | **exact** — every plane, every pixel, `time` only |
+| reference reproducibility floor, `wallis_fill` | ±9 m/yr median on L7; golden is one draw from it |
 | correlator vs reference `Dx`/`Dy`, S2 | corr 0.995/0.992, bias < 0.01 px; base level 50% exact and 99.4% on-grid |
 | AutoRIFT.jl product against golden | needs the post-correlation chain (phase 2) |
 

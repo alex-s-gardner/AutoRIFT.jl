@@ -188,20 +188,25 @@ whose preprocessing is `hps`. Two runs on a Sentinel-2 granule agree bit for bit
 plane, and so does a local run against ASF's product; only the `time` coordinate moves,
 by `crop.py::numeric_hash` under a per-process hash salt.
 
-**Landsat 7 and Landsat 4/5 are not deterministic**, and the reference does not reproduce
-itself there. The driver selects the filter by scene name — `wallis_fill` for `L[EO]07_`,
-`fft` for `LT0[45]_`, `hps` otherwise (`vend/testautoRIFT.py:718-723`) — and
-`_wallis_filter_fill` fills Landsat 7's Scan Line Corrector gaps with `rng.normal` from
-an **unseeded** `np.random.default_rng()` (`autoRIFT.py:113-125`). The input imagery
-therefore differs on every run, and the correlator faithfully reports different
+**Any pair with a `wallis_fill` scene is not deterministic**, and the reference does not
+reproduce itself there. `_wallis_filter_fill` fills Landsat 7's Scan Line Corrector gaps
+with `rng.normal` from an **unseeded** `np.random.default_rng()` (`autoRIFT.py:113-125`),
+so the input imagery differs on every run and the correlator faithfully reports different
 displacements.
 
-Measured on `LE07_L1TP_061018_20120428`: two runs agree on **3.4%** of `vx`, at a median
-difference of 9 m/yr and a p95 of 34, and coverage moves enough to change the product's
-own `P<nn>` name. A local run differs from ASF's golden product by statistically the same
-amount, so **that golden product is one draw from a distribution rather than a fixed
-target**. Those cases have to be gated against the reference's own run-to-run envelope,
-measured by running the container twice.
+The filter is chosen **per scene**, not per pair — `wallis_fill` for `L[EO]07_`, `fft` for
+`LT0[45]_`, `hps` otherwise (`vend/testautoRIFT.py:718-723`) — and **one** unseeded scene
+is enough to make a pair irreproducible. Measured across all nine optical golden cases,
+the split is exact with no exceptions: all five `['hps','hps']` pairs reproduce ASF's
+product bit for bit, and all four with at least one `wallis_fill` scene do not, including
+a Landsat 8 reference against a Landsat 7 secondary.
+
+On `LE07_L1TP_061018_20120428`, two runs agree on **3.4%** of `vx` at a median difference
+of 9 m/yr and a p95 of 34, and coverage moves enough to change the product's own `P<nn>`
+name. A local run differs from ASF's golden product by statistically the same amount, so
+**that golden product is one draw from a distribution rather than a fixed target**. Those
+cases have to be gated against the reference's own run-to-run envelope, measured by
+running the container twice.
 
 AutoRIFT.jl's `WallisGapfill` seeds its generator and so is reproducible; that is a
 deliberate difference, and it means AutoRIFT.jl cannot match any single draw exactly.

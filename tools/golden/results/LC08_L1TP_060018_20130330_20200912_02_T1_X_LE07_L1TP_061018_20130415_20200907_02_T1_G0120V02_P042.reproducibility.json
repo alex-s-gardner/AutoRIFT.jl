@@ -1,0 +1,295 @@
+{
+    "provenance": {
+        "julia": "1.12.5",
+        "ncores": 8,
+        "cpu": "apple-m2",
+        "image": "ghcr.io/asfhyp3/hyp3-autorift:0.28.4",
+        "autorift_commit": "397ff7e-dirty",
+        "machine": "arm64-apple-darwin24.0.0",
+        "recorded": "2026-09-05T16:12:33.951"
+    },
+    "comparison": {
+        "vs_golden": {
+            "time_delta_s": 0.8,
+            "variables": [
+                {
+                    "name": "chip_size_height",
+                    "n_both": 688574,
+                    "only_a": 30554,
+                    "bias": -0.5064379427628694,
+                    "max_abs": 720,
+                    "only_b": 31639,
+                    "exact_fraction": 0.8780653931167892,
+                    "p99": 720
+                },
+                {
+                    "name": "chip_size_width",
+                    "n_both": 688574,
+                    "only_a": 30554,
+                    "bias": -0.5064379427628694,
+                    "max_abs": 720,
+                    "only_b": 31639,
+                    "exact_fraction": 0.8780653931167892,
+                    "p99": 720
+                },
+                {
+                    "name": "interp_mask",
+                    "n_both": 34100,
+                    "only_a": 39093,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 39497,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "v",
+                    "n_both": 688574,
+                    "only_a": 30554,
+                    "bias": 0.13602604803550525,
+                    "max_abs": 550,
+                    "only_b": 31639,
+                    "exact_fraction": 0.16224980902560945,
+                    "p99": 202
+                },
+                {
+                    "name": "v_error",
+                    "n_both": 688574,
+                    "only_a": 30554,
+                    "bias": 0.40421218343997883,
+                    "max_abs": 31,
+                    "only_b": 31639,
+                    "exact_fraction": 0.2346443519505529,
+                    "p99": 30
+                },
+                {
+                    "name": "vx",
+                    "n_both": 688574,
+                    "only_a": 30554,
+                    "bias": 0.4165449174671132,
+                    "max_abs": 562,
+                    "only_b": 31639,
+                    "exact_fraction": 0.11912154684899517,
+                    "p99": 201
+                },
+                {
+                    "name": "vy",
+                    "n_both": 688574,
+                    "only_a": 30554,
+                    "bias": 0.5772219107895448,
+                    "max_abs": 730,
+                    "only_b": 31639,
+                    "exact_fraction": 0.21012556384644207,
+                    "p99": 245
+                }
+            ],
+            "identical": false,
+            "x_max": 0,
+            "b": "LC08_L1TP_060018_20130330_20200912_02_T1_X_LE07_L1TP_061018_20130415_20200907_02_T1_G0120V02_P042.nc",
+            "missing_vars": [
+            ],
+            "agrees_on_data": false,
+            "y_max": 0,
+            "attrib_diffs": {
+                "vy.error_slow": [
+                    "121.2",
+                    "120.6"
+                ],
+                "vx.error": [
+                    "89.8",
+                    "89.9"
+                ],
+                "vx.stable_shift_stationary": [
+                    "56.8",
+                    "57.5"
+                ],
+                "vx.stable_count_stationary": [
+                    "591318",
+                    "593719"
+                ],
+                "vy.stable_shift": [
+                    "85.8",
+                    "86.2"
+                ],
+                "vx.error_stationary": [
+                    "89.8",
+                    "89.9"
+                ],
+                "vy.error_stationary": [
+                    "121.1",
+                    "120.5"
+                ],
+                "vx.stable_count_slow": [
+                    "598712",
+                    "601058"
+                ],
+                "vx.stable_shift": [
+                    "56.8",
+                    "57.5"
+                ],
+                "vx.stable_shift_slow": [
+                    "55.4",
+                    "56.1"
+                ],
+                "vy.error": [
+                    "121.1",
+                    "120.5"
+                ],
+                "vy.stable_count_stationary": [
+                    "591318",
+                    "593719"
+                ],
+                "vy.stable_shift_stationary": [
+                    "85.8",
+                    "86.2"
+                ],
+                "time.microseconds_added": [
+                    "1323",
+                    "801558"
+                ],
+                "vy.stable_count_slow": [
+                    "598712",
+                    "601058"
+                ]
+            },
+            "a": "LC08_L1TP_060018_20130330_20200912_02_T1_X_LE07_L1TP_061018_20130415_20200907_02_T1_G0120V02_P042_IL_ASF_OD.nc"
+        },
+        "floor": {
+            "time_delta_s": 0.043,
+            "variables": [
+                {
+                    "name": "chip_size_height",
+                    "n_both": 689052,
+                    "only_a": 30076,
+                    "bias": -0.47299768377422896,
+                    "max_abs": 720,
+                    "only_b": 30124,
+                    "exact_fraction": 0.878280594207694,
+                    "p99": 720
+                },
+                {
+                    "name": "chip_size_width",
+                    "n_both": 689052,
+                    "only_a": 30076,
+                    "bias": -0.47299768377422896,
+                    "max_abs": 720,
+                    "only_b": 30124,
+                    "exact_fraction": 0.878280594207694,
+                    "p99": 720
+                },
+                {
+                    "name": "interp_mask",
+                    "n_both": 33975,
+                    "only_a": 39218,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 38653,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "v",
+                    "n_both": 689052,
+                    "only_a": 30076,
+                    "bias": -0.033731851877652194,
+                    "max_abs": 597,
+                    "only_b": 30124,
+                    "exact_fraction": 0.10206631720102402,
+                    "p99": 200
+                },
+                {
+                    "name": "v_error",
+                    "n_both": 689052,
+                    "only_a": 30076,
+                    "bias": -0.018091522845881006,
+                    "max_abs": 31,
+                    "only_b": 30124,
+                    "exact_fraction": 0.2821847988250524,
+                    "p99": 30
+                },
+                {
+                    "name": "vx",
+                    "n_both": 689052,
+                    "only_a": 30076,
+                    "bias": 1.0078150850734051,
+                    "max_abs": 622,
+                    "only_b": 30124,
+                    "exact_fraction": 0.005249240986166501,
+                    "p99": 198
+                },
+                {
+                    "name": "vy",
+                    "n_both": 689052,
+                    "only_a": 30076,
+                    "bias": -0.21117999802627377,
+                    "max_abs": 753,
+                    "only_b": 30124,
+                    "exact_fraction": 0.19767448610554791,
+                    "p99": 247
+                }
+            ],
+            "identical": false,
+            "x_max": 0,
+            "b": "LC08_L1TP_060018_20130330_20200912_02_T1_X_LE07_L1TP_061018_20130415_20200907_02_T1_G0120V02_P042_IL_ASF_OD.nc",
+            "missing_vars": [
+            ],
+            "agrees_on_data": false,
+            "y_max": 0,
+            "attrib_diffs": {
+                "vx.error": [
+                    "89.8",
+                    "90.1"
+                ],
+                "vx.stable_shift_stationary": [
+                    "56.8",
+                    "58.3"
+                ],
+                "vx.stable_count_stationary": [
+                    "591318",
+                    "591527"
+                ],
+                "vy.stable_shift": [
+                    "85.8",
+                    "85.4"
+                ],
+                "vx.error_stationary": [
+                    "89.8",
+                    "90.1"
+                ],
+                "vx.error_slow": [
+                    "89.8",
+                    "90.1"
+                ],
+                "vx.stable_count_slow": [
+                    "598712",
+                    "598983"
+                ],
+                "vy.stable_count_stationary": [
+                    "591318",
+                    "591527"
+                ],
+                "vx.stable_shift": [
+                    "56.8",
+                    "58.3"
+                ],
+                "vy.stable_shift_stationary": [
+                    "85.8",
+                    "85.4"
+                ],
+                "vx.stable_shift_slow": [
+                    "55.4",
+                    "56.9"
+                ],
+                "time.microseconds_added": [
+                    "1323",
+                    "44578"
+                ],
+                "vy.stable_count_slow": [
+                    "598712",
+                    "598983"
+                ]
+            },
+            "a": "LC08_L1TP_060018_20130330_20200912_02_T1_X_LE07_L1TP_061018_20130415_20200907_02_T1_G0120V02_P042_IL_ASF_OD.nc"
+        }
+    }
+}
