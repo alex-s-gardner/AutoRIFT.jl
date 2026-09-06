@@ -57,9 +57,19 @@ using Printf, Statistics
 The reference's search grid as a `PointSet`.
 
 Coordinates become 1-based, and a point the reference skipped — search limit zero — keeps a zero
-radius, which is how `PointSet` marks a point to skip. The `+0.5` even-chip offset is deliberately
-not applied: AutoRIFT.jl adds it at correlation time, so applying it here would displace every
-centre by a pixel.
+radius, which is how `PointSet` marks a point to skip.
+
+**The captured grid already carries the reference's own `+0.5`.** `runAutorift` sets
+`xGrid = round(xGrid) + 0.5` before correlating (`autoRIFT.py:890-891`) and `capture.py` dumps the
+arrays after that, so the values arriving here are half-integers in 0-based pixel coordinates. Adding
+1 for 1-based indexing would therefore land half a pixel past the point AutoRIFT.jl means, because
+`_shift_points` adds its own `0.5` for the even-chip centroid at correlation time. Subtracting the
+reference's half pixel and adding the index base — `x + 1 - 0.5` — puts the two on one grid.
+
+Getting this wrong is invisible in a median: a half-pixel offset produces no residual under uniform
+motion and one proportional to the local velocity gradient, so it shows up only as a
+gradient-correlated difference map. Measured before the fix, exact agreement fell from 66.5% in the
+flattest gradient decile to 5.6% in the steepest.
 """
 function pointset_from_capture(k::Capture)
     xg = k.arrays["in_xGrid"]
@@ -75,7 +85,7 @@ function pointset_from_capture(k::Capture)
     scale_y = Float64(k.scalars["ScaleChipSizeY"])
 
     return PointSet(
-        Float64.(xg) .+ 1, Float64.(yg) .+ 1,
+        Float64.(xg) .+ 0.5, Float64.(yg) .+ 0.5,
         Int.(srx), Int.(sry),
         Float64.(dx0), Float64.(dy0),
         fill(chip0, size(xg)), fill(round(Int, chip0 * scale_y), size(xg)),

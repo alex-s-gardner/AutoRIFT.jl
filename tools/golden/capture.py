@@ -100,8 +100,19 @@ def install():
         call = state['n']
         manifest = {'call': call, 'arrays': {}, 'scalars': {}, 'skipped': {}}
 
-        _dump(self, INPUTS, 'in_', manifest)
         original(self)
+        # Inputs are taken *after* the call, not before. `runAutorift` rewrites them as its first
+        # action — `self.xGrid = np.round(self.xGrid[0:rlim, 0:clim]) + 0.5` and the same for `yGrid`,
+        # then truncates `Dx0`, `Dy0`, `SearchLimit*` and the chip bounds to that same window
+        # (`autoRIFT.py:883-905`) — and it is the rewritten arrays the correlator sees. Dumping them
+        # first captures an integer grid missing the half pixel, which puts every search centre half a
+        # pixel from where the reference put it: a residual that is zero under uniform motion and
+        # grows with the velocity gradient, so it hides in the median and shows up only as a
+        # gradient-correlated difference map.
+        #
+        # `self.I1`/`self.I2` are also rewritten, by the uniform-data-type conversion, so taking them
+        # after is right for the same reason.
+        _dump(self, INPUTS, 'in_', manifest)
         _dump(self, OUTPUTS, 'out_', manifest)
 
         for name in SCALARS:
