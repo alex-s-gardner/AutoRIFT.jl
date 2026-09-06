@@ -679,23 +679,38 @@ end
 # Points for one level: the caller's grid with this level's chip size, and the radius zeroed
 # wherever the level should not attempt a point.
 #
-# A point is attempted only when the level's chip size lies within that point's own
-# `chip_size_min_x`/`chip_size_max_x`, matching the reference's per-level mask
-# (`autoRIFT.py:534`). Zero in either means unbounded, which is the default, so a grid that
-# carries no bounds admits every level exactly as it did before the fields existed.
+# **The base level ignores the per-point chip-size bounds entirely, and so does this.** The
+# reference's `M0` gate — `(ChipSizeMinX <= ChipSizeUniX[i]) & (ChipSizeMaxX >= ChipSizeUniX[i])` —
+# sits inside `if self.ChipSize0X != ChipSizeUniX[i]` (`autoRIFT.py:509-539`). The `else` branch that
+# runs at the base chip size copies the search limits unchanged (`:587-593`), with no bounds test at
+# all. So every point with a positive radius is attempted at the finest chip whatever its
+# `chip_size_min_x` says, and the bounds restrict only the coarser levels.
 #
-# The bound earns its place on real data. ITS_LIVE's parameter rasters permit a 960 m chip at
-# 1.7% of points over Jakobshavn, and running it everywhere instead produces estimates from a
+# Applying the bound at every level costs a great deal on production data, because the bounds are
+# spatially clustered: on the golden Sentinel-2 case the reference answers 136,800 points at its base
+# chip size whose own `chip_size_min_x` is 48, 96 or 192. Gating them out left them unsearched there
+# and falling through to a coarser level, which produced a 148,048-point skew toward coarser chips and
+# 27% of shared points disagreeing about which level owns them.
+#
+# Coarser levels do apply it, and it earns its place there. ITS_LIVE's parameter rasters permit a 960 m
+# chip at 1.7% of points over Jakobshavn, and running it everywhere instead produces estimates from a
 # chip far larger than the ice structure it covers — measured at a 0.73 correlation against the
-# reference where the finest level reaches 0.99.
+# reference where the finest level reaches 0.99. The reference additionally *dilates* the coarse
+# mask with `colfilt(..., 0)`, a maximum over `6 / Scale` cells (`:534-539`), which `_decimate_level`
+# reproduces on the `wanted` mask.
+#
+# Zero in either bound means unbounded, which is the default, so a grid carrying no bounds admits
+# every level exactly as it did before the fields existed.
 function _level_points(grid::PointSet{2}, p::Params, chip_size::Extent,
                        wanted::AbstractMatrix{Bool})
     n = size(grid)
+    base = chip_size.X == p.chip_size_min.X
     rx = Matrix{Int}(undef, n)
     ry = Matrix{Int}(undef, n)
     @inbounds for i in eachindex(grid)
         lo, hi = grid.chip_size_min_x[i], grid.chip_size_max_x[i]
-        permitted = (lo == 0 || chip_size.X >= lo) && (hi == 0 || chip_size.X <= hi)
+        permitted = base ||
+                    ((lo == 0 || chip_size.X >= lo) && (hi == 0 || chip_size.X <= hi))
         if wanted[i] && permitted
             rx[i] = grid.radius_x[i]
             ry[i] = grid.radius_y[i]

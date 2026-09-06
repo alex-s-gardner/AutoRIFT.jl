@@ -830,6 +830,13 @@ a bright, low-contrast window, and in the reference it produced negative varianc
 square roots were `NaN` — which then propagated into the validity mask, silently
 discarding data. Upstream now clamps the variance at zero, which stops the `NaN`s but
 leaves the precision loss; computing the variance about the measured mean avoids both.
+
+The size of that precision loss, measured against an exact `Float64` result on a 256²
+scene of mean 130 and standard deviation 25 at `width = 5`: the reference's formula is off
+by a median of 0.54 and up to 5.79, this one by a median of 1.5e-6 and up to 9.5e-6. So
+the two cannot agree bit for bit, and the difference is ~10⁵× the size of the tolerance a
+Float32 rounding difference would justify. `tools/golden/README.md` records what that costs
+in the golden comparison.
 """
 function wallis(img::AbstractMatrix, mask::AbstractMatrix{Bool}, width::Integer,
                 min_std::Real = 0.0)
