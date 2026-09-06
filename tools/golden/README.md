@@ -330,26 +330,45 @@ All five deterministic optical cases, on the reference's own captured inputs, `d
 | LC08 East Greenland | 690,929 | 35,638 | 63.24% | 76.59% | 0.0000 | 0.7500 | 98.96% | +0.985 |
 | S2B Jakobshavn | 599,910 | 17,970 | 67.92% | 82.40% | 0.0000 | 0.6698 | 97.60% | +0.997 |
 | LC09 Antarctic peninsula | 443,677 | 27,088 | 58.81% | 75.27% | 0.0000 | 0.5625 | 97.29% | +0.951 |
-| **LC08 Jakobshavn** | 1,655,605 | 60,455 | **22.73%** | **55.90%** | 0.0625 | 1.0464 | **91.59%** | +0.994 |
+| LC08 Jakobshavn | 1,659,423 | 56,637 | 55.14% | 72.67% | 0.0000 | 0.9375 | 96.09% | +0.996 |
 | *L8/L9 benchmark (the gate)* | *87,814* | — | *77.40%* | *97.30%* | *0.0000* | *0.1411* | *99.30%* | — |
 
 **S2A Malaspina passes the gate outright** — 92.67% exact against 77.4%, p99 0.125 against 0.1411,
-level agreement 99.77% against 99.3%. That is the existence proof that the harness, the conventions
-and the correlator chain can reach benchmark quality on a production scene, so the other four are
-about those scenes rather than about a systematic defect.
+level agreement 99.77% against 99.3%. That is the existence proof that the harness, the conventions and
+the correlator chain reach benchmark quality on a production scene.
 
-The ordering across cases is informative: `exact` tracks **level agreement** almost monotonically, and
-the two statistics move together far more tightly than either tracks scene size or sensor. Level
-agreement is therefore the lever, which is the same conclusion the residual tail's 6.55x enrichment
-points at.
+The ordering across cases tracks **level agreement** almost monotonically, and far more tightly than it
+tracks scene size or sensor. Level agreement is therefore the lever, which is where the residual tail's
+enrichment also points.
 
-**LC08 Jakobshavn is the outlier and is not explained by configuration.** It scores 22.73% where S2B
-on the *same glacier* scores 67.92% and the `tools/ab` benchmark on the *same sensor and glacier*
-scores 77.4%. The settings are structurally identical to S2B's — `ChipSize0X/GridSpacingX = 2` on both,
-the same `{16, 32, 64, 64}` oversample ladder, the same `sparseSearchSampleRate` — so the difference is
-not a parameter. Its median residual is exactly 1/16, one base-level quantization step, which is the
-same benign-looking signature the half-pixel grid bug wore; it is being plotted rather than reasoned
-about.
+### The half-pixel grid convention, twice
+
+The LC08 Jakobshavn row above is the *second* measurement of that case. The first read 22.73% exact with
+a median residual of exactly one quantization step, and it was wrong: its capture had been taken before
+`capture.py` learned to dump inputs *after* `runAutorift` rewrites the grid, so it held the raw `Int32`
+grid rather than the `round(xGrid) + 0.5` the correlator actually uses.
+
+Correcting it moved the case from 22.73% to **55.14%**, and the base level from 34.08% to **77.37%** —
+the benchmark's own figure. The median went from 1/16 to exactly 0, which is the offset disappearing.
+
+Three things about this are worth keeping, because each cost real time:
+
+**The fractional part of the captured grid identifies the fault immediately.** A correct capture is
+`Float32` with every non-zero coordinate at `x.5`; the broken one was `Int32` at `x.0`. `in == out`
+shape is the corroborating check, since a pre-rewrite capture carries `origSize` while the correlator
+runs on the chopped `rlim`/`clim`. `pointset_from_capture` now *errors* on a non-half-integer grid.
+
+**A forced re-capture silently returned the same arrays.** A stale `autoRIFT_intermediate.nc` makes the
+driver skip correlation entirely (`testautoRIFT.py:693-706`), so `runAutorift` is never called and the
+patch has nothing to intercept — while the run writes a fresh product, a fresh log and exits 0.
+`capture_reference` now removes that file and requires `call1.json` to be newer than the run, because
+the patch reporting that it was *installed* does not establish that it *fired*.
+
+**Statistics could not see it and a heatmap could.** A half-pixel offset produces zero residual under
+uniform motion and residual proportional to the local velocity gradient, so the median stayed at one
+step — readable as tie-breaking — while the difference map showed red/blue dipoles along every fast-flow
+margin, scaling with the gradient. That is the same signature, on the same case, that the earlier
+half-pixel bug wore.
 
 ### Finding: the reference varies upsampling per chip size
 
@@ -435,8 +454,9 @@ produced it.
 | container vs ASF golden, all 9 optical cases | **5/5 `hps` cases exact**; the 4 with a `wallis_fill` scene cannot be |
 | reference reproducibility floor, `hps` | **exact** — every plane, every pixel, `time` only |
 | reference reproducibility floor, `wallis_fill` | ±9 m/yr median on L7; golden is one draw from it |
-| correlator vs reference `Dx`/`Dy`, all 5 `hps` cases | **S2A Malaspina passes the gate** (92.7% exact, p99 0.125, level 99.8%); three between 58.8% and 67.9%; LC08 Jakobshavn an outlier at 22.7% |
+| correlator vs reference `Dx`/`Dy`, all 5 `hps` cases | **S2A Malaspina passes the gate** (92.7% exact, p99 0.125, level 99.8%); the rest between 55.1% and 67.9% |
 | correlator vs `arImgDisp_s` (`tools/ab` stage 1) | **bit-identical**, 100% exact at chip 32 |
+| whole pipeline vs reference (`tools/ab` stage 2) | **81.8% exact**, 98.7% within one step, p99 0.0752 px — the pyramid is not bit-identical on either harness, only the single-level correlator is |
 | AutoRIFT.jl product against golden | needs the post-correlation chain (phase 2) |
 
 ### Open, in priority order
