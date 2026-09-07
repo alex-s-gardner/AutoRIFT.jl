@@ -269,3 +269,88 @@ Coverage is identical at both passes and differs by ~100,000 points at the endpo
 coverage difference is introduced after the fine pass** — by the rejection, the fill and the merge, not
 by the correlator. And the base-level value residual is the `UInt8` quantization, measured above. Those
 are the two remaining threads, and they are now separated rather than confounded.
+
+## Gate 3 extended — levels 1–3, the fill, and the merge
+
+All four chip-size levels captured with the stage trace and walked rung by rung:
+
+```bash
+for L in 0 1 2 3; do
+  CAPTURE_STAGES=1 CAPTURE_STAGE_LEVEL=$L julia --project=tools/golden \
+    tools/golden/intermediate.jl LC08_L1TP_009011 --run $((200+L)) --force
+  julia --project=tools/golden -t 8 tools/golden/stages.jl LC08_L1TP_009011 --run $((200+L)) --all
+done
+```
+
+| level | chip | grid | rungs | state |
+|---|---:|---|---|---|
+| 0 | 16 | 2344×2336 | 16 | **16 green** |
+| 1 | 32 | 1172×1168 | 16 | **16 green** |
+| 2 | 64 | 586×584 | 16 | **16 green** |
+| 3 | 128 | 293×292 | 16 | **16 green** |
+
+The stages this adds beyond the setup, all exact at every level:
+
+| rung | reference | measured |
+|---|---|---|
+| 3.8 filter parameters, coarse and fine | `filtDisp` records | width 9/9, `FracValid` 0.32/0.32 and 0.41/0.41, iterations 2/2 and 3/3 |
+| 3.13 fine rejection | `filtDisp kept` | 190,446 of 348,397 at level 1; the nulled field carries exactly that many |
+| 3.14 fill median and its gate | `DxFM`, `MM` | **exact** — 5,475,584 at level 0, 1,368,896 at level 1 |
+| 3.15 the three-pass fill mask | `MF` | **exact** — every point, every level |
+| 3.16 / 3.17 merge and quantization | `ChipSizeX`, `Dx` | level 0 is **97.8%** on the 1/16 grid; levels 1–3 are **0.04%**, **0.02%**, **0.06%** on theirs |
+
+Rung 3.17 is the independent confirmation of the closed coarse-level question: the base level's values
+are quantized and the coarse levels' are not, on the reference's own arrays, because both sides replace
+the measurement with a bicubic resize. `exact` is meaningful at level 0 and meaningless above it.
+
+### A second real bug: the grid spacing read from the nodata margin
+
+`_cell_centres` took the spacing as `x[1,2] - x[1,1]`. A production grid is zeroed wherever there is no
+data (`testautoRIFT.py:394-403`), so on a scene whose first row and column are ocean both values are
+`1.5` and the spacing reads as **zero** — the half-cell shift vanishes and every coarse node sits at its
+cell's first point, half a cell from where `_undecimate_level` reads it back. On this case that left
+99.8% of level-1 nodes 4 or 5 px from the reference's. `_grid_step` takes the mode of adjacent steps
+instead.
+
+### What rung 3.1 reports, and why it does not gate
+
+The residual grid difference above the base level is a decision, not a defect. The reference resizes
+with `INTER_AREA` and snaps to `round(x + 0.5) - 0.5`; AutoRIFT.jl decimates and shifts to the cell
+centre. On a **rotated** grid — `x` varies 1 px per row here — the block mean is not the x-centre of the
+column pair and the snap moves it a further half pixel: the cell centre is 3992.5 on both sides, the
+reference's block mean is exactly 3993.0, its snapped node 3993.5. Following it would move the
+correlation position without moving the read-back, which `src/multichip.jl` records as measuring worse
+than matching neither half. The rung reports the offset as a fraction of a cell — **0.250, 0.375,
+0.438** at strides 2, 4, 8, converging on half a cell — so a *change* in it means the decimation or the
+read-back moved.
+
+### Gate 4 re-measured: read the counts, not the percentage
+
+The two fixes move the two cases in **opposite directions**, and the percentage is misleading on both.
+
+| case | both | exact % | **exact count** | only jl | only ref |
+|---|---:|---:|---:|---:|---:|
+| S2A before | 586,090 | 92.66% | 543,071 | 6,643 | 10,528 |
+| S2A after | 561,410 | **96.74%** | **543,108** | 14,193 | 35,208 |
+| *change* | −24,680 | *+4.08 pt* | **+37** | +7,550 | +24,680 |
+| LC08 before | 1,660,132 | 55.12% | 915,065 | 46,761 | 55,928 |
+| LC08 after | 1,681,367 | 54.45% | **915,504** | **25,591** | **34,693** |
+| *change* | +21,235 | *−0.67 pt* | +439 | **−21,170** | **−21,235** |
+
+**S2A's 4-point gain is a coverage artifact and not an improvement.** The 24,680 points that left
+`both` are exactly the 24,680 that appeared in `only_ref`, and the exact *count* moved by **+37 of
+543,071** — 0.007%. AutoRIFT.jl stopped measuring 24,680 points it used to measure, they were
+disproportionately ones it had got wrong, and removing them from the denominator raised the fraction
+while the numerator stood still.
+
+**LC08 is a genuine coverage improvement**, and it is unambiguous because *both* exclusive sets shrank:
+`only_jl` −21,170 and `only_ref` −21,235, with 21,235 points moving into agreement. The percentage fell
+0.67 points only because the denominator grew faster than the numerator.
+
+So: `exact` as a percentage is not a safe headline when coverage moves. **The count and the two
+exclusive sets are, and a fix that shrinks both exclusive sets is improving; one that grows them is
+not.**
+
+Open, and this is the next thing to measure: **why S2A lost 24,680 measurements.** The stage ladder has
+run only on LC08, and the rung that would answer it — the coarse mask `MC2` restricting the fine search
+— is the one stage the ladder does not yet cover. Capture S2A's levels and walk it there.
