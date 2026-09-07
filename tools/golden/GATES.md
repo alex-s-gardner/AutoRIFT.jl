@@ -187,3 +187,37 @@ not to look like a bug. `arImgDisp_*(a, b)` cuts its chip from `b` and the refer
 `(self.I2, self.I1)`, so `I1` supplies the chip and binds to AutoRIFT.jl's *secondary*.
 `tools/ab/README.md` states this and `correlator.jl` asserts it; every new diagnostic has to re-derive
 it, and the cost of getting it wrong is a plausible measurement rather than an error.
+
+### The base level's residual is the `UInt8` quantization, measured on both paths
+
+The fine pass at the base chip size, fed the reference's own post-coarse-mask radii so only the
+correlation is under test, agrees on **71.88%** of 2,159,437 points exactly — with **coverage
+identical**: 2,159,437 measured on both sides and zero exclusive either way. `DxF` is 100.000% on the
+1/16 grid on the reference side, so `exact` is the right statistic here and 71.88% is a real figure
+rather than an artifact of comparing unquantized fields.
+
+That number sits below the pipeline benchmark's 81.8%, and the reason is the element type rather than
+the pipeline. Running the *same window, same chip, same radius* through stage 1 at each element type
+separates them, because the reference has two correlators and dispatches on dtype:
+
+| path | entry point | exact `dx` | within one step | p99 | max |
+|---|---|---:|---:|---:|---:|
+| `Float32` | `arImgDisp_s` | **100.00%** | **100.00%** | 0.0000 | **0.0000** |
+| `UInt8` | `arImgDisp_u` | 84.8% | 97.7% | 4.41 | **35.81** |
+
+The float path is **bit-identical at every one of 3,721 points**. The byte path, on the same imagery
+at the same settings, disagrees on 15% and by up to 35.8 px. Production — and therefore every golden
+case — takes the byte path, because `uniform_data_type` rescales each scene by its own mean and
+standard deviation and quantizes to 256 levels before `runAutorift` is reached
+(`autoRIFT.py:359-384`). The capture confirms it: `in_I1` is `UInt8` using all 256 levels.
+
+So the base-level residual on a golden case is **not** evidence of a defect in AutoRIFT.jl's
+correlator. Collapsing a filtered float field onto 256 levels creates ties and near-ties the float
+field does not have, and a tie broken differently at a plateau puts the peak far away rather than one
+step away — which is what a 35.8 px maximum beside a 0.0000 median describes. The quantizer itself is
+verified against the reference's own `uniform_data_type` (`tools/ab/README.md`), so the two sides are
+quantizing identically and then disagreeing about the surface that results.
+
+This is why `tools/golden/README.md` lists the `UInt8` conversion as **matched, not endorsed**: it is
+reproduced to agree with the reference, and it costs accuracy at every point. The float path being
+bit-identical is the measurement that says so.
