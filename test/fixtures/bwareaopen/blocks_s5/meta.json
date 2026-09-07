@@ -1,0 +1,22 @@
+{
+  "arrays": {
+    "expected": {
+      "dtype": "uint8",
+      "shape": [
+        20,
+        20
+      ]
+    },
+    "src": {
+      "dtype": "uint8",
+      "shape": [
+        20,
+        20
+      ]
+    }
+  },
+  "params": {
+    "connectivity": 8,
+    "size1": 5
+  }
+}

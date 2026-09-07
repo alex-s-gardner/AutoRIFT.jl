@@ -428,6 +428,155 @@ def gen_disttransform() -> int:
 
 
 # ---------------------------------------------------------------------------
+# The Python autoRIFT's own window reductions
+# ---------------------------------------------------------------------------
+#
+# These two need the reference installed, not just OpenCV, so they are generated in an environment
+# that has `autoRIFT` importable and skipped otherwise. Unlike the OpenCV fixtures above, they pin
+# the *reference implementation's* behaviour rather than the math: `colfilt` is where the pyramid's
+# grid resize, search-radius widening, prior averaging and hole filling all come from
+# (`autoRIFT.py:509-808`), and a difference in any of its five options moves the answer at every
+# level. These are the only fixtures that constrain those reductions, so `src/window.jl` is held to
+# measured output rather than to a reading of the argument list.
+
+
+def _reference_colfilt():
+    """The reference's `colfilt` and `bwareaopen`, or `None` when autoRIFT is not importable."""
+    try:
+        import sys
+
+        import autoRIFT.autoRIFT  # noqa: F401  -- for its side effect on sys.modules
+
+        mod = sys.modules["autoRIFT.autoRIFT"]
+        return mod.colfilt, mod.bwareaopen
+    except Exception:
+        return None
+
+
+# `colfilt`'s `option` argument. Names are the Julia-side spelling.
+COLFILT_OPTIONS = {0: "max", 1: "min", 2: "mean", 3: "median", 4: "range", 6: "mad"}
+
+
+def gen_colfilt() -> int:
+    """Every `colfilt` option, at odd and even kernels, with and without NaNs.
+
+    Four properties of this function are load-bearing and none is visible in its signature:
+
+    **The border mode differs per option.** Options 0, 1 and 4 call `generic_filter` with its default
+    mode, which is `reflect`; options 2, 3 and 6 pass `mode='constant', cval=np.nan`. So a max and a
+    mean of the same window disagree at the border by construction, and a port that picks one
+    convention for all of them is wrong for the others.
+
+    **NaN is not handled uniformly either.** `fmean`, `fMAD` and the median skip NaNs and return NaN
+    only for an all-NaN window, while `fmax`/`fmin`/`frange` compare against NaN directly — and
+    `v > result` is false for a NaN, so a NaN is simply never selected. Option 0 then converts a
+    leftover `-inf` (an all-NaN window) back to NaN, and **option 4 does not**, so a range over an
+    all-NaN window returns `-inf - inf = -inf` rather than NaN. That asymmetry is the reference's,
+    and a reader who assumes symmetry gets a different mask.
+
+    **Even kernels have a chunk seam.** The left margin is `(k-1)//2` where `generic_filter` centres
+    at `k//2`, so for even `k` the first output column of each chunk after the first reads padding
+    where it should read data. Only the non-base pyramid levels use even kernels. The fixtures record
+    the output *including* that artifact, because the question of whether to reproduce it is decided
+    by measurement against a case that exercises it, not in advance.
+
+    **The chunk count changes the answer.** `chunkSize` defaults to 4 but is a parameter, and the
+    seam above is per chunk — so a fixture that only ever ran one chunk would hide it. Both are
+    generated.
+    """
+    ref = _reference_colfilt()
+    if ref is None:
+        print("  colfilt: skipped, autoRIFT not importable in this environment")
+        return 0
+    colfilt, _ = ref
+
+    n = 0
+    # 24x30, deliberately non-square and not a multiple of any kernel below, so a transposed or
+    # off-by-one read fails on the shape as well as the values.
+    base = (texture((24, 30), seed=11) * 20 - 10).astype(np.float32)
+
+    holed = base.copy()
+    rng = np.random.default_rng(12)
+    holed[rng.random(holed.shape) < 0.25] = np.nan
+    # One all-NaN window at every kernel below, which is the case that separates option 0 from
+    # option 4 and is the one a random hole pattern is unlikely to produce.
+    holed[2:10, 2:10] = np.nan
+
+    fields = {"plain": base, "holed": holed}
+    for field_name, src in fields.items():
+        for k in (2, 3, 4, 5, 9):
+            for chunks in (4, 1):
+                for option, opt_name in COLFILT_OPTIONS.items():
+                    out = colfilt(src.copy(), (k, k), option, chunks)
+                    write_case(
+                        f"colfilt/{opt_name}_{field_name}_k{k}_c{chunks}",
+                        {"src": src, "expected": np.asarray(out, dtype=np.float32)},
+                        {
+                            "option": option,
+                            "reducer": opt_name,
+                            "kernel": k,
+                            "chunk_size": chunks,
+                            "even_kernel": k % 2 == 0,
+                            "has_nan": bool(np.isnan(src).any()),
+                            # Recorded rather than inferred: the two differ per option and that is
+                            # the whole point of pinning them.
+                            "border": "reflect" if option in (0, 1, 4) else "constant_nan",
+                            "nan_to_nan": option != 4,
+                        },
+                    )
+                    n += 1
+    return n
+
+
+def gen_bwareaopen() -> int:
+    """`bwareaopen(image, size1)`: drop connected components smaller than `size1`.
+
+    The reference calls it as `bwareaopen(!foo1, 5)` (`autoRIFT.py:803`) to decide whether a hole is
+    small enough to interpolate across, on **8-connectivity** (`connectivity=2`). Connectivity is the
+    detail that matters and it is not symmetric in its consequences: under 4-connectivity a diagonal
+    pair of holes is two components of one pixel instead of one component of two, so the size test
+    answers differently on exactly the shapes the criterion exists to catch.
+
+    The `diagonal` case is the discriminating one — a pure diagonal chain is one component at 8 and
+    `n` at 4 — so a fixture set without it would pass under either convention.
+    """
+    ref = _reference_colfilt()
+    if ref is None:
+        print("  bwareaopen: skipped, autoRIFT not importable in this environment")
+        return 0
+    _, bwareaopen = ref
+
+    rng = np.random.default_rng(13)
+    cases = {
+        "speckle": (rng.random((32, 40)) < 0.35).astype(np.uint8),
+        "diagonal": np.zeros((16, 16), dtype=np.uint8),
+        "blocks": np.zeros((20, 20), dtype=np.uint8),
+        "empty": np.zeros((8, 8), dtype=np.uint8),
+        "full": np.ones((8, 8), dtype=np.uint8),
+    }
+    for i in range(16):
+        cases["diagonal"][i, i] = 1
+    # A 2x2 hole is the shape the neighbour-count criterion cannot close and the size test can, so
+    # it is the case the fill criterion turns on. Sizes 1, 4 and 9 beside it bracket `size1 = 5`.
+    cases["blocks"][2:4, 2:4] = 1
+    cases["blocks"][8, 8] = 1
+    cases["blocks"][12:14, 12:14] = 1
+    cases["blocks"][12:15, 2:5] = 1
+
+    n = 0
+    for name, src in cases.items():
+        for size1 in (2, 5, 9):
+            out = bwareaopen(src.copy(), size1)
+            write_case(
+                f"bwareaopen/{name}_s{size1}",
+                {"src": src, "expected": np.asarray(out).astype(np.uint8)},
+                {"size1": size1, "connectivity": 8},
+            )
+            n += 1
+    return n
+
+
+# ---------------------------------------------------------------------------
 
 
 GENERATORS = (
@@ -438,6 +587,8 @@ GENERATORS = (
     ("matchtemplate", gen_matchtemplate),
     ("peak", gen_peak),
     ("disttransform", gen_disttransform),
+    ("colfilt", gen_colfilt),
+    ("bwareaopen", gen_bwareaopen),
 )
 
 
@@ -462,18 +613,42 @@ def main() -> None:
         total += count
         print(f"  {name}: {count} cases")
 
-    manifest = {
-        "generated_by": "tools/python_ref/gen_fixtures.py",
+    # A named-group run *merges* into the manifest rather than replacing it. Regenerating one group
+    # leaves the other groups' case directories on disk untouched, so a manifest listing only the
+    # groups just run would understate what the corpus holds and drop the versions the rest were
+    # pinned against — and `fixtures_test.jl` gates on the total. Groups are recorded with the
+    # library versions that produced *them*, since the corpus can legitimately span two OpenCV
+    # builds: a fixture is a record of one library's output, and rewriting all of them to match a
+    # newer build would move the target the suite is held to.
+    path = FIXTURE_DIR / "manifest.json"
+    previous = {}
+    if path.exists():
+        try:
+            previous = json.loads(path.read_text())
+        except ValueError:
+            previous = {}
+
+    versions = {
         "opencv_version": cv2.__version__,
         "numpy_version": np.__version__,
         "python_version": sys.version.split()[0],
-        "groups": written,
-        "total_cases": total,
     }
-    (FIXTURE_DIR / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True)
-    )
-    print(f"\n{total} cases written to {FIXTURE_DIR}")
+    groups = dict(previous.get("groups", {}))
+    group_versions = dict(previous.get("group_versions", {}))
+    groups.update(written)
+    for name in written:
+        group_versions[name] = versions
+
+    manifest = {
+        "generated_by": "tools/python_ref/gen_fixtures.py",
+        **versions,
+        "groups": groups,
+        "group_versions": group_versions,
+        "total_cases": sum(groups.values()),
+    }
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    print(f"\n{total} cases written to {FIXTURE_DIR}"
+          f" ({manifest['total_cases']} in the corpus)")
     print(f"opencv {cv2.__version__}, numpy {np.__version__}")
 
 
