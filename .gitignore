@@ -62,3 +62,6 @@ __pycache__/
 /tools/ab/bench_python.txt
 /tools/ab/bench_pair_*.bin
 /tools/ab/bench_scene.bin
+
+# Scratch figures for inspection; regenerate with tools/golden/*_maps.jl
+tmp_figs/

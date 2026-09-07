@@ -198,8 +198,13 @@ def install():
         from autoRIFT import autoRIFT as ar_module
 
         install_levels(ar_module, manifest)
+        # Off unless asked for: a line-level trace over a 2344x2336 grid run costs real time, and the
+        # ordinary capture does not need it.
+        if os.environ.get('CAPTURE_STAGES'):
+            install_stage_trace(manifest, level=int(os.environ.get('CAPTURE_STAGE_LEVEL', '1')))
 
         original(self)
+        sys.settrace(None)
         # Inputs are taken *after* the call, not before. `runAutorift` rewrites them as its first
         # action — `self.xGrid = np.round(self.xGrid[0:rlim, 0:clim]) + 0.5` and the same for `yGrid`,
         # then truncates `Dx0`, `Dy0`, `SearchLimit*` and the chip bounds to that same window
@@ -240,5 +245,71 @@ def main():
     process_main()
 
 
+STAGE_LOCALS = (
+    'xGrid0', 'yGrid0', 'M0', 'SearchLimitX0', 'SearchLimitY0', 'Dx00', 'Dy00',
+    'xGrid0C', 'yGrid0C', 'SearchLimitX0C', 'SearchLimitY0C', 'Dx0C', 'Dy0C',
+    'DxC', 'DyC', 'M0C', 'MC', 'MC2',
+    'DxF', 'DyF', 'DxFM', 'DyFM', 'MF', 'MM',
+    'Dx', 'Dy', 'ChipSizeX', 'InterpMask',
+)
+
+
+def install_stage_trace(manifest, level=1):
+    """Dump each named local of `runAutorift` the first time it changes, for one chip-size level.
+
+    Written once per (name, level): the *first* value each stage produces is what the next stage
+    consumes, and re-dumping every rebinding inside the three-pass fill loop would bury that in
+    revisions. `level` selects which iteration of the chip-size loop to record, since a whole-scene run
+    has four and dumping all of them multiplies the output by four for no gain — the level under
+    investigation is chosen deliberately.
+    """
+    seen = {}
+    state = {'level': 0}
+    stages = manifest.setdefault('stages', {})
+
+    def tracer(frame, event, arg):
+        if event == 'call':
+            return tracer if frame.f_code.co_name == 'autorift' else None
+        if event != 'line':
+            return tracer
+        loc = frame.f_locals
+        # `i` is the chip-size loop variable; it advances once per level.
+        if 'i' in loc and isinstance(loc['i'], (int, np.integer)):
+            state['level'] = int(loc['i'])
+        if state['level'] != level:
+            return tracer
+        for name in STAGE_LOCALS:
+            v = loc.get(name)
+            if not isinstance(v, np.ndarray) or v.ndim != 2:
+                continue
+            key = '%s_L%d' % (name, level)
+            if key in seen:
+                continue
+            a = v.view(np.uint8) if v.dtype == np.bool_ else v
+            if a.dtype.str not in xchg.TAGS:
+                continue
+            seen[key] = True
+            stages[key] = _write('stage_' + key, np.ascontiguousarray(a))
+            print('[capture] stage %s %s %s' % (key, a.dtype.str, a.shape), flush=True)
+        return tracer
+
+    sys.settrace(tracer)
+    return tracer
+
+
 if __name__ == '__main__':
     main()
+
+
+# Ordered stage trace: the local arrays `runAutorift` builds between its calls.
+#
+# The wrappers above record what crosses a function boundary, which is not enough to say *where*
+# agreement is lost. Between `arImgDisp_u` and `filtDisp` the reference builds a dozen intermediates —
+# the resized grid, the decimated search limits, the coarse mask, its distance-transform dilation, the
+# expanded mask that gates the fine search — and a disagreement can enter at any of them. Comparing
+# only the endpoints leaves the interior unmeasured, which is how five successive hypotheses about
+# this pipeline each turned out to be wrong: each was consistent with the endpoints and none was
+# tested against the intermediate that would have refuted it.
+#
+# `sys.settrace` on the frame is what makes them reachable: they are local to a loop body, so nothing
+# short of a line-level trace can see them without rewriting the function.

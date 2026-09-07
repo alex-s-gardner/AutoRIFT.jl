@@ -77,6 +77,14 @@ function capture_reference(c::GoldenCase; n::Integer = 100, threads::Integer = 8
     # machine whose keys live under a named profile needs no edit to that file.
     profile = get(ENV, "AWS_PROFILE", "itslive")
 
+    # `CAPTURE_STAGES` turns on the line-level trace of `runAutorift`'s locals, which is what makes a
+    # stage-by-stage comparison possible: the intermediates between the correlator calls are local to
+    # the loop body and unreachable any other way. Off by default because the trace is slow.
+    stageenv = String[]
+    haskey(ENV, "CAPTURE_STAGES") &&
+        append!(stageenv, ["-e", "CAPTURE_STAGES=1",
+                           "-e", "CAPTURE_STAGE_LEVEL=" * get(ENV, "CAPTURE_STAGE_LEVEL", "1")])
+
     args = ["--reference", c.reference..., "--secondary", c.secondary...]
     c.frame_id === nothing || append!(args, ["--frame-id", c.frame_id])
 
@@ -94,6 +102,7 @@ function capture_reference(c::GoldenCase; n::Integer = 100, threads::Integer = 8
            -e OMP_NUM_THREADS=$threads -e CAPTURE_DIR=/home/ubuntu/work/capture
            -e AWS_PROFILE=$profile
            -e PYTHONPATH=/opt/capture
+           $stageenv
            --entrypoint /bin/bash
            $IMAGE -lc $inner`
 
