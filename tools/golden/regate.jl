@@ -61,7 +61,7 @@ const GATES = Gate[
     Gate("2.x", "colfilt, bwareaopen and the window reductions", false, function ()
         script = """
         using AutoRIFT, Test, Random, Statistics, JSON3
-        const TD = joinpath("$(ROOT)", "test")
+        const TD = joinpath(raw"$(ROOT)", "test")
         include(joinpath(TD, "utils.jl"))
         @testset "gate" begin
             include(joinpath(TD, "fixtures_test.jl"))
@@ -71,7 +71,12 @@ const GATES = Gate[
         """
         isdir(joinpath(ROOT, "test", "fixtures", "colfilt")) ||
             return (:skipped, "colfilt fixtures absent; regenerate with gen_fixtures.py")
-        return capture_run(`julia --project=$ROOT -e "using TestEnv; TestEnv.activate(); $script"`) do t
+        # `--project=tools/golden` and not `TestEnv`: TestEnv re-resolves the package's test dependencies,
+        # and `FastGeoProjections` on `main` has moved past this project's `[compat]` bound, so the
+        # resolution fails before any test runs. That failure is present on `main` too and is not what
+        # this gate is measuring. The golden project has AutoRIFT dev'd with a manifest that resolves,
+        # and none of the files below touch the offending dependency.
+        return capture_run(`julia --project=$(@__DIR__) -e $script`) do t
             occursin("Test Summary", t) || return (:red, last_line(t))
             occursin(r"Fail|Error", t) && return (:red, "assertions failed: " * last_line(t))
             return (:green, "all assertions pass")
@@ -119,11 +124,11 @@ const GATES = Gate[
         script = """
         using AutoRIFT, Test, Random, Statistics
         using AutoRIFT: params
-        const TD = joinpath("$(ROOT)", "test")
+        const TD = joinpath(raw"$(ROOT)", "test")
         include(joinpath(TD, "utils.jl"))
         @testset "realdata" begin include(joinpath(TD, "realdata.jl")) end
         """
-        return capture_run(`julia --project=$ROOT -t 8 -e "using TestEnv; TestEnv.activate(); $script"`) do t
+        return capture_run(`julia --project=$(@__DIR__) -t 8 -e $script`) do t
             occursin("Test Summary", t) || return (:red, last_line(t))
             occursin(r"Fail|Error", t) && return (:red, "assertions failed: " * last_line(t))
             return (:green, "all assertions pass")
@@ -131,7 +136,10 @@ const GATES = Gate[
     end),
 
     Gate("3.x", "the stage ladder on the golden Landsat case", false, function ()
-        cmd = `julia --project=$(@__DIR__) -t 8 $(joinpath(@__DIR__, "stages.jl")) LC08_L1TP_009011 --all`
+        # Run 200 holds the base-level trace; 201..203 hold the coarser levels. Named explicitly because
+        # the default run has no stage trace, and a gate that skips is a gate that never runs.
+        cmd = `julia --project=$(@__DIR__) -t 8 $(joinpath(@__DIR__, "stages.jl"))
+               LC08_L1TP_009011 --run 200 --all`
         return capture_run(cmd) do t
             occursin("no stage trace", t) &&
                 return (:skipped, "no stage trace on disk; re-capture with CAPTURE_STAGES=1")
