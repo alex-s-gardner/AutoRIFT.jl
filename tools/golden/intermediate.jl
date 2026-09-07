@@ -174,6 +174,13 @@ One `runAutorift` call's arrays and scalars, as Julia values.
 orientation the reference had it. `scalars` carries every attribute that affects the result, so
 `Params` can be configured from what the reference used rather than from what the driver is believed
 to set. `levels` is the per-level record, empty for a capture taken before it was collected.
+
+`stages` holds the locals `runAutorift` builds *between* those calls, keyed as the trace names them —
+`xGrid0_L0`, `SearchLimitX0_rev2_L0`, `MC2_L0`. It is empty unless the capture was taken with
+`CAPTURE_STAGES=1`, and it holds one chip-size level per run. This is what makes a stage-by-stage
+comparison possible: those arrays are local to the loop body, so the function boundaries are the only
+other place two implementations can be compared, and comparing there compares two dozen composed steps
+at once.
 """
 struct Capture
     call::Int
@@ -181,6 +188,7 @@ struct Capture
     scalars::Dict{String,Any}
     skipped::Dict{String,String}
     levels::Vector{LevelRecord}
+    stages::Dict{String,Matrix}
 end
 
 
@@ -225,7 +233,15 @@ function read_capture(dir::AbstractString; call::Integer = 1)
             (Int(r.grid_shape[1]), Int(r.grid_shape[2])),
             counts, la))
     end
-    return Capture(m.call, arrays, scalars, skipped, sort!(levels, by = r -> r.seq))
+
+    # The stage trace, absent unless the capture asked for it. Keys carry the level, so a directory
+    # holding traces of two levels keeps them apart.
+    stages = Dict{String,Matrix}()
+    for (name, _) in pairs(get(m, :stages, (;)))
+        stages[String(name)] = xread(joinpath(dir, "stage_" * String(name)))
+    end
+
+    return Capture(m.call, arrays, scalars, skipped, sort!(levels, by = r -> r.seq), stages)
 end
 
 read_capture(c::GoldenCase; n::Integer = 100, call::Integer = 1) =

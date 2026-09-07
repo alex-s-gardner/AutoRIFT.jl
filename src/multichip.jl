@@ -800,6 +800,20 @@ end
 # against the rate rather than against the step.
 _sparse_stride(p::Params) = p.coarse_stride * _oversample(p)
 
+# How wide a window the coarse radius is reduced over: the sparse stride, rounded **up to odd**.
+#
+# The reference does exactly this and says why by construction — `filtWidth = stride + 1` when the
+# stride is even and `stride` when it is odd (`autoRIFT.py:618-626`) — so the window is always
+# symmetric about the node it is sampled at. An even window has a left bias, which would place a
+# coarse point's radius over a cell offset half a step from the point itself.
+#
+# This is not the same quantity as the stride, and using the stride binds a coarse point's radius to a
+# window one short of the reference's: at stride 8 that under-covers 1,809 of 85,556 coarse points on
+# the golden Landsat case, by up to 152 pixels, always downward. A point whose radius is too small
+# searches a narrower window than the reference did and rails out or misses the peak wherever the
+# prior was doing work.
+_sparse_filter_width(stride::Int) = iseven(stride) ? stride + 1 : stride
+
 # Which points the coarse pass correlates, and where they sit on the full grid.
 #
 # `nothing` when the coarse grid is too small for the filter to judge consistency on — the caller
@@ -825,13 +839,17 @@ function _coarse_points(pts::PointSet{2}, p::Params, chip_size::Extent)
     # The coarse point's radius must cover its whole cell, since it stands in for every fine
     # point inside it — hence the max over the cell rather than a sample of one point.
     #
+    # Over `_sparse_filter_width(stride)` and not `stride`: the window is symmetric about the node,
+    # which for an even stride is one wider than the step. See there.
+    #
     # Computed per coarse cell rather than by a full-grid sliding max that is then decimated:
     # the latter discards fifteen sixteenths of its work at stride 4, and measured 113 us and
     # 405 KB per level against 7.9 us here. It also stays in `Int` throughout, where the
     # sliding form needed a Float32 round trip in each direction.
     coarse = pts[rows, cols]
-    _cell_max_radius!(coarse.radius_x, pts.radius_x, rows, cols, stride)
-    _cell_max_radius!(coarse.radius_y, pts.radius_y, rows, cols, stride)
+    fw = _sparse_filter_width(stride)
+    _cell_max_radius!(coarse.radius_x, pts.radius_x, rows, cols, stride, fw)
+    _cell_max_radius!(coarse.radius_y, pts.radius_y, rows, cols, stride, fw)
     fill!(coarse.chip_size_x, chip_size.X)
     fill!(coarse.chip_size_y, chip_size.Y)
     return (; coarse, rows, cols, filt)
@@ -946,12 +964,17 @@ end
 
 # Maximum radius over each coarse cell, matching the left-biased window convention the sliding
 # reductions use so the two agree at the boundaries.
-function _cell_max_radius!(out, radius, rows, cols, stride::Int)
+#
+# `width` is the window, which is not the same as `stride`: the reduction is symmetric about the node,
+# so an even stride reduces over one more point than it steps. `_sparse_filter_width` derives it, and
+# it defaults to `stride` for the callers whose cells genuinely are `stride` wide — the mask expansion
+# in `_expand_coarse_mask` inverts *that* assignment and must keep using it.
+function _cell_max_radius!(out, radius, rows, cols, stride::Int, width::Int = stride)
     nr, nc = size(radius)
     # The cell's extent about its centre, from the one place that convention lives. Writing it out
     # here would be a third transcription of a rule `window.jl` documents as the easiest in the
     # package to get backwards.
-    lo, _, hi, _ = _window_margins(stride, stride)
+    lo, _, hi, _ = _window_margins(width, width)
     @inbounds for (jo, j) in enumerate(cols), (io, i) in enumerate(rows)
         m = 0
         for jj in max(j - lo, 1):min(j + hi, nc)

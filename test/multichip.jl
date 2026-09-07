@@ -663,6 +663,38 @@ end
     @test_throws ArgumentError params(; chip_size = 32, chip_size_max = 96)
 end
 
+@testset "an even sparse stride reduces over an odd window" begin
+    # `filtWidth = stride + 1` when the stride is even and `stride` when it is odd
+    # (`autoRIFT.py:618-626`), so the coarse radius reduction is symmetric about the node it is
+    # sampled at. An even window has a left bias, which would place a coarse point's radius over a
+    # cell offset half a step from the point.
+    @test AutoRIFT._sparse_filter_width(8) == 9
+    @test AutoRIFT._sparse_filter_width(4) == 5
+    @test AutoRIFT._sparse_filter_width(2) == 3
+    @test AutoRIFT._sparse_filter_width(3) == 3
+    @test AutoRIFT._sparse_filter_width(5) == 5
+    # Odd either way, which is the property the rule exists for.
+    for stride in 1:16
+        @test isodd(AutoRIFT._sparse_filter_width(stride))
+        @test AutoRIFT._sparse_filter_width(stride) >= stride
+    end
+
+    # And the reduction itself is symmetric: a one-hot radius at a coarse node must reach the same
+    # distance either side of it. Reducing over the stride instead reaches one fewer point on the
+    # right, which under-covers the cell and always downward.
+    radius = zeros(Int, 33, 1)
+    radius[17, 1] = 5
+    stride = 8
+    rows = stride:stride:33
+    out = zeros(Int, length(rows), 1)
+    AutoRIFT._cell_max_radius!(out, radius, rows, 1:1, stride,
+                               AutoRIFT._sparse_filter_width(stride))
+    # Node 17 is `rows[2]`, so its own cell sees the 5; the neighbours either side must see it
+    # equally or not at all.
+    @test out[2, 1] == 5
+    @test out[1, 1] == out[3, 1]
+end
+
 @testset "the coarse mask sits on the lattice the radii were reduced over" begin
     # `_cell_max_radius!` takes the maximum radius over the cell *centred* on each coarse point,
     # and `_expand_coarse_mask` inverts that assignment. The two have to agree for every fine
