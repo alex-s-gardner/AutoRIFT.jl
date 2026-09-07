@@ -1240,14 +1240,17 @@ function dtype_pair(c::GoldenCase; byte::Integer, float::Integer)
     kf = read_capture(c; n = float)
     out = StageResult[]
 
-    # The captures must differ in the data path and nothing else, and each states its own path.
-    db = get(kb.scalars, "DataType", nothing)
-    df = get(kf.scalars, "DataType", nothing)
-    push!(out, StageResult("dtype: the two captures are the two paths", "DataType",
-                           "0 and 1", db == 0 && df == 1, 2,
-                           "byte run $byte reports DataType $db and eltype $(eltype(kb.arrays["in_I1"])); " *
-                           "float run $float reports $df and $(eltype(kf.arrays["in_I1"]))"))
-    (db == 0 && df == 1) || return out
+    # The captures must differ in the data path and nothing else. **The element type of `in_I1` is the
+    # authority, not the `DataType` scalar**: the scalar was added later, so a capture taken before it
+    # simply lacks the key — and the correlator dispatches on the array's dtype rather than on the
+    # attribute anyway (`autoRIFT.py:655,745`), so the array is what decides which template ran.
+    tb = eltype(kb.arrays["in_I1"])
+    tf = eltype(kf.arrays["in_I1"])
+    push!(out, StageResult("dtype: the two captures are the two paths", "in_I1 eltype",
+                           "UInt8 and Float32", tb === UInt8 && tf === Float32, 2,
+                           "byte run $byte: $tb (DataType $(get(kb.scalars, "DataType", "absent"))); " *
+                           "float run $float: $tf (DataType $(get(kf.scalars, "DataType", "absent")))"))
+    (tb === UInt8 && tf === Float32) || return out
 
     L = traced_level(kb)
     L == traced_level(kf) || return push!(out, StageResult(

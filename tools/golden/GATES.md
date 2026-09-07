@@ -601,3 +601,56 @@ well — which rung 3.6 already does separately, and finds exact — so the conf
 correlator alone reads **99.27%**. Rung 3.7 uses the captured grid.
 
 Ladder totals: **LC08 23 rungs green** at both traced levels, **S2A 21 green**.
+
+## The Float32 capture, and the floor it establishes per level
+
+```bash
+CAPTURE_STAGES=1 CAPTURE_STAGE_LEVEL=1 CAPTURE_FLOAT32=1 \
+  julia --project=tools/golden tools/golden/intermediate.jl LC08_L1TP_009011 --run 301 --force
+julia --project=tools/golden -t 8 tools/golden/stages.jl LC08_L1TP_009011 --dtype-pair 201,301
+```
+
+`CAPTURE_FLOAT32` runs the same production pipeline with the pyramid reaching `arImgDisp_s` rather than
+`arImgDisp_u`, so the reference's two correlator templates can be compared **against each other on
+production imagery**. That difference belongs to neither implementation and bounds what any rung on
+that level can be asked to achieve.
+
+### `DataType` is not the lever, and the reason is worth keeping
+
+The class has `uniform_data_type` with a `DataType == 1` branch that keeps a `Float32` field
+(`autoRIFT.py:356-404`) — but the container's vendored driver **inlines** the `DataType == 0` arithmetic
+instead of calling the method (`vend/testautoRIFT.py:449-481`, the same rescale-and-round written out).
+So setting the attribute changes nothing, and `grep uniform_data_type` over the whole container finds
+only the definition. Setting a flag and reporting success is precisely the silent no-op this harness has
+been bitten by twice, so the arrays are widened in the `runAutorift` patch instead, with the pre-call
+dtype asserted `uint8` and the post-call dtype asserted `float32`.
+
+What this measures is **which template correlates the same values**. It does not measure what the
+quantization cost — both runs see quantized values, because the driver has already overwritten `obj.I1`
+by the time any patch on this method can see it. `tools/ab` stage 1 measures that separately on a
+windowed float field.
+
+### The floor is not the same at every level, and that is the finding
+
+| case, level | chip | reference byte vs its own float | AutoRIFT.jl vs reference | attributable |
+|---|---:|---:|---:|---|
+| S2A, level 2 | 96 | **98.54%** exact, max 7 px | 98.54%, max 5 px | **nothing** |
+| LC08, level 1 | 32 | **99.92%** exact, max 21 px | 90.86%, max 399 px | **~9 points** |
+
+Coverage is identical in both pairs — zero exclusive nodes either way on 137 and 6,643 nodes — so the
+floor is a value disagreement only.
+
+**This is what the dtype pair is for.** At chip 96 on S2A the reference disagrees with itself as much as
+AutoRIFT.jl disagrees with it, so the 1.46% there is quantization tie-breaking and there is nothing to
+chase. At chip 32 on LC08 the floor is 99.92% and AutoRIFT.jl is at 90.86% — the shortfall is **real**,
+not a tie, and it is the first coarse-level residual on this ladder that cannot be explained away. A
+byte-only comparison reports 98.54% and 90.86% and gives no way to tell those two situations apart.
+
+Rung 3.12 also lands with it: the coarse read-back's width-5 median is **exact** against the reference's
+own `DxFM` on all 1,368,896 points, once fed the `DxF` state the fill loop left rather than the last
+state on the grid — `DxF` is rebound again by the strong interpolation that *follows* this median, and
+medianing that reports 25.7% differing. The rung selects its input by role and names the state it chose.
+
+**LC08 level 1: 24 rungs, 24 green.** Next: the 9 points at chip 32 are now the only attributable
+coarse-level residual on the ladder, and rungs 3.6, 3.10 and 3.12 are all exact there — so the remaining
+candidates are the coarse pass's own peak selection at that chip size and the level's prior.
