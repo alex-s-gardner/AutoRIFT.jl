@@ -302,10 +302,11 @@ def install_stage_trace(manifest, level=1):
                 continue
             key = '%s_L%d' % (name, level)
             if name in REDUMP:
-                # Cheap change detector: a sum over the raw bytes. A false negative would drop a
-                # revision, and for these arrays the changes are wholesale zeroing, which no plausible
-                # collision hides.
-                sig = (int(v.sum()) if v.dtype != np.bool_ else int(v.sum()), int(v.size))
+                # Change detector over the raw bytes rather than the values: a displacement array is
+                # full of `NaN`, so a numeric sum both throws on conversion and compares unequal to
+                # itself. Hashing the buffer sidesteps both and detects any change, including one that
+                # a sum would cancel.
+                sig = hash(v.tobytes())
                 if revs.get(name) == sig:
                     continue
                 revs[name] = sig
