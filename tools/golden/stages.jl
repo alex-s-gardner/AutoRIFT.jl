@@ -885,12 +885,28 @@ function rungs_coarse_correlation(k::Capture, L::Int, chip::Int)
         # The reference's own record says how many it measured, so a silent shape or grid error cannot
         # pass as agreement.
         refn = level === nothing ? count(!isnan, refdx) : k.levels[level].counts["measured"]
+        # **A reference-only node whose value is exactly `-radius_x` is the degenerate-chip corner, not a
+        # measurement AutoRIFT.jl failed to make.** A constant chip carries no information about
+        # displacement, and the reference returns the search window's corner there — `dx = -radius_x`,
+        # `dy = +radius_y` — where AutoRIFT.jl reports nothing. `tools/golden/README.md` registers that as
+        # matched-for-agreement-not-endorsed, in the direction where AutoRIFT.jl deliberately differs.
+        #
+        # Counted separately rather than tolerated: it is a fabricated value over masked and low-texture
+        # ground, so folding it into the coverage gate would make the gate reward reproducing it. At chip
+        # 32 on the golden Landsat case 10 of 13 reference-only nodes are exactly `-radius_x` and the other
+        # 3 are one off it, at a neighbouring radius.
+        fabricated = 0
+        for i in eachindex(cd.dx, refdx)
+            isnan(cd.dx[i]) && !isnan(refdx[i]) || continue
+            r = Float64(pts.radius_x[i])
+            abs(Float64(refdx[i]) + r) <= 1 && (fabricated += 1)
+        end
         push!(out, StageResult("3.7 coarse correlation, $label",
                                "DxC (reference measured $refn)",
-                               "coverage identical",
-                               oj == 0 && orf == 0 && count(!isnan, refdx) == refn, both,
-                               @sprintf("both %d, only jl %d, only ref %d; exact %.2f%%, median %.4g, p99 %.4g, max %.4g, bias %+.4g",
-                                        both, oj, orf, 100frac,
+                               "coverage identical but for degenerate chips",
+                               oj == 0 && orf == fabricated && count(!isnan, refdx) == refn, both,
+                               @sprintf("both %d, only jl %d, only ref %d (%d the degenerate-chip corner); exact %.2f%%, median %.4g, p99 %.4g, max %.4g, bias %+.4g",
+                                        both, oj, orf, fabricated, 100frac,
                                         isempty(ad) ? 0.0 : median(ad),
                                         isempty(ad) ? 0.0 : quantile(ad, 0.99),
                                         isempty(ad) ? 0.0 : maximum(ad),

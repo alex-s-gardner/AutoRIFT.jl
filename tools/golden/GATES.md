@@ -545,3 +545,59 @@ per-node comparison of *which* of the three masks each side applies where, on th
 arrays are all captured. It is not obviously worth the effort — the residual is 3,806 points of 596,618
 (0.6%) on a case that already passes the gate — so the honest next step is to leave it and check whether
 the other `hps` cases show the same 0.6% or something structurally different.
+
+## Gate 3 — the correlator rung, on both element types
+
+**The dtype pair is now a standing part of every rung that runs a correlator**, not a one-off probe. The
+reference has two correlators — `arImgDisp_u` on bytes, `arImgDisp_s` on floats, separate C++ templates
+— and production reaches the byte one (`uniform_data_type` quantizes to 256 levels before `runAutorift`,
+`autoRIFT.py:359-384`). Running both separates a difference in what the correlator *computes* from a tie
+the quantization created in the surface it computes *on*.
+
+### The reference against itself is the floor
+
+Handing the two templates the same information — the captured bytes, and those bytes widened to
+`Float32` — gives a disagreement that belongs to neither implementation:
+
+| comparison, chip 96 coarse pass, S2A | both | exact | max |
+|---|---:|---:|---:|
+| **reference `UInt8` vs its own `Float32`** | 137 | **98.54%** | **7 px** |
+| AutoRIFT.jl vs reference, `UInt8` | 137 | 98.54% | 7 px |
+| AutoRIFT.jl vs reference, `Float32` | 137 | 98.54% | 5 px |
+
+AutoRIFT.jl sits **exactly on the floor**. The 1.46% is not attributable to it: the reference disagrees
+with itself by the same amount on the same nodes, from which template ran. A rung reporting that figure
+has found nothing.
+
+**AutoRIFT.jl is bit-identical across the two element types** — every rung reports the same numbers on
+`UInt8` and `Float32`, because `_prepare` preserves the element type and one code path handles both. So
+the byte/float split is a property of the *reference* here, not a second code path to verify.
+
+### Rung 3.7, across cases and levels
+
+| case | level | chip | coarse nodes | only jl | only ref | exact | bias |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| LC08 | 0 | 16 | 35,142 | **0** | **0** | 86.54% | −0.092 |
+| LC08 | 1 | 32 | 6,630 | **0** | 13 † | 90.86% | −0.521 |
+| S2A | 0 | 24 | 11,285 | **0** | **0** | 99.21% | +0.004 |
+| S2A | 2 | 96 | 137 | **0** | **0** | 99.27% | −0.037 |
+
+† All 13 are the reference's **degenerate-chip corner**: 10 are exactly `-radius_x` and the other 3 are
+one off it at a neighbouring radius. A constant chip carries no displacement information, and the
+reference returns the search window's corner there where AutoRIFT.jl reports nothing —
+already registered in the matched-not-endorsed table as a difference AutoRIFT.jl keeps deliberately.
+The rung counts them separately rather than tolerating them, so the gate cannot come to reward
+reproducing a fabricated value.
+
+**Coverage is identical everywhere else** — zero exclusive nodes either way, on four level/case
+combinations. `exact` ranges 86.5–99.3%, and both the low figures are LC08, whose 15 m panchromatic band
+quantizes harder than S2A's.
+
+### A harness correction
+
+The 85.22% I reported for chip 96 was a harness artifact: it rebuilt the coarse grid with
+`_coarse_points` instead of using the reference's captured `xGrid0C`. Rebuilding measures the setup as
+well — which rung 3.6 already does separately, and finds exact — so the conflation read as 85% where the
+correlator alone reads **99.27%**. Rung 3.7 uses the captured grid.
+
+Ladder totals: **LC08 23 rungs green** at both traced levels, **S2A 21 green**.
