@@ -128,3 +128,62 @@ on — while leaving their case directories on disk, so the corpus and its index
 now merges and records the library versions per group, which the corpus genuinely needs: the original
 311 cases were generated under OpenCV 4.10 and these 135 under 4.13, and rewriting the older ones to
 match the newer build would move the target the suite is held to rather than verify it.
+
+## Gate 3 — the stage ladder
+
+`tools/golden/stages.jl` feeds AutoRIFT.jl the reference's own dumped input for one stage of
+`autorift()` at a time and diffs against that stage's dumped output. Julia output is never chained
+into the next Julia stage, so each rung is a statement about one step rather than about a composition
+of two dozen.
+
+```bash
+CAPTURE_STAGES=1 CAPTURE_STAGE_LEVEL=0 julia --project=tools/golden \
+    tools/golden/intermediate.jl LC08_L1TP_009011 --force
+julia --project=tools/golden -t 8 tools/golden/stages.jl LC08_L1TP_009011
+```
+
+Measured on `LC08_L1TP_009011_20200703` at chip 16 (the base level), grid 2344×2336 = 5,475,584
+points, coarse grid 293×292 = 85,556.
+
+| # | stage | reference array | gate | measured | state |
+|---|---|---|---|---|---|
+| 3.1 | the level's grid | `xGrid0_L0` | exact | **all 5,475,584 equal** | **green** |
+| 3.5 | zero / `minSearch` rewrite | `SearchLimitX0_rev1_L0` | exact | **all 5,475,584 equal** | **green** |
+| 3.4 | the prior | `Dx00_L0` | exact | **all 5,475,584 equal** | **green** |
+| 3.6a | coarse sample lattice | `xGrid0C_L0` | exact | **all 85,556 equal** | **green** |
+| 3.6b | coarse radius, both axes | `SearchLimitX0C_L0`, `…Y…` | exact | **all 85,556 equal**, after the fix below | **green** |
+| 3.6c | coarse prior, both axes | `Dx0C_L0`, `Dy0C_L0` | exact | **all 85,556 equal** | **green** |
+
+Two stages beyond the committed rungs, measured so the next rung starts from a number rather than an
+assumption:
+
+| stage | measured | reading |
+|---|---|---|
+| coarse correlation `DxC` | **coverage identical** — 35,142 measured on both sides, 0 exclusive either way, and `M0C` agrees on 85,556 of 85,556 (**100%**). `dx` **86.54%** exact, rising to **94.66%** at correlation ≥ 0.5 | agreement improving with peak strength is the shape to expect. 9.61% differ by more than a pixel, concentrated at large radii (median radius 13 against 6 elsewhere) |
+| `MC`, the coarse rejection | reference keeps 16,746, AutoRIFT.jl 16,724; **98.47%** of the grid agrees, and the exclusive split is balanced — 644 jl-only against 666 ref-only | the filter's parameters match exactly (width 9, `FracValid` 0.32, 2 iterations). A balanced split is marginal decisions straddling one threshold, not a bias |
+
+### A real bug the endpoint comparison could not see
+
+The reference sets `filtWidth = stride + 1` when the sparse stride is even and `stride` when it is odd
+(`autoRIFT.py:618-626`), so the coarse radius reduction is symmetric about the node it samples at.
+`_cell_max_radius!` reduced over the stride, which at an even stride reaches one fewer point on the
+right.
+
+Measured against the reference's own `SearchLimitX0C`: **1,809 of 85,556** coarse points carried a
+radius too small, by up to **152 pixels**, every one downward and none on the grid border. A coarse
+point whose radius under-covers its cell searches a narrower window than the reference did, so it
+rails out or misses the peak exactly where the prior was doing work — which presents as a correlator
+disagreement rather than as a setup difference. With the rule applied both axes are exact on all
+85,556 points, and `tools/ab` stage 2 is unchanged at 81.8% exact.
+
+The endpoint comparison for this case reads 63.24% exact and nothing in it points at a window width.
+The rung that found it compares one array against the array the reference built for it.
+
+### The argument-order trap, paid once more
+
+Writing the coarse-pass comparison, `ImagePair(I1, I2)` in place of `(I2, I1)` reported **22.25%**
+exact where the correct order reports **86.54%** — low enough to look like a finding and high enough
+not to look like a bug. `arImgDisp_*(a, b)` cuts its chip from `b` and the reference calls it as
+`(self.I2, self.I1)`, so `I1` supplies the chip and binds to AutoRIFT.jl's *secondary*.
+`tools/ab/README.md` states this and `correlator.jl` asserts it; every new diagnostic has to re-derive
+it, and the cost of getting it wrong is a plausible measurement rather than an error.
