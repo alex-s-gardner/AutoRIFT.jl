@@ -495,7 +495,53 @@ is ruled out — AutoRIFT.jl searches *more* coarse points there (5,575 against 
 searching a wider set and succeeding on fewer, which points at the coarse correlation or its rejection
 on this scene rather than at any of the setup stages the ladder has verified exact.
 
-**Next**: compare the chip-96 coarse pass point by point against the reference's own `DxC` at that
-level, the way rung 3.7 does at the base level. The capture holds it (`DxC_rev0_L2`), and the two sides
-searched overlapping but different point sets, so the comparison has to be restricted to the
-intersection before the counts mean anything.
+### The chip-96 coarse pass, on the intersection of the two search sets
+
+`DxC_rev0_L2` is on a 32×32 grid — the coarse pass of the chip-96 level, not its fine pass. Restricting
+to the nodes both sides gave a positive radius:
+
+| | value |
+|---|---:|
+| searched — julia / reference / **intersection** | 210 / 137 / **115** of 1,024 |
+| on the intersection: both measured | **115** |
+| only julia / only reference | **0 / 0** |
+| exact | **85.22%** |
+| median / p99 / max / bias | 0 / 6 / 9 / **+0** |
+
+**The coarse correlator is not the problem at this level.** Coverage on the intersection is perfect —
+115 measured by both, zero exclusive either way — and the bias is exactly zero. Both sides also measure
+**100%** of what they search (210/210 and 137/137), so neither is failing to correlate. `exact` at
+85.22% with a p99 of 6 px is the integer coarse pass choosing between competing peaks on a 96 px chip,
+which is the expected regime.
+
+Downstream of it, on the 32² coarse grid: `MC` agrees at 976 of 1,024 nodes and `MC2` at 747.
+
+### Correcting an earlier reading in this file
+
+The line above recording that AutoRIFT.jl "searches *more* coarse points there (5,575 against 4,164)"
+and admits "27,744 level points against 4,164" **compared the wrong quantities**. 27,744 is the `MC2`
+mask alone, before the radius gate; the radius-gated intersection — what the fine pass actually
+receives — is **3,496** against the reference's **4,164**. So AutoRIFT.jl searches slightly *fewer*, at
+84%, not 6.7× more.
+
+That also disposes of the candidate fix. Rebuilding the admission mask the reference's way — bounds,
+then `colfilt(..., 0)` over `6/Scale` cells, then `INTER_NEAREST` — reconstructs its `M0` to **94.27%**
+and moves the fine-pass count from 3,496 to **5,033**, overshooting 4,164 in the other direction. Both
+rules land within about 20% of the reference and neither is clearly right, so this is not one
+identifiable rule to fix.
+
+### Where that leaves the coarse levels
+
+Every stage the ladder measures is exact or reported-as-designed, at four levels of LC08 and three of
+S2A. The coarse correlator agrees with zero bias and identical coverage on the intersection. What
+remains is a **composition of near-threshold decisions** — which nodes clear the admission bound, the
+`MC` rejection, the dilation and the radius gate — where each factor individually agrees to within a few
+percent and their intersection differs by more. The reference's own three-mask intersection at chip 96
+is 4,164 from factors of 14,416, 32,160 and 44,426; an intersection is that much more sensitive to each
+factor than any factor is on its own.
+
+That is a real explanation and not a satisfying one, so it is worth stating what would settle it: a
+per-node comparison of *which* of the three masks each side applies where, on the same 260² grid. The
+arrays are all captured. It is not obviously worth the effort — the residual is 3,806 points of 596,618
+(0.6%) on a case that already passes the gate — so the honest next step is to leave it and check whether
+the other `hps` cases show the same 0.6% or something structurally different.
