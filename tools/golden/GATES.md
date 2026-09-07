@@ -221,3 +221,51 @@ quantizing identically and then disagreeing about the surface that results.
 This is why `tools/golden/README.md` lists the `UInt8` conversion as **matched, not endorsed**: it is
 reproduced to agree with the reference, and it costs accuracy at every point. The float path being
 bit-identical is the measurement that says so.
+
+## Gate 4 — the endpoints, and no slide
+
+```bash
+julia --project=tools/golden tools/golden/regate.jl --all
+```
+
+Every gate above, re-run in one command. A gate whose inputs are absent reports **skipped** rather
+than green, because a gate that silently passes when it did not run is worse than one that fails.
+
+| gate | measured |
+|---|---|
+| 2.x colfilt, bwareaopen, window reductions | **green** — all assertions pass |
+| 0.1 the correlator alone | **green** — exact 100.0% |
+| 0.2 the whole pipeline, 3072² | **green** — exact 81.8%, within step 98.7% |
+| 0.3 the ITS_LIVE granule | **green** — all assertions pass |
+| 3.x the stage ladder | **green** — 8 rungs, 8 green, 0 red |
+
+**5 ran, 5 green, 0 red.**
+
+The golden endpoints, on the reference's own captured inputs, after the coarse-radius fix:
+
+| case | both | only jl | only ref | exact `dx` | median | p99 | corr | before |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| S2A Malaspina (**anchor**) | 586,090 | 6,643 | 10,528 | **92.66%** | 0.0625 | 0.418 | +0.997 | 92.67%, only_ref 10,531 |
+| LC08 East Greenland | 1,660,132 | 46,761 | 55,928 | 55.12% | 0.111 | 1.375 | +0.996 | 55.14% |
+
+The anchor holds and its coverage improves slightly — `only_ref` 10,531 → 10,528. Neither endpoint
+moves materially, which is the expected result and worth stating plainly: the coarse-radius fix
+corrected 1,809 of 85,556 coarse points, and a coarse point's radius only changes the answer where the
+fine pass would otherwise have missed the peak. The fix is right on its own terms — it is exact against
+the reference's own array where it was not before — and it is not what the endpoint gap is made of.
+
+**Where that leaves the endpoint gap.** The ladder has now measured every setup stage as exact and both
+correlation passes as coverage-identical, so the gap is neither the setup nor a failure to measure:
+
+| stage | coverage | value agreement |
+|---|---|---|
+| setup (grid, radii, priors, coarse lattice) | — | **exact**, 5,475,584 and 85,556 points |
+| coarse correlation | **identical**, 0 exclusive either way | 86.5% exact, 94.7% at corr ≥ 0.5 |
+| coarse rejection `MC` | 98.47% agree, balanced (644 / 666) | — |
+| fine correlation | **identical**, 0 exclusive either way | 71.9% exact, 100.000% of reference values on the 1/16 grid |
+| endpoint | 46,761 jl-only, 55,928 ref-only | 55.1% exact |
+
+Coverage is identical at both passes and differs by ~100,000 points at the endpoint, so **every
+coverage difference is introduced after the fine pass** — by the rejection, the fill and the merge, not
+by the correlator. And the base-level value residual is the `UInt8` quantization, measured above. Those
+are the two remaining threads, and they are now separated rather than confounded.
