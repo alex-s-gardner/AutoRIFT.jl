@@ -47,9 +47,12 @@ DimensionalData = "0.29, 0.30"
 DiskArrays = "0.4"
 FFTW = "1.8"
 FFTW_jll = "3.3.12"
-# 0.1 is what ImagePairGeometry requires and what its `main` is; the registry has only 0.0.2, which
-# is why the `[sources]` table below pins it.
-FastGeoProjections = "0.1"
+# Both minors, because the `[sources]` entry below tracks `main` — which is 0.2.0 — while
+# `ImagePairGeometry` accepts `0.1, 0.2`. A single-minor bound here fails the moment `main` crosses it:
+# pinned at 0.1 the resolver refuses with `empty intersection between FastGeoProjections@0.2.0 and
+# project compatibility 0.1`, before any test runs. The registry has only 0.0.2, which is why the pin
+# exists at all.
+FastGeoProjections = "0.1, 0.2"
 ImageCore = "0.10"
 ImageFeatures = "0.5"
 ImagePairGeometry = "0.1"
@@ -75,8 +78,11 @@ julia = "1.10"
 # run rather than be skipped.
 #
 # `ImagePairGeometry` is unregistered outright. `FastGeoProjections` is registered, but only at 0.0.2,
-# while `ImagePairGeometry` requires 0.1 — so without this the resolver fails before any test runs,
-# with `Unsatisfiable requirements detected for package FastGeoProjections`. Its `main` is 0.1.0.
+# while `ImagePairGeometry` requires 0.1 or 0.2 — so without this the resolver fails before any test
+# runs, with `Unsatisfiable requirements detected for package FastGeoProjections`.
+#
+# `rev = "main"` means the version it resolves to moves without a change here, so the `[compat]` bound
+# above admits every minor `ImagePairGeometry` accepts rather than the one `main` happens to be at.
 #
 # Julia 1.11 and later only: `Pkg.Types.Project` gained a `sources` field there, and 1.10 ignores this
 # table entirely — which is why the `lts` job skips that one testset. See `.github/workflows/CI.yml`.
