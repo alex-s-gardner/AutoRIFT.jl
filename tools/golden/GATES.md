@@ -790,3 +790,54 @@ addressable from the manifest rather than by globbing a directory.
 An `hps` pair writes no `filtered/` at all, since it is filtered inside `autorift()`.
 `record_filtered_scenes` records `filtered_dir: null` in that case rather than staying silent, so a reader
 distinguishes "no filtered scenes" from "not looked for".
+
+## Step 2 — `wallis_gapfill` against `_wallis_filter_fill`, masks exact
+
+```bash
+micromamba run -n arift-ref python tools/python_ref/gen_fixtures.py wallisfill
+julia --project=. -e 'using TestEnv; TestEnv.activate(); include("test/preprocess.jl")'
+```
+
+Nine fixtures — three scenes (scan-line stripes, a wide margin plus interior gaps, a flat patch) × three
+`(width, cutoff)` settings — each recording every deterministic array the filter builds. **213 assertions
+pass.**
+
+| what | measured | state |
+|---|---|---|
+| `invalid_data` | **exact**, all 9 cases | green |
+| `potential_data` (within 30 px of data) | **exact**, all 9 | green |
+| `missing_data` (gaps grown by `buff`) | **exact**, all 9 | green |
+| `zero_mask` (the mask the pipeline writes to disk) | **exact**, all 9 | green |
+| the fill *set* | deterministic and seed-independent; two seeds agree on `v`, disagree on values | green |
+| the local standard deviation | **differs by up to 183** in the input's units | by design, three causes below |
+
+### Every mask is exact; the statistics differ, in three ways and all deliberate
+
+That split is the useful result: the filter's *decisions* — which pixels are gaps, which are reachable,
+which are filled, which stay masked — agree exactly, and those are what propagate, because a filled pixel
+is marked valid and so stops masking out its neighbours. The *values* differ for three separate reasons,
+each a choice the reference made:
+
+1. **The gap zeros are in its statistics.** It detects gaps as `isclose(image, 0)` and then computes the
+   local mean and standard deviation over the raw array anyway, so a window touching a gap is normalized by
+   a spread the gap itself created. AutoRIFT.jl excludes them via the mask — the difference
+   `wallis_gapfill`'s docstring already records.
+2. **`E[x²] − E[x]²`, clipped at zero** (`_preprocess_filt_std`), against AutoRIFT.jl's about-the-mean
+   form. `REFERENCE.md` measures the reference's median error at 0.54 and AutoRIFT.jl's at 1.5e-6 against
+   an exact `Float64` truth.
+3. **Mixed border modes inside one filter — new, and not previously recorded.** `_remove_local_mean` uses
+   `BORDER_CONSTANT` while `_preprocess_filt_std` uses `BORDER_REFLECT`, so the numerator and the divisor
+   of a single Wallis call disagree about the border. Unmasked statistics with the accurate variance still
+   differ by 54.7 for this reason alone.
+
+The testset asserts the *shape* of that disagreement rather than tolerating it: masks exact, values not,
+and AutoRIFT.jl's divisor finite everywhere it has a neighbourhood. A change that made the values agree
+would mean one of the three had been silently adopted.
+
+### A harness error worth recording, because it looked exactly like a defect
+
+The first comparison reported 4,512 pixels differing on `potential_data`. That was the probe passing
+`dilate_within(invalid, 30)` where the reference's `distanceTransform(invalid) < 30` measures each *invalid*
+pixel's distance to the nearest *valid* one — so the Julia form dilates the **valid** set. With the polarity
+right it is exact on all nine cases. The test now asserts the polarity explicitly, since the wrong one runs
+happily and produces a plausible number.

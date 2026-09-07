@@ -576,6 +576,134 @@ def gen_bwareaopen() -> int:
     return n
 
 
+def gen_wallisfill() -> int:
+    """`_wallis_filter_fill` (`autoRIFT.py:69-126`), the Landsat 7 scan-line-gap filter.
+
+    The one preprocessing method with no fixture, and the only one that draws random numbers — which is
+    exactly why its *deterministic* parts have to be pinned separately. The reference fills the gaps from
+    an unseeded `np.random.default_rng`, so two of its own runs disagree there and no comparison of the
+    filled values means anything. Everything else about the filter is deterministic and is what this
+    fixture covers:
+
+      * `invalid_data`, from `isclose(image, 0)` — the gap set as the filter sees it.
+      * `potential_data`, an exact Euclidean `distanceTransform` of the gaps thresholded at **30** — the
+        reach that makes an interior scan-line gap fillable while leaving a whole outer margin alone.
+      * `missing_data`, that set grown by `buff = sqrt(2*((w-1)/2)^2) + 0.01`, and `zero_mask`, the
+        complement of the valid domain — the mask the *pipeline* consumes, written to disk beside the
+        filtered scene.
+      * `low_std`, the sub-`std_cutoff` set grown by the same buffer.
+      * The Wallis output itself wherever the fill did not draw.
+
+    **Two thresholds and one comparison direction are load-bearing**, and each is easy to transcribe
+    wrongly in a way that changes which pixels get noise rather than data: `< 30` is strict where the two
+    buffer tests are `<= buff`, and `low_std` is `std < std_cutoff` on a standard deviation that can be
+    `NaN` — where a `NaN` fails `<` and so counts as *passing*, the opposite of what a missing-data test
+    should conclude. AutoRIFT.jl writes `!(sd >= cutoff)` deliberately so a `NaN` counts as low contrast;
+    the fixture records what the reference actually does so the difference is measured rather than assumed.
+
+    The scene has real scan-line gaps — every eighth column, the pattern `gen_disttransform`'s `stripes`
+    case uses — because that is the shape the filter exists for, and a random hole pattern does not
+    exercise the 30-pixel reach at all.
+    """
+    ref = _reference_colfilt()
+    if ref is None:
+        print("  wallisfill: skipped, autoRIFT not importable in this environment")
+        return 0
+
+    import sys
+
+    mod = sys.modules["autoRIFT.autoRIFT"]
+
+    n = 0
+    # Non-square and not a multiple of the stripe period, so an off-by-one or a transpose fails on the
+    # shape as well as the values.
+    base = (texture((96, 120), seed=21) * 400 + 100).astype(np.float32)
+
+    cases = {}
+    # Scan-line gaps: whole columns of zero, which is what the SLC failure produces.
+    stripes = base.copy()
+    stripes[:, ::8] = 0.0
+    cases["stripes"] = stripes
+    # A wide margin plus interior gaps: the discriminating case for the 30-pixel reach, since the margin
+    # must stay unfilled while the interior gaps are filled.
+    margin = base.copy()
+    margin[:, :35] = 0.0
+    margin[:, 60::8] = 0.0
+    cases["margin"] = margin
+    # A flat patch, so `low_std` has something to find beyond the gaps themselves.
+    flat = base.copy()
+    flat[:, ::8] = 0.0
+    flat[20:40, 20:50] = 250.0
+    cases["flatpatch"] = flat
+
+    for name, image in cases.items():
+        for width, cutoff in ((5, 0.25), (5, 1.0), (3, 0.25)):
+            buff = float(np.sqrt(2 * ((width - 1) / 2) ** 2) + 0.01)
+            invalid = np.isclose(image, 0.0)
+            potential = (
+                cv2.distanceTransform(invalid.astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE) < 30
+            )
+            missing0 = potential & invalid
+            missing = (
+                cv2.distanceTransform((~missing0).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+                <= buff
+            )
+            valid_domain = ~invalid | missing
+            zero_mask = ~valid_domain
+
+            kernel = np.ones((width, width), dtype=np.float32) / (width * width)
+            shifted = mod._remove_local_mean(image, kernel)
+            std = mod._preprocess_filt_std(image, kernel)
+            low_std_raw = std < cutoff
+            low_std = (
+                cv2.distanceTransform((~low_std_raw).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+                <= buff
+            )
+            missing_final = (missing | low_std) & valid_domain
+
+            # The filter's own output, with the RNG seeded so the case is reproducible. The drawn
+            # positions are `fill_data`; their values are recorded but must not be compared.
+            saved = np.random.default_rng
+            np.random.default_rng = lambda seed=None: saved(20260907 if seed is None else seed)
+            try:
+                filtered, zm = mod._wallis_filter_fill(image.copy(), width, cutoff)
+            finally:
+                np.random.default_rng = saved
+
+            write_case(
+                f"wallisfill/{name}_w{width}_c{str(cutoff).replace('.', 'p')}",
+                {
+                    "src": image,
+                    "invalid": invalid.astype(np.uint8),
+                    "potential": potential.astype(np.uint8),
+                    "missing": missing.astype(np.uint8),
+                    "low_std": low_std.astype(np.uint8),
+                    "missing_final": missing_final.astype(np.uint8),
+                    "zero_mask": zero_mask.astype(np.uint8),
+                    "shifted": np.asarray(shifted, dtype=np.float32),
+                    "std": np.asarray(std, dtype=np.float32),
+                    "filtered": np.asarray(filtered, dtype=np.float32),
+                    "fill_data": (valid_domain & missing_final).astype(np.uint8),
+                },
+                {
+                    "filter_width": width,
+                    "std_cutoff": cutoff,
+                    "buff": buff,
+                    "reach": 30,
+                    # Recorded because the two are different comparisons and a port that uses one for
+                    # both changes which pixels are filled.
+                    "reach_test": "strict <",
+                    "buffer_test": "<=",
+                    # The filled values come from an unseeded generator in production; this case seeded
+                    # it only so the fixture is reproducible. Compare the positions, never the values.
+                    "fill_values_are_random": True,
+                    "seed_used_for_fixture": 20260907,
+                },
+            )
+            n += 1
+    return n
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -589,6 +717,7 @@ GENERATORS = (
     ("disttransform", gen_disttransform),
     ("colfilt", gen_colfilt),
     ("bwareaopen", gen_bwareaopen),
+    ("wallisfill", gen_wallisfill),
 )
 
 

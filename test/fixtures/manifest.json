@@ -10,6 +10,11 @@
       "numpy_version": "1.26.4",
       "opencv_version": "4.13.0",
       "python_version": "3.10.20"
+    },
+    "wallisfill": {
+      "numpy_version": "1.26.4",
+      "opencv_version": "4.13.0",
+      "python_version": "3.10.20"
     }
   },
   "groups": {
@@ -21,10 +26,11 @@
     "matchtemplate": 72,
     "peak": 5,
     "pyrup": 40,
-    "resize": 48
+    "resize": 48,
+    "wallisfill": 9
   },
   "numpy_version": "1.26.4",
   "opencv_version": "4.13.0",
   "python_version": "3.10.20",
-  "total_cases": 446
+  "total_cases": 455
 }
