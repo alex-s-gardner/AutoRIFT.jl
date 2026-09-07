@@ -459,6 +459,39 @@ produced it.
 | whole pipeline vs reference (`tools/ab` stage 2) | **81.8% exact**, 98.7% within one step, p99 0.0752 px — the pyramid is not bit-identical on either harness, only the single-level correlator is |
 | AutoRIFT.jl product against golden | needs the post-correlation chain (phase 2) |
 
+### The stage ladder, and what it localized
+
+`tools/golden/stages.jl` compares one intermediate of `autorift()` at a time, feeding AutoRIFT.jl the
+reference's own dumped input and diffing against that stage's dumped output. `tools/golden/GATES.md`
+holds the measurements; what they change about the list below is worth stating first, because two of
+its entries were framed against endpoint statistics that the ladder now decomposes.
+
+| stage | coverage | value agreement |
+|---|---|---|
+| setup — grid, search-limit rewrite, prior, coarse lattice, coarse radii, coarse priors | — | **exact**, over 5,475,584 fine and 85,556 coarse points |
+| coarse correlation | **identical** — 35,142 both sides, 0 exclusive either way, `M0C` 100% | 86.5% exact, 94.7% at correlation ≥ 0.5 |
+| coarse rejection `MC` | 98.47% of the grid agrees, balanced: 644 jl-only against 666 ref-only | — |
+| fine correlation | **identical** — 2,159,437 both sides, 0 exclusive either way | 71.9% exact; the reference's `DxF` is 100.000% on the 1/16 grid |
+| endpoint (`runAutorift` out) | 46,761 jl-only, 55,928 ref-only | 55.1% exact |
+
+Two conclusions follow, and neither was available from the endpoints alone:
+
+**Every coverage difference is introduced after the fine pass.** Both correlation passes measure exactly
+the same point sets, and the endpoint differs by about a hundred thousand. So the rejection, the fill and
+the merge own all of it — the correlator never fails to measure a point the reference measures.
+
+**The base-level value residual is the `UInt8` quantization.** The same window through stage 1 at each
+element type: `Float32` via `arImgDisp_s` is bit-identical at all 3,721 points, `UInt8` via
+`arImgDisp_u` agrees on 84.8% with a 35.8 px maximum. Production takes the byte path, and the capture
+confirms `in_I1` is `UInt8` over all 256 levels. This is the "matched, not endorsed" `UInt8` row below,
+now with the measurement that quantifies what it costs.
+
+**One real bug came out of it.** The reference reduces a coarse radius over `filtWidth = stride + 1` for
+an even sparse stride (`autoRIFT.py:618-626`), so the window is symmetric about the sampled node.
+`_cell_max_radius!` reduced over the stride, leaving 1,809 of 85,556 coarse points with a radius too
+small by up to 152 pixels, every one downward. Invisible at the endpoint, which reads 55% exact and says
+nothing about a window width.
+
 ### Open, in priority order
 
 1. **The remaining 32%, which is mostly the coarse levels.** Decomposed on the aligned grid:
@@ -476,8 +509,10 @@ produced it.
    agreement**, which carries a 6.55x enrichment in the residual tail and is the one part of that tail
    not explained by the coarse-level bicubic; then the 14% of base-level points beyond one step. Hole
    filling is done, and the outlier filter's parameters and reducers are ruled out.
-2. **Coverage, and it is the outlier filter.** 16,893 points AutoRIFT.jl answers alone against 19,162
-   the reference does. Disabling the filter and changing nothing else settles which side owns it:
+2. **Coverage, and it is introduced after the fine pass.** The ladder narrows this: both correlation
+   passes measure identical point sets with zero exclusive points either way, so the rejection, the fill
+   and the merge own the whole difference. Disabling the filter and changing nothing else settles which
+   of those it is:
 
    | outlier filter | both measured | only jl | only ref |
    |---|---:|---:|---:|
