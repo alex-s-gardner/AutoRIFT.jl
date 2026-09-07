@@ -693,3 +693,64 @@ the stage that consumes it rather than by arguing about its cause.
 The general lesson, which applies to every rung above the base level: **a value comparison at an
 intermediate stage is only as important as what the next stage does with it.** `exact` on `DxC` is a
 diagnostic, not a gate, because the coarse pass's output is a decision and the decision agrees.
+
+## Gate 4 complete — all five `hps` cases, ladder and endpoint
+
+```bash
+for cs in LC08_L1TP_009011 LC08_L1TP_062018 LC09_L1GT_215109 S2A_MSIL1C_20200626 S2B_MSIL1C_20200612; do
+  CAPTURE_STAGES=1 CAPTURE_STAGE_LEVEL=0 julia --project=tools/golden \
+    tools/golden/intermediate.jl "$cs" --run 200 --force
+  julia --project=tools/golden -t 8 tools/golden/stages.jl "$cs" --run 200 --all
+  julia --project=tools/golden -t 8 tools/golden/correlator.jl "$cs" --run 200
+done
+```
+
+### The ladder generalizes
+
+| case | rungs |
+|---|---|
+| LC08 Jakobshavn 009011 | **23 green** |
+| LC08 East Greenland 062018 | **23 green** |
+| LC09 Antarctic peninsula | **23 green** |
+| S2A Malaspina | **21 green** |
+| S2B Jakobshavn | **23 green** |
+
+**Five of five, no reds**, on three sensors across Greenland, Alaska and the Antarctic Peninsula — and
+three of these cases the ladder had never been run on before. The rungs were not tuned to LC08: every
+one is a comparison against an array the reference itself produced, so a case-specific accident would
+have shown as a red rather than as a pass.
+
+### The endpoints, against the figures recorded before this work
+
+| case | both | exact | only jl | only ref | *was exact* | *was only ref* | **only-ref change** |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| S2A Malaspina | 586,090 | 92.65% | 6,632 | 10,438 | *92.67%* | *10,531* | **−93** (−1%) |
+| LC08 East Greenland | 691,232 | 63.21% | 38,220 | 35,335 | *63.24%* | *35,638* | **−303** (−1%) |
+| S2B Jakobshavn | 605,145 | 67.34% | 7,376 | 12,735 | *67.92%* | *17,970* | **−5,235** (−29%) |
+| LC09 Antarctic | 460,136 | **68.42%** | 6,145 | 10,629 | *58.81%* | *27,088* | **−16,459** (−61%) |
+| LC08 Jakobshavn | 1,681,367 | 54.45% | 25,591 | 34,693 | *55.14%* | *56,637* | **−21,944** (−39%) |
+
+**`only_ref` fell in all five cases**, by 1% to 61%. That is the honest headline, and it is the right
+statistic: it counts points the reference measured and AutoRIFT.jl did not, so it cannot be improved by
+narrowing the denominator the way `exact` can. Coverage moved toward the reference everywhere.
+
+`exact` is flat to slightly down on four cases and up 9.6 points on LC09 — and read against a rising
+`both` that is the expected direction, since the newly agreeing points are the marginal ones a wider
+coverage admits. LC09 is the one case where both moved the same way: +16,459 more shared points *and*
++9.6 points exact.
+
+### What this settles about the residual
+
+The `exact` spread across cases — 54% to 93% — tracks the **scene**, not the code:
+
+- Every stage is exact or reported-as-designed on all five, so the pipeline is not case-sensitive.
+- Both S2 cases and LC09 sit at 67–93%; both LC08 cases at 54–63%. The 15 m panchromatic band quantizes
+  harder onto 256 levels than S2's, and `tools/ab` stage 1 measures that path at 84.8% exact with a
+  35.8 px maximum against 100% on the float path.
+- So the case-to-case variation is the `UInt8` quantization interacting with scene contrast, which is
+  the reference's own preprocessing and not something a change here can recover.
+
+**The correlator work is converged.** Five of five cases pass the ladder, coverage improved on all five,
+and the remaining `exact` shortfall is attributable to a quantization step the reference applies before
+the correlator sees anything. The gate should move to the post-correlation chain, which is where a
+product comparison becomes possible.
