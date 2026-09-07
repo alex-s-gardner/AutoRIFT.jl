@@ -26,6 +26,19 @@
 # within-one-step fraction are the statistics and `exact` is meaningless. `tools/golden/README.md`
 # records the measurement that closed that question.
 #
+# **Every rung that runs a correlator runs it on both element types, and the reference against itself is
+# the floor.** The reference has two correlators — `arImgDisp_u` on bytes, `arImgDisp_s` on floats,
+# separate C++ templates — and production reaches the byte one, because `uniform_data_type` quantizes to
+# 256 levels before `runAutorift` is called (`autoRIFT.py:359-384`). Running the pair separates a
+# difference in what the correlator *computes* from a tie the quantization created in the surface it
+# computes *on*: collapsing a filtered float field onto 256 levels makes plateaus the float field does
+# not have, and a plateau broken differently puts the peak whole pixels away rather than one step away.
+#
+# Handing the two templates the same information — the captured bytes, and those bytes widened to
+# `Float32` — gives a disagreement that belongs to neither implementation and bounds what any rung can
+# be asked to achieve. Measured at chip 96 on the S2A case: **98.54% exact, maximum 7 px**, the
+# reference against itself. A rung reporting that figure has found nothing; one reporting worse has.
+#
 # Stages run in order and the ladder stops at the first red one, because a stage fed a correct input
 # tells you about itself, while the stages after a red one are being asked a question whose premise
 # has already failed.
@@ -38,7 +51,7 @@ include("correlator.jl")
 using AutoRIFT
 using AutoRIFT: PointSet, windowmax, windowmean, windowrange, windowmedian, sanitize!,
                 rebuild, params, extent, rescale, relax, window, DisplacementField, Params,
-                resample, Nearest
+                resample, Nearest, measure_at, subpixel_at
 using Printf, Statistics
 
 # ---------------------------------------------------------------------------
@@ -248,6 +261,7 @@ function ladder(c::GoldenCase; n::Integer = 100, stop_on_red::Bool = true)
     push!(out, rung_search_rewrite(k, L, minsearch))
     push!(out, rung_priors(k, L, chip, chip0, spacing))
     append!(out, rungs_coarse_sampling(k, L, chip))
+    append!(out, rungs_coarse_correlation(k, L, chip))
     append!(out, rungs_filter_params(k, L))
     append!(out, rungs_coarse_mask(k, L, chip))
     append!(out, rungs_fill(k, L))
@@ -796,6 +810,103 @@ function rungs_fill(k::Capture, L::Int)
     isempty(mine) && return out
     push!(out, exact_stage("3.15 fill mask", last(mine), UInt8.(jl_mf), k.stages[last(mine)]))
     return out
+end
+
+# ---------------------------------------------------------------------------
+# 3.7 — the coarse correlation, on both element types
+# ---------------------------------------------------------------------------
+#
+# **Every rung that runs a correlator runs it twice, on `UInt8` and on `Float32`, and the pair is the
+# measurement rather than either half.** The reference has two correlators — `arImgDisp_u` on bytes and
+# `arImgDisp_s` on floats, separate C++ templates — and production reaches the byte one, because
+# `uniform_data_type` rescales each scene by its own mean and standard deviation and quantizes to 256
+# levels before `runAutorift` is called (`autoRIFT.py:359-384`).
+#
+# What the pair separates is a difference in what the correlator *computes* from a tie the quantization
+# created in the surface it computes *on*. Collapsing a filtered float field onto 256 levels makes
+# plateaus the float field does not have, and a plateau broken differently puts the peak far away rather
+# than one step away — which is why the byte path's disagreements are measured in whole pixels while the
+# float path's are bit-exact. A byte-only comparison reports the sum of the two and cannot apportion it.
+#
+# **The reference against itself is the floor.** Handing the two templates the same information — the
+# captured bytes, and those same bytes widened to `Float32` — gives a disagreement that belongs to
+# neither implementation. At chip 96 on the S2A case that floor is 98.54% exact with a maximum of 7 px,
+# and AutoRIFT.jl sits *on* it against both paths. A rung cannot be asked to do better than the
+# reference reproducing itself, so the floor is what it is gated against.
+#
+# The grid is the reference's own captured coarse grid, not one rebuilt by `_coarse_points`: rebuilding
+# it measures the setup as well, which rung 3.6 already does separately, and on this case that
+# conflation read as 85% where the correlator alone reads 98.5%.
+function rungs_coarse_correlation(k::Capture, L::Int, chip::Int)
+    out = StageResult[]
+    xg = _state_coarse(k, "xGrid0C", L)
+    xg === nothing && return out
+    yg = _state_coarse(k, "yGrid0C", L)
+    srx = _state_coarse(k, "SearchLimitX0C", L, size(xg))
+    sry = _state_coarse(k, "SearchLimitY0C", L, size(xg))
+    dx0 = _state_coarse(k, "Dx0C", L, size(xg))
+    refdx = _state_coarse(k, "DxC", L, size(xg))
+    any(isnothing, (yg, srx, sry, dx0, refdx)) && return out
+    dy0 = _state_coarse(k, "Dy0C", L, size(xg))
+
+    p = params(; kwargs_from_capture(k)...)
+    n = size(xg)
+    pts = PointSet(Float64.(xg) .+ 1, Float64.(yg) .+ 1, Int.(srx), Int.(sry),
+                   Float64.(dx0), Float64.(dy0), fill(chip, n), fill(chip, n),
+                   zeros(Int, n), zeros(Int, n))
+    a = k.arrays["in_I1"]
+    b = k.arrays["in_I2"]
+    level = findfirst(r -> r.kind == "coarse" && r.chip_size[1] == Float64(chip), k.levels)
+
+    for (label, aa, bb) in (("UInt8", a, b), ("Float32", Float32.(a), Float32.(b)))
+        pair = AutoRIFT._prepare(ImagePair(bb, aa), p)
+        cd = AutoRIFT.run_pass(AutoRIFT.WholeScene(pair), deepcopy(pts), p,
+                               measure_at(p, L + 1), AutoRIFT.NoRefine())
+        both = 0; oj = 0; orf = 0; ex = 0
+        d = Float64[]
+        for i in eachindex(cd.dx, refdx)
+            mj = isnan(cd.dx[i]); mr = isnan(refdx[i])
+            mj && mr && continue
+            if mr
+                oj += 1
+            elseif mj
+                orf += 1
+            else
+                both += 1
+                δ = Float64(cd.dx[i]) - Float64(refdx[i])
+                push!(d, δ)
+                δ == 0 && (ex += 1)
+            end
+        end
+        ad = abs.(d)
+        frac = both == 0 ? 0.0 : ex / both
+        # Coverage is the gate: a coarse node the reference measured and this did not is a decision, and
+        # `exact` is reported beside it because the byte path's ties are not a position disagreement.
+        # The reference's own record says how many it measured, so a silent shape or grid error cannot
+        # pass as agreement.
+        refn = level === nothing ? count(!isnan, refdx) : k.levels[level].counts["measured"]
+        push!(out, StageResult("3.7 coarse correlation, $label",
+                               "DxC (reference measured $refn)",
+                               "coverage identical",
+                               oj == 0 && orf == 0 && count(!isnan, refdx) == refn, both,
+                               @sprintf("both %d, only jl %d, only ref %d; exact %.2f%%, median %.4g, p99 %.4g, max %.4g, bias %+.4g",
+                                        both, oj, orf, 100frac,
+                                        isempty(ad) ? 0.0 : median(ad),
+                                        isempty(ad) ? 0.0 : quantile(ad, 0.99),
+                                        isempty(ad) ? 0.0 : maximum(ad),
+                                        isempty(d) ? 0.0 : mean(d))))
+    end
+    return out
+end
+
+# A coarse-grid state of `name` at this level: the one on the coarse grid, which is the smallest shape
+# the level traced. `want` pins it when the name has states on more than one grid — `SearchLimitX0C` is
+# dumped both undecimated and decimated.
+function _state_coarse(k::Capture, name::AbstractString, L::Int, want = nothing)
+    revs = _revisions(k, name, L)
+    isempty(revs) && return nothing
+    want === nothing || return _state_shaped(k, name, L, want)
+    return k.stages[argmin(kk -> prod(size(k.stages[kk])), revs)]
 end
 
 # ---------------------------------------------------------------------------
