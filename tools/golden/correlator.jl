@@ -263,7 +263,20 @@ function compare_correlator(c::GoldenCase; n::Integer = 100)
         # here as a changed `sign` instead of as a silent bias.
         pos = _axis_stats(String(axis), jul, ref, +1)
         neg = _axis_stats(String(axis), jul, ref, -1)
-        pos.exact >= neg.exact ? pos : neg
+        # **Chosen on correlation, not on `exact`.** `exact` is zero for *both* signs whenever no point
+        # is quantized, which is every pair whose base chip size was skipped — on the golden L7 pair the
+        # reference resolves only chips 32 and 64, where both implementations replace the measurement
+        # with a bicubic resize and 0.03% of values land on any 1/N grid. The comparison then ties at
+        # zero, `>=` keeps `+1`, and the report shows `dy` at sign `+` with a −0.85 correlation and a
+        # 0.76 px bias: a flipped axis presented as a measured choice.
+        #
+        # Correlation is the right discriminant because it is what a sign error actually destroys — a
+        # near-perfect *anti*-correlation is a flipped sign and nothing else, which is why `_axis_stats`
+        # computes it. It is also defined wherever two points vary, so it does not collapse on an
+        # unquantized level the way `exact` does.
+        pick(a, b) = (isnan(a.correlation) ? -Inf : a.correlation) >=
+                     (isnan(b.correlation) ? -Inf : b.correlation) ? a : b
+        pick(pos, neg)
     end
 
     return (; time = t, overlap = (ny, nx), dx = stats[1], dy = stats[2],
