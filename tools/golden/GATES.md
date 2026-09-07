@@ -473,6 +473,29 @@ Reproducing the reference's rule on the same input admits 17,955 nodes against s
 the two masks agree on **94.27%** of the 67,600. That is the right shape for a fix but the wrong sign
 to explain this gap on its own — sampling admits *more* — so it wants measuring rather than assuming.
 
-**Next**: instrument `_undecimate_level` on the chip-96 level directly — how many of its 11,424
-measurements survive the `valid > 0.5 && isfinite` gate, and how many the merge then declines. That is
-one measurement, and it is the last unmeasured link between a level's raw coverage and what it posts.
+### The read-back measured, and what it leaves
+
+Instrumenting the chip-96 level directly closes the chain:
+
+| step | AutoRIFT.jl | reference |
+|---|---:|---:|
+| coarse nodes measured, on the 260² grid | **2,935** | **4,164** |
+| after the read-back to the full 1040² grid | 46,960 | — |
+| contributed to the merge | **1,516** | **4,033** |
+
+`_undecimate_level` spreads each coarse node over its whole `stride²` cell — 2,935 × 16 = 46,960
+exactly — and `_merge_level!` then keeps only the points no finer level claimed. The reference does the
+same two things (`autoRIFT.py:857-866`: `INTER_NEAREST` of `M0`, then `idxRaw = M0 & (ChipSizeX == 0)`),
+and its 4,164 coarse measurements yield 4,033 full-grid points because the finer levels have already
+claimed roughly fifteen of every sixteen. So the spread and the gate both match in kind.
+
+**The difference is upstream of both: the coarse pass measures 2,935 nodes where the reference measures
+4,164.** That is 70%, and it is what the remaining ~2,500 chip-96 points reduce to. The admission gate
+is ruled out — AutoRIFT.jl searches *more* coarse points there (5,575 against 4,164) — so the level is
+searching a wider set and succeeding on fewer, which points at the coarse correlation or its rejection
+on this scene rather than at any of the setup stages the ladder has verified exact.
+
+**Next**: compare the chip-96 coarse pass point by point against the reference's own `DxC` at that
+level, the way rung 3.7 does at the base level. The capture holds it (`DxC_rev0_L2`), and the two sides
+searched overlapping but different point sets, so the comparison has to be restricted to the
+intersection before the counts mean anything.
