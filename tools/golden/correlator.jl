@@ -104,13 +104,71 @@ function pointset_from_capture(k::Capture)
     chip0 = Int(k.scalars["ChipSize0X"])
     scale_y = Float64(k.scalars["ScaleChipSizeY"])
 
+    rx, ry = _level_search_limits(srx, sry, k)
+
     return PointSet(
         Float64.(xg) .+ 1, Float64.(yg) .+ 1,
-        Int.(srx), Int.(sry),
+        rx, ry,
         Float64.(dx0), Float64.(dy0),
         fill(chip0, size(xg)), fill(round(Int, chip0 * scale_y), size(xg)),
         Int.(csmin), Int.(csmax),
     )
+end
+
+"""
+    _level_search_limits(srx, sry, k) -> (rx, ry)
+
+The search radii the correlator is handed, which are **not** the ones the capture records.
+
+`runAutorift` rewrites them at the top of every level (`autoRIFT.py:598-602`) and it is the rewritten
+array the correlator sees:
+
+```python
+idxZero = (SearchLimitX0 <= 0) | (SearchLimitY0 <= 0)
+SearchLimitX0[idxZero] = 0
+SearchLimitY0[idxZero] = 0
+SearchLimitX0[~idxZero & (SearchLimitX0 < minSearch)] = minSearch
+```
+
+Two rules, and each changes which window is searched:
+
+  * **Either axis zero zeroes both.** A point wanting 5 across and 0 down is skipped entirely, not
+    searched as a horizontal line.
+  * **A nonzero radius below `minSearch` is raised to it.** A point asking for 1 searches at 6.
+
+Skipping this is not a small effect: 944,036 points on the golden Landsat case carry a radius that
+differs from the captured one, by up to 23. And it biases a comparison in a way that looks like the
+opposite of its cause — the rewritten points are the *small*-radius ones, so agreement appears best
+where the radius is smallest, which reads as the large radii being at fault.
+
+`minSearch` comes from the capture when present. A capture taken before it was recorded falls back to
+the reference's own default with a warning, since silently using a wrong floor reproduces exactly the
+bug this function exists to fix.
+"""
+function _level_search_limits(srx, sry, k::Capture)
+    minsearch = if haskey(k.scalars, "minSearch")
+        Int(k.scalars["minSearch"])
+    else
+        @warn "capture predates `minSearch` being recorded; using the reference's default of 6 " *
+              "(`autoRIFT.py:946`). Redo the capture with `--force` to take it from the run."
+        6
+    end
+
+    rx = Int.(srx)
+    ry = Int.(sry)
+    out_x = similar(rx)
+    out_y = similar(ry)
+    @inbounds for i in eachindex(rx, ry)
+        x, y = rx[i], ry[i]
+        if x <= 0 || y <= 0
+            out_x[i] = 0
+            out_y[i] = 0
+        else
+            out_x[i] = max(x, minsearch)
+            out_y[i] = max(y, minsearch)
+        end
+    end
+    return out_x, out_y
 end
 
 """

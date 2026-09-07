@@ -42,6 +42,11 @@ SCALARS = (
     'OverSampleRatio', 'WallisFilterWidth', 'MultiThread',
     'BuffDistanceC', 'CoarseCorCutoff', 'sparseSearchSampleRate',
     'DataTypeInput', 'ChipSizeMaxXInput', 'preproc_filt_width',
+    # `minSearch` is the floor the level loop applies to every nonzero search limit
+    # (`autoRIFT.py:598-602`), so the radius the correlator receives is not the radius this capture
+    # records in `in_SearchLimitX` — a point asking for 1 searches at 6. Without this scalar the Julia
+    # side cannot reconstruct what the correlator was actually handed.
+    'minSearch',
 )
 
 # Arrays to take before the call: the filtered pair, the grid, the priors, the per-point limits.
@@ -267,6 +272,14 @@ def install_stage_trace(manifest, level=1):
     state = {'level': 0}
     stages = manifest.setdefault('stages', {})
 
+    # Arrays that are rebound or mutated in place, and whose *later* state is what a downstream stage
+    # consumes. `SearchLimitX0` is built at `:599`, read by the coarse pass at `:629`, then zeroed
+    # against the coarse mask at `:724` before the fine pass reads it — three distinct values in one
+    # name. Dumping only the first hides the handoff the trace exists to check, so these are dumped
+    # every time the bytes change, numbered in order.
+    REDUMP = ('SearchLimitX0', 'SearchLimitY0', 'Dx', 'Dy', 'ChipSizeX', 'InterpMask')
+    revs = {}
+
     def tracer(frame, event, arg):
         if event == 'call':
             return tracer if frame.f_code.co_name == 'autorift' else None
@@ -275,7 +288,12 @@ def install_stage_trace(manifest, level=1):
         loc = frame.f_locals
         # `i` is the chip-size loop variable; it advances once per level.
         if 'i' in loc and isinstance(loc['i'], (int, np.integer)):
-            state['level'] = int(loc['i'])
+            new = int(loc['i'])
+            if new != state['level']:
+                # A name still bound from the previous iteration is not this level's value, so the
+                # change detector is cleared at the boundary rather than carrying a stale signature in.
+                revs.clear()
+            state['level'] = new
         if state['level'] != level:
             return tracer
         for name in STAGE_LOCALS:
@@ -283,13 +301,30 @@ def install_stage_trace(manifest, level=1):
             if not isinstance(v, np.ndarray) or v.ndim != 2:
                 continue
             key = '%s_L%d' % (name, level)
-            if key in seen:
+            if name in REDUMP:
+                # Cheap change detector: a sum over the raw bytes. A false negative would drop a
+                # revision, and for these arrays the changes are wholesale zeroing, which no plausible
+                # collision hides.
+                sig = (int(v.sum()) if v.dtype != np.bool_ else int(v.sum()), int(v.size))
+                if revs.get(name) == sig:
+                    continue
+                revs[name] = sig
+                n = sum(1 for kk in stages
+                        if kk.startswith(name + '_rev') and kk.endswith('_L%d' % level))
+                key = '%s_rev%d_L%d' % (name, n, level)
+            elif key in seen:
                 continue
             a = v.view(np.uint8) if v.dtype == np.bool_ else v
             if a.dtype.str not in xchg.TAGS:
                 continue
             seen[key] = True
-            stages[key] = _write('stage_' + key, np.ascontiguousarray(a))
+            # `.copy()`, not `ascontiguousarray`: that returns the *same* buffer for an array which is
+            # already contiguous, so a later in-place write reaches the dumped bytes. `SearchLimitX0`
+            # is mutated at `autoRIFT.py:724` — zeroed wherever the coarse mask rejected — long after
+            # this dump, and without a copy the file ends up holding the post-mutation state while
+            # claiming to be the value the coarse pass consumed. That misattributed 420 coarse radii to
+            # a reducer difference when the arrays were simply from different moments.
+            stages[key] = _write('stage_' + key, np.ascontiguousarray(a).copy())
             print('[capture] stage %s %s %s' % (key, a.dtype.str, a.shape), flush=True)
         return tracer
 
