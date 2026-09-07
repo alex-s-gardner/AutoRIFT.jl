@@ -687,19 +687,50 @@ end
 function rungs_filter_params(k::Capture, L::Int)
     p = params(; kwargs_from_capture(k)...)
     out = StageResult[]
-    # The level's two `filtDisp` calls, in order: coarse then fine. A level that `continue`d out
-    # before its fine pass has only one, and a level that never ran has none.
-    calls = [r for r in k.levels if r.kind == "filtDisp"]
-    # Two calls per level that resolved, coarse first.
-    idx = 2L + 1
-    if length(calls) < idx + 1
-        return [StageResult("3.8 filter parameters", "filtDisp", "exact", false, 0,
-                            "capture holds $(length(calls)) filtDisp records; level $L needs $(idx + 1)")]
-    end
+    # **A level's `filtDisp` calls are found by grid shape, not by counting two per level.** A level
+    # whose coarse pass falls below `CoarseCorCutoff` `continue`s out (`autoRIFT.py:704-706`) and never
+    # runs a fine pass, so it contributes *one* record — and every later level's index shifts. On the
+    # golden L7 pair the base level does exactly that: 102 of 20,525 coarse points survive, 0.50%
+    # against a 1% cutoff, and both implementations agree to skip it. Indexing at `2L + 1` then compares
+    # the *coarse* filter against the fine filter's parameters and reports a difference that is entirely
+    # the harness's.
+    #
+    # The coarse record is on the level's decimated coarse grid and the fine record on its level grid, so
+    # the shapes name them. `nothing` for a pass that did not run, and the rung says so rather than
+    # inventing a comparison.
+    # **Shape alone is ambiguous across levels, so the search is bounded to this level's own records.**
+    # A coarse grid at one level can have the same shape as a *fine* grid several levels up: on the golden
+    # Landsat case level 0's coarse grid is 293x292 and level 3's fine grid is 293x292 too, since both are
+    # the full grid divided by 8. Searching the whole list picks whichever matched last and compares the
+    # coarse filter against fine parameters.
+    #
+    # `k.levels` is in call order, so this level's records are the ones between the correlator calls that
+    # carry its chip size — and the coarse record precedes the fine one within that span.
+    coarse_shape = size(_state_coarse(k, "xGrid0C", L))
+    level_shape = size(_consumed_grid(k, "xGrid0", L))
+    chip_here = Float64(Int(k.scalars["ChipSize0X"]) << L)
+    span = findall(r -> r.kind != "filtDisp" && r.chip_size[1] == chip_here, k.levels)
+    lo = isempty(span) ? 1 : first(span)
+    # Up to the next level's first correlator call, so a shape shared with a later level cannot be reached.
+    nxt = findfirst(i -> i > lo && k.levels[i].kind != "filtDisp" &&
+                         k.levels[i].chip_size[1] != chip_here, eachindex(k.levels))
+    hi = nxt === nothing ? length(k.levels) : nxt - 1
+    mine = k.levels[lo:hi]
+    calls = [r for r in mine if r.kind == "filtDisp"]
+    coarse_call = findfirst(r -> r.grid_shape == coarse_shape, calls)
+    fine_call = findfirst(r -> r.grid_shape == level_shape, calls)
     coarse_ratio = AutoRIFT._oversample(p)
-    for (label, call, filt) in
-        (("coarse", calls[idx], rescale(relax(p.outliers), coarse_ratio, p.coarse_stride)),
-         ("fine", calls[idx + 1], rescale(p.outliers, coarse_ratio)))
+    if fine_call === nothing
+        push!(out, StageResult("3.8 filter parameters, fine", "filtDisp", "level ran no fine pass",
+                               true, 0,
+                               "the coarse pass fell below CoarseCorCutoff, so this level was skipped " *
+                               "on both sides — rung 3.9 is where that agreement is gated"))
+    end
+    for (label, ci, filt) in
+        (("coarse", coarse_call, rescale(relax(p.outliers), coarse_ratio, p.coarse_stride)),
+         ("fine", fine_call, rescale(p.outliers, coarse_ratio)))
+        ci === nothing && continue
+        call = calls[ci]
         got = (window(filt), filt.min_agree_fraction, filt.iterations)
         want = (call.counts["filt_width"], call.oversample, call.counts["iterations"])
         ref_frac = call.frac_valid
