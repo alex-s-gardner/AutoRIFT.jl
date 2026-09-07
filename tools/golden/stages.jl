@@ -36,8 +36,8 @@ include("intermediate.jl")
 include("correlator.jl")
 
 using AutoRIFT
-using AutoRIFT: PointSet, windowmax, windowmean, windowrange, sanitize!, rebuild,
-                params, extent
+using AutoRIFT: PointSet, windowmax, windowmean, windowrange, windowmedian, sanitize!,
+                rebuild, params, extent, rescale, relax, window, DisplacementField, Params
 using Printf, Statistics
 
 # ---------------------------------------------------------------------------
@@ -211,16 +211,14 @@ One traced array, by its bare name. Errors rather than returning `nothing` when 
 a stage silently skipped is a rung the ladder reports as green.
 """
 function stage(k::Capture, name::AbstractString, level::Integer)
-    key = "$(name)_L$(level)"
-    haskey(k.stages, key) && return k.stages[key]
-    # A name in `REDUMP` is written with a revision index instead, and *which* revision a stage
-    # consumes is the question — `SearchLimitX0` holds three distinct values under one name. So a
-    # bare lookup that finds only revisions is an error naming them rather than a guess at one.
-    revs = sort!([kk for kk in keys(k.stages) if occursin(Regex("^$(name)_rev\\d+_L$(level)\$"), kk)])
-    isempty(revs) && error("no stage `$key` in this capture; traced: " *
+    revs = _revisions(k, name, level)
+    isempty(revs) && error("no stage `$(name)_L$(level)` in this capture; traced: " *
                            join(sort!(collect(keys(k.stages))), ", "))
-    error("`$name` is mutated in place, so it has revisions rather than one value: " *
-          join(revs, ", ") * ". Ask for the revision the consuming stage reads.")
+    # One state, so there is nothing to choose. More than one and the choice *is* the question — which
+    # state a downstream stage consumes — so this refuses rather than guessing, and names them.
+    length(revs) == 1 && return k.stages[only(revs)]
+    error("`$name` has $(length(revs)) states at level $level: " * join(revs, ", ") *
+          ". Ask for the one the consuming stage reads, by the property that identifies it.")
 end
 
 stage_rev(k::Capture, name::AbstractString, rev::Integer, level::Integer) =
@@ -249,12 +247,51 @@ function ladder(c::GoldenCase; n::Integer = 100, stop_on_red::Bool = true)
     push!(out, rung_search_rewrite(k, L, minsearch))
     push!(out, rung_priors(k, L, chip, chip0, spacing))
     append!(out, rungs_coarse_sampling(k, L, chip))
+    append!(out, rungs_filter_params(k, L))
+    append!(out, rungs_fill(k, L))
+    append!(out, rungs_merge(k, L, chip, chip0))
 
     if stop_on_red
         i = findfirst(r -> !r.passed, out)
         i === nothing || (out = out[1:i])
     end
     return out
+end
+
+# The grid state the correlator actually consumed, selected by the property that identifies it rather
+# than by a revision number.
+#
+# Above the base chip size the reference rebinds `xGrid0` twice in three lines — `cv2.resize` builds it
+# and the even-chip snap replaces it with `round(x + 0.5) - 0.5` (`autoRIFT.py:509-530`) — and it is the
+# snapped grid the coarse and fine passes read. The two are distinguishable without knowing the order
+# they were written in: **every non-zero coordinate of the snapped grid is a half-integer**, where the
+# resize leaves quarter-fractions. `correlator.jl` already errors on a grid that fails this test, for the
+# same reason and against the same convention.
+#
+# Selecting by the property rather than by `rev1` is what keeps this correct when the trace's dump order
+# changes. Comparing against the pre-snap state instead reports 47.8% of the grid differing while the
+# interpolation agrees to the bit — the difference is entirely `20.75` against `20.5`.
+function _consumed_grid(k::Capture, name::AbstractString, L::Int)
+    cands = String[]
+    key = "$(name)_L$L"
+    haskey(k.stages, key) && push!(cands, key)
+    append!(cands, sort!([kk for kk in keys(k.stages)
+                         if occursin(Regex("^$(name)_rev\\d+_L$L\$"), kk)],
+                        by = kk -> parse(Int, match(r"rev(\d+)_", kk).captures[1])))
+    isempty(cands) && error("no `$name` at level $L in this capture")
+    for kk in cands
+        nz = filter(!iszero, vec(Float64.(k.stages[kk])))
+        isempty(nz) && continue
+        all(≈(0.5), nz .- floor.(nz)) && return k.stages[kk]
+    end
+    # No candidate is on the half-integer convention. At the base chip size that is expected only if the
+    # capture predates the grid rewrite, which `pointset_from_capture` already rejects; above it, it
+    # means the snap did not run and the reader should know rather than silently compare.
+    error("no state of `$name` at level $L is on the half-integer convention the correlator uses; " *
+          "candidates " * join(cands, ", ") * ". Fractional parts of the last: " *
+          string(sort(unique(let v = filter(!iszero, vec(Float64.(k.stages[last(cands)])))
+                                 v .- floor.(v)
+                             end))))
 end
 
 # ---------------------------------------------------------------------------
@@ -273,19 +310,45 @@ end
 # `stride`-th point and shifting to the cell centre (`_decimate_level`, `_cell_centres`). Those two
 # reach the same place by different routes, so the rung compares the positions rather than the method.
 function rung_grid(k::Capture, L::Int, chip::Int, chip0::Int)
-    xg0 = stage(k, "xGrid0", L)
+    xg0 = _consumed_grid(k, "xGrid0", L)
     if L == 0
         return exact_stage("3.1 grid, base level", "xGrid0", k.arrays["in_xGrid"], xg0)
     end
+    # **AutoRIFT.jl decimates where the reference resizes, and the two reach different positions by
+    # design.** The reference builds its grid with `INTER_AREA` and snaps to `round(x + 0.5) - 0.5`,
+    # which averages `stride` coordinates and lands on the cell's centre; `_decimate_level` takes every
+    # `stride`-th point and shifts it to the same centre (`_cell_centres`). Those agree in the interior
+    # and cannot agree at the grid's zero margin, where the reference averages real coordinates with the
+    # zeros the driver wrote and AutoRIFT.jl does not.
+    #
+    # So the gate is the interior, and the margin is counted rather than tolerated: a position
+    # difference there changes which pixels a chip covers, and `src/multichip.jl` records that
+    # self-consistency between correlation position and read-back is what the accuracy depends on —
+    # not agreement with either half of the reference separately.
     stride = chip ÷ chip0
     full = pointset_from_capture(k)
     sub = AutoRIFT._decimate_level(full, trues(size(full)), stride)
     sub === nothing && return StageResult("3.1 grid, level $L", "xGrid0", "exact", false, 0,
                                           "AutoRIFT.jl decimated to nothing at stride $stride")
-    # The reference's grid is 0-based and AutoRIFT.jl's 1-based, so the comparison subtracts the
-    # index base rather than comparing raw coordinates. `pointset_from_capture` added it.
-    return exact_stage("3.1 grid, level $L", "xGrid0",
-                       Float32.(sub.grid.x .- 1), xg0)
+    jl = Float32.(sub.grid.x .- 1)
+    size(jl) == size(xg0) || return StageResult("3.1 grid, level $L", "xGrid0", "exact", false, 0,
+        "shape $(size(jl)) against reference $(size(xg0)) — AutoRIFT.jl's decimation and the " *
+        "reference's resize disagree about the level's grid size")
+    # A point is on the zero margin if the reference averaged any zero into it, which is exactly where
+    # the two constructions cannot coincide.
+    interior = 0; agree = 0; margin = 0
+    for i in eachindex(jl, xg0)
+        if iszero(xg0[i])
+            margin += 1
+        else
+            interior += 1
+            jl[i] == xg0[i] && (agree += 1)
+        end
+    end
+    frac = interior == 0 ? 0.0 : agree / interior
+    return StageResult("3.1 grid, level $L", "xGrid0", "interior exact", frac >= 1.0, interior,
+                       @sprintf("interior %d, agree %d (%.4f%%); zero margin %d excluded",
+                                interior, agree, 100frac, margin))
 end
 
 # ---------------------------------------------------------------------------
@@ -308,15 +371,41 @@ end
 # by up to 23 pixels, and biases the comparison opposite to its cause, since the rewritten points are
 # the small-radius ones.
 function rung_search_rewrite(k::Capture, L::Int, minsearch::Int)
-    before_x = stage_rev(k, "SearchLimitX0", 0, L)
-    before_y = stage_rev(k, "SearchLimitY0", 0, L)
-    after_x = stage_rev(k, "SearchLimitX0", 1, L)
+    # The two states this rung is about, chosen by *shape* rather than by revision number. Above the
+    # base chip size the resize rebinds the name, so `rev0` still holds the previous level's full-grid
+    # array and the first value this level computed is a later revision — the level's own grid size is
+    # what identifies them.
+    # **The two states are identified by content, not by position.** The rewrite raises every nonzero
+    # radius to at least `minSearch`, so the state *before* it has nonzero values below `minSearch` and
+    # the state *after* does not — and the pair to compare is the last pre-rewrite state with the first
+    # post-rewrite one. Selecting by revision index instead picks whichever the trace happened to write
+    # in those slots: at level 1 the sequence is rev1 and rev2 pre-rewrite, rev3 and rev4 after, so
+    # `(rev1, rev2)` compares two pre-rewrite states and reports 22.6% differing.
+    want = size(_consumed_grid(k, "xGrid0", L))
+    revs = [kk for kk in _revisions(k, "SearchLimitX0", L) if size(k.stages[kk]) == want]
+    below(kk) = any(v -> 0 < v < minsearch, k.stages[kk])
+    pre = findlast(below, revs)
+    post = pre === nothing ? nothing : findfirst(i -> !below(revs[i]), (pre + 1):length(revs))
+    (pre === nothing || post === nothing) && return StageResult(
+        "3.5 search-limit rewrite", "SearchLimitX0", "exact", false, 0,
+        "no pre/post-`minSearch` pair among " *
+        join(["$kk min-nonzero $(minimum(filter(!iszero, vec(k.stages[kk])); init = 0.0f0))"
+              for kk in revs], ", "))
+    after_key = revs[pre + post]
+    before_x = k.stages[revs[pre]]
+    after_x = k.stages[after_key]
+    # `SearchLimitY0` is rewritten in the same statement, so its matching state is the one at the same
+    # index — but its revision count can differ, since the trace numbers each name independently.
+    yrevs = [kk for kk in _revisions(k, "SearchLimitY0", L) if size(k.stages[kk]) == want]
+    ybelow(kk) = any(v -> 0 < v < minsearch, k.stages[kk])
+    ypre = findlast(ybelow, yrevs)
+    before_y = k.stages[ypre === nothing ? first(yrevs) : yrevs[ypre]]
 
-    pts = rebuild(pointset_from_capture(k);
-                  radius_x = Int.(before_x), radius_y = Int.(before_y))
+    pts = PointSet(zeros(want), zeros(want), Int.(before_x), Int.(before_y),
+                   zeros(want), zeros(want), fill(1, want), fill(1, want),
+                   zeros(Int, want), zeros(Int, want))
     sanitize!(pts, minsearch)
-    return exact_stage("3.5 search-limit rewrite", "SearchLimitX0_rev1",
-                       Float32.(pts.radius_x), after_x)
+    return exact_stage("3.5 search-limit rewrite", after_key, Float32.(pts.radius_x), after_x)
 end
 
 # ---------------------------------------------------------------------------
@@ -335,18 +424,114 @@ end
 # At the base chip size there is no decimation and the three are copies, so this rung asserts that —
 # a level that widened its own base radius would be searching a window the reference does not.
 function rung_priors(k::Capture, L::Int, chip::Int, chip0::Int, spacing::Int)
-    dx00 = stage(k, "Dx00", L)
+    dx00 = _integral_state(k, "Dx00", L)
     if L == 0
         return exact_stage("3.4 prior, base level", "Dx00", k.arrays["in_Dx0"], dx00)
     end
+    # The reference reduces with `colfilt(Dx0, (1/Scale, 1/Scale), 2)` — a NaN-aware mean over the cell
+    # — then resizes with `INTER_NEAREST` and rounds (`autoRIFT.py:568-586`). So the comparison is the
+    # reduced field sampled at the level's nodes, and `windowmean` is the reducer Gate 2 pinned against
+    # `colfilt` option 2.
     stride = chip ÷ chip0
     mx = windowmean(k.arrays["in_Dx0"], stride)
-    # The reference resizes the reduced field with `INTER_NEAREST` and rounds
-    # (`autoRIFT.py:585-586`), so the comparison is on the reduced values at the decimated nodes.
     rows = 1:stride:size(mx, 1)
     cols = 1:stride:size(mx, 2)
-    return exact_stage("3.4 prior, level $L", "Dx00",
-                       Float32.(round.([mx[i, j] for i in rows, j in cols])), dx00)
+    jl = Float32.(round.([mx[i, j] for i in rows, j in cols]))
+    size(jl) == size(dx00) || return StageResult("3.4 prior, level $L", "Dx00", "exact", false, 0,
+        "shape $(size(jl)) against reference $(size(dx00)) — the trace recorded `Dx00` on a " *
+        "different grid than this level's, so the two are not the same quantity")
+    return exact_stage("3.4 prior, level $L", "Dx00", jl, dx00)
+end
+
+# The `PointSet` this level's coarse pass runs on, built from the level's own traced arrays.
+#
+# At the base chip size that is the capture's own grid. Above it the reference has resized everything by
+# `ChipSize0X / chip` (`autoRIFT.py:509-586`), and taking the full grid instead compares a 2344-wide
+# array against an 1172-wide one — a `BoundsError` if you are lucky and a wrong answer if the shapes
+# happen to admit the index.
+#
+# The radii come from the first revision whose shape is this level's, not from `rev0`: the resize
+# rebinds the name, so at a level above the base `rev0` still holds the previous level's full-grid
+# array. Selecting by shape states that requirement rather than encoding a revision count that shifts
+# with the level.
+function _level_pointset(k::Capture, L::Int, chip::Int, p::Params)
+    full = pointset_from_capture(k)
+    L == 0 && return AutoRIFT._level_points(full, p, extent(chip), trues(size(full)))
+
+    xg = _consumed_grid(k, "xGrid0", L)
+    yg = _consumed_grid(k, "yGrid0", L)
+    # The post-`minSearch` state, which is what the coarse pass's `colfilt` reduces and what the
+    # correlator receives. Identified by content — no nonzero value below `minSearch` — rather than by
+    # revision index, for the reason rung 3.5 records.
+    minsearch = Int(k.scalars["minSearch"])
+    sx = _post_rewrite(k, "SearchLimitX0", L, size(xg), minsearch)
+    sy = _post_rewrite(k, "SearchLimitY0", L, size(xg), minsearch)
+    # The **rounded** prior, which is what the coarse slice and the fine pass both read
+    # (`autoRIFT.py:585-586`). Identified by its values being integral: the pre-round state carries the
+    # cell mean's quarter-fractions. The prior displaces the chip and `chip_bounds` floors the displaced
+    # centre, so a half-pixel prior moves the chip a whole pixel.
+    dx0 = _integral_state(k, "Dx00", L)
+    dy0 = _integral_state(k, "Dy00", L)
+    # `Dx00` is traced on the full grid here, so it is reduced onto the level's lattice the way the
+    # reference builds it: a NaN-aware cell mean, `INTER_NEAREST` back to the level's shape, and
+    # **rounded** (`autoRIFT.py:568-586`). The rounding is not cosmetic — the prior displaces the chip,
+    # and `chip_bounds` floors the displaced centre, so a half-pixel prior moves the chip by a pixel.
+    # Omitting it puts 360 of 21,316 coarse points a half pixel from where the reference put them.
+    if size(dx0) != size(xg)
+        stride = size(dx0, 1) ÷ size(xg, 1)
+        rows = 1:stride:size(dx0, 1)
+        cols = 1:stride:size(dx0, 2)
+        dx0 = round.(windowmean(dx0, stride)[rows, cols][1:size(xg, 1), 1:size(xg, 2)])
+        dy0 = round.(windowmean(dy0, stride)[rows, cols][1:size(xg, 1), 1:size(xg, 2)])
+    end
+    n = size(xg)
+    return PointSet(
+        Float64.(xg) .+ 1, Float64.(yg) .+ 1,
+        Int.(sx), Int.(sy),
+        Float64.(dx0), Float64.(dy0),
+        fill(chip, n), fill(chip, n),
+        zeros(Int, n), zeros(Int, n),
+    )
+end
+
+# The state of `name` at this level whose values are all integers, which is the reference's `round`ed
+# form. `Dx00` is built by a cell mean and then rounded (`autoRIFT.py:585-586`), so the two states are
+# told apart by their fractional parts rather than by which was written first.
+function _integral_state(k::Capture, name::AbstractString, L::Int)
+    revs = _revisions(k, name, L)
+    isempty(revs) && error("no `$name` at level $L")
+    for kk in revs
+        all(v -> isnan(v) || v == round(v), k.stages[kk]) && return k.stages[kk]
+    end
+    # At the base chip size the prior is copied unchanged and may legitimately be fractional, so the
+    # last state is the answer there rather than an error.
+    return k.stages[last(revs)]
+end
+
+# The first state of `name` at this level, on grid `want`, that the `minSearch` rewrite has already
+# been applied to: no nonzero value below `minSearch` (`autoRIFT.py:596-602`). That is the array the
+# coarse reduction and the correlator both read.
+function _post_rewrite(k::Capture, name::AbstractString, L::Int, want::Tuple{Int,Int}, minsearch::Int)
+    revs = [kk for kk in _revisions(k, name, L) if size(k.stages[kk]) == want]
+    isempty(revs) && error("no state of `$name` at level $L on grid $want")
+    for kk in revs
+        any(v -> 0 < v < minsearch, k.stages[kk]) || return k.stages[kk]
+    end
+    error("every state of `$name` at level $L still has a nonzero radius below minSearch=$minsearch; " *
+          "the rewrite was expected to have run before the coarse pass")
+end
+
+# The first revision of `name` at this level whose shape is `want`, or the unversioned array.
+function _level_revision(k::Capture, name::AbstractString, L::Int, want::Tuple{Int,Int})
+    key = "$(name)_L$L"
+    haskey(k.stages, key) && size(k.stages[key]) == want && return k.stages[key]
+    revs = sort!([kk for kk in keys(k.stages) if occursin(Regex("^$(name)_rev\\d+_L$L\$"), kk)],
+                 by = kk -> parse(Int, match(r"rev(\d+)_", kk).captures[1]))
+    for kk in revs
+        size(k.stages[kk]) == want && return k.stages[kk]
+    end
+    error("no revision of `$name` at level $L has shape $want; have " *
+          join(["$kk $(size(k.stages[kk]))" for kk in revs], ", "))
 end
 
 # ---------------------------------------------------------------------------
@@ -367,9 +552,18 @@ end
 # This rung is *not* crop-safe: which fine points the lattice lands on depends on the grid's extent, so
 # a sub-window samples a different set and the comparison would be against the wrong nodes.
 function rungs_coarse_sampling(k::Capture, L::Int, chip::Int)
-    pts = pointset_from_capture(k)
     p = params(; kwargs_from_capture(k)...)
-    lp = AutoRIFT._level_points(pts, p, extent(chip), trues(size(pts)))
+    # **This level's grid, not the full one.** Above the base chip size the reference resizes by
+    # `ChipSize0X / chip` and everything after that runs on the resized grid — at chip 32 the grid is
+    # 1172x1168 against the full 2344x2336. So the points handed to the coarse setup have to be this
+    # level's, and the level's own traced arrays are what supply them: the resized grid, and the radii
+    # and priors as the level rewrote them.
+    #
+    # `SearchLimitX0_rev0` is the *leftover* full-grid value at a level above the base, because the
+    # resize rebinds the name — `rev1` is the first value this level computed. Selecting by shape rather
+    # than by revision number states the requirement instead of encoding a count that changes with the
+    # level.
+    lp = _level_pointset(k, L, chip, p)
     setup = AutoRIFT._coarse_points(lp, p, extent(chip))
     setup === nothing && return [StageResult("3.6 coarse sampling", "xGrid0C", "exact", false, 0,
                                             "AutoRIFT.jl found no coarse grid at this level")]
@@ -393,6 +587,222 @@ function rungs_coarse_sampling(k::Capture, L::Int, chip::Int)
         push!(out, exact_stage("3.6c coarse prior $axis", refname, Float32.(jl), stage(k, refname, L)))
     end
     return out
+end
+
+# ---------------------------------------------------------------------------
+# 3.8 / 3.13 — the outlier filter's parameters
+# ---------------------------------------------------------------------------
+#
+# `autorift()` derives two filters from one parameter set (`autoRIFT.py:484-505`): `DispFiltC` for the
+# coarse pass, loosened for the decimation, and `DispFiltF` for the fine pass. AutoRIFT.jl's `relax`
+# and `rescale` reproduce those derivations, and this rung checks the *results* against the reference's
+# own `filtDisp` records rather than re-deriving the formula on this side.
+#
+# Worth a rung because a parameter mismatch and a reducer mismatch are indistinguishable in the mask
+# they produce, and a comparison of masks alone would attribute one to the other. The reference reports
+# `FiltWidth`, `FracValid` and `Iter` per call, so this is a direct read.
+function rungs_filter_params(k::Capture, L::Int)
+    p = params(; kwargs_from_capture(k)...)
+    out = StageResult[]
+    # The level's two `filtDisp` calls, in order: coarse then fine. A level that `continue`d out
+    # before its fine pass has only one, and a level that never ran has none.
+    calls = [r for r in k.levels if r.kind == "filtDisp"]
+    # Two calls per level that resolved, coarse first.
+    idx = 2L + 1
+    if length(calls) < idx + 1
+        return [StageResult("3.8 filter parameters", "filtDisp", "exact", false, 0,
+                            "capture holds $(length(calls)) filtDisp records; level $L needs $(idx + 1)")]
+    end
+    coarse_ratio = AutoRIFT._oversample(p)
+    for (label, call, filt) in
+        (("coarse", calls[idx], rescale(relax(p.outliers), coarse_ratio, p.coarse_stride)),
+         ("fine", calls[idx + 1], rescale(p.outliers, coarse_ratio)))
+        got = (window(filt), filt.min_agree_fraction, filt.iterations)
+        want = (call.counts["filt_width"], call.oversample, call.counts["iterations"])
+        ref_frac = call.frac_valid
+        ok = got[1] == want[1] && got[3] == want[3] && isapprox(got[2], ref_frac; atol = 1e-6)
+        push!(out, StageResult("3.8 filter parameters, $label", "filtDisp", "exact", ok, 1,
+                               @sprintf("width %d/%d, frac %.4f/%.4f, iterations %d/%d (julia/reference)",
+                                        got[1], want[1], got[2], ref_frac, got[3], want[3])))
+    end
+    return out
+end
+
+# ---------------------------------------------------------------------------
+# 3.14 / 3.15 — the median field and the three-pass hole fill
+# ---------------------------------------------------------------------------
+#
+# The reference nulls its rejected points, takes one `fillFiltWidth`-wide median of what remains, and
+# then fills for three passes from *that* field (`autoRIFT.py:764-808`):
+#
+#     DxF[~M0] = nan
+#     DxFM = colfilt(DxF, (fillFiltWidth, fillFiltWidth), 3)      # once, before the loop
+#     MM = ~isnan(DxFM)
+#     for j in range(3):
+#         foo  = MF | M0
+#         foo1 = (filter2D(foo, ones(3,3)) >= 6) | foo             # area closing
+#         fillIdx = ~bwareaopen(~foo1, 5) & ~foo & MM              # or a small component
+#         MF[fillIdx] = True; DxF[fillIdx] = DxFM[fillIdx]
+#
+# Both rungs feed AutoRIFT.jl the reference's own inputs: `DxF` from the level record and `M0` from the
+# `filtDisp` record, so the rejection is taken from the reference and only the fill is under test.
+#
+# **`DxFM` is computed once, outside the loop.** Every pass therefore fills from the median of the
+# *original* field, and a point filled in pass 1 does not change what pass 2 fills with. `_fill_holes!`
+# recomputes its median per pass over the progressively filled field, so a second-pass fill there sees
+# first-pass values. That is a real difference in the values filled — not in which points are filled —
+# and the rung measures it rather than asserting either behaviour.
+function rungs_fill(k::Capture, L::Int)
+    p = params(; kwargs_from_capture(k)...)
+    out = StageResult[]
+
+    # `DxF`, `DyF` and `MF` are mutated in place by the fill, so the trace numbers their revisions and a
+    # consumer has to name the one it wants. `rev0` is the state before the fill: the raw correlator
+    # output for `DxF`, and all-zero for `MF`.
+    dxf_key = haskey(k.stages, "DxF_rev0_L$L") ? "DxF_rev0_L$L" : "DxF_L$L"
+    haskey(k.stages, dxf_key) || return out
+
+    # **`rev0` of `DxF` is the value *before* `DxF[~M0] = nan`.** `DxF` is bound by the correlator at
+    # `:735`, so the first state on disk is the raw fine measurement, while the reference medians the
+    # field *after* `filtDisp` has nulled the rejected points (`autoRIFT.py:764-773`). Medianing the raw
+    # field compares two different inputs: it reports 23.6% of `DxFM` differing, entirely because
+    # AutoRIFT.jl sees neighbours the reference has already thrown away.
+    #
+    # The `filtDisp` record supplies the mask that closes the gap. Two calls per resolved level, coarse
+    # first, so the fine pass is the second — and its `kept` count is checked against the nulling to
+    # confirm the right record was taken rather than assumed.
+    dxf = copy(k.stages[dxf_key])
+    dyf = copy(k.stages[replace(dxf_key, "Dx" => "Dy")])
+
+    # The `filtDisp` record for *this level's fine pass*, chosen by grid shape rather than by a
+    # positional index. A level that `continue`d out before its fine pass contributes fewer records than
+    # the two a resolved level does, so `2L + 2` is not reliably its index — and the fine pass is the one
+    # whose grid matches this level's `DxF`.
+    fine = [r for r in k.levels if r.kind == "filtDisp" && r.grid_shape == size(dxf)]
+    isempty(fine) && return [StageResult("3.13 fine rejection", "filtDisp", "exact", false, 0,
+        "no filtDisp record on this level's $(size(dxf)) grid; shapes present: " *
+        join(unique(r.grid_shape for r in k.levels if r.kind == "filtDisp"), ", "))]
+    fine_filt = last(fine)
+    kept = fine_filt.arrays["kept"] .!= 0
+    dxf[.!kept] .= NaN32
+    dyf[.!kept] .= NaN32
+    push!(out, StageResult("3.13 fine rejection", "filtDisp kept", "count matches",
+                           count(!isnan, dxf) == fine_filt.counts["kept"],
+                           count(kept),
+                           @sprintf("kept %d of %d; nulled field has %d valid",
+                                    fine_filt.counts["kept"], fine_filt.counts["in_mask"],
+                                    count(!isnan, dxf))))
+
+    # The reference's `MM`: where its one-shot median exists. This gates every fill, so a difference
+    # here bounds everything downstream.
+    fillw = Int(get(k.scalars, "fillFiltWidth", 3))
+    jl_dxfm = windowmedian(dxf, fillw)
+    push!(out, exact_stage("3.14 fill median (width $fillw)", "DxFM", jl_dxfm, stage(k, "DxFM", L)))
+    push!(out, exact_stage("3.14 fill median gate", "MM",
+                           UInt8.(map(!isnan, jl_dxfm)), stage(k, "MM", L)))
+
+    # The fill itself, on the reference's own rejected field. `_fill_holes!` mutates, so it gets a copy.
+    d = DisplacementField(copy(dxf), copy(dyf),
+                          fill(NaN32, size(dxf)), fill(NaN32, size(dxf)),
+                          map(!isnan, dxf))
+    filled = AutoRIFT._fill_holes!(d, p)
+    jl_mf = falses(size(dxf))
+    for i in filled
+        jl_mf[i] = true
+    end
+    # The *last* `MF` revision, which is the state after the three fill passes. `rev0` is the all-zero
+    # initialization at `:790`, and comparing against it reports that the reference filled nothing.
+    # The last `MF` state *on this level's grid*. `rev0` is the all-zero initialization at `:790`, and
+    # above the base chip size the final revision is the merge's `INTER_NEAREST` resize back to the full
+    # grid (`:861`) — a different quantity from the mask the fill produced.
+    mine = [kk for kk in _revisions(k, "MF", L) if size(k.stages[kk]) == size(dxf)]
+    isempty(mine) && return out
+    push!(out, exact_stage("3.15 fill mask", last(mine), UInt8.(jl_mf), k.stages[last(mine)]))
+    return out
+end
+
+# ---------------------------------------------------------------------------
+# 3.16 / 3.17 — the merge, and what this level contributed to it
+# ---------------------------------------------------------------------------
+#
+# At the base chip size the merge is an assignment (`autoRIFT.py:810-816`): `Dx = DxF` wholesale, and
+# `ChipSizeX[M0 | MF] = chip`. Above it the level's field is resized back up and written only where no
+# finer level has claimed the point (`:818-866`):
+#
+#     idxRaw  = M0 & (ChipSizeX == 0)
+#     idxFill = MF & (ChipSizeX == 0)
+#     ChipSizeX[idxRaw | idxFill] = chip
+#     Dx[idxRaw | idxFill] = DxF[idxRaw | idxFill]
+#
+# `ChipSizeX` is the rung that matters, and it is a *decision* rather than a measurement — which level
+# owns each point — so it is gated on exact equality. The displacement is gated differently by level:
+# quantized at the base chip size, where both sides land on the upsampling grid, and on bias above it,
+# where both replace their measurement with a bicubic resize and neither field is quantized.
+#
+# The reference's `ChipSizeX` accumulates across levels, so the state after this level is its last
+# revision at this level. Comparing against `rev0` would compare against what this level inherited.
+function rungs_merge(k::Capture, L::Int, chip::Int, chip0::Int)
+    out = StageResult[]
+    cs_key = _last_revision(k, "ChipSizeX", L)
+    cs_key === nothing && return out
+    ref_cs = k.stages[cs_key]
+
+    # Which points this level owns in the reference's answer: those it set to this chip size.
+    ref_owned = ref_cs .== Float32(chip)
+    push!(out, StageResult("3.16 level ownership", cs_key, "reported", true, count(ref_owned),
+                           @sprintf("reference assigns %d points to chip %d; grid %s",
+                                    count(ref_owned), chip, size(ref_cs))))
+
+    # The displacement this level contributed, against the reference's own accumulated `Dx` restricted
+    # to the points it owns. Both sides are on the full grid here, so no resampling is involved in the
+    # comparison itself.
+    dx_key = _last_revision(k, "Dx", L)
+    dx_key === nothing && return out
+    ref_dx = k.stages[dx_key]
+    step = 1 / Float64(_level_upsampling(k, L))
+    owned_ref = [ref_dx[i] for i in eachindex(ref_dx) if ref_owned[i]]
+    onstep = count(v -> !isnan(v) && abs(v * (1 / step) - round(v * (1 / step))) < 1e-4, owned_ref)
+    nval = count(!isnan, owned_ref)
+    # Whether the level's values are quantized decides which statistic is meaningful downstream, so it
+    # is measured here rather than assumed from the level index.
+    push!(out, StageResult("3.17 quantization of this level", dx_key,
+                           L == 0 ? "expected quantized" : "expected unquantized",
+                           true, nval,
+                           @sprintf("%d of %d owned values on the 1/%d grid (%.3f%%)",
+                                    onstep, nval, round(Int, 1 / step),
+                                    100onstep / max(nval, 1))))
+    return out
+end
+
+# The upsampling factor this level used, from the reference's own per-level record.
+function _level_upsampling(k::Capture, L::Int)
+    corr = [r for r in k.levels if r.kind in ("coarse", "fine")]
+    for r in corr
+        r.chip_size[1] == Float64(Int(k.scalars["ChipSize0X"]) << L) && return r.oversample
+    end
+    return 16.0
+end
+
+# Every state of `name` at this level, in the order the trace wrote them, with the unversioned array
+# first if there is one. The states of a name the pyramid rewrites are what a rung has to choose
+# between, and choosing needs the list.
+function _revisions(k::Capture, name::AbstractString, L::Int)
+    out = String[]
+    key = "$(name)_L$L"
+    haskey(k.stages, key) && push!(out, key)
+    append!(out, sort!([kk for kk in keys(k.stages)
+                        if occursin(Regex("^$(name)_rev\\d+_L$L\$"), kk)],
+                       by = kk -> parse(Int, match(r"rev(\d+)_", kk).captures[1])))
+    return out
+end
+
+# The highest-numbered revision of `name` at this level, or `nothing`.
+function _last_revision(k::Capture, name::AbstractString, L::Int)
+    revs = sort!([kk for kk in keys(k.stages) if occursin(Regex("^$(name)_rev\\d+_L$L\$"), kk)],
+                 by = kk -> parse(Int, match(r"rev(\d+)_", kk).captures[1]))
+    isempty(revs) || return last(revs)
+    key = "$(name)_L$L"
+    return haskey(k.stages, key) ? key : nothing
 end
 
 # ---------------------------------------------------------------------------

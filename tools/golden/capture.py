@@ -336,23 +336,34 @@ def install_stage_trace(manifest, level=1):
     *supposed* to carry in from the previous level, and seeding is what makes `rev0` this level's
     contribution rather than the state it started from.
     """
-    seen = {}
     state = {'level': None}
     stages = manifest.setdefault('stages', {})
 
-    # `MF`, `DxF` and `DyF` join the list because the fill loop mutates them in place
-    # (`autoRIFT.py:790-808`): `MF` is created all-zero at `:790` and only the `for j in range(3)` body
-    # sets anything, so a single dump catches the zeros and reports that the reference filled nothing.
-    # `DxF`/`DyF` are bound by the correlator and then nulled against the rejection mask at `:772-773`
-    # before the fill overwrites entries, so one dump catches the raw measurement rather than either
-    # later state. A consumer must say which revision it wants, which is the point of numbering them.
-    # `xGrid0`/`yGrid0` are rebound twice in three lines above the base chip size: `cv2.resize` builds
-    # them and the even-chip snap replaces them with `round(x + 0.5) - 0.5` (`autoRIFT.py:509-530`). It
-    # is the *snapped* grid the correlator sees, and one dump catches the resize — whose values sit at
-    # quarter-fractions where the snapped ones are all half-integers. That difference reads as an
-    # interpolation mismatch when the interpolation in fact agrees to the bit.
-    REDUMP = ('SearchLimitX0', 'SearchLimitY0', 'Dx', 'Dy', 'ChipSizeX', 'InterpMask',
-              'MF', 'DxF', 'DyF', 'xGrid0', 'yGrid0')
+    # **Every state of every name, not the first.** Almost every local in this loop is rebound at least
+    # once, and which state a downstream stage consumes is exactly what a stage comparison has to
+    # establish — so dumping one state per name is what makes a comparison silently compare the wrong
+    # quantity. Five names cost a rung each before this became the default:
+    #
+    #   `xGrid0`/`yGrid0`  `cv2.resize` builds them, then the even-chip snap replaces them with
+    #                      `round(x + 0.5) - 0.5` (`:509-530`). The correlator reads the snapped grid;
+    #                      the resize's values sit at quarter-fractions where the snapped ones are all
+    #                      half-integers, so the first state reads as an interpolation mismatch when the
+    #                      interpolation agrees to the bit.
+    #   `Dx00`/`Dy00`      built by `colfilt`, then resized and **rounded** at `:585-586`. The prior
+    #                      displaces the chip and `chip_bounds` floors the result, so an unrounded prior
+    #                      moves the chip by a pixel.
+    #   `SearchLimitX0`    built at `:599`, read by the coarse pass at `:629`, zeroed against the coarse
+    #                      mask at `:724` — and raised to `minSearch` in between. Four states at a
+    #                      coarse level, two of them before the rewrite.
+    #   `MF`               created all-zero at `:790`; only the fill loop sets anything, so one dump
+    #                      says the reference filled nothing.
+    #   `DxF`/`DyF`        bound by the correlator, then nulled against the rejection mask at
+    #                      `:772-773`. Medianing the un-nulled field sees neighbours the reference has
+    #                      already discarded.
+    #
+    # The cost of dumping all of them is disk, and the cost of dumping one was five wrong measurements.
+    # A consumer names the state it wants — by a property that identifies it, not by an index, since the
+    # count varies with the level.
     revs = {}
 
     def _sig(v):
@@ -390,19 +401,12 @@ def install_stage_trace(manifest, level=1):
             if revs.get(name) == sig:
                 continue
             revs[name] = sig
-            key = '%s_L%d' % (name, level)
-            if name in REDUMP:
-                n = sum(1 for kk in stages
-                        if kk.startswith(name + '_rev') and kk.endswith('_L%d' % level))
-                key = '%s_rev%d_L%d' % (name, n, level)
-            elif key in seen:
-                # Not in `REDUMP`: only the first value this level computes is wanted, and a later
-                # rebinding of the same name is a revision this comparison does not use.
-                continue
+            n = sum(1 for kk in stages
+                    if kk.startswith(name + '_rev') and kk.endswith('_L%d' % level))
+            key = '%s_rev%d_L%d' % (name, n, level)
             a = v.view(np.uint8) if v.dtype == np.bool_ else v
             if a.dtype.str not in xchg.TAGS:
                 continue
-            seen[key] = True
             # `.copy()`, not `ascontiguousarray`: that returns the *same* buffer for an array which is
             # already contiguous, so a later in-place write reaches the dumped bytes. `SearchLimitX0`
             # is mutated at `autoRIFT.py:724` — zeroed wherever the coarse mask rejected — long after
