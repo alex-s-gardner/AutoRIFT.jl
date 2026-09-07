@@ -51,7 +51,7 @@ include("correlator.jl")
 using AutoRIFT
 using AutoRIFT: PointSet, windowmax, windowmean, windowrange, windowmedian, sanitize!,
                 rebuild, params, extent, rescale, relax, window, DisplacementField, Params,
-                resample, Nearest, measure_at, subpixel_at
+                resample, Nearest, Area, measure_at, subpixel_at
 using Printf, Statistics
 
 # ---------------------------------------------------------------------------
@@ -265,6 +265,7 @@ function ladder(c::GoldenCase; n::Integer = 100, stop_on_red::Bool = true)
     append!(out, rungs_filter_params(k, L))
     append!(out, rungs_coarse_mask(k, L, chip))
     append!(out, rungs_fill(k, L))
+    append!(out, rungs_readback(k, L, chip, chip0))
     append!(out, rungs_merge(k, L, chip, chip0))
 
     if stop_on_red
@@ -1045,6 +1046,81 @@ function rungs_coarse_mask(k::Capture, L::Int, chip::Int)
 end
 
 # ---------------------------------------------------------------------------
+# 3.12 — the coarse read-back: from a level's own grid to the full one
+# ---------------------------------------------------------------------------
+#
+# Above the base chip size a level measures on a decimated grid and its answer has to be carried back to
+# the full one. The reference does it in four steps (`autoRIFT.py:820-856`), and every one is traced:
+#
+#     DxF0 = colfilt(Dx, (Scale+1, Scale+1), 2)          # the finer levels' answer, NaN-aware mean
+#     DxF0 = resize(DxF0, level_shape, INTER_AREA)        # reduced onto this level's grid
+#     DxFM = colfilt(DxF, (5,5), 3)                       # this level's own holes, median-filled
+#     DxFM[isnan(DxF) & !isnan(DxF0)] = DxF0[...]          # prefer the finer answer where it exists
+#     DxF[isnan(DxF) & !isnan(DxFM)] = DxFM[...]           # then the median
+#     DxF = resize(DxF, full_shape, INTER_CUBIC)           # and up to the full grid
+#
+# `_undecimate_level` and `_fill_level_holes` are AutoRIFT.jl's form of the same chain, and the ordering
+# is load-bearing on both sides: the prior first, then the local median, then the nearest finite value.
+# Filling nearest-first lets one distant value stand in for a whole gap, which at the edge of a fast
+# feature means a value from across the discontinuity.
+#
+# **This is the stage that decides how much of a level's measurement survives**, so it is where a level
+# that measures plenty and posts little has to be looked at. The comparison is per step rather than
+# end-to-end: a bicubic resize of a slightly different field differs everywhere, so only the step that
+# first diverges says anything.
+function rungs_readback(k::Capture, L::Int, chip::Int, chip0::Int)
+    out = StageResult[]
+    L == 0 && return out                      # the base level is assigned, not resized
+    scale = chip ÷ chip0
+
+    # `DxFM` at a coarse level has three states: the `fillFiltWidth` median the fill loop reads, the
+    # width-5 median built here, and that same array with `DxF0` written into it. The second is the one
+    # this step produces, and it is identified by being the first state whose window is 5 rather than
+    # `fillFiltWidth` — so it is taken by position among the states on this level's grid instead, since
+    # both medians have the same shape.
+    lvlshape = size(_consumed_grid(k, "xGrid0", L))
+    dxf_states = [kk for kk in _revisions(k, "DxF", L) if size(k.stages[kk]) == lvlshape]
+    dxfm_states = [kk for kk in _revisions(k, "DxFM", L) if size(k.stages[kk]) == lvlshape]
+    (isempty(dxf_states) || length(dxfm_states) < 2) && return out
+
+    # **The `DxF` this step reads is the one the fill loop left, not the last state on the grid.** `DxF`
+    # is rebound once more at `:854` by the strong interpolation that *follows* this median, so the last
+    # state is downstream of the very step being checked — medianing it reports 25.7% differing where the
+    # right input reports none.
+    #
+    # The two are told apart by role rather than by index: the median's input is the state whose own
+    # width-5 median is the array under test, which is a property this can check rather than a count it
+    # has to know. On this level that selects `rev4` of five states, and it is exact.
+    ref_dxfm = k.stages[dxfm_states[2]]
+    match = findfirst(dxf_states) do kk
+        m = windowmedian(k.stages[kk], 5)
+        all(i -> (isnan(m[i]) && isnan(ref_dxfm[i])) || m[i] == ref_dxfm[i], eachindex(m))
+    end
+    dxf_key = match === nothing ? last(dxf_states) : dxf_states[match]
+    push!(out, exact_stage("3.12a level median (width 5), from $dxf_key", dxfm_states[2],
+                           windowmedian(k.stages[dxf_key], 5), ref_dxfm))
+
+    # The finer levels' answer reduced onto this level's grid: a `Scale + 1` wide NaN-aware mean, then an
+    # `INTER_AREA` resize. The mean is not redundant with the area average — its window is one wider than
+    # a cell, so it reaches across each cell boundary and closes a partly-missing neighbourhood before the
+    # area step weights what remains. `_undecimate_level`'s `reduce_prior` is this pair.
+    dxf = k.stages[dxf_key]
+    prev = _last_revision(k, "Dx", L - 1)
+    if prev !== nothing && size(k.stages[prev]) != lvlshape
+        jl = resample(windowmean(k.stages[prev], scale + 1), lvlshape, Area();
+                      scale = (Float64(scale), Float64(scale)))
+        # Reported: `DxF0` is a local and the trace does not carry it, so this states the reconstruction
+        # against the input it was built from rather than against the reference's own array.
+        push!(out, StageResult("3.12b prior reduced onto the level", "DxF0 (not traced)", "reported",
+                               true, length(jl),
+                               @sprintf("from %s: %d of %d finite; median %.4g",
+                                        prev, count(!isnan, jl), length(jl),
+                                        (v = filter(!isnan, vec(jl)); isempty(v) ? 0.0 : median(v)))))
+    end
+    return out
+end
+
+# ---------------------------------------------------------------------------
 # 3.16 / 3.17 — the merge, and what this level contributed to it
 # ---------------------------------------------------------------------------
 #
@@ -1143,11 +1219,94 @@ function report(rs::Vector{StageResult})
     return red == 0
 end
 
+"""
+    dtype_pair(c; byte, float) -> Vector{StageResult}
+
+The same level of the same case captured on both of the reference's data paths, compared against each
+other.
+
+`byte` is an ordinary capture (`DataType = 0`, quantized to 256 levels, `arImgDisp_u`) and `float` one
+taken with `CAPTURE_FLOAT32=1` (`DataType = 1`, the filtered field kept, `arImgDisp_s`). Everything else
+about the two runs is identical, so the difference between them **is** the quantization's contribution —
+measured on production imagery rather than inferred from a windowed test.
+
+This is what makes a byte-path residual attributable. A residual that is also present between the
+reference's two own paths is the quantizer's; one that is not is the pipeline's. The comparison is on the
+reference's own `DxC` arrays, so AutoRIFT.jl is not involved and the result is a property of the reference
+alone — which is exactly what a floor has to be.
+"""
+function dtype_pair(c::GoldenCase; byte::Integer, float::Integer)
+    kb = read_capture(c; n = byte)
+    kf = read_capture(c; n = float)
+    out = StageResult[]
+
+    # The captures must differ in the data path and nothing else, and each states its own path.
+    db = get(kb.scalars, "DataType", nothing)
+    df = get(kf.scalars, "DataType", nothing)
+    push!(out, StageResult("dtype: the two captures are the two paths", "DataType",
+                           "0 and 1", db == 0 && df == 1, 2,
+                           "byte run $byte reports DataType $db and eltype $(eltype(kb.arrays["in_I1"])); " *
+                           "float run $float reports $df and $(eltype(kf.arrays["in_I1"]))"))
+    (db == 0 && df == 1) || return out
+
+    L = traced_level(kb)
+    L == traced_level(kf) || return push!(out, StageResult(
+        "dtype: same level", "stage trace", "equal", false, 0,
+        "byte capture traced level $L, float capture traced level $(traced_level(kf))"))
+
+    # The grid the two runs correlated. It is built before `uniform_data_type` matters, so a difference
+    # here means the two runs are not the same problem and nothing below them is comparable.
+    gb = _consumed_grid(kb, "xGrid0C", L)
+    gf = _consumed_grid(kf, "xGrid0C", L)
+    push!(out, exact_stage("dtype: same coarse grid", "xGrid0C", gb, gf))
+    gb == gf || return out
+
+    for (label, name) in (("dx", "DxC"), ("dy", "DyC"))
+        rb = _state_coarse(kb, name, L, size(gb))
+        rf = _state_coarse(kf, name, L, size(gb))
+        (rb === nothing || rf === nothing) && continue
+        both = 0; ob = 0; of = 0; ex = 0
+        d = Float64[]
+        for i in eachindex(rb, rf)
+            mb = isnan(rb[i]); mf = isnan(rf[i])
+            mb && mf && continue
+            if mf
+                ob += 1
+            elseif mb
+                of += 1
+            else
+                both += 1
+                δ = Float64(rb[i]) - Float64(rf[i])
+                push!(d, δ)
+                δ == 0 && (ex += 1)
+            end
+        end
+        ad = abs.(d)
+        # Reported, never gated: this is the reference disagreeing with itself, so there is no verdict to
+        # reach — only a number every other rung on this level has to be read against.
+        push!(out, StageResult("dtype: reference byte vs float, $label", name, "reported", true, both,
+                               @sprintf("both %d, byte only %d, float only %d; exact %.2f%%, median %.4g, p99 %.4g, max %.4g, bias %+.4g",
+                                        both, ob, of, both == 0 ? 0.0 : 100ex / both,
+                                        isempty(ad) ? 0.0 : median(ad),
+                                        isempty(ad) ? 0.0 : quantile(ad, 0.99),
+                                        isempty(ad) ? 0.0 : maximum(ad),
+                                        isempty(d) ? 0.0 : mean(d))))
+    end
+    return out
+end
+
 function main(args)
-    isempty(args) && error("usage: stages.jl <product-name-fragment> [--run N] [--all]")
+    isempty(args) && error("usage: stages.jl <product> [--run N] [--all] [--dtype-pair BYTE,FLOAT]")
     c = only(cases(args[1]))
     n = 100
     i = findfirst(==("--run"), args); i === nothing || (n = parse(Int, args[i + 1]))
+    j = findfirst(==("--dtype-pair"), args)
+    if j !== nothing
+        b, f = parse.(Int, split(args[j + 1], ","))
+        ok = report(dtype_pair(c; byte = b, float = f))
+        ok || exit(1)
+        return nothing
+    end
     ok = report(ladder(c; n, stop_on_red = !("--all" in args)))
     ok || exit(1)
     return nothing

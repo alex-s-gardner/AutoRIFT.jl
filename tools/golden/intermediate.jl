@@ -84,6 +84,12 @@ function capture_reference(c::GoldenCase; n::Integer = 100, threads::Integer = 8
     haskey(ENV, "CAPTURE_STAGES") &&
         append!(stageenv, ["-e", "CAPTURE_STAGES=1",
                            "-e", "CAPTURE_STAGE_LEVEL=" * get(ENV, "CAPTURE_STAGE_LEVEL", "1")])
+    # `CAPTURE_FLOAT32` runs the same pipeline with `DataType = 1`, so the correlator sees the filtered
+    # float field rather than a 256-level quantization of it and the pyramid reaches `arImgDisp_s`. Paired
+    # with an ordinary capture of the same case it separates the quantization's contribution to a residual
+    # from everything else; see `capture.py`. A separate `--run` is wanted, since the two captures differ
+    # in `in_I1`'s element type and nothing else names which is which.
+    haskey(ENV, "CAPTURE_FLOAT32") && append!(stageenv, ["-e", "CAPTURE_FLOAT32=1"])
 
     args = ["--reference", c.reference..., "--secondary", c.secondary...]
     c.frame_id === nothing || append!(args, ["--frame-id", c.frame_id])

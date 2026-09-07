@@ -42,6 +42,12 @@ SCALARS = (
     'GridSpacingX', 'SkipSampleX', 'SkipSampleY',
     'OverSampleRatio', 'WallisFilterWidth', 'MultiThread',
     'BuffDistanceC', 'CoarseCorCutoff', 'sparseSearchSampleRate',
+    # `DataType` decides which branch of `uniform_data_type` ran and therefore which correlator the
+    # pyramid reached: 0 quantizes to 256 levels and dispatches to `arImgDisp_u`, 1 keeps the filtered
+    # `Float32` field and dispatches to `arImgDisp_s`. Recorded so a reader takes the path from the
+    # capture rather than from the directory it happened to find it in — the two captures are otherwise
+    # indistinguishable except by the element type of `in_I1`.
+    'DataType',
     'DataTypeInput', 'ChipSizeMaxXInput', 'preproc_filt_width',
     # `minSearch` is the floor the level loop applies to every nonzero search limit
     # (`autoRIFT.py:598-602`), so the radius the correlator receives is not the radius this capture
@@ -247,7 +253,40 @@ def install():
         if os.environ.get('CAPTURE_STAGES'):
             install_stage_trace(manifest, level=int(os.environ.get('CAPTURE_STAGE_LEVEL', '1')))
 
+        # `CAPTURE_FLOAT32` correlates the float field instead of the 256-level quantization of it.
+        #
+        # **`DataType` is not the lever, because `uniform_data_type` never runs.** The class has it
+        # (`autoRIFT.py:356-404`, with `DataType == 1` keeping a `Float32` field), but the container's
+        # vendored driver *inlines* the `DataType == 0` arithmetic instead of calling the method — the same
+        # rescale-and-round, written out at `vend/testautoRIFT.py:449-481` — so setting the attribute
+        # changes nothing and `grep uniform_data_type` finds only the definition. Setting `DataType` and
+        # reporting success is exactly the silent no-op this harness has been bitten by before, so the
+        # arrays are widened here instead, where their state can be checked rather than assumed.
+        #
+        # Widening the *quantized* bytes rather than reaching back for the pre-quantization field: the
+        # driver has already overwritten `obj.I1`, so the float field is gone by the time any patch on this
+        # method can see it. What that buys is still the measurement wanted — the two runs then differ only
+        # in which C++ template correlates the same values, `arImgDisp_u` on bytes against `arImgDisp_s` on
+        # floats, which is the reference disagreeing with itself and the floor every other rung is read
+        # against. It does *not* measure what the quantization cost, since both runs see quantized values;
+        # `tools/ab` stage 1 measures that on a windowed float field.
+        if os.environ.get('CAPTURE_FLOAT32'):
+            if self.I1.dtype != np.uint8:
+                raise RuntimeError(
+                    f'expected the driver to have quantized to uint8; found {self.I1.dtype}. '
+                    'The float path is selected by widening those bytes, so a different input dtype '
+                    'means this is no longer the comparison it claims to be.')
+            self.I1 = self.I1.astype(np.float32)
+            self.I2 = self.I2.astype(np.float32)
+            self.DataType = 1
+            print('[capture] widened I1/I2 to Float32: the pyramid now reaches arImgDisp_s '
+                  'rather than arImgDisp_u on the same values', flush=True)
+
         original(self)
+        # The patch has to have *fired*, and the element type is what says so. A run that reported the
+        # widening and then correlated bytes would look identical in every other respect.
+        if os.environ.get('CAPTURE_FLOAT32') and self.I1.dtype != np.float32:
+            raise RuntimeError(f'CAPTURE_FLOAT32 was set but I1 is {self.I1.dtype} after the call')
         sys.settrace(None)
         # That the patch was *installed* does not establish that it *fired* — the same distinction the
         # stale-`autoRIFT_intermediate.nc` trap taught, applied to the wrapper rather than to the run.
