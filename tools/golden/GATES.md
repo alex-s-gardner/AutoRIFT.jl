@@ -654,3 +654,42 @@ medianing that reports 25.7% differing. The rung selects its input by role and n
 **LC08 level 1: 24 rungs, 24 green.** Next: the 9 points at chip 32 are now the only attributable
 coarse-level residual on the ladder, and rungs 3.6, 3.10 and 3.12 are all exact there — so the remaining
 candidates are the coarse pass's own peak selection at that chip size and the level's prior.
+
+## Are the chip-32 coarse differences worth chasing? No — measured, not judged
+
+The coarse pass exists to produce `MC` and then `MC2`, the mask that restricts the fine search. Whether
+a differing coarse *value* matters is therefore answerable rather than a matter of taste: follow it to
+the mask and see whether the fine pass searches a different set.
+
+LC08 level 1, chip 32, 6,643 measured coarse nodes:
+
+| step | measurement |
+|---|---|
+| coarse values differing | **606** of 6,643 (9.12%) |
+| of those, **both sides reject** at `MC` | **353** (58.3%) — no consequence by construction |
+| both keep | 112; they disagree about keeping **141** |
+| `MC` agreement over the grid | 21,095 of 21,316 (**98.96%**) |
+| **`MC2` agreement**, each side dilating its own `MC` | 21,308 of 21,316 (**99.96%**) — 8 cells |
+| **fine pass search set** | **348,397 on both sides, symmetric difference 0** |
+
+**The differences are inert.** 58% of them are rejected by both sides anyway; the rest survive the
+dilation into 8 differing cells of 21,316; and after expansion to the level grid the fine pass searches
+the **identical set** — not merely the same count, the same points. That 348,397 also matches the
+reference's own final `SearchLimitX0_rev4_L1` exactly, so the agreement is with the reference's real
+behaviour rather than between two reconstructions.
+
+Where the 606 sit is consistent with that: median radius **18.5** against 8 elsewhere, median `|Δ|` 4 px
+rising to 399 at the maximum. These are wide-window, weak-peak nodes where an integer coarse pass with no
+subpixel refinement picks between competing maxima — and only 13.5% are railing against the search
+limit, so it is not a window-size failure either. A coarse estimate exists to say *whether* a
+neighbourhood is worth searching, not where the feature is; the fine pass re-measures every point it
+admits.
+
+**So this is noise in the strict sense that matters: it has no downstream consequence.** The 9-point
+`exact` shortfall at chip 32 is not attributable to a defect, and the earlier note calling it "the first
+coarse-level residual that cannot be explained away" was premature — it is explained, by following it to
+the stage that consumes it rather than by arguing about its cause.
+
+The general lesson, which applies to every rung above the base level: **a value comparison at an
+intermediate stage is only as important as what the next stage does with it.** `exact` on `DxC` is a
+diagnostic, not a gate, because the coarse pass's output is a decision and the decision agrees.
