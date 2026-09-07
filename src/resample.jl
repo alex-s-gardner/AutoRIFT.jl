@@ -237,13 +237,19 @@ end
 """
     dilate_within(mask, radius) -> BitMatrix
 
-Every position within Euclidean `radius` of a `true` in `mask`.
+Every position **strictly closer than** Euclidean `radius` to a `true` in `mask`.
 
-Used to grow the coarse pass's validity mask before it restricts the fine search: a coarse
+Grows the coarse pass's validity mask before it restricts the fine search: a coarse
 estimate is evidence that the neighbourhood is worth searching, not only that one point.
 The radius is in grid cells and is a genuine Euclidean distance rather than a chessboard
 one, which matters at the radii in use — a chessboard ball of radius 8 is 40%
 larger in area than a Euclidean one.
+
+Strict, matching the reference's `distance_transform_edt(!MC) < BuffDistanceC`
+(`autoRIFT.py:709`). The boundary carries real weight on a lattice: at the default radius of 8 the
+positions at distance *exactly* 8 are the axis-aligned ones eight cells out, and admitting them
+widens the searched region by 72 coarse cells on the golden Landsat case — 30,084 fine points once
+the mask is expanded, every one of them a point the reference leaves unsearched.
 
 Exact, via the two-pass squared-distance transform of Felzenszwalb & Huttenlocher (2012):
 separable, O(n) per row and column, and not an approximation like the chamfer masks that
@@ -254,7 +260,7 @@ function dilate_within(mask::AbstractMatrix{Bool}, radius::Real)
     r2 = Float64(radius)^2
     out = BitMatrix(undef, size(mask))
     @inbounds for i in eachindex(out)
-        out[i] = d2[i] <= r2
+        out[i] = d2[i] < r2
     end
     return out
 end

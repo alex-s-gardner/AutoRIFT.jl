@@ -110,10 +110,15 @@ end
     d = dilate_within(m, 3)
     # Euclidean, not chessboard: the corner of the 3x3 box is at distance sqrt(18) > 3.
     @test d[6, 6]
-    @test d[6, 9]           # exactly 3 away
+    # **Strict**, matching `distance_transform_edt(!MC) < BuffDistanceC` (`autoRIFT.py:709`). The
+    # position exactly `radius` away is excluded, and on a lattice that is a whole ring of points: at
+    # the default radius of 8 admitting them widened the searched region by 72 coarse cells on the
+    # golden Landsat case, 30,084 fine points after expansion.
+    @test !d[6, 9]          # exactly 3 away, so outside
+    @test d[6, 8]           # 2 away
     @test !d[6, 10]
     @test !d[9, 9]          # distance sqrt(18) ~ 4.24
-    @test count(d) == count(i -> (Tuple(i)[1] - 6)^2 + (Tuple(i)[2] - 6)^2 <= 9,
+    @test count(d) == count(i -> (Tuple(i)[1] - 6)^2 + (Tuple(i)[2] - 6)^2 < 9,
                             CartesianIndices(m))
 
     @test !any(dilate_within(falses(5, 5), 3))       # empty stays empty
@@ -669,9 +674,11 @@ end
     # first two points gives zero there, `_cell_centres` then shifts by nothing, and every coarse node
     # sits at its cell's first point — half a cell from where `_undecimate_level` reads it back. On the
     # golden Landsat case that left 99.8% of level-1 nodes 4 or 5 px from the reference's.
-    x = Float64[(c <= 5 || r <= 5) ? 1.5 : 1.5 + 8 * (c - 1) for r in 1:12, c in 1:12]
-    y = Float64[(c <= 5 || r <= 5) ? 1.5 : 1.5 + 8 * (r - 1) for r in 1:12, c in 1:12]
-    @test x[1, 2] == x[1, 1]                       # the trap: adjacent margin points are equal
+    # Zero is the nodata marker, so the margin is zeroed rather than held at the first coordinate --
+    # which is what the driver writes and what makes a step touching it describe the margin.
+    x = Float64[(c <= 5 || r <= 5) ? 0.0 : 1.5 + 8 * (c - 1) for r in 1:12, c in 1:12]
+    y = Float64[(c <= 5 || r <= 5) ? 0.0 : 1.5 + 8 * (r - 1) for r in 1:12, c in 1:12]
+    @test iszero(x[1, 1]) && iszero(x[1, 2])       # the trap: adjacent margin points are equal
     @test AutoRIFT._grid_step(x, 2) == 8
     @test AutoRIFT._grid_step(y, 1) == 8
 
@@ -681,6 +688,15 @@ end
     # Non-square spacing is read per axis.
     yc = Float64[1.5 + 3 * (r - 1) for r in 1:12, _ in 1:12]
     @test AutoRIFT._grid_step(yc, 1) == 3
+
+    # **The step is signed, because the grid is rotated by an arbitrary amount.** A step along a row
+    # moves `x` by the spacing times the cosine of the rotation: 8 on a near-axis-aligned Landsat grid
+    # and −1 on a Sentinel-2 grid rotated near 90°. Keeping only positive steps sees nothing but the
+    # jumps out of the zeroed margin — on the golden S2A case that returns 10979 where the answer is −1,
+    # which puts every chip-96 coarse point outside a 10,980 px image and drops the level entirely.
+    xrot = Float64[(c <= 5 || r <= 5) ? 0.0 : 5000.0 - (c - 1) for r in 1:12, c in 1:12]
+    @test AutoRIFT._grid_step(xrot, 2) == -1
+
     # No spacing at all: a single column, or an all-zero grid.
     @test AutoRIFT._grid_step(zeros(4, 4), 2) == 0.0
     @test AutoRIFT._grid_step(reshape(Float64[1.5], 1, 1), 2) == 0.0

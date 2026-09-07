@@ -480,28 +480,37 @@ end
 # survives untouched, and `_shift_points` applies the `+ 0.5` at correlation time for every level
 # alike. Snapping on top of that would move a coarse centre half a pixel off the lattice the finest
 # level uses.
-# The spacing of a gridded coordinate array along `dim`, as the most common positive step between
-# adjacent points.
+# How far one step along `dim` moves this coordinate, as the modal signed step between adjacent points
+# that both carry a coordinate.
 #
-# The most common step and not the first one, because a production grid carries zeros wherever the
-# driver found no data, and a step that straddles the boundary between a zeroed region and a real one is
-# neither the spacing nor a multiple of it. A mode over the whole array is unaffected by however much of
-# it is margin, so long as some of it is not.
+# Three properties of a production grid make the obvious readings wrong, and each has been measured:
 #
-# Zero when nothing is gridded — an all-zero coordinate array, which happens only if the caller has no
-# grid at all. `_cell_centres` then shifts by nothing, which is the right answer for a grid that has no
-# spacing to speak of.
+#   * **It is zeroed at nodata.** The driver clears `xGrid` wherever there is no data
+#     (`testautoRIFT.py:394-403`), so `x[1, 2] - x[1, 1]` is `0` on a scene whose first row and column
+#     are ocean. Reading the spacing there gives zero, `_cell_centres` shifts by nothing, and every
+#     coarse node sits at its cell's first point — half a cell from where `_undecimate_level` reads it
+#     back.
+#   * **It is rotated, by an arbitrary amount.** A step along a row moves `x` by the spacing times the
+#     cosine of the rotation, which is `8` on a near-axis-aligned Landsat grid and `-1` on a Sentinel-2
+#     grid rotated near 90°. So the step is not the grid spacing, it is *signed*, and a rule that keeps
+#     only positive steps sees nothing but the jumps out of the margin — on the S2A case that returned
+#     `10979` where the answer is `-1`, and put every chip-96 coarse point outside the image.
+#   * **A step straddling the margin boundary is neither.** Those are the large spurious values, and
+#     they are always a minority of the array, so the mode excludes them without needing to identify
+#     them.
+#
+# Zero only when no two adjacent points both carry a coordinate, which means the caller has no grid.
+# `_cell_centres` then shifts by nothing, which is right for a grid with no spacing to speak of.
 function _grid_step(x::AbstractMatrix, dim::Int)
-    counts = Dict{Float64,Int}()
     n = size(x, dim)
     n > 1 || return 0.0
-    # Every adjacent pair along `dim`, at whatever stride the other axis has: one pass, no allocation
-    # beyond the tally, and a mode rather than a mean so a handful of boundary-straddling steps cannot
-    # move the answer.
+    counts = Dict{Float64,Int}()
     @inbounds for j in axes(x, 3 - dim), i in 1:(n - 1)
         a, b = dim == 2 ? (x[j, i], x[j, i + 1]) : (x[i, j], x[i + 1, j])
+        # Both endpoints must be on the grid. A zero is the nodata marker, not a coordinate, so a step
+        # touching one describes the margin rather than the spacing.
+        (iszero(a) || iszero(b)) && continue
         d = Float64(b) - Float64(a)
-        d > 0 || continue
         counts[d] = get(counts, d, 0) + 1
     end
     isempty(counts) && return 0.0

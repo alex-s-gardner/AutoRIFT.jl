@@ -249,6 +249,7 @@ function ladder(c::GoldenCase; n::Integer = 100, stop_on_red::Bool = true)
     push!(out, rung_priors(k, L, chip, chip0, spacing))
     append!(out, rungs_coarse_sampling(k, L, chip))
     append!(out, rungs_filter_params(k, L))
+    append!(out, rungs_coarse_mask(k, L, chip))
     append!(out, rungs_fill(k, L))
     append!(out, rungs_merge(k, L, chip, chip0))
 
@@ -794,6 +795,125 @@ function rungs_fill(k::Capture, L::Int)
     mine = [kk for kk in _revisions(k, "MF", L) if size(k.stages[kk]) == size(dxf)]
     isempty(mine) && return out
     push!(out, exact_stage("3.15 fill mask", last(mine), UInt8.(jl_mf), k.stages[last(mine)]))
+    return out
+end
+
+# ---------------------------------------------------------------------------
+# 3.9 / 3.10 / 3.11 — the coarse mask, and the fine search it restricts
+# ---------------------------------------------------------------------------
+#
+# This is the stage that decides *where the fine pass is allowed to look*, and therefore the one that
+# owns a coverage difference the correlator cannot explain. Three steps (`autoRIFT.py:702-724`):
+#
+#     ROIC = SearchLimitX0C > 0
+#     CoarseCorValidFac = sum(MC[ROIC]) / sum(M0C[ROIC])     # the level's go/no-go gate
+#     if CoarseCorValidFac < CoarseCorCutoff: continue
+#     MC2 = distance_transform_edt(!MC) < BuffDistanceC      # dilate on the *coarse* grid
+#     MC2 = resize(MC2, coarse_shape * stride, INTER_NEAREST)
+#     ... pad by edge replication if that falls short of the fine grid ...
+#     SearchLimitX0[!MC2] = 0                                # and this is what the fine pass sees
+#
+# The last line is the one that matters: a point outside `MC2` has its radius zeroed and is never
+# searched, so **every measurement lost here is lost before the correlator runs**. `M0C` and `MC` are
+# already compared at rungs 3.7 and 3.8; what this adds is the dilation, the expansion, and the
+# resulting radius — the three places a matching mask can still restrict a different region.
+function rungs_coarse_mask(k::Capture, L::Int, chip::Int)
+    out = StageResult[]
+    haskey(k.stages, "MC_rev0_L$L") || return out
+    p = params(; kwargs_from_capture(k)...)
+    mc = _last_revision(k, "MC", L)
+    mc === nothing && return out
+    keep = k.stages[mc] .!= 0
+
+    # The go/no-go gate, on the reference's own `MC` and `M0C` so only the ratio is under test. A level
+    # the reference dropped and AutoRIFT.jl kept — or the reverse — is a whole chip size of coverage.
+    m0c = _last_revision(k, "M0C", L)
+    if m0c !== nothing
+        measured = k.stages[m0c] .!= 0
+        srx = _state_shaped(k, "SearchLimitX0C", L, size(keep))
+        if srx !== nothing
+            roic = srx .> 0
+            denom = count(roic .& measured)
+            numer = count(roic .& keep)
+            frac = denom == 0 ? 0.0 : numer / denom
+            cutoff = p.min_coarse_valid_fraction
+            push!(out, StageResult("3.9 coarse valid fraction", mc,
+                                   string("same verdict at cutoff ", cutoff),
+                                   (frac >= cutoff) == (frac >= Float64(k.scalars["CoarseCorCutoff"])),
+                                   denom,
+                                   @sprintf("%d of %d coarse points kept = %.4f; cutoff julia %.4g, reference %.4g; both %s",
+                                            numer, denom, frac, cutoff,
+                                            Float64(k.scalars["CoarseCorCutoff"]),
+                                            frac >= cutoff ? "continue" : "skip the level")))
+        end
+    end
+
+    # The dilation, on the coarse grid. `dilate_within` is AutoRIFT.jl's form of
+    # `distance_transform_edt(!MC) < BuffDistanceC`, and `test/fixtures/disttransform` pins the transform
+    # itself — so a difference here is the threshold or the buffer, not the metric.
+    grown = AutoRIFT.dilate_within(keep, p.coarse_buffer)
+    ref_mc2 = _state_shaped(k, "MC2", L, size(keep))
+    if ref_mc2 !== nothing
+        push!(out, exact_stage("3.10 coarse dilation", "MC2 (coarse)",
+                               UInt8.(grown), ref_mc2))
+    end
+
+    # The expansion back to the fine grid, and then the radius the fine pass actually receives. The
+    # radius is the consequential comparison: `_expand_coarse_mask` and the reference's
+    # `INTER_NEAREST` + edge-replication padding are two independent derivations of one correspondence,
+    # and `src/multichip.jl` records that an offset between them puts the mask a row off the evidence
+    # that produced it.
+    # **The reference's expansion is offset from its own evidence, and AutoRIFT.jl's is not.** Its
+    # `INTER_NEAREST` resize is left-aligned — coarse cell `k` covers fine `(k-1)*stride+1 .. k*stride`,
+    # so the node at fine index `k*stride` is the *last* point of its own cell — while the radius it
+    # reduces for that node is a centred `filtWidth`-wide window, fine `k*stride-4 .. k*stride+4` at the
+    # default stride. So the reference gathers coherence evidence from fine 4..12 and applies it to fine
+    # 1..8: offset by 3. `_expand_coarse_mask` inverts `_cell_max_radius!`'s own cell assignment instead,
+    # so the mask lands on exactly the points the evidence was gathered over.
+    #
+    # This rung therefore *reports*. Reproducing the reference here would mean restricting the fine
+    # search using evidence from three cells away, and `src/multichip.jl` records the measurement that
+    # matching one of the reference's two halves alone is worse than matching neither. What is worth
+    # watching is the count: it is the number of points the two disagree about searching, and rung 3.11c
+    # gives the totals it resolves to.
+    want = size(_consumed_grid(k, "xGrid0", L))
+    stride = AutoRIFT._sparse_stride(p)
+    expanded = AutoRIFT._expand_coarse_mask(grown, want, stride)
+    full_mc2 = _state_shaped(k, "MC2", L, want)
+    if full_mc2 !== nothing
+        ref = full_mc2 .!= 0
+        push!(out, StageResult("3.11a coarse mask on the fine grid", "MC2 (fine)", "reported", true,
+                               length(ref),
+                               @sprintf("julia searches %d, reference %d, differ %d of %d (%.4f%%); julia-only %d, reference-only %d",
+                                        count(expanded), count(ref), count(expanded .!= ref),
+                                        length(ref), 100count(expanded .!= ref) / length(ref),
+                                        count(expanded .& .!ref), count(ref .& .!expanded))))
+    end
+
+    # `SearchLimitX0` after the zeroing: the array the fine correlator is handed. Identified as the
+    # post-rewrite state whose zero count exceeds the pre-mask one — the mask only ever zeroes more.
+    minsearch = Int(k.scalars["minSearch"])
+    revs = [kk for kk in _revisions(k, "SearchLimitX0", L) if size(k.stages[kk]) == want]
+    post = [kk for kk in revs if !any(v -> 0 < v < minsearch, k.stages[kk])]
+    if length(post) >= 2
+        before = k.stages[post[1]]
+        after = k.stages[last(post)]
+        jl = copy(before)
+        jl[.!expanded] .= 0.0f0
+        # Inherits 3.11a's offset by construction, so this reports the same disagreement in the units
+        # that matter: how many points each side ends up searching.
+        push!(out, StageResult("3.11b fine search radius", last(post), "reported", true,
+                               length(jl),
+                               @sprintf("differ %d of %d (%.4f%%); julia searches %d, reference %d",
+                                        count(i -> jl[i] != after[i], eachindex(jl)), length(jl),
+                                        100count(i -> jl[i] != after[i], eachindex(jl)) / length(jl),
+                                        count(>(0), jl), count(>(0), after))))
+        push!(out, StageResult("3.11c points the mask removes", last(post), "reported", true,
+                               count(>(0), before),
+                               @sprintf("reference searches %d of %d points after the mask (%d zeroed); julia %d",
+                                        count(>(0), after), count(>(0), before),
+                                        count(>(0), before) - count(>(0), after), count(>(0), jl))))
+    end
     return out
 end
 
