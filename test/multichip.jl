@@ -663,6 +663,39 @@ end
     @test_throws ArgumentError params(; chip_size = 32, chip_size_max = 96)
 end
 
+@testset "grid spacing survives a zeroed nodata margin" begin
+    # A production grid is zeroed wherever there is no data (`testautoRIFT.py:394-403`), so a scene
+    # whose first rows and columns are ocean has `x[1, 2] == x[1, 1]`. Reading the spacing from the
+    # first two points gives zero there, `_cell_centres` then shifts by nothing, and every coarse node
+    # sits at its cell's first point — half a cell from where `_undecimate_level` reads it back. On the
+    # golden Landsat case that left 99.8% of level-1 nodes 4 or 5 px from the reference's.
+    x = Float64[(c <= 5 || r <= 5) ? 1.5 : 1.5 + 8 * (c - 1) for r in 1:12, c in 1:12]
+    y = Float64[(c <= 5 || r <= 5) ? 1.5 : 1.5 + 8 * (r - 1) for r in 1:12, c in 1:12]
+    @test x[1, 2] == x[1, 1]                       # the trap: adjacent margin points are equal
+    @test AutoRIFT._grid_step(x, 2) == 8
+    @test AutoRIFT._grid_step(y, 1) == 8
+
+    # A clean grid gives the same answer, so the mode is not a special case for margins.
+    xc = Float64[1.5 + 8 * (c - 1) for _ in 1:12, c in 1:12]
+    @test AutoRIFT._grid_step(xc, 2) == 8
+    # Non-square spacing is read per axis.
+    yc = Float64[1.5 + 3 * (r - 1) for r in 1:12, _ in 1:12]
+    @test AutoRIFT._grid_step(yc, 1) == 3
+    # No spacing at all: a single column, or an all-zero grid.
+    @test AutoRIFT._grid_step(zeros(4, 4), 2) == 0.0
+    @test AutoRIFT._grid_step(reshape(Float64[1.5], 1, 1), 2) == 0.0
+
+    # And the consequence the helper exists for: a decimated node lands at the cell centre, half a
+    # cell from its first point, even when the grid's first row and column are margin.
+    grid = AutoRIFT.rebuild(gridpoints((200, 200), 8; chip_size = 16, search_radius = 6)[1:12, 1:12];
+                            x, y)
+    sub = AutoRIFT._decimate_level(grid, trues(12, 12), 2)
+    @test sub !== nothing
+    # Cell (r, c) spans full columns 2c-1 and 2c, whose x differ by the spacing, so the centre is
+    # half a spacing above the first — 4 px here.
+    @test sub.grid.x[4, 4] == grid.x[7, 7] + 4
+end
+
 @testset "an even sparse stride reduces over an odd window" begin
     # `filtWidth = stride + 1` when the stride is even and `stride` when it is odd
     # (`autoRIFT.py:618-626`), so the coarse radius reduction is symmetric about the node it is

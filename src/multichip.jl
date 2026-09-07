@@ -480,13 +480,68 @@ end
 # survives untouched, and `_shift_points` applies the `+ 0.5` at correlation time for every level
 # alike. Snapping on top of that would move a coarse centre half a pixel off the lattice the finest
 # level uses.
+# The spacing of a gridded coordinate array along `dim`, as the most common positive step between
+# adjacent points.
+#
+# The most common step and not the first one, because a production grid carries zeros wherever the
+# driver found no data, and a step that straddles the boundary between a zeroed region and a real one is
+# neither the spacing nor a multiple of it. A mode over the whole array is unaffected by however much of
+# it is margin, so long as some of it is not.
+#
+# Zero when nothing is gridded — an all-zero coordinate array, which happens only if the caller has no
+# grid at all. `_cell_centres` then shifts by nothing, which is the right answer for a grid that has no
+# spacing to speak of.
+function _grid_step(x::AbstractMatrix, dim::Int)
+    counts = Dict{Float64,Int}()
+    n = size(x, dim)
+    n > 1 || return 0.0
+    # Every adjacent pair along `dim`, at whatever stride the other axis has: one pass, no allocation
+    # beyond the tally, and a mode rather than a mean so a handful of boundary-straddling steps cannot
+    # move the answer.
+    @inbounds for j in axes(x, 3 - dim), i in 1:(n - 1)
+        a, b = dim == 2 ? (x[j, i], x[j, i + 1]) : (x[i, j], x[i + 1, j])
+        d = Float64(b) - Float64(a)
+        d > 0 || continue
+        counts[d] = get(counts, d, 0) + 1
+    end
+    isempty(counts) && return 0.0
+    best = 0.0
+    bestn = 0
+    for (d, c) in counts
+        c > bestn && (best = d; bestn = c)
+    end
+    return best
+end
+
 function _cell_centres(sub::PointSet{2}, full::PointSet{2}, rows, cols, stride::Int)
     stride == 1 && return sub
-    # From the first two points along each axis, so a non-square spacing shifts by the right amount on
-    # each. A single-point axis cannot happen: `_decimate_level` requires at least three coarse points.
+    # The grid's spacing, taken as the most common step between adjacent points rather than from the
+    # first two. A production grid is **zeroed wherever there is no data** — the driver clears `xGrid`,
+    # `yGrid`, the priors and the search limits at nodata before correlating
+    # (`testautoRIFT.py:394-403`) — so a scene whose first row and column are ocean has
+    # `x[1, 2] - x[1, 1] == 0`, and reading the spacing there gives zero. The shift then vanishes and
+    # every coarse node stays at its cell's first point, half a cell from where `_undecimate_level`
+    # reads it back.
+    #
+    # That is a silent, systematic offset: on the golden Landsat case it left 99.8% of level-1 nodes 4
+    # or 5 pixels from the reference's, which reads as a correlator disagreement concentrated where the
+    # velocity field varies.
     nr, nc = size(full)
-    sx = nc > 1 ? full.x[1, 2] - full.x[1, 1] : 0.0
-    sy = nr > 1 ? full.y[2, 1] - full.y[1, 1] : 0.0
+    sx = _grid_step(full.x, 2)
+    sy = _grid_step(full.y, 1)
+    # The reference reaches the same cell centre by a different route and lands half a pixel away on a
+    # **rotated** grid. Its `INTER_AREA` averages a `stride`-by-`stride` block, so on a grid whose `x`
+    # varies down a column — which a projected grid's does, by 1 px per row on the golden Landsat case —
+    # the block mean is not the x-centre of the column pair, and `round(x + 0.5) - 0.5` then snaps it to
+    # the next half-integer up. Measured at level 1: the cell centre is 3992.5 on both sides, the
+    # reference's block mean is exactly 3993.0, and its snapped node is 3993.5.
+    #
+    # The half pixel is *not* reproduced here. `_undecimate_level` reads a coarse node back from the cell
+    # centre, so shifting the correlation position without shifting the read-back would measure the field
+    # in one place and attribute it to another — and `src/multichip.jl` records the measurement that
+    # self-consistency between the two halves is what the accuracy depends on, not agreement with either
+    # of the reference's halves separately. `tools/golden/README.md` carries this as matched-not-endorsed
+    # in the other direction: a deliberate difference, with the reason it is deliberate.
     # Half the span of this cell, which is `stride` points except where the grid ran out.
     halfx = [(min(c + stride - 1, nc) - c) / 2 for c in cols]
     halfy = [(min(r + stride - 1, nr) - r) / 2 for r in rows]
