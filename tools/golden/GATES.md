@@ -429,3 +429,50 @@ k*stride+4`. So the reference gathers coherence evidence from fine 4..12 and app
 mask lands on exactly the points the evidence came from. Rung 3.11a reports the disagreement (28,032
 points on LC08, split 14,016 each way, with both sides searching the same total of 2,615,872) rather
 than gating on it.
+
+## Gate 3 — S2A's coarse levels, and where the residual 3,806 points are
+
+All three captured S2A levels walk clean:
+
+| case, level | chip | rungs | state |
+|---|---:|---|---|
+| S2A, level 0 | 24 | 19 | **19 green** |
+| S2A, level 1 | 48 | 19 | **19 green** |
+| S2A, level 2 | 96 | 19 | **19 green** |
+
+So every stage the ladder covers — the grid, the search-limit rewrite, the priors, the coarse
+lattice/radii/priors, the filter parameters, the rejection, the fill median and its gate, the fill mask,
+the merge and the quantization — is exact or reported-as-designed at every level of both cases.
+
+### The residual is the coarse read-back, not the setup
+
+Cross-tabulating the merged `ChipSizeX` point by point localizes what remains:
+
+| reference \ julia | 0 | 24 | 48 | 96 |
+|---|---:|---:|---:|---:|
+| **0** | 478,350 | 68 | 6,116 | 448 |
+| **24** | 34 | **553,857** | 221 | 0 |
+| **48** | **7,839** | 261 | 30,124 | 249 |
+| **96** | **2,565** | 1 | 648 | 819 |
+
+The base level agrees on 553,857 of 554,112 — **99.95%**. The whole gap is the bold left column: 7,839
++ 2,565 = **10,404** points the reference resolves at chip 48 or 96 and AutoRIFT.jl leaves unresolved,
+against 6,632 it resolves that the reference does not.
+
+**It is not the admission gate.** Traced through the reference's own arrays at chip 96: its radius
+survives at 44,426 nodes, its `M0` zeroing cuts that to 4,164, and 4,164 coarse measurements become
+4,033 full-grid points. AutoRIFT.jl's radius survives at 44,289 — within 0.3% — and its bound gate
+leaves 5,575, so it searches *more* coarse points and its level measures 11,424 on the full grid. It
+then contributes only 1,516. **More raw coverage, fewer posted points**, which puts the loss in
+`_undecimate_level`'s read-back rather than in anything upstream of it.
+
+One genuine difference is identified and quantified there: AutoRIFT.jl *samples* the per-point chip
+bounds at the decimated node, where the reference **dilates** its admission mask with
+`colfilt(..., 0)` over `6/Scale` cells before inverting and resizing (`autoRIFT.py:531-544`).
+Reproducing the reference's rule on the same input admits 17,955 nodes against sampling's 24,746, and
+the two masks agree on **94.27%** of the 67,600. That is the right shape for a fix but the wrong sign
+to explain this gap on its own — sampling admits *more* — so it wants measuring rather than assuming.
+
+**Next**: instrument `_undecimate_level` on the chip-96 level directly — how many of its 11,424
+measurements survive the `valid > 0.5 && isfinite` gate, and how many the merge then declines. That is
+one measurement, and it is the last unmeasured link between a level's raw coverage and what it posts.
