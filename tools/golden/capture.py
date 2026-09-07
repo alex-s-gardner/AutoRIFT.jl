@@ -302,25 +302,45 @@ STAGE_LOCALS = (
 
 
 def install_stage_trace(manifest, level=1):
-    """Dump each named local of `runAutorift` the first time it changes, for one chip-size level.
+    """Dump each named local of `runAutorift` as this chip-size level produces it.
 
-    Written once per (name, level): the *first* value each stage produces is what the next stage
-    consumes, and re-dumping every rebinding inside the three-pass fill loop would bury that in
-    revisions. `level` selects which iteration of the chip-size loop to record, since a whole-scene run
-    has four and dumping all of them multiplies the output by four for no gain — the level under
-    investigation is chosen deliberately.
+    `level` is the chip-size loop's own index `i`, so it is **0-based**: `level=0` is the base chip
+    size, `level=1` the next one up. One level per run, because a line trace over a whole-scene grid
+    costs real time and dumping four multiplies the output for no gain.
+
+    **A name bound in this level's frame is not necessarily this level's value.** `autorift`'s loop
+    body rebinds `xGrid0`, `M0`, `DxC` and the rest each iteration, so at the first line of an
+    iteration every one of them still holds the *previous* level's array — and dumping the first value
+    seen while the level index matches records that leftover instead. On the golden Landsat case that
+    put a 2344x2336 base-level `xGrid0` in the files for level 1, where the resized grid is
+    1172x1168: the shape is the only thing that gives it away, and a reader comparing against a
+    level-1 array of the right shape would find no counterpart at all while one comparing loosely
+    would diff two different levels.
+
+    So the change detector is *seeded* at the level boundary with whatever is bound there, rather than
+    cleared. A name is then dumped when its bytes first differ from what this level inherited, which is
+    the first value this level actually computed.
+
+    Names in `REDUMP` are dumped at every subsequent change too, numbered in order. `SearchLimitX0` is
+    built at `:599`, read by the coarse pass at `:629`, then zeroed against the coarse mask at `:724`
+    before the fine pass reads it — three distinct values under one name, and dumping only the first
+    hides the handoff the trace exists to check. `Dx`, `Dy`, `ChipSizeX` and `InterpMask` are the
+    cross-level accumulators, where the same reasoning applies for a different reason: they are
+    *supposed* to carry in from the previous level, and seeding is what makes `rev0` this level's
+    contribution rather than the state it started from.
     """
     seen = {}
-    state = {'level': 0}
+    state = {'level': None}
     stages = manifest.setdefault('stages', {})
 
-    # Arrays that are rebound or mutated in place, and whose *later* state is what a downstream stage
-    # consumes. `SearchLimitX0` is built at `:599`, read by the coarse pass at `:629`, then zeroed
-    # against the coarse mask at `:724` before the fine pass reads it — three distinct values in one
-    # name. Dumping only the first hides the handoff the trace exists to check, so these are dumped
-    # every time the bytes change, numbered in order.
     REDUMP = ('SearchLimitX0', 'SearchLimitY0', 'Dx', 'Dy', 'ChipSizeX', 'InterpMask')
     revs = {}
+
+    def _sig(v):
+        # Over the raw bytes rather than the values: a displacement array is full of `NaN`, so a
+        # numeric sum both throws on conversion and compares unequal to itself. Hashing detects any
+        # change, including one a sum would cancel, and does not care what the values mean.
+        return hash(v.tobytes())
 
     def tracer(frame, event, arg):
         if event == 'call':
@@ -332,30 +352,33 @@ def install_stage_trace(manifest, level=1):
         if 'i' in loc and isinstance(loc['i'], (int, np.integer)):
             new = int(loc['i'])
             if new != state['level']:
-                # A name still bound from the previous iteration is not this level's value, so the
-                # change detector is cleared at the boundary rather than carrying a stale signature in.
+                state['level'] = new
+                # Seed, not clear: every array bound right now belongs to the level that just ended,
+                # so recording its signature is what makes the next dump of that name a value this
+                # level computed.
                 revs.clear()
-            state['level'] = new
+                for nm in STAGE_LOCALS:
+                    vv = loc.get(nm)
+                    if isinstance(vv, np.ndarray) and vv.ndim == 2:
+                        revs[nm] = _sig(vv)
         if state['level'] != level:
             return tracer
         for name in STAGE_LOCALS:
             v = loc.get(name)
             if not isinstance(v, np.ndarray) or v.ndim != 2:
                 continue
+            sig = _sig(v)
+            if revs.get(name) == sig:
+                continue
+            revs[name] = sig
             key = '%s_L%d' % (name, level)
             if name in REDUMP:
-                # Change detector over the raw bytes rather than the values: a displacement array is
-                # full of `NaN`, so a numeric sum both throws on conversion and compares unequal to
-                # itself. Hashing the buffer sidesteps both and detects any change, including one that
-                # a sum would cancel.
-                sig = hash(v.tobytes())
-                if revs.get(name) == sig:
-                    continue
-                revs[name] = sig
                 n = sum(1 for kk in stages
                         if kk.startswith(name + '_rev') and kk.endswith('_L%d' % level))
                 key = '%s_rev%d_L%d' % (name, n, level)
             elif key in seen:
+                # Not in `REDUMP`: only the first value this level computes is wanted, and a later
+                # rebinding of the same name is a revision this comparison does not use.
                 continue
             a = v.view(np.uint8) if v.dtype == np.bool_ else v
             if a.dtype.str not in xchg.TAGS:
@@ -368,6 +391,7 @@ def install_stage_trace(manifest, level=1):
             # claiming to be the value the coarse pass consumed. That misattributed 420 coarse radii to
             # a reducer difference when the arrays were simply from different moments.
             stages[key] = _write('stage_' + key, np.ascontiguousarray(a).copy())
+            stages[key]['level'] = level
             print('[capture] stage %s %s %s' % (key, a.dtype.str, a.shape), flush=True)
         return tracer
 
