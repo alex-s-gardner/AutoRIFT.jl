@@ -316,13 +316,23 @@ end
 function report(r)
     @printf("\ncorrelated in %.1f s; grid julia %s, reference %s, compared %s\n",
             r.time, r.julia_size, r.reference_size, r.overlap)
-    @printf("\n%-5s %5s %9s %8s %8s %8s %9s %9s %9s %8s\n",
-            "axis", "sign", "both", "only jl", "only ref", "exact", "median", "p99", "max", "corr")
+    # The exact **count** beside the fraction, because the fraction is not comparable between runs whose
+    # coverage differs — and coverage is one of the things being fixed. Measured on the S2A case: two
+    # changes moved `exact` from 92.66% to 96.74% while the count moved by 37 points of 543,071, because
+    # the 24,680 points that left `both` were disproportionately ones AutoRIFT.jl had got wrong. Dropping
+    # them from the denominator raises the fraction and improves nothing.
+    #
+    # The two exclusive sets are printed for the same reason and read together: a change that shrinks
+    # both is unambiguously better, and one that grows either is trading coverage for a percentage.
+    @printf("\n%-5s %5s %9s %8s %8s %8s %10s %9s %9s %9s %8s\n",
+            "axis", "sign", "both", "only jl", "only ref", "exact", "exact n", "median", "p99", "max", "corr")
     for s in (r.dx, r.dy)
-        @printf("%-5s %5s %9d %8d %8d %7.2f%% %9.4g %9.4g %9.4g %+8.5f\n",
+        @printf("%-5s %5s %9d %8d %8d %7.2f%% %10d %9.4g %9.4g %9.4g %+8.5f\n",
                 s.name, s.sign > 0 ? "+" : "-", s.both, s.only_julia, s.only_reference,
-                100 * s.exact_fraction, s.median, s.p99, s.max_abs, s.correlation)
+                100 * s.exact_fraction, s.exact, s.median, s.p99, s.max_abs, s.correlation)
     end
+    @printf("\nmeasured by julia %d, by reference %d\n",
+            r.dx.both + r.dx.only_julia, r.dx.both + r.dx.only_reference)
     @printf("\nbias: dx %+.6g, dy %+.6g\n", r.dx.bias, r.dy.bias)
     return nothing
 end
