@@ -48,6 +48,13 @@ SCALARS = (
     # records in `in_SearchLimitX` — a point asking for 1 searches at 6. Without this scalar the Julia
     # side cannot reconstruct what the correlator was actually handed.
     'minSearch',
+    # The outlier filter and the hole fill. `autorift()` derives `DispFiltC`/`DispFiltF` from
+    # `FracValid`, `FracSearch`, `FiltWidth`, `Iter` and `MadScalar` (`autoRIFT.py:484-505`), and the
+    # three-pass fill uses `fillFiltWidth` for its median (`:775-790`). These are the stages that own
+    # the coverage difference, so comparing them against a *believed* parameter set would attribute a
+    # parameter mismatch to a reducer or to the merge.
+    'FracValid', 'FracSearch', 'FiltWidth', 'Iter', 'MadScalar',
+    'fillFiltWidth', 'colfiltChunkSize', 'StandardDeviationCutoff',
 )
 
 # Arrays to take before the call: the filtered pair, the grid, the priors, the per-point limits.
@@ -333,7 +340,19 @@ def install_stage_trace(manifest, level=1):
     state = {'level': None}
     stages = manifest.setdefault('stages', {})
 
-    REDUMP = ('SearchLimitX0', 'SearchLimitY0', 'Dx', 'Dy', 'ChipSizeX', 'InterpMask')
+    # `MF`, `DxF` and `DyF` join the list because the fill loop mutates them in place
+    # (`autoRIFT.py:790-808`): `MF` is created all-zero at `:790` and only the `for j in range(3)` body
+    # sets anything, so a single dump catches the zeros and reports that the reference filled nothing.
+    # `DxF`/`DyF` are bound by the correlator and then nulled against the rejection mask at `:772-773`
+    # before the fill overwrites entries, so one dump catches the raw measurement rather than either
+    # later state. A consumer must say which revision it wants, which is the point of numbering them.
+    # `xGrid0`/`yGrid0` are rebound twice in three lines above the base chip size: `cv2.resize` builds
+    # them and the even-chip snap replaces them with `round(x + 0.5) - 0.5` (`autoRIFT.py:509-530`). It
+    # is the *snapped* grid the correlator sees, and one dump catches the resize — whose values sit at
+    # quarter-fractions where the snapped ones are all half-integers. That difference reads as an
+    # interpolation mismatch when the interpolation in fact agrees to the bit.
+    REDUMP = ('SearchLimitX0', 'SearchLimitY0', 'Dx', 'Dy', 'ChipSizeX', 'InterpMask',
+              'MF', 'DxF', 'DyF', 'xGrid0', 'yGrid0')
     revs = {}
 
     def _sig(v):

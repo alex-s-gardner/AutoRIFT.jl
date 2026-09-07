@@ -162,6 +162,10 @@ struct LevelRecord
     oversample::Float64
     grid_shape::Tuple{Int,Int}
     counts::Dict{String,Int}
+    # The one filter parameter that is not an integer. `NaN` on a correlator record, which has no
+    # filter — comparing a derived `FracValid` against the reference's needs the value, not a rounding
+    # of it, since `8/25` and `0.32` differ in the last bits.
+    frac_valid::Float64
     arrays::Dict{String,Matrix}
 end
 
@@ -226,12 +230,15 @@ function read_capture(dir::AbstractString; call::Integer = 1)
         for key in (:measured, :in_mask, :kept, :filt_width, :iterations)
             haskey(r, key) && (counts[String(key)] = Int(r[key]))
         end
+        # `frac_valid` is the one filter parameter that is not an integer, so it travels beside the
+        # counts rather than in them. `NaN` for a correlator record, which has no filter.
+        counts_frac = Float64(get(r, :frac_valid, NaN))
         push!(levels, LevelRecord(
             r.seq, String(r.kind),
             (Float64(get(r, :chip_size_x, NaN)), Float64(get(r, :chip_size_y, NaN))),
             Float64(get(r, :oversample, NaN)),
             (Int(r.grid_shape[1]), Int(r.grid_shape[2])),
-            counts, la))
+            counts, counts_frac, la))
     end
 
     # The stage trace, absent unless the capture asked for it. Keys carry the level, so a directory
