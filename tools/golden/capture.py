@@ -25,6 +25,7 @@ itself; `tools/ab/README.md` states it and `tools/ab/stage2_python.py` asserts i
 import json
 import os
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -92,6 +93,28 @@ def _dump(obj, names, prefix, manifest):
         manifest['arrays'][f'{prefix}{name}'] = _write(f'{prefix}{name}', v)
 
 
+def reference_module():
+    """The `autoRIFT.autoRIFT` module, which is where `arImgDisp_*`, `DISP_FILT` and `colfilt` live.
+
+    `from autoRIFT import autoRIFT` does **not** give this. The package's `__init__` binds that name to
+    the `autoRIFT` *class*, so the import returns a class that has none of these symbols — and
+    `setattr` on it then patches an attribute nothing calls, while reporting success. Every capture
+    taken that way carries `levels: []`, which reads as "the reference resolved no levels" rather than
+    as a harness fault.
+
+    `sys.modules` is the reliable route: the module is already imported by the time anything here runs,
+    and its dotted name is unambiguous where the attribute lookup is not.
+    """
+    mod = sys.modules.get('autoRIFT.autoRIFT')
+    if mod is None:
+        import autoRIFT.autoRIFT  # noqa: F401  -- imported for its side effect on sys.modules
+
+        mod = sys.modules['autoRIFT.autoRIFT']
+    if not isinstance(mod, types.ModuleType):
+        raise TypeError(f'autoRIFT.autoRIFT resolved to {type(mod)}, not a module')
+    return mod
+
+
 def install_levels(module, manifest):
     """Patch the per-level correlator and filter calls to dump what each pyramid level decided.
 
@@ -110,14 +133,24 @@ def install_levels(module, manifest):
     Calls are numbered in the order they happen. `ChipSizeX` is an argument to the correlator, so the
     level is recorded rather than deduced, and the coarse and fine passes are distinguished by
     `SubPixFlag` — the coarse pass runs with it `False`.
+
+    `module` must be the `autoRIFT.autoRIFT` *module*, which is what `autorift()` resolves these names
+    against. See `reference_module`.
     """
     seq = {'n': 0}
     levels = manifest.setdefault('levels', [])
 
     def wrap_corr(name):
-        original = getattr(module, name, None)
-        if original is None:
-            return
+        # `raise`, not a silent return. A missing symbol means this patch cannot observe anything, and
+        # the run that follows still writes a product, a log and an exit status of 0 — so a quiet
+        # skip is indistinguishable from a level that genuinely never ran, which is exactly the
+        # reading a wrong `module` produces.
+        if not hasattr(module, name):
+            raise AttributeError(
+                f'{module.__name__} has no {name}; the per-level patch cannot be installed. '
+                'This is the symptom of patching the autoRIFT *class* rather than the module '
+                'that defines these functions — see `reference_module`.')
+        original = getattr(module, name)
 
         def patched(I1, I2, xGrid, yGrid, ChipSizeX, ChipSizeY, SearchLimitX, SearchLimitY,
                     Dx0, Dy0, SubPixFlag, overSampleRatio, *rest):
@@ -156,32 +189,33 @@ def install_levels(module, manifest):
     # The rejection mask each pass keeps. Paired with the raw `dx` above, this separates "this level
     # never measured the point" from "this level measured it and threw it away", which the merged
     # `ChipSizeX` cannot distinguish.
-    disp_filt = getattr(module, 'DISP_FILT', None)
-    if disp_filt is not None:
-        original_filt = disp_filt.filtDisp
+    if not hasattr(module, 'DISP_FILT'):
+        raise AttributeError(f'{module.__name__} has no DISP_FILT; see `reference_module`.')
+    disp_filt = module.DISP_FILT
+    original_filt = disp_filt.filtDisp
 
-        def patched_filt(self, Dx, Dy, SearchLimitX, SearchLimitY, M, OverSampleRatio):
-            seq['n'] += 1
-            n = seq['n']
-            kept = original_filt(self, Dx, Dy, SearchLimitX, SearchLimitY, M, OverSampleRatio)
-            levels.append({
-                'seq': n,
-                'kind': 'filtDisp',
-                'filt_width': int(self.FiltWidth),
-                'frac_valid': float(self.FracValid),
-                'iterations': int(self.Iter),
-                'oversample': float(OverSampleRatio),
-                'grid_shape': list(np.shape(Dx)),
-                'in_mask': int(np.count_nonzero(M)),
-                'kept': int(np.count_nonzero(kept)),
-                'arrays': {'kept': _write(f'lvl{n}_kept', np.asarray(kept).view(np.uint8))},
-            })
-            print(f'[capture] level call {n}: filtDisp width {self.FiltWidth} '
-                  f'frac {self.FracValid:.4f} kept {np.count_nonzero(kept)} '
-                  f'of {np.count_nonzero(M)}', flush=True)
-            return kept
+    def patched_filt(self, Dx, Dy, SearchLimitX, SearchLimitY, M, OverSampleRatio):
+        seq['n'] += 1
+        n = seq['n']
+        kept = original_filt(self, Dx, Dy, SearchLimitX, SearchLimitY, M, OverSampleRatio)
+        levels.append({
+            'seq': n,
+            'kind': 'filtDisp',
+            'filt_width': int(self.FiltWidth),
+            'frac_valid': float(self.FracValid),
+            'iterations': int(self.Iter),
+            'oversample': float(OverSampleRatio),
+            'grid_shape': list(np.shape(Dx)),
+            'in_mask': int(np.count_nonzero(M)),
+            'kept': int(np.count_nonzero(kept)),
+            'arrays': {'kept': _write(f'lvl{n}_kept', np.asarray(kept).view(np.uint8))},
+        })
+        print(f'[capture] level call {n}: filtDisp width {self.FiltWidth} '
+              f'frac {self.FracValid:.4f} kept {np.count_nonzero(kept)} '
+              f'of {np.count_nonzero(M)}', flush=True)
+        return kept
 
-        disp_filt.filtDisp = patched_filt
+    disp_filt.filtDisp = patched_filt
 
 
 def install():
@@ -200,9 +234,7 @@ def install():
         # Per-level patches go on before the call, since they record what happens inside it. They
         # write into this call's manifest, so a driver that runs the correlator more than once keeps
         # the levels attributed to the right run.
-        from autoRIFT import autoRIFT as ar_module
-
-        install_levels(ar_module, manifest)
+        install_levels(reference_module(), manifest)
         # Off unless asked for: a line-level trace over a 2344x2336 grid run costs real time, and the
         # ordinary capture does not need it.
         if os.environ.get('CAPTURE_STAGES'):
@@ -210,6 +242,16 @@ def install():
 
         original(self)
         sys.settrace(None)
+        # That the patch was *installed* does not establish that it *fired* — the same distinction the
+        # stale-`autoRIFT_intermediate.nc` trap taught, applied to the wrapper rather than to the run.
+        # `autorift()` calls the correlator at least twice per resolved level, so an empty list means
+        # the wrapper never ran, and the only way that happens after the checks in `install_levels` is
+        # if the loop `continue`d out of every level. Either way it is a fault to surface, not a
+        # measurement to record: a downstream reader seeing `levels: []` cannot tell the two apart.
+        if not manifest['levels']:
+            raise RuntimeError(
+                'runAutorift returned with no per-level records. The correlator wrapper was '
+                'installed but never called, so nothing inside the pyramid was observed.')
         # Inputs are taken *after* the call, not before. `runAutorift` rewrites them as its first
         # action — `self.xGrid = np.round(self.xGrid[0:rlim, 0:clim]) + 0.5` and the same for `yGrid`,
         # then truncates `Dx0`, `Dy0`, `SearchLimit*` and the chip bounds to that same window
