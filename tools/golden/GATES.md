@@ -754,3 +754,39 @@ The `exact` spread across cases — 54% to 93% — tracks the **scene**, not the
 and the remaining `exact` shortfall is attributable to a quantization step the reference applies before
 the correlator sees anything. The gate should move to the post-correlation chain, which is where a
 product comparison becomes possible.
+
+# Phase 2 — the remaining seven optical pairs
+
+Four L7/L8×L7 pairs use `_wallis_filter_fill` and three L4/5 pairs use `_wallis_filter` + `_fft_filter`.
+Both filters run in `process.py` on the **native** scenes, before geogrid, so neither is visible at the
+`runAutorift` boundary the phase-1 captures take.
+
+## Step 1 — the reference's filtered scenes are recoverable
+
+```bash
+CAPTURE_STAGES=1 CAPTURE_STAGE_LEVEL=0 julia --project=tools/golden \
+  tools/golden/intermediate.jl LE07_L1TP_061018_20120428 --run 200 --force
+```
+
+`process.py:312-336` dispatches the filter on platform and writes `Float32` GeoTIFFs to
+`Path.cwd()/'filtered'` (`create_filtered_filepath`, `:252`). The container runs in the mounted directory
+(`intermediate.jl` does `cd /home/ubuntu/work`), so they persist — the older L7 runs lack them only
+because they predate that path.
+
+| | measured | state |
+|---|---|---|
+| filtered scenes present | **4**: two `Float32` bands, two `uint8` zero masks | **green** |
+| reference band | `LE07_..._061018_..._B8.TIF`, 15101×16721, 252,503,821 finite | green |
+| secondary band | `LE07_..._060018_..._B8.TIF`, 15721×17221, 270,731,341 finite | green |
+| zero masks | same shapes, 89,606,614 and 107,932,572 set | green |
+| recorded in `call1.json` | `filtered_dir` plus shape, dtype, finite/nonzero counts and geotransform per file | green |
+
+**The shapes are the finding.** The filtered reference is 15101×**16721** while `in_I1` at the
+`runAutorift` boundary is 15101×**11338** — geogrid crops to the common overlap *after* filtering, which is
+exactly what `process.py:312`'s `FIXME` describes and why the filter cannot be validated from the
+correlator's inputs alone. The filtered scenes are the input a staged comparison needs, and they are now
+addressable from the manifest rather than by globbing a directory.
+
+An `hps` pair writes no `filtered/` at all, since it is filtered inside `autorift()`.
+`record_filtered_scenes` records `filtered_dir: null` in that case rather than staying silent, so a reader
+distinguishes "no filtered scenes" from "not looked for".

@@ -106,6 +106,60 @@ def _dump(obj, names, prefix, manifest):
         manifest['arrays'][f'{prefix}{name}'] = _write(f'{prefix}{name}', v)
 
 
+def record_filtered_scenes(manifest):
+    """Record the filtered scenes `process.py` wrote, so a reader takes them from the manifest.
+
+    **Landsat 4/5 and 7 are not filtered inside `autorift()`.** `process.py:312-336` dispatches on the
+    platform and applies the filter to the *native* scenes before geogrid runs — `apply_fft_filter` for
+    L4/5 and `apply_wallis_nodata_fill_filter` for L7 and any L8 paired with an L7 — writing `Float32`
+    GeoTIFFs to `Path.cwd()/'filtered'` (`create_filtered_filepath`, `:252`). The `FIXME` there says why:
+    the FFT filter locates the scene corners, and geogrid rounds and chops corners when subsetting to the
+    common overlap, so the filter has to see the native footprint.
+
+    That means the byte arrays this capture takes at the `runAutorift` boundary are **downstream of a
+    filter whose output is a file on disk**, and comparing against them alone cannot separate a filter
+    difference from a correlator one. Recording the paths makes those scenes the input a Julia-side
+    comparison can be fed, which is what turns the L4/5 and L7 cases from a product diff into a staged one.
+
+    Only the properties go in the manifest, not the arrays: they are full scenes at native resolution, and
+    the GeoTIFFs are already on disk beside the capture. Shape, dtype and finite count are enough for a
+    reader to assert it opened the file the capture meant.
+    """
+    filtered = manifest.setdefault('filtered', {})
+    directory = Path.cwd() / 'filtered'
+    if not directory.is_dir():
+        # Not an error: an `hps` pair is filtered inside `autorift()` and writes nothing here. The
+        # absence is the fact, and a reader distinguishes "no filtered scenes" from "not looked for".
+        manifest['filtered_dir'] = None
+        print('[capture] no filtered/ directory: this pair is filtered inside autorift()', flush=True)
+        return
+
+    manifest['filtered_dir'] = str(directory)
+    try:
+        from osgeo import gdal
+
+        gdal.UseExceptions()
+    except ImportError:
+        gdal = None
+
+    for path in sorted(directory.iterdir()):
+        if path.suffix.lower() not in ('.tif', '.tiff'):
+            continue
+        rec = {'file': path.name, 'bytes': path.stat().st_size}
+        if gdal is not None:
+            ds = gdal.Open(str(path))
+            band = ds.GetRasterBand(1)
+            a = band.ReadAsArray()
+            rec.update(shape=[int(ds.RasterYSize), int(ds.RasterXSize)],
+                       dtype=str(a.dtype),
+                       finite=int(np.count_nonzero(np.isfinite(a))),
+                       nonzero=int(np.count_nonzero(a)),
+                       geotransform=[float(v) for v in ds.GetGeoTransform()])
+            ds = None
+        filtered[path.stem] = rec
+        print(f'[capture] filtered scene {path.name}: {rec.get("shape")} {rec.get("dtype")}', flush=True)
+
+
 def reference_module():
     """The `autoRIFT.autoRIFT` module, which is where `arImgDisp_*`, `DISP_FILT` and `colfilt` live.
 
@@ -311,6 +365,8 @@ def install():
         # after is right for the same reason.
         _dump(self, INPUTS, 'in_', manifest)
         _dump(self, OUTPUTS, 'out_', manifest)
+
+        record_filtered_scenes(manifest)
 
         for name in SCALARS:
             if hasattr(self, name):
