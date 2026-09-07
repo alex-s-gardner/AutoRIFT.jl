@@ -354,3 +354,78 @@ not.**
 Open, and this is the next thing to measure: **why S2A lost 24,680 measurements.** The stage ladder has
 run only on LC08, and the rung that would answer it — the coarse mask `MC2` restricting the fine search
 — is the one stage the ladder does not yet cover. Capture S2A's levels and walk it there.
+
+## Gate 3 extended again — the coarse mask, and S2A's lost measurements
+
+The ladder now covers `MC2`, the stage that decides where the fine pass may look — and therefore the
+one stage that can lose a measurement the correlator never gets to attempt. Three rungs
+(`autoRIFT.py:702-724`): the go/no-go valid fraction, the dilation on the coarse grid, and the
+expansion to the fine grid with the radius it produces.
+
+```bash
+CAPTURE_STAGES=1 CAPTURE_STAGE_LEVEL=0 julia --project=tools/golden \
+    tools/golden/intermediate.jl S2A_MSIL1C_20200626 --run 200 --force
+julia --project=tools/golden -t 8 tools/golden/stages.jl S2A_MSIL1C_20200626 --run 200 --all
+```
+
+| case, level | rungs | state |
+|---|---|---|
+| LC08, level 0 | 21 | **21 green** |
+| S2A, level 0 | 19 | **19 green** |
+
+### Where S2A's 24,680 lost measurements went
+
+Not `MC2` — that accounts for ~4,600 points. Comparing level assignments directly localized it:
+
+| chip | julia | reference | delta |
+|---|---:|---:|---:|
+| 0 (unresolved) | 505,997 | 484,982 | +21,015 |
+| 24 | 554,187 | 554,112 | **+75** |
+| 48 | 21,416 | 38,473 | −17,057 |
+| 96 | **0** | 4,033 | −4,033 |
+
+The base level agreed to 75 points. **Chip 96 produced nothing at all**, and chip 48 was short by
+17,057 — so the whole loss was above the base level. Chip 96 returned in 0.2 s having correlated zero
+coarse points, and the reason was arithmetic: its coarse points sat at x between **16,470 and 27,423**
+on a **10,980 px** image. Every window fell outside the scene, nothing correlated, and the level was
+dropped for a zero denominator.
+
+**Two bugs, both mine, both in code added earlier in this session:**
+
+`_grid_step` kept only *positive* steps. A step along a row moves `x` by the spacing times the cosine
+of the grid's rotation — `8` on a near-axis-aligned Landsat grid and **`−1`** on this Sentinel-2 grid,
+rotated near 90°. Keeping positives saw nothing but the jumps out of the zeroed nodata margin and
+returned **10979**. The step is signed, and is taken only between points that both carry a coordinate.
+
+`dilate_within` tested `d2 <= r2` where the reference tests `< BuffDistanceC`. On a lattice that
+boundary is a whole ring: all **72** disagreeing coarse cells sat at distance *exactly* 8.0, which the
+expansion multiplied to **30,084** fine points.
+
+### The result, read as counts
+
+| S2A | both | exact % | **exact count** | only jl | only ref |
+|---|---:|---:|---:|---:|---:|
+| original baseline | 586,090 | 92.66% | 543,071 | 6,643 | 10,528 |
+| after the first two fixes | 561,410 | *96.74%* | 543,108 | 14,193 | 35,208 |
+| **after these two** | 586,180 | 92.65% | **543,093** | **6,632** | **10,438** |
+
+Both exclusive sets are now **below the original baseline** — `only_jl` 6,632 against 6,643 and
+`only_ref` 10,438 against 10,528 — so the 24,680-point regression is gone rather than traded for a
+percentage. Chip 96 is restored from 0 measured points to 46,960, and the level-assignment gap closes
+from 21,015 to 3,806. `exact` sits at 92.65% against the baseline's 92.66%, which is the right shape:
+the fixes were about coverage, and the count moved by +22.
+
+`tools/ab` stage 2 is unchanged at 81.8% exact, 98.7% within one step, p99 0.0752. `Pkg.test()` passes
+— 703,968 assertions — after the `FastGeoProjections` compat bump to `"0.1, 0.2"`, which was failing
+at resolution on this branch and on `main`.
+
+### One more matched-not-endorsed difference, measured
+
+The reference's `MC2` expansion is `INTER_NEAREST`, which is **left-aligned**: coarse cell `k` covers
+fine `(k-1)*stride+1 .. k*stride`, so the node at `k*stride` is the *last* point of its own cell. But
+the radius it reduces for that node is a centred `filtWidth`-wide window, fine `k*stride-4 ..
+k*stride+4`. So the reference gathers coherence evidence from fine 4..12 and applies it to fine 1..8 —
+**offset by 3**. `_expand_coarse_mask` inverts `_cell_max_radius!`'s own assignment instead, so the
+mask lands on exactly the points the evidence came from. Rung 3.11a reports the disagreement (28,032
+points on LC08, split 14,016 each way, with both sides searching the same total of 2,615,872) rather
+than gating on it.
