@@ -10,6 +10,8 @@
 
 using CairoMakie, Printf, Statistics
 
+include(joinpath(@__DIR__, "bundle.jl"))
+
 const FIG_D = joinpath(@__DIR__, "stage2")
 const FIG_PLOTS = joinpath(@__DIR__, "plots")
 # The scale the difference maps are drawn at: one step of the sub-pixel search, which is the finest
@@ -37,21 +39,10 @@ const FIG_SIZE = (1560, 929)
 # the disagreement and reports it, so a convention change on either side surfaces as a printed sign
 # rather than as a figure full of apparent error.
 function load_stage2()
-    shapes = Dict{String,Tuple{Int,Int}}()
-    scalars = Dict{String,Int}()
-    for line in eachline(joinpath(FIG_D, "manifest.txt"))
-        s = strip(line)
-        (isempty(s) || startswith(s, "#")) && continue
-        parts = split(s)
-        if length(parts) == 2
-            scalars[parts[1]] = parse(Int, parts[2])
-        else
-            shapes[parts[1]] = Tuple(parse.(Int, split(parts[3], "x")))
-        end
-    end
-    rd(name, T, dims) = reshape(collect(reinterpret(T, read(joinpath(FIG_D, "$name.bin")))), dims)
+    shapes, scalars = read_manifest(FIG_D)
+    rd(name, T, dims) = read_bin(FIG_D, name, T, dims)
     js = shapes["julia_dx"]
-    ps = Tuple(parse.(Int, split(strip(read(joinpath(FIG_D, "python_shape.txt"), String)))))
+    ps = read_python_shape(FIG_D)
     nr, nc = min(js[1], ps[1]), min(js[2], ps[2])
     crop(A) = A[1:nr, 1:nc]
 
