@@ -761,6 +761,120 @@ def gen_warpaffine() -> int:
     return n
 
 
+def gen_scenegeometry() -> int:
+    """The pixel-derived scene footprint: connected components, contour moments, `minAreaRect`.
+
+    `_fft_filter` recovers the imaged swath from the valid-data mask (`autoRIFT.py:153-206`), and it has to:
+    a Landsat L1T product is `ORIENTATION = NORTH_UP`, so its MTL corners are the axis-aligned bounding box
+    and carry no rotation at all — measured, on `LT05_L1TP_060018_19851028`, as 0.00/90.00 against the
+    71.60/−20.25 the reference logs. The swath is a rotated quadrilateral inside that raster and exists only
+    in the pixels.
+
+    Four primitives, each pinned because each can differ between OpenCV builds in a way that moves the
+    angles:
+
+      * `connectedComponentsWithStats` and `_find_largest_region`'s `area[1:].argmax() + 1` — the `1:` skips
+        the background label, and an off-by-one there selects the background and returns an empty region.
+      * `findContours` with `RETR_EXTERNAL` + `CHAIN_APPROX_SIMPLE`, whose point *order* and count depend on
+        the approximation, and `moments`' `m01/m00` centroid computed from it.
+      * **`minAreaRect`'s angle, whose convention changed in OpenCV 4.5.** Before, it returned
+        `[-90, 0)`; from 4.5 it returns `(0, 90]`. The filter uses `-angle` to rotate its quadrant map, so
+        the two conventions rotate opposite ways. The fixture records what the pinned build returns rather
+        than assuming either.
+      * `distanceTransform` from a single seed pixel, which is how the filter finds the extreme point of
+        each quadrant.
+
+    The cases are the shapes the filter meets: a rotated quadrilateral on fill (a north-up L1T scene), the
+    same with a second smaller region so `_find_largest_region` has to choose, and a near-axis-aligned one
+    where the angle convention is most visible.
+    """
+    n = 0
+    rng = np.random.default_rng(31)
+
+    def rotated_quad(shape, angle, inset=0.18):
+        """A filled rotated rectangle on a zero background, as a north-up scene's valid data looks."""
+        y, x = shape
+        canvas = np.zeros(shape, dtype=np.uint8)
+        h, w = int(y * (1 - 2 * inset)), int(x * (1 - 2 * inset))
+        rect = np.zeros(shape, dtype=np.uint8)
+        rect[(y - h) // 2:(y + h) // 2, (x - w) // 2:(x + w) // 2] = 255
+        m = cv2.getRotationMatrix2D(center=(x / 2, y / 2), angle=angle, scale=1)
+        cv2.warpAffine(src=rect, M=m, dsize=(x, y), dst=canvas, flags=cv2.INTER_NEAREST)
+        return canvas
+
+    cases = {}
+    cases["swath_18deg"] = rotated_quad((200, 240), 18.0)
+    cases["swath_m8deg"] = rotated_quad((200, 240), -8.13)
+    cases["swath_near0"] = rotated_quad((200, 240), 0.7)
+    # Two regions: the filter must keep the larger. The smaller is deliberately not tiny, so an
+    # argmax on the wrong axis or including the background picks it.
+    two = rotated_quad((200, 240), 18.0).copy()
+    two[8:60, 8:70] = 255
+    cases["two_regions"] = two
+
+    for name, valid in cases.items():
+        regions = (valid != 0).astype("uint8") * 255
+        n_labels, label_arr, stats, centroids = cv2.connectedComponentsWithStats(regions)
+        area = stats[:, cv2.CC_STAT_AREA]
+        max_label = int(area[1:].argmax() + 1)
+        largest = label_arr.copy()
+        largest[largest != max_label] = 0
+        single = np.uint8((largest != 0) * 255)
+
+        contours, hierarchy = cv2.findContours(single, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contour = contours[0]
+        moment = cv2.moments(contour)
+        centroid_y = moment["m01"] / moment["m00"]
+        centroid_x = moment["m10"] / moment["m00"]
+        rect = cv2.minAreaRect(contour)
+        angle = rect[2]
+
+        # The quadrant map and its rotation, which is how each quadrant's extreme point is found.
+        quadrants = np.ones(single.shape, dtype="uint8")
+        quadrants[:, int(np.floor(centroid_x)):] += 1
+        quadrants[int(np.floor(centroid_y)):, :] += 2
+        rot = cv2.getRotationMatrix2D(center=(centroid_x, centroid_y), angle=-angle, scale=1)
+        rotated = cv2.warpAffine(src=quadrants, M=rot, dsize=(single.shape[1], single.shape[0]))
+
+        centroid_array = np.ones(single.shape, dtype="uint8")
+        centroid_array[int(np.floor(centroid_y)), int(np.floor(centroid_x))] = 0
+        dist = cv2.distanceTransform(centroid_array, cv2.DIST_L2, 5)
+        dist[single != 255] = 0
+
+        corners = {}
+        for label, q in (("tl", 1), ("tr", 2), ("bl", 3), ("br", 4)):
+            window = np.zeros(dist.shape, dtype=np.float32)
+            roi = rotated == q
+            window[roi] = dist[roi]
+            corners[label] = [int(v) for v in np.unravel_index(int(np.argmax(window)), window.shape)]
+
+        def slope(p1, p2):
+            return float(np.rad2deg(np.arctan((p1[1] - p2[1]) / (p1[0] - p2[0]))))
+
+        along = float(np.nanmax([slope(corners["bl"], corners["br"]), slope(corners["tl"], corners["tr"])]))
+        cross = float(np.nanmax([slope(corners["br"], corners["tr"]), slope(corners["bl"], corners["tl"])]))
+
+        write_case(
+            f"scenegeometry/{name}",
+            {"valid": valid, "single_region": single,
+             "quadrants": quadrants, "rotated_quadrants": rotated,
+             "distance": np.asarray(dist, dtype=np.float32)},
+            {"built_angle_hint": name,
+             "n_labels": int(n_labels), "max_label": max_label,
+             "largest_area": int(area[max_label]),
+             "contour_points": int(len(contour)),
+             "centroid": [centroid_x, centroid_y],
+             # Recorded, never assumed: OpenCV changed this range in 4.5.
+             "minarearect_angle": float(angle),
+             "minarearect_angle_range": "(0, 90] since OpenCV 4.5",
+             "minarearect_size": [float(rect[1][0]), float(rect[1][1])],
+             "corners": corners,
+             "along_track": along, "cross_track": cross},
+        )
+        n += 1
+    return n
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -776,6 +890,7 @@ GENERATORS = (
     ("bwareaopen", gen_bwareaopen),
     ("wallisfill", gen_wallisfill),
     ("warpaffine", gen_warpaffine),
+    ("scenegeometry", gen_scenegeometry),
 )
 
 

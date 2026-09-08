@@ -927,16 +927,51 @@ check disposed of, and because the reason generalizes.
 `ORIENTATION = NORTH_UP` is the explanation: an L1T product is resampled north-up, so *both* the projected
 and the lat/lon corner sets are the axis-aligned bounding box of the raster, and every slope from them is 0
 or ±90. What `_fft_filter` measures is the **valid-data region inside** that raster — the rotated swath a
-north-up product contains surrounded by fill — and that is in the pixels and nowhere in the metadata.
+north-up product contains surrounded by fill. The rotation exists because the acquisition track does not
+line up with map coordinates, and at high latitude no scene's does.
+
+So the corner fields cannot supply it. Whether *some* metadata can is a separate question, and the next
+section answers it.
 
 Also confirmed by line order: `apply_landsat_filtering` is called at `process.py:477` and the reprojection
 logs at `:482`, so the filter sees the native scene. The rotation is not an artifact of reprojection.
 
-**So the derived route is reproduced, as the plan pre-committed.** Agreement is the objective; the reference
-used pixel geometry, and a filter matched to it must use the same. That restores the four primitives the
-metadata route would have removed — `connectedComponentsWithStats`, `findContours` + `moments` +
-`minAreaRect`, and the quadrant `warpAffine` — and with them the `minAreaRect` angle-convention hazard,
-which now has to be pinned rather than avoided.
+### Correcting the above: the *corner* fields are refuted, metadata is not
+
+The paragraph above concluded too broadly from too narrow a check. The rotation is **orbit geometry** — the
+acquisition track does not line up with map coordinates, and at high latitude no scene does — so the place
+to look is not the corners but the orbit. Every Landsat L1 product ships an `_ANG.txt` beside the MTL
+carrying `EPHEMERIS_ECEF_{X,Y,Z}` at 1 s spacing, which is the satellite's actual trajectory.
+
+Differencing consecutive ECEF positions and rotating into local ENU at the mid-orbit point gives the
+ground-track azimuth, and its `atan(north/east)` is the along-track slope in a north-up raster's own terms:
+
+| scene | ephemeris `atan(n/e)` | reference logged along | Δ |
+|---|---:|---:|---:|
+| `LT05_L1TP_060018_19851028` | **71.63°** | **71.60°** | **0.03°** |
+| `LT05_L1GS_061018_19860123` | **71.65°** | 75.49° | 3.84° |
+
+**The orbit is the right quantity and the reference's derivation is the approximation.** Both scenes are the
+same descending pass — azimuth 198.37° and 198.35°, differing by 0.02° — so the true heading is essentially
+constant, while the reference's estimate moves 3.9°. That variation is the signature of a pixel-derived
+value: it follows how the valid region happens to be clipped. Scene 2 is `L1GS` — systematic correction, not
+terrain-corrected — at quality tier T2, so its footprint is the less regular one.
+
+Two further checks say the same. The reference's cross-track values are **not perpendicular** to its
+along-track ones — −20.25° against 71.60° − 90° = −18.40°, and −16.37° against −14.51° — off by 1.85° and
+2.03°, where a real cross-track direction is perpendicular by definition. And a 0.03° agreement on the
+well-conditioned scene is far too close to be coincidence.
+
+So the metadata route is viable after all, and better: `_ANG.txt` carries the geometry, the MTL corners
+simply do not. What it cannot do is *match* the reference on a scene where the reference's own estimate is
+3.8° off the truth.
+
+**That is the trade this step exists to surface, and it is the plan's pre-committed decision point.**
+Agreement is the current objective, so the derived route is what a matched filter must use — and the four
+primitives come back with it, including the `minAreaRect` angle-convention hazard. The orbit route is
+recorded in `tools/golden/README.md`'s matched-not-endorsed table as the more correct alternative, with the
+measurement above as its justification, to be adopted once agreement is established. `mtl.jl` keeps the
+ephemeris reader so that decision is one call away rather than a re-derivation.
 
 ### A second finding from the same log: the filter is a no-op on this pair
 
