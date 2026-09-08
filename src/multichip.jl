@@ -746,15 +746,27 @@ function _undecimate_level(got, fullsize::Tuple{Int,Int}, rows, cols,
     return (; field = out, filled)
 end
 
-# How many grid points span one chip of the finest level, per axis, taken as the smaller of the
-# two so a non-square configuration does not over-widen either axis of the filter window.
+# How many grid points span one chip of the finest level.
+#
+# **The X axis alone, which is what the reference uses.** Its ratio is
+# `int(self.ChipSize0X / self.GridSpacingX)` (`autoRIFT.py:481`) — one number, from the X chip and the
+# X spacing, with no Y term anywhere. Taking the smaller of the two axes agrees whenever the chip is
+# square, which every optical case in the golden set is, and diverges as soon as it is not: a
+# Sentinel-1 pair runs `ScaleChipSizeY = 0.25`, so a 64x16 chip on a grid spaced 32 gives 2 in X and
+# **0** in Y, and the minimum collapses the ratio to 1. The filter then judges over a 5-wide window at
+# `FracValid = 0.32` where the reference uses 9 at a threshold raised by its overlap term, which
+# rejects far less — measured as 176,211 points answered against the reference's 70,508 on
+# `S1A_..._20151120T080202`.
+#
+# Matched rather than endorsed: a filter window derived from X and applied to both axes of a 4:1 chip
+# covers four times as much ground across track as along it, which is not obviously the right
+# neighbourhood for judging consistency. See `tools/golden/README.md`.
 #
 # Only a grid at least as fine as its chips has overlapping neighbourhoods, so a spacing coarser
 # than the chip gives one and the filter is left alone. Integer division matches the reference,
 # which rejects a non-dividing pair outright (`autoRIFT.py:474-482`) rather than rounding.
 function _oversample(p::Params)
     ox = p.chip_size_min.X ÷ max(p.grid_spacing.X, 1)
-    oy = p.chip_size_min.Y ÷ max(p.grid_spacing.Y, 1)
     # Capped at 2. The ratio is how many grid points span one chip, and the filter's window and
     # agreement fraction both grow with it: at 4 the threshold is 186 of 289 neighbours and at 8 it
     # is 877 of 1089, which no real velocity field clears — measured as zero coverage for a 64 px
@@ -762,7 +774,7 @@ function _oversample(p::Params)
     # keep the ratio fixed, so the formula it uses (`autoRIFT.py:498-502`) was only ever exercised
     # there. A caller who posts a grid four times finer than its chips gets the same neighbourhood
     # in ground units that the reference would use, and `_level_decimation` does the rest.
-    return clamp(min(ox, oy), 1, 2)
+    return clamp(ox, 1, 2)
 end
 
 # Points for one level: the caller's grid with this level's chip size, and the radius zeroed

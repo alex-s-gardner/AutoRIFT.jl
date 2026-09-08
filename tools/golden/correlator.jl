@@ -216,8 +216,14 @@ function kwargs_from_capture(k::Capture)
     spacing = Int(k.scalars["GridSpacingX"])
     maxchip = Int(maximum(k.arrays["in_ChipSizeMaxX"]))
 
+    # **Both chip bounds carry `ScaleChipSizeY`, not just the minimum.** `in_ChipSizeMaxX` is the X
+    # axis alone — the array's name says so — and the pyramid doubles both axes together, so Y's
+    # maximum is Y's minimum times the same number of doublings. Scaling only `chip_size` leaves the
+    # two axes reaching their maxima after different doublings, which `_check_levels` rejects: on a
+    # Sentinel-1 pair at `ScaleChipSizeY = 0.25` that is `8` in X against `32` in Y. Invisible on
+    # every optical case, where the scale is 1.0 and the two forms coincide.
     return (; chip_size = (X = chip0, Y = round(Int, chip0 * scale_y)),
-            chip_size_max = (X = maxchip, Y = maxchip),
+            chip_size_max = (X = maxchip, Y = round(Int, maxchip * scale_y)),
             grid_spacing = (X = spacing, Y = spacing),
             subpixel = subpixel_from_capture(k),
             preprocess = :none)
