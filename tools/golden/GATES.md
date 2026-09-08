@@ -1168,3 +1168,95 @@ path at 84.8% exact with a 35.8 px maximum against 100% on the float path.
 The three remaining phase-3-and-beyond groups are unchanged in status: eight Sentinel-1 pairs and two NISAR
 pairs need the radar geogrid path, and no golden pair has been compared as a *product* because the
 post-correlation chain does not exist in Julia. Those are the next two gates, in that order.
+
+---
+
+# Radar phase — one Sentinel-1 SLC pair, gate by gate
+
+Scope is deliberately **one** S1-SLC pair as a probe, then a reassessment. Radar container time is the
+reason: this pair's capture took **2h15m** against ~8 min for an optical one, so the decision about the
+remaining eight pairs is made against a measured cost rather than an estimate.
+
+The pair is `S1A_IW_SLC__1SSH_20151120T080202_..._X_..._20151214T080202_..._G0120V02_P002` — the
+smallest SLC in the set at 1536x1024 output with 70,214 valid velocity points.
+
+## Step 1 — the capture, green
+
+```bash
+julia --project=tools/golden tools/golden/intermediate.jl S1A_IW_SLC__1SSH_20151120T080202 --run 200
+```
+
+The reference's own ISCE3 produced `reference.tif`/`secondary.tif` and the capture intercepted
+`runAutorift` at the same boundary the twelve optical pairs use, with **no harness change** —
+`capture.py` passes its command line to `hyp3_autorift.process.main()`, which reaches
+`process_sentinel1_slc_isce3`.
+
+| | |
+|---|---|
+| grid | 3520 x 3280 |
+| image | 23857 x 65978 `UInt8` |
+| wall clock | ~2h15m |
+| on-disk | 26 GB |
+
+### What `optflag` does, and why the correlator needs no radar mode
+
+`optflag`/`optical_flag` appears five times in `testautoRIFT.py` and **every one is before the capture
+boundary**: `loadProduct` per-scene (`:304`), the `ChipSizeMaxX` override it skips (`:376`),
+`obj.Dy0 = -1 * obj.Dy0` (`:402`), and the `OverSampleRatio` table (`:477`). `grep optflag` on
+`autoRIFT.py` returns nothing. So the radar path differs only in *what arrays and scalars the
+correlator is handed*, which is exactly what the capture records.
+
+## Step 2 — every captured scalar, against what the code trace predicted
+
+Recorded **before** running the ladder, so a later surprise is measured against a written expectation.
+
+| scalar | optical | this pair | predicted? |
+|---|---|---|---|
+| `WallisFilterWidth` | 5 | **21** | yes — `vend/testautoRIFT.py:714` sets 21 for `nc_sensor == 'S1'` |
+| `OverSampleRatio` | 16/32/64/64 | **32/64/128/128** | yes — `:477`, the `optflag == 0` branch |
+| `DataType` | 0 | **0** | yes — the byte path, as production optical |
+| `ChipSize0X` | 16 | **64** | **no** |
+| `ScaleChipSizeY` | 1.0 | **0.25** | **no** |
+| `GridSpacingX` | 8 | 32 | — |
+| `SkipSampleX/Y` | 32 | 32 | — |
+| `minSearch` | 6 | 6 | — |
+| `FracValid` / `FracSearch` | 0.32 / 0.2 | 0.32 / 0.2 | — |
+| `CoarseCorCutoff` | 0.01 | 0.01 | — |
+
+Two facts no reading of the driver would have given, and both matter:
+
+- **`ChipSize0X = 64`**, a 4x larger base chip than any optical case. The pyramid therefore runs
+  64/128/256/512 rather than 16/32/64/128, which is why the `OverSampleRatio` keys differ.
+- **`ScaleChipSizeY = 0.25`**, so every chip is **64 x 16** — strongly anisotropic, from SAR
+  range/azimuth geometry. Every optical pair in the set is 1.0. This exercises the chip-size
+  asymmetry already registered as matched-not-endorsed in `README.md`, on a case where the asymmetry
+  is 4:1 rather than absent.
+
+### The reference's own level records, which bound what the ladder can assert
+
+| seq | kind | chip | oversample | grid | measured / kept |
+|---|---|---|---|---|---|
+| 1 | coarse | 64 x 16 | 32 | 440 x 410 | 40,105 |
+| 2 | filtDisp | — | 32 | 440 x 410 | kept 132 of 40,105 |
+| 3 | coarse | 128 x 32 | 64 | 220 x 205 | 8,620 |
+| 4 | filtDisp | — | 64 | 220 x 205 | kept 206 of 8,620 |
+| 5 | **fine** | 128 x 32 | 64 | 1760 x 1640 | 128,825 |
+| 6 | filtDisp | — | 64 | 1760 x 1640 | kept 15,703 of 128,825 |
+| 7 | coarse | 256 x 64 | 128 | 110 x 102 | 1,790 |
+| 8 | filtDisp | — | 128 | 110 x 102 | **kept 0** |
+| 9 | coarse | 512 x 128 | 128 | 55 x 51 | 397 |
+| 10 | filtDisp | — | 128 | 55 x 51 | **kept 0** |
+
+Two structural differences from every optical case, stated as expectations for step 3:
+
+- **Only one fine pass runs, at chip 128 x 32.** The base level (64 x 16) has a coarse pass and a
+  `filtDisp` but *no* fine pass, and the two coarsest levels are rejected outright. So the merged
+  answer comes from one level, and `exact` at the base chip size is not a meaningful gate here —
+  bias and correlation are, as for the two optical pairs whose base level is skipped.
+- **`filtDisp` keeps almost nothing at the coarse levels** — 132 of 40,105, then 0 twice. A rung
+  asserting a nonempty coarse mask will fail for reasons that are the reference's behaviour, not a
+  disagreement.
+
+**`STAGES: 0`** — this capture was taken without `CAPTURE_STAGES=1`, so the loop-local trace is
+absent and the stage-by-stage rungs cannot run against it. Re-capturing costs another 2h15m; step 3
+records what the ladder can and cannot check without it.
