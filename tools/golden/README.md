@@ -32,12 +32,17 @@ naming rule, for two reasons that a derived mapping gets wrong:
 Burst jobs are the exception: a product never names its bursts, so the first reference burst's
 timestamp identifies `img1`.
 
-| phase | cases | platforms | blocked on |
+| phase | cases | platforms | state |
 |---|---|---|---|
-| 3 | 9 | Landsat 7/8/9, Sentinel-2 | the post-correlation chain |
-| 4 | 3 | Landsat 4/5 | an FFT destripe filter |
+| 3 | 9 | Landsat 7/8/9, Sentinel-2 | **correlator validated, 9/9**; a product comparison needs the post-correlation chain |
+| 4 | 3 | Landsat 4/5 | **correlator validated, 3/3**; `Destripe` implemented and exact against the reference |
 | 5 | 8 | Sentinel-1 SLC and OPERA bursts | the radar geogrid path and ISCE3 detection |
 | 6 | 2 | NISAR L1 RSLC, L2 GSLC | as phase 5 |
+
+All twelve optical pairs pass the stage ladder with every stage exact or reported-as-designed;
+`tools/golden/GATES.md` holds the per-case table and the measurements behind each gate. What remains for them
+is a *product* comparison, which needs the chain downstream of `correlate` — displacement to velocity,
+stable-shift correction, error estimation, cropping and netCDF packaging — none of which exists in Julia.
 
 `P<nn>` in a product name is `roi_valid_percentage` truncated — valid pixels within the ROI, not
 within the grid. The grid-wide fraction is lower, 5–42% across the set, so the two are not
