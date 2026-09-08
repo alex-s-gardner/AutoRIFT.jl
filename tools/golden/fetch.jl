@@ -126,6 +126,12 @@ end
 #
 # `provider=ASF` is required, not a filter: CMR refuses an unconstrained cross-collection granule
 # query outright rather than searching everything.
+#
+# **The CMR hit and the credential are two separate questions, and this reports both.** CMR search is
+# anonymous, so a granule resolves whether or not `~/.netrc` can read it: reporting `:ok` off the hit
+# alone claims a route that has never been exercised, and the first thing to exercise it is then a
+# container run that dies on `401 Unauthorized` after reaching the driver. `urs_status` is what
+# separates "the archive does not have this" from "we may not read it".
 function resolve_asf(c::GoldenCase)
     query = c.reference[1]
     url = "https://cmr.earthdata.nasa.gov/search/granules.umm_json" *
@@ -142,8 +148,70 @@ function resolve_asf(c::GoldenCase)
     # and the count is reported rather than treated as ambiguity.
     n = length(c.reference)
     scope = n == 1 ? "1 scene" : "$n bursts, first resolved"
+    urs = urs_status()
+    urs === :ok || return (; status = :unauthorized, route = "cmr/asf + ~/.netrc",
+                           detail = "$scope; $hits CMR granule(s); Earthdata $urs")
     return (; status = :ok, route = "cmr/asf + ~/.netrc",
             detail = "$scope; $hits CMR granule(s)")
+end
+
+"""
+    urs_status() -> Symbol
+
+Whether `~/.netrc`'s `urs.earthdata.nasa.gov` credential authenticates: `:ok`, `:rejected`,
+`:absent`, `:ambiguous`, or `:unreachable`.
+
+Asked against `urs.earthdata.nasa.gov` itself rather than against a data URL, because an ASF download
+is a redirect chain and a 401 anywhere along it is ambiguous between a bad credential and a granule
+this account is not approved for. The answer is cached: every radar case shares one credential, and
+`--check` over ten cases should not be ten login attempts.
+
+**A duplicate `machine` entry is reported rather than probed, because the probe cannot see it.**
+`Downloads` authenticates through libcurl, which takes the *first* matching entry; Python's `netrc`
+module — which is what `hyp3lib.fetch` inside the container uses — takes the *last*. So a `~/.netrc`
+holding one host twice with different passwords makes this check and the container disagree by
+construction: libcurl reads a working credential and reports `:ok` while the run dies on
+`401 Unauthorized` after reaching the driver. Whichever entry is stale, two entries for one host is
+unresolvable here and the honest status is `:ambiguous`.
+"""
+const _URS = Ref{Union{Symbol,Nothing}}(nothing)
+function urs_status()
+    _URS[] === nothing || return _URS[]
+    return _URS[] = _probe_urs()
+end
+
+const URS_HOST = "urs.earthdata.nasa.gov"
+
+function _probe_urs()
+    path = joinpath(homedir(), ".netrc")
+    isfile(path) || return :absent
+    netrc_host_count(path, URS_HOST) > 1 && return :ambiguous
+    # `Downloads` reads `~/.netrc` through libcurl, so no credential is handled here — the status code
+    # is the whole answer and nothing secret enters this process.
+    r = try
+        Downloads.request("https://$URS_HOST/api/users/tokens";
+                          method = "GET", throw = false, timeout = 60)
+    catch
+        return :unreachable
+    end
+    r.status == 200 && return :ok
+    r.status in (401, 403) && return :rejected
+    return :unreachable
+end
+
+"""
+    netrc_host_count(path, host) -> Int
+
+How many `machine <host>` entries `path` declares.
+
+Counts tokens rather than lines: `.netrc` is whitespace-delimited, so one entry may span lines or
+share one. Only the machine names are inspected — no `login` or `password` token is read, so a
+credential cannot leak through this function or its caller's error messages.
+"""
+function netrc_host_count(path::AbstractString, host::AbstractString)
+    toks = split(read(path, String))
+    return count(i -> toks[i] == "machine" && i < length(toks) && toks[i + 1] == host,
+                 eachindex(toks))
 end
 
 escape_uri(s) = replace(s, " " => "%20")
