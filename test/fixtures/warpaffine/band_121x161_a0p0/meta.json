@@ -1,0 +1,44 @@
+{
+  "arrays": {
+    "expected": {
+      "dtype": "float32",
+      "shape": [
+        121,
+        161
+      ]
+    },
+    "matrix": {
+      "dtype": "float64",
+      "shape": [
+        2,
+        3
+      ]
+    },
+    "selected": {
+      "dtype": "uint8",
+      "shape": [
+        121,
+        161
+      ]
+    },
+    "src": {
+      "dtype": "float32",
+      "shape": [
+        121,
+        161
+      ]
+    }
+  },
+  "params": {
+    "angle": 0.0,
+    "band_half_rows": 20,
+    "center": [
+      80.5,
+      60.5
+    ],
+    "consumer_test": "filter == 1",
+    "interpolation": "bilinear (warpAffine default)",
+    "notch_half_cols": 30,
+    "selected_count": 4040
+  }
+}

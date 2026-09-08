@@ -704,6 +704,63 @@ def gen_wallisfill() -> int:
     return n
 
 
+def gen_warpaffine() -> int:
+    """`warpAffine` of a `getRotationMatrix2D`, which is the only OpenCV call the destripe filter keeps.
+
+    `_fft_filter` builds two band-reject masks by rotating one base mask to the along- and cross-track
+    angles (`autoRIFT.py:207-215`): a 140-row horizontal band with a 200-column vertical notch removed,
+    rotated about the *image* centre. Everything else the filter does with OpenCV — connected components,
+    contours, moments, `minAreaRect`, a rotated quadrant map, four distance-transform argmaxes — exists only
+    to recover the scene footprint from pixels, and the MTL corners give that directly.
+
+    Three properties are pinned because each changes which frequencies the filter rejects:
+
+      * **The interpolation of a 0/1 mask.** `warpAffine` defaults to bilinear, so a rotated mask is *not*
+        binary — its edge carries fractional values, and `_fft_filter` then compares `filter_a == 1`, which
+        keeps only the pixels that stayed exactly 1. A port that rounds or nearest-samples the rotation
+        selects a different, larger band.
+      * **The centre convention.** `getRotationMatrix2D` takes `(x, y)` and the filter passes
+        `(center_x, center_y) = (x/2, y/2)` — the true half-extent, not the integer `floor` it uses for the
+        band's own row range. So the mask is built about a truncated centre and rotated about an untruncated
+        one, which for an even dimension differ by half a pixel.
+      * **The sign of the angle.** The quadrant rotation uses `-angle` and the two band rotations use
+        `+cross_track` / `+along_track` (`:178`, `:211-212`), so a single convention for both is wrong.
+
+    Cases cover the angles these scenes actually produce — near 0, near ±8 (a Landsat descending pass is
+    about 8 degrees off north), and ±90 — on both an even and an odd dimension so the centre convention is
+    exercised where it bites.
+    """
+    n = 0
+    shapes = ((120, 160), (121, 161))
+    for (y, x) in shapes:
+        # The filter's own base mask, so the fixture pins the rotation of the array that is actually rotated
+        # rather than of a generic test pattern.
+        base = np.zeros((y, x), dtype=np.float32)
+        cy, cx = int(np.floor(y / 2)), int(np.floor(x / 2))
+        half_band, half_notch = 20, 30          # scaled from the filter's 70 and 100 for this size
+        base[max(cy - half_band, 0):cy + half_band, :] = 1
+        base[:, max(cx - half_notch, 0):cx + half_notch] = 0
+
+        for angle in (0.0, 8.13, -8.13, 45.0, 90.0, -90.0):
+            rot = cv2.getRotationMatrix2D(center=(x / 2, y / 2), angle=angle, scale=1)
+            out = cv2.warpAffine(src=base, M=rot, dsize=(x, y))
+            write_case(
+                f"warpaffine/band_{y}x{x}_a{str(angle).replace('.', 'p').replace('-', 'm')}",
+                {"src": base, "matrix": np.asarray(rot, dtype=np.float64),
+                 "expected": np.asarray(out, dtype=np.float32),
+                 # What the filter actually consumes: the strict `== 1` test, not the rotated float mask.
+                 "selected": (out == 1).astype(np.uint8)},
+                {"angle": angle, "center": [x / 2, y / 2],
+                 "interpolation": "bilinear (warpAffine default)",
+                 "band_half_rows": half_band, "notch_half_cols": half_notch,
+                 # Recorded because it is the comparison the filter makes and the reason bilinear matters.
+                 "consumer_test": "filter == 1",
+                 "selected_count": int((out == 1).sum())},
+            )
+            n += 1
+    return n
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -718,6 +775,7 @@ GENERATORS = (
     ("colfilt", gen_colfilt),
     ("bwareaopen", gen_bwareaopen),
     ("wallisfill", gen_wallisfill),
+    ("warpaffine", gen_warpaffine),
 )
 
 

@@ -904,3 +904,57 @@ same run then reports `dy` at sign `−` with bias **+0.0076**.
 
 Both were invisible on the five `hps` cases, whose base levels always resolve. A case class that exercises
 a different branch is what found them.
+
+## Step 4 — the metadata route is refuted, and the plan's fallback applies
+
+```bash
+CAPTURE_STAGES=1 CAPTURE_STAGE_LEVEL=0 julia --project=tools/golden \
+  tools/golden/intermediate.jl LT05_L1TP_060018_19851028 --run 200 --force
+grep -E "track angle|banding" <run-dir>/capture.log
+```
+
+The plan proposed reading the scan geometry from the MTL rather than deriving it from pixels, deleting four
+of the five OpenCV calls. **The measurement says no.** Recorded because it was a good idea that a cheap
+check disposed of, and because the reason generalizes.
+
+| what | value |
+|---|---|
+| reference's logged angles, scene 1 | along **71.60°**, cross **−20.25°** |
+| reference's logged angles, scene 2 | along **75.49°**, cross **−16.37°** |
+| angles from `CORNER_*_PROJECTION_*_PRODUCT` | along **0.00°**, cross **90.00°** |
+| `ORIENTATION` in the MTL | `"NORTH_UP"` |
+
+`ORIENTATION = NORTH_UP` is the explanation: an L1T product is resampled north-up, so *both* the projected
+and the lat/lon corner sets are the axis-aligned bounding box of the raster, and every slope from them is 0
+or ±90. What `_fft_filter` measures is the **valid-data region inside** that raster — the rotated swath a
+north-up product contains surrounded by fill — and that is in the pixels and nowhere in the metadata.
+
+Also confirmed by line order: `apply_landsat_filtering` is called at `process.py:477` and the reprojection
+logs at `:482`, so the filter sees the native scene. The rotation is not an artifact of reprojection.
+
+**So the derived route is reproduced, as the plan pre-committed.** Agreement is the objective; the reference
+used pixel geometry, and a filter matched to it must use the same. That restores the four primitives the
+metadata route would have removed — `connectedComponentsWithStats`, `findContours` + `moments` +
+`minAreaRect`, and the quadrant `warpAffine` — and with them the `minAreaRect` angle-convention hazard,
+which now has to be pinned rather than avoided.
+
+### A second finding from the same log: the filter is a no-op on this pair
+
+```
+Along track angle is 71.60 degrees
+Cross track angle is -20.25 degrees
+Power along flight direction (2216) does not exceed banding threshold (500). No banding filter applied.
+```
+
+That message is misleading and the arithmetic says why. The condition is
+`((sA/sB >= 2) | (sB/sA >= 2)) & ((sA > 500) | (sB > 500))` (`autoRIFT.py:227`), and 2216 > 500 satisfies
+the second clause — so it is the **ratio** clause that failed: the two band powers are within a factor of
+two of each other. The message blames the threshold for a decision the ratio made.
+
+Both scenes of this pair decline the band-reject, so the filter returns the *clamped* image — `±3` clipped,
+NaN→0 — unfiltered. That is still not a pass-through, which is why the branch has to be asserted rather
+than inferred from output agreement: a filter that no-ops on both sides agrees trivially.
+
+`gen_warpaffine` is generated and stands regardless, since the band masks are rotated on either route: 12
+cases across two dimensions and six angles, recording the bilinear rotation *and* the `== 1` selection the
+filter actually consumes.
