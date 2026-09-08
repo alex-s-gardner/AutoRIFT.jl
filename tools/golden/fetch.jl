@@ -186,17 +186,29 @@ function _probe_urs()
     path = joinpath(homedir(), ".netrc")
     isfile(path) || return :absent
     netrc_host_count(path, URS_HOST) > 1 && return :ambiguous
+    # **Retried, because one 401 does not distinguish a bad credential from a throttled endpoint.**
+    # URS answers 401 when it is rate-limiting as well as when it rejects, and this probe is cheap
+    # enough to run repeatedly while debugging — which is exactly how a working credential gets
+    # throttled. A single reading then condemns it, and the next hour is spent looking for a
+    # credential problem that does not exist. Three attempts, spaced, and a `:rejected` only when
+    # every one agrees.
+    #
     # `Downloads` reads `~/.netrc` through libcurl, so no credential is handled here — the status code
     # is the whole answer and nothing secret enters this process.
-    r = try
-        Downloads.request("https://$URS_HOST/api/users/tokens";
-                          method = "GET", throw = false, timeout = 60)
-    catch
-        return :unreachable
+    last = :unreachable
+    for attempt in 1:3
+        attempt > 1 && sleep(2.0 * attempt)
+        r = try
+            Downloads.request("https://$URS_HOST/api/users/tokens";
+                              method = "GET", throw = false, timeout = 60)
+        catch
+            last = :unreachable
+            continue
+        end
+        r.status == 200 && return :ok
+        last = r.status in (401, 403) ? :rejected : :unreachable
     end
-    r.status == 200 && return :ok
-    r.status in (401, 403) && return :rejected
-    return :unreachable
+    return last
 end
 
 """
