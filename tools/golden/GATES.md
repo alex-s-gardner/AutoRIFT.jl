@@ -841,3 +841,66 @@ The first comparison reported 4,512 pixels differing on `potential_data`. That w
 pixel's distance to the nearest *valid* one — so the Julia form dilates the **valid** set. With the polarity
 right it is exact on all nine cases. The test now asserts the polarity explicitly, since the wrong one runs
 happily and produces a plausible number.
+
+## Step 3 — the four L7 / L8×L7 pairs, ladder and endpoint
+
+```bash
+CAPTURE_STAGES=1 CAPTURE_STAGE_LEVEL=0 julia --project=tools/golden \
+  tools/golden/intermediate.jl <case> --run 200 --force
+julia --project=tools/golden -t 8 tools/golden/stages.jl <case> --run 200 --all
+julia --project=tools/golden -t 8 tools/golden/correlator.jl <case> --run 200
+```
+
+The reference filters these on the native scenes, so the arrays at the `runAutorift` boundary already
+carry its `_wallis_filter_fill` output. That makes the fill the reference's and puts only the correlator
+chain under test — the decision recorded in this phase's Context, and what lets the same 23-rung ladder run
+unchanged.
+
+### The ladder
+
+| case | rungs | note |
+|---|---|---|
+| `LE07_L1TP_061018_20120428` | **13 green** | base level skipped; both sides agree |
+| `LE07_L1TP_061018_20130314` | **23 green** | |
+| `LE07_L1TP_063018_20040810` | **23 green** | |
+| `LC08_L1TP_060018_20130330` × `LE07` | **23 green** | |
+
+**Four of four, no reds**, including the correlator rung on both element types. Nothing in `stages.jl`
+needed a new rung, which is the result the plan was checking for.
+
+### The endpoints
+
+| case | both | exact | exact n | only jl | only ref | bias dx / dy | corr |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `LE07_..._20120428` | 106,232 | **0.00%** † | 0 | 11,000 | 32,552 | +0.008 / +0.008 | +0.891 / +0.849 |
+| `LE07_..._20130314` | 713,312 | 59.83% | 426,805 | 24,893 | 47,474 | −0.035 / −0.010 | +0.920 / +0.917 |
+| `LE07_..._20040810` | 918,395 | 50.18% | 460,854 | 55,935 | 69,334 | −0.010 / −0.004 | +0.973 / +0.975 |
+| `LC08_060018` × `LE07` | 672,901 | 58.49% | 393,554 | 26,607 | 49,674 | +0.011 / +0.011 | +0.955 / +0.931 |
+
+Bias is under 0.035 px on every axis of every case and correlation is 0.85–0.98, which is the shape the
+`hps` cases show. Three of the four sit at 50–60% exact, comparable to the LC08 `hps` pairs (54–63%).
+
+† **`exact = 0.00%` on the first case is correct by construction, not a failure.** Its base level is
+skipped — 102 of 20,525 coarse points survive, 0.50% against a 1% cutoff — so the reference resolves *only*
+chips 32 and 64, and 0.03% of its own `dy` values land on any 1/N grid. Above the base chip size both
+implementations replace the measurement with a bicubic resize, so nothing is quantized and `exact` is the
+wrong statistic there. Bias and correlation are the gate, and both pass.
+
+### Two harness bugs, both of which read as package defects
+
+**The filter-parameter rung indexed `filtDisp` records at `2L + 1`.** That assumes every level runs a
+coarse *and* a fine pass. A level below `CoarseCorCutoff` `continue`s out (`autoRIFT.py:704-706`) and
+contributes one record, shifting every later level's index — so on the first L7 pair the rung compared the
+coarse filter against fine parameters and reported `frac 0.41/0.32, iterations 3/2`. Selecting by grid
+shape alone then *regressed a green case*: level 0's coarse grid is 293×292 on the golden Landsat pair and
+level 3's fine grid is 293×292 too, both being the full grid over 8. The search is now bounded to the
+records between this level's own correlator calls.
+
+**The sign selector compared `exact`, which is zero for both signs when nothing is quantized.** The
+comparison tied at zero, `>=` kept `+1`, and the report showed `dy` at sign `+` with a **−0.849
+correlation and a 0.761 px bias** — a flipped axis presented as a measured choice. Correlation is now the
+discriminant, because it is what a sign error destroys and it stays defined on an unquantized level. The
+same run then reports `dy` at sign `−` with bias **+0.0076**.
+
+Both were invisible on the five `hps` cases, whose base levels always resolve. A case class that exercises
+a different branch is what found them.
