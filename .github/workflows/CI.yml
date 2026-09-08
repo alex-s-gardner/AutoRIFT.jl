@@ -77,18 +77,32 @@ jobs:
                         push!(pinned, strip(first(split(line, "="))))
                 end
                 isempty(pinned) && error("no [sources] entries found; this step is now misplaced")
+                # A pinned name that is also a real dependency keeps its `[compat]` bound. Only the
+                # `[extras]` entry goes, and the bound stays valid because the name is still declared.
+                declared = String[]
+                section = ""
+                for line in lines
+                    startswith(line, "[") && (section = strip(line))
+                    (section == "[deps]" || section == "[weakdeps]") && occursin("=", line) &&
+                        !startswith(line, "[") && push!(declared, strip(first(split(line, "="))))
+                end
                 println("dropping from the LTS test target: ", join(pinned, ", "))
                 out = String[]
                 section = ""
                 for line in lines
                     startswith(line, "[") && (section = strip(line))
-                    # A dropped entry takes the comment block above it, which documents a name that
-                    # is no longer there, and its `[compat]` bound with it: Julia 1.10 rejects a
-                    # bound whose name is in none of `deps`, `weakdeps` or `extras` with
-                    # `Compat <name> not listed`, so leaving the bound behind trades one resolve
-                    # failure for another.
-                    if (section == "[extras]" || section == "[compat]") &&
-                            any(p -> startswith(line, p * " "), pinned)
+                    # A dropped entry takes the comment block above it, which documents a name that is
+                    # no longer there.
+                    #
+                    # Its `[compat]` bound goes too, but *only* when the name is declared nowhere else:
+                    # Julia 1.10 rejects a bound whose name is in none of `deps`, `weakdeps` or
+                    # `extras` with `Compat <name> not listed`, while Aqua rejects a `weakdeps` entry
+                    # that has *no* bound with `does not declare a compat entry`. `ImagePairGeometry`
+                    # backs an extension and so must keep its bound; `FastGeoProjections` is
+                    # `[extras]`-only and so must lose it.
+                    drop = section == "[extras]" ||
+                           (section == "[compat]" && !any(d -> startswith(line, d * " "), declared))
+                    if drop && any(p -> startswith(line, p * " "), pinned)
                         while !isempty(out) && startswith(lstrip(last(out)), "#")
                             pop!(out)
                         end
