@@ -166,13 +166,13 @@ is a redirect chain and a 401 anywhere along it is ambiguous between a bad crede
 this account is not approved for. The answer is cached: every radar case shares one credential, and
 `--check` over ten cases should not be ten login attempts.
 
-**A duplicate `machine` entry is reported rather than probed, because the probe cannot see it.**
-`Downloads` authenticates through libcurl, which takes the *first* matching entry; Python's `netrc`
-module — which is what `hyp3lib.fetch` inside the container uses — takes the *last*. So a `~/.netrc`
-holding one host twice with different passwords makes this check and the container disagree by
-construction: libcurl reads a working credential and reports `:ok` while the run dies on
-`401 Unauthorized` after reaching the driver. Whichever entry is stale, two entries for one host is
-unresolvable here and the honest status is `:ambiguous`.
+**A duplicate `machine` entry is reported rather than probed, because which one wins is not this
+check's to decide.** libcurl takes the first matching entry and Python's `netrc` module — which is
+what `hyp3lib.fetch` uses inside the container — takes the last, so two entries for one host with
+different passwords mean this check and the container can consult different credentials. A `:ok` here
+would then promise a route the container cannot take, and the failure surfaces as
+`401 Unauthorized` half an hour into a run, after the driver has already downloaded a SAFE. Neither
+entry is knowably the live one from here, so the honest status is `:ambiguous`.
 """
 const _URS = Ref{Union{Symbol,Nothing}}(nothing)
 function urs_status()
