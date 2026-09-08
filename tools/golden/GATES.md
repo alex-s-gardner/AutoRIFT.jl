@@ -1343,3 +1343,66 @@ pair's run reduced from 59 GB to 11 GB by deleting `product/` and `product_sec/`
 intermediates, which are regenerable and read by no gate. The floor matters more on radar than optical
 because SAR amplitude has a long right tail, so `uniform_data_type`'s `mean ± 3σ` clips differently.
 Recorded as the one plan item not executed.
+
+## Step 5 — no slide, and the reassessment this scope existed for
+
+```bash
+julia --project=tools/golden tools/golden/regate.jl --all
+julia --project=. -e 'import Pkg; Pkg.test()'
+```
+
+| gate | measured |
+|---|---|
+| 2.x colfilt, bwareaopen, window reductions | **green** |
+| 0.1 the correlator alone | **green** — exact 100.0% |
+| 0.2 the whole pipeline, 3072² | **green** — exact 81.8%, within step 98.7% |
+| 0.3 the ITS_LIVE granule | **green** |
+| 3.opt the stage ladder on every optical case | **green — 12/12** |
+| **3.rdr the endpoint on the Sentinel-1 SLC pair** | **green** — bias 0.0271/0.0030, corr +0.962/+0.909, `dy` sign −, both 60,611 |
+| 3.x the stage ladder, base case | **green** — 23 rungs |
+
+**7 ran, 7 green, 0 red.** `Pkg.test()` passes. The `_oversample` change touched shipping code and the
+optical gates did not move — 12/12 before and after.
+
+`3.rdr` is its own gate rather than a thirteenth case in `3.opt`: that gate's value is that all twelve of
+its cases are optical, so a red one names the class that broke.
+
+### What one radar pair cost, and what it bought
+
+| | |
+|---|---|
+| capture wall clock | **2h15m** (plan estimated 30–60 min) |
+| peak on-disk | 59 GB, reducible to 11 GB |
+| package bugs found | 1 — `_oversample` consulted the wrong axis |
+| harness bugs found | 1 — `chip_size_max` not scaled by `ScaleChipSizeY` |
+| plan items not executed | 1 — the byte-vs-float floor, on disk |
+
+### The three questions this scope was chosen to answer
+
+**1. What does a pair cost?** 2h15m and ~60 GB peak, against ~8 min for an optical pair. The ISCE3
+coregistration is the long pole, not the correlator. 44 GB of that is `product/` and `product_sec/` —
+per-burst intermediates that no gate reads and that can be deleted immediately after the capture.
+
+**2. Did any rung need radar-specific work?** No rung, but two configuration paths did, and both were
+invisible across all twelve optical pairs because they only appear when the chip is anisotropic. Neither
+is in the correlator: `optflag` never reaches the `autoRIFT` object, and that prediction held — the
+correlator has no radar mode, and the byte path, the pyramid and the `filtDisp` chain all behaved as the
+optical cases led us to expect once the chip geometry was configured correctly.
+
+**3. Is S1-BURST the same problem?** Unknown, and it takes a different driver — `process_burst` rather
+than `process_slc`, with multi-burst mosaicking before the correlator. What this pair establishes is
+that the *boundary* is identical: `capture.py` needed no change to intercept a radar run, and the same
+`kwargs_from_capture`/`pointset_from_capture` path drives AutoRIFT.jl once `ScaleChipSizeY` is honoured
+in both chip bounds.
+
+### What the remaining eight would need
+
+Disk, before time. The twelve optical runs hold 63 GB and this pair's reduced run 11 GB, leaving 35 GB
+free — enough for one radar capture at a time if `product/` is deleted as soon as the capture is
+verified. Eight pairs at 2h15m is ~18 hours of container time, and three of them are S1-BURST with up to
+24 bursts each, so the burst driver's cost is not yet measured.
+
+The one plan item left undone is the **byte-vs-float floor** (`--dtype-pair`), which needs a second
+capture of this same pair at `CAPTURE_FLOAT32=1`. It matters more on radar than optical: SAR amplitude
+has a long right tail, so `uniform_data_type`'s `mean ± 3σ` window clips a different fraction than it
+does on optical reflectance, and the floor is what makes the 9,897 reference-only points attributable.

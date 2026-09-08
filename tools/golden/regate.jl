@@ -167,6 +167,46 @@ const GATES = Gate[
                 (red > 0 ? ": " * join(filter(r -> !endswith(r, "ok"), results), ", ") : ""))
     end),
 
+    Gate("3.rdr", "the endpoint on the Sentinel-1 SLC pair", true, function ()
+        # **Its own gate, not folded into `3.opt`.** That gate's value is that all twelve of its cases are
+        # optical, so a red one names the class that broke; a mixed list would hide which.
+        #
+        # Gated on bias and correlation rather than on rungs, for two reasons. The ladder needs
+        # `CAPTURE_STAGES=1` and a radar capture is 2h15m, so no stage trace is on disk. And `exact` is 0
+        # by construction here: the base level (64x16) runs a coarse pass and a `filtDisp` but no fine
+        # pass, so every reported point comes from the 128x32 level bicubic-resized rather than quantized.
+        #
+        # The `dy` sign is part of the assertion. `optflag == 0` pre-flips `Dy0` (`testautoRIFT.py:402`),
+        # and `correlator.jl` picks the sign by correlation rather than asserting it — so a regression that
+        # silently reintroduced the flip would show up here as `+` and a collapsed correlation.
+        cmd = `julia --project=$(@__DIR__) -t 8 $(joinpath(@__DIR__, "correlator.jl"))
+               S1A_IW_SLC__1SSH_20151120T080202 --run 200`
+        return capture_run(cmd) do t
+            occursin("no call1.json", t) && return (:skipped, "no capture on disk")
+            rows = collect(eachmatch(r"^(dx|dy)\s+([+-])\s+(\d+)\s+\d+\s+\d+\s+[\d.]+%\s+\d+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+([+-][\d.]+)"m, t))
+            length(rows) == 2 || return (:red, "could not read both axes: " * last_line(t))
+            bm = match(r"bias: dx ([+-]?[\d.e-]+), dy ([+-]?[\d.e-]+)", t)
+            bm === nothing && return (:red, "no bias line: " * last_line(t))
+            bx, by = abs(parse(Float64, bm.captures[1])), abs(parse(Float64, bm.captures[2]))
+            corr = Dict(r.captures[1] => parse(Float64, r.captures[4]) for r in rows)
+            sign = Dict(r.captures[1] => r.captures[2] for r in rows)
+            both = parse(Int, first(rows).captures[3])
+            # Floors are the measured values less a margin, so noise does not flip the gate while a real
+            # regression does. Bias 0.035 px is the optical figure; correlation and coverage are this
+            # pair's own, recorded in GATES.md.
+            fails = String[]
+            bx <= 0.035 || push!(fails, "dx bias $bx > 0.035")
+            by <= 0.035 || push!(fails, "dy bias $by > 0.035")
+            corr["dx"] >= 0.93 || push!(fails, "dx corr $(corr["dx"]) < 0.93")
+            corr["dy"] >= 0.87 || push!(fails, "dy corr $(corr["dy"]) < 0.87")
+            sign["dy"] == "-" || push!(fails, "dy sign $(sign["dy"]), expected -")
+            both >= 55_000 || push!(fails, "both $both < 55000")
+            isempty(fails) ||  return (:red, join(fails, "; "))
+            return (:green, @sprintf("bias %.4f/%.4f, corr %+.3f/%+.3f, dy sign %s, both %d",
+                                     bx, by, corr["dx"], corr["dy"], sign["dy"], both))
+        end
+    end),
+
     Gate("3.x", "the stage ladder on the golden Landsat case", false, function ()
         # Run 200 holds the base-level trace; 201..203 hold the coarser levels. Named explicitly because
         # the default run has no stage trace, and a gate that skips is a gate that never runs.
