@@ -1075,3 +1075,32 @@ Ratio 1.867 against a threshold of 2, so the clamped image is returned. That is 
 ±3 clamp still applies — which is why the branch is asserted explicitly rather than inferred from output
 agreement. A filter that no-ops on both sides agrees trivially, and this gate can tell that from real
 agreement because it checks the two power sums and the branch as well as the output.
+
+## Step 6 — the three L4/5 pairs, ladder and endpoint
+
+| case | rungs | note |
+|---|---|---|
+| `LT05_L1TP_060018_19851028` × `LT05_L1GS_061018` | **23 green** | |
+| `LT04_L1TP_063018_19880611` × `LT04_..._19880627` | **23 green** | |
+| `LT05_L1GS_001013_19920425` × `LT05_..._19920628` | **13 green** | base level skipped; both sides agree. The `P000` case |
+
+| case | both | exact | exact n | only jl | only ref | bias dx / dy | corr |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `LT05_060018` | 124,397 | 27.09% | 33,702 | 17,113 | 33,460 | −0.005 / −0.008 | +0.993 / +0.977 |
+| `LT04_063018` | 272,917 | 55.95% | 152,693 | 23,374 | 25,681 | **+0.0004 / +0.0004** | +0.982 / +0.955 |
+| `LT05_001013` (`P000`) | 17,764 | **0.00%** † | 0 | 1,940 | 2,252 | −0.140 / −0.034 | +0.987 / +0.986 |
+
+Bias is under 0.01 px on the two well-populated pairs and correlation is 0.95–0.99 on all three. `LT04` is
+the cleanest golden case measured so far by bias — **0.0004 px on both axes**.
+
+† `LT05_001013` is the `P000` case, the one pair in the whole set exercising the **uncropped product
+schema**: `process.py` crops only products with at least one valid pixel, and cropping is what adds the time
+axis. It is also the smallest by an order of magnitude — 17,764 shared points against 124k–273k — and its
+base level is skipped, so every point is coarse and unquantized, which is why `exact` is 0 by construction.
+Its −0.14 px `dx` bias is the largest in the optical set and is worth attention only in proportion to its
+size: 17,764 points against 4.4 million across the twelve pairs. Recorded rather than chased.
+
+`LT05_060018`'s 27.09% is the lowest `exact` of the twelve. Its base level *does* resolve, so unlike the
+skipped-level cases the figure is comparable — and it is the pair whose destripe filter **declines** on both
+scenes, so both sides correlate a clamped-but-unfiltered field. Bias is nonetheless −0.005 px and
+correlation +0.993, so the two agree about position and disagree about the last quantization step.

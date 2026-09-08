@@ -7,12 +7,23 @@
 # package, and it is deleted when the real loader lands: nothing outside `tools/golden` calls it, and the
 # gate it feeds compares angles against the reference's own logged values rather than against this parse.
 #
-# **Why metadata rather than the image.** `_fft_filter` recovers the scene footprint from pixels —
-# `connectedComponentsWithStats`, `findContours`, `moments`, `minAreaRect`, a `warpAffine`d quadrant map,
-# four `distanceTransform` argmaxes — because it only ever receives an array (`autoRIFT.py:153-206`). The
-# MTL carries the four corners in projected metres directly, which is the quantity all of that estimates.
-# `process.py:312`'s own `FIXME` records that the derived route is degraded by geogrid's corner rounding
-# and chopping, so the metadata is also the better value, not merely the cheaper one.
+# **The corner fields do not carry the scan geometry, and that is measured.** `_fft_filter` recovers the
+# footprint from pixels — `connectedComponentsWithStats`, `findContours`, `moments`, `minAreaRect`, a
+# `warpAffine`d quadrant map, four `distanceTransform` argmaxes (`autoRIFT.py:153-206`) — and reading the
+# MTL corners instead does *not* reproduce it: an L1 product is `ORIENTATION = NORTH_UP`, so both its
+# projected and its lat/lon corner sets are the axis-aligned bounding box and every slope from them is 0
+# or ±90, against the 71.60°/−20.25° the reference logs.
+#
+# What does carry it is the **orbit**: the `_ANG.txt` beside the MTL holds `EPHEMERIS_ECEF_{X,Y,Z}` at 1 s
+# spacing, and two consecutive positions transformed into the raster's own CRS give the ground-track
+# direction. The projection step is not optional — a slope on a UTM raster is a grid bearing, and grid north
+# departs from true north by the meridian convergence, 3.2° here and more near the poles. Measured that way
+# the orbit's cross-track lands within 0.03° of the reference's, while its along-track differs by a constant
+# 1.89° because the reference takes `nanmax` of two edge slopes and so is biased toward the worse edge.
+#
+# `tools/golden/README.md` registers the orbit route as the more correct alternative, to be adopted once the
+# L4/5 pairs agree. `mtl_corners` and `scan_angles` below are kept for that comparison, not because the
+# corners are the answer.
 
 using Printf
 
@@ -48,10 +59,13 @@ end
 
 The four scene corners in projected metres, as `(ul, ur, ll, lr)` of `(x, y)`.
 
-Named for the *product* corners, `CORNER_*_PROJECTION_{X,Y}_PRODUCT`, and not the L1T grid corners: these
-are the footprint of the imaged swath, which is what the destripe filter's along- and cross-track angles
-describe. A scene missing them is an error — a `Float64` default would put the footprint at the origin and
-produce two plausible angles from nothing.
+The `CORNER_*_PROJECTION_{X,Y}_PRODUCT` fields. On a north-up product — which every Landsat L1 is — these
+are the **axis-aligned bounding box** of the raster and not the imaged swath, so slopes taken from them are
+0 and ±90 rather than the scan directions. Kept for that comparison, since establishing what a field does
+*not* carry is worth as much as establishing what it does.
+
+A scene missing them is an error rather than a default: a `Float64` zero would put the footprint at the
+origin and produce two plausible angles from nothing.
 """
 function mtl_corners(fields::AbstractDict)
     get2(c) = let kx = "CORNER_$(c)_PROJECTION_X_PRODUCT", ky = "CORNER_$(c)_PROJECTION_Y_PRODUCT"
@@ -89,14 +103,14 @@ function scan_angles(corners; spacing::Tuple{Real,Real})
     ul, ur, ll, lr = px(corners.ul), px(corners.ur), px(corners.ll), px(corners.lr)
     slope(a, b) = rad2deg(atan((a[2] - b[2]) / (a[1] - b[1])))
     # `_get_slopes(tl, tr, bl, br)`: along-track from the bottom and top edges, cross-track from the sides.
-    along = maximum(skipnan((slope(ll, lr), slope(ul, ur))))
-    cross = maximum(skipnan((slope(lr, ur), slope(ll, ul))))
+    along = maximum(skip_nan((slope(ll, lr), slope(ul, ur))))
+    cross = maximum(skip_nan((slope(lr, ur), slope(ll, ul))))
     return (along, cross)
 end
 
-# `nanmax`: the reference uses `np.nanmax`, which ignores a `NaN` slope rather than propagating it. A `NaN`
+# `skip_nan`: the reference uses `np.nanmax`, which ignores a `NaN` slope rather than propagating it. A `NaN`
 # arises when two corners coincide, which a degenerate footprint can produce.
-skipnan(t) = (v = filter(!isnan, collect(t)); isempty(v) ? [NaN] : v)
+skip_nan(t) = (v = filter(!isnan, collect(t)); isempty(v) ? [NaN] : v)
 
 """
     mtl_scan_angles(path; spacing) -> (along_track, cross_track)
