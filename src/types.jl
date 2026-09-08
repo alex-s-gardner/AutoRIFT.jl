@@ -393,6 +393,63 @@ end
 Sobel(; width = 5) = Sobel(width)
 
 """
+    Destripe(; along_track, cross_track, band_half = 70, notch_half = 100,
+             clamp = 3, power_threshold = 500, ratio = 2, sigma = 10)
+
+Reject the stronger of two band-limited noise directions in the frequency domain.
+
+For Landsat 4 and 5, whose Multispectral Scanner leaves coherent banding along one of the two scan
+directions. A band-reject in the Fourier domain removes it where a spatial filter cannot: the stripes are
+narrow in frequency and broad in space, so they occupy a thin line through the origin that can be excised
+without touching the texture correlation needs.
+
+`along_track` and `cross_track` are the scan directions in **degrees on the raster's own grid**, and they are
+arguments rather than derived from the image. Two reasons. It keeps this a pure function of image and
+geometry, so it is testable on a synthetic scene with known stripes. And the geometry has a better source
+than the pixels: a scene's `_ANG.txt` carries the orbit ephemeris, which gives the ground-track heading
+directly once transformed into the raster's CRS — the scene is rotated because the acquisition track does not
+align with map coordinates, and near the poles none does.
+
+Only one direction is filtered, and only sometimes. The two band powers are compared, and the reject applies
+only if one exceeds the other by `ratio` **and** the larger exceeds `power_threshold`. Otherwise the image is
+returned clamped but unfiltered — which is not a pass-through, since `clamp` still applies.
+
+The defaults are the reference's (`autoRIFT.py:153-243`). `band_half` and `notch_half` are in pixels and are
+*not* scaled to the image, so the rejected band is a fixed width in frequency regardless of scene size,
+which is a property of the reference rather than a derivation.
+"""
+struct Destripe <: PreprocessMethod
+    along_track::Float64
+    cross_track::Float64
+    band_half::Int
+    notch_half::Int
+    clamp::Float64
+    power_threshold::Float64
+    ratio::Float64
+    sigma::Float64
+
+    function Destripe(along_track::Real, cross_track::Real, band_half::Integer,
+                      notch_half::Integer, clamp::Real, power_threshold::Real,
+                      ratio::Real, sigma::Real)
+        isfinite(along_track) && isfinite(cross_track) ||
+            throw(ArgumentError("scan angles must be finite, got " *
+                                "along_track=$along_track, cross_track=$cross_track"))
+        band_half > 0 ||
+            throw(ArgumentError("`band_half` must be positive, got $band_half"))
+        notch_half >= 0 ||
+            throw(ArgumentError("`notch_half` must be >= 0, got $notch_half"))
+        clamp > 0 || throw(ArgumentError("`clamp` must be positive, got $clamp"))
+        ratio >= 1 || throw(ArgumentError("`ratio` must be >= 1, got $ratio"))
+        return new(Float64(along_track), Float64(cross_track), Int(band_half), Int(notch_half),
+                   Float64(clamp), Float64(power_threshold), Float64(ratio), Float64(sigma))
+    end
+end
+
+Destripe(; along_track, cross_track, band_half = 70, notch_half = 100, clamp = 3,
+         power_threshold = 500, ratio = 2, sigma = 10) =
+    Destripe(along_track, cross_track, band_half, notch_half, clamp, power_threshold, ratio, sigma)
+
+"""
     Laplacian(; width = 5)
 
 Laplacian (isotropic second derivative) of the log-amplitude image. Intended
@@ -618,6 +675,10 @@ Side length of the filter window, or `0` for methods that take no window.
 """
 filter_width(::Union{NoPreprocess,Decibel,Deramp}) = 0
 filter_width(m::Union{Highpass,Wallis,WallisGapfill,Sobel,Laplacian}) = m.width
+# A whole-image FFT, so there is no local window and a block halo has nothing to widen. The band masks are
+# global by construction: a frequency-domain reject cannot be computed on a tile without changing what it
+# rejects, which is why `Destripe` runs before blocking rather than inside it.
+filter_width(::Destripe) = 0
 
 """
     AutoRIFT.filter_reach(method::PreprocessMethod) -> Int

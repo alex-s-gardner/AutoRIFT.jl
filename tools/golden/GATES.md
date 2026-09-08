@@ -1012,12 +1012,66 @@ half — largest region, centroid, `minAreaRect` angle and size, the four quadra
 and lands on the reference's logged values to four decimals. So the derived route is now *specified* by
 arrays on disk rather than by a reading of Python, and Step 5 gates against those.
 
-It also corrects the earlier note: on this scene the filter **does** band-reject —
-`sA = 511`, `sB = 2373`, ratio 4.64 ≥ 2 and both above 500, so `applied: true`. The
-"does not exceed banding threshold" line in the run log belongs to a different scene, and the branch has to
-be recorded per scene rather than per pair.
+**Retracted, and the retraction is the useful part.** This entry originally claimed the filter *does*
+band-reject on this scene, with `sA = 511`, `sB = 2373`, ratio 4.64. That was **two wrong inputs agreeing**:
+the probe read the scene from `filtered/`, which is already Wallis-filtered, and applied `_wallis_filter` to
+it a second time. Both sides then saw a doubly-filtered field, and their agreement looked like a pass.
+
+Run from the *native* scene through `process.py`'s own `apply_fft_filter`, the numbers are 1187 and 2216,
+ratio **1.87 < 2**, and the filter **declines**. The Wallis output's standard deviation says which input is
+right without any reference to the filter: 0.770 from the native scene, matching the on-disk filtered scene's
+0.771, against 0.972 for the doubly-filtered one.
+
+The lesson is the one this ladder exists for: *a stage fed the wrong input can agree*. `filtered/` is the
+filter's **output**, so it is what a filter comparison is gated against and never what it is fed.
 
 **Decision for Step 5, taken here rather than during implementation:** reproduce the derived route, because
 agreement is the objective and the reference's along-track is what it is. The orbit route is registered in
 `README.md` as the more correct alternative with the measurement above as its justification, to be adopted
 once the L4/5 pairs agree. `tools/golden/mtl.jl` keeps the ephemeris reader so that switch is one call.
+
+## Step 5 — the destripe filter, exact against the reference's own chain
+
+```bash
+# dump the reference's chain from the native scene, inside the container
+python /opt/capture/ds10.py /vsis3/usgs-landsat/.../LT05_..._B2.TIF <out>
+julia --project=tools/golden -t 8 <compare>
+```
+
+`Destripe` is new in `src/types.jl` and `src/preprocess.jl`, taking the two scan angles as arguments so the
+filter is a pure function of image and geometry.
+
+| what | measured | state |
+|---|---|---|
+| the clamp to ±3, NaN→0 | **exact**, 65,140,551 pixels | green |
+| `warpAffine` band masks, 12 fixture cases | **exact**, both parities, all six angles | green |
+| band powers on the real scene | julia along **2216** / cross **1187**; reference the same two numbers | green |
+| the branch | julia **DECLINE** at ratio 1.867; reference **declined** | green |
+| **the filter output** | **exact — 100.0000% on all 38,707,144 valid pixels** | **green** |
+
+### Three details the reference gets wrong or unusually, each found by measurement
+
+**OpenCV interpolates in fixed point, and on a 0/1 mask that changes the answer.** `warpAffine` rounds each
+source coordinate to 1/32 (`INTER_BITS = 5`) before splitting it into an integer part and a weight, so a
+coordinate within 1/64 of an integer snaps onto it and the interpolated value is *exactly* 1 where a
+`Float64` computation gives 0.993903. The consumer tests `== 1` (`autoRIFT.py:225-226`), so that is the
+difference between a cell being rejected and kept: ignoring it missed **60 of 3,720** selected cells on an
+odd-sized mask, all on the band's rotated edge — precisely where a band-reject decides how much it rejects.
+
+**The rotation direction cannot be checked on counts.** `getRotationMatrix2D` builds the forward map and
+`warpAffine` samples the source at `M ⋅ dst`, so the source offset carries the angle's own sign, not its
+negation. Getting it backwards rotates the band the other way — and a rotation is area-preserving, so the
+*count* of selected cells is identical: 3,804 under both signs, with 3,120 of them in different places. Only
+the positions catch it.
+
+**The reference's log labels are swapped.** `rotation_a` is built from `cross_track` (`:208`), so `sA` is the
+cross-track power — but it prints as `Along track power` (`:226-227`). The two logged numbers are right and
+their names are exchanged. Harmless to the branch, which tests a ratio and a maximum, and to the band chosen,
+which is the larger sum — but it would send a reader hunting a swap that is not in the arithmetic.
+
+### And the filter declines on this pair
+
+Ratio 1.867 against a threshold of 2, so the clamped image is returned. That is *not* a pass-through — the
+±3 clamp still applies — which is why the branch is asserted explicitly rather than inferred from output
+agreement. A filter that no-ops on both sides agrees trivially, and this gate can tell that from real
+agreement because it checks the two power sums and the branch as well as the output.
