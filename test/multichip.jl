@@ -250,20 +250,34 @@ end
     @test nmeasured(fine) < counts[3]
     @test count(isnan, fine.dx) >= 40        # the band spans several grid rows
 
-    # With the whole pyramid the band *is* resolvable here, because the eight points the coarse
-    # levels leave open form holes small enough for `fill_min_hole` to close. Filling is part of
-    # the answer rather than a fallback, so this asserts the measurement is right where it fills
-    # — a filled point that invented motion would fail the median checks below.
-    @test counts[3] == length(grid.x)
+    # With the whole pyramid most of the band is resolvable, because the points the coarse levels
+    # leave open form holes small enough for `fill_min_hole` to close. Filling is part of the answer
+    # rather than a fallback, so this asserts the measurement is right where it fills — a filled
+    # point that invented motion would fail the median checks below.
+    #
+    # **A fraction, not an exact count.** The band is set to a single constant, so a chip lying
+    # inside it has zero variance and whether it correlates at all is decided by the last bits of a
+    # variance sum. Reduction order is not fixed across Julia versions — 1.10 and 1.12 disagree on
+    # three of the 196 base-level points here, which cascades to 42 open holes against 8 — so an
+    # equality would assert one version's rounding. What the pyramid owes is that nearly every point
+    # is answered, and that is what this measures.
+    @test counts[3] >= 0.75 * length(grid.x)
     mx, my = motion(correlate_multichip(pair, grid,
                                         params(; chip_size = 32, chip_size_max = 128)))
     @test med(filter(!isnan, mx)) ≈ 6 atol = 0.05
     @test med(filter(!isnan, my)) ≈ -4 atol = 0.05
 
-    # Without the hole-size criterion the same run leaves those eight open, which is what makes
-    # them a fill rather than a measurement.
-    @test nmeasured(correlate_multichip(
-        pair, grid, params(; chip_size = 32, chip_size_max = 128, fill_min_hole = 0))) == 188
+    # Raising the hole-size criterion is what closes those points, which is what makes them a fill
+    # rather than a measurement. Compared across two thresholds on the same run rather than against
+    # `counts[3]`: how many holes are small enough to close at the default is float-dependent per
+    # above, and on some versions the default closes none of them.
+    unfilled = nmeasured(correlate_multichip(
+        pair, grid, params(; chip_size = 32, chip_size_max = 128, fill_min_hole = 0)))
+    generous = nmeasured(correlate_multichip(
+        pair, grid, params(; chip_size = 32, chip_size_max = 128, fill_min_hole = 16)))
+    @test unfilled < generous
+    # Filling only ever adds, so the default sits between the two.
+    @test unfilled <= counts[3] <= generous
 end
 
 @testset "chip_size records the level that won" begin
@@ -559,13 +573,22 @@ end
 
     quantized(v, n) = all(x -> abs(x * n - round(x * n)) < 1e-4, filter(!isnan, v))
 
+    # **Measured points only.** `chipsize_level` returns its field after `_reject_and_fill!` has run,
+    # so `field.dx` holds filled values beside measured ones — and a filled value is interpolated
+    # from its neighbours, never passed through the cascade, so it has no reason to land on the
+    # `1/n` grid. Two of the 196 points here fill to the midpoint of adjacent measurements, which is
+    # exactly a half-step off. Asserting over the whole field tests the fill, not the quantization
+    # this testset is named for; which points fill is float-dependent, so it also fails on one Julia
+    # version and not another.
+    measured(lvl, f) = f[setdiff(eachindex(f), lvl.filled)]
+
     for n in (8, 16, 64)
         p = params(; chip_size = 32, chip_size_max = 32, subpixel = (PyramidRefine(n),))
         lvl = chipsize_level(pair, grid, p, 32, trues(size(grid)), first(p.similarity),
                              AutoRIFT.subpixel_at(p, 1))
         @test !isnothing(lvl)
-        @test quantized(vec(lvl.field.dx), n)
-        @test quantized(vec(lvl.field.dy), n)
+        @test quantized(measured(lvl, vec(lvl.field.dx)), n)
+        @test quantized(measured(lvl, vec(lvl.field.dy)), n)
         # The shift is still recovered, so a finer grid is not being bought with accuracy.
         @test med(filter(!isnan, -lvl.field.dx)) ≈ 5.3 atol = 0.2
     end
