@@ -47,6 +47,12 @@ DimensionalData = "0.29, 0.30"
 DiskArrays = "0.4"
 FFTW = "1.8"
 FFTW_jll = "3.3.12"
+# Both minors, because the `[sources]` entry below tracks `main` — which is 0.2.0 — while
+# `ImagePairGeometry` accepts `0.1, 0.2`. A single-minor bound here fails the moment `main` crosses it:
+# pinned at 0.1 the resolver refuses with `empty intersection between FastGeoProjections@0.2.0 and
+# project compatibility 0.1`, before any test runs. The registry has only 0.0.2, which is why the pin
+# exists at all.
+FastGeoProjections = "0.1, 0.2"
 ImageCore = "0.10"
 ImageFeatures = "0.5"
 ImagePairGeometry = "0.1"
@@ -68,20 +74,31 @@ Statistics = "1"
 Test = "1"
 julia = "1.10"
 
-# `ImagePairGeometry` is unregistered, so the test environment cannot resolve it by name alone. This
-# names where it comes from, which is what lets the geogrid handoff tests run rather than be skipped.
+# Where the unregistered test dependencies come from, which is what lets the geogrid handoff tests
+# run rather than be skipped.
+#
+# `ImagePairGeometry` is unregistered outright. `FastGeoProjections` is registered, but only at 0.0.2,
+# while `ImagePairGeometry` requires 0.1 or 0.2 — so without this the resolver fails before any test
+# runs, with `Unsatisfiable requirements detected for package FastGeoProjections`.
+#
+# `rev = "main"` means the version it resolves to moves without a change here, so the `[compat]` bound
+# above admits every minor `ImagePairGeometry` accepts rather than the one `main` happens to be at.
 #
 # Julia 1.11 and later only: `Pkg.Types.Project` gained a `sources` field there, and 1.10 ignores this
 # table entirely — which is why the `lts` job skips that one testset. See `.github/workflows/CI.yml`.
-# Both this and the skip go away once ImagePairGeometry is registered.
+# Both entries and the skip go away once the two packages are registered at these versions.
 [sources]
 ImagePairGeometry = {url = "https://github.com/alex-s-gardner/ImagePairGeometry.jl"}
+FastGeoProjections = {url = "https://github.com/alex-s-gardner/FastGeoProjections.jl", rev = "main"}
 
 [extras]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
 ArchGDAL = "c9ce4bd3-c3d5-55b8-8973-c0e20141b8c3"
 DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
 DiskArrays = "3c3547ce-8d99-4f5e-a174-61eb10b00ae3"
+# Not used by any test directly: it is `ImagePairGeometry`'s dependency, listed only so the
+# `[sources]` entry that pins it has somewhere to attach.
+FastGeoProjections = "981663e8-0c94-46dd-b2cf-efc8480900ec"
 ImageCore = "a09fc81d-aa75-5fe9-8630-4744c3626534"
 ImageFeatures = "92ff4b2b-8094-53d3-b29d-97f740f06cef"
 ImagePairGeometry = "7d3defa8-4bb6-45cf-b5d0-7628f127c0fd"
@@ -100,4 +117,4 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 [targets]
 test = ["Test", "Aqua", "ArchGDAL", "JET", "JSON3", "Random", "Statistics", "Rasters", "DimensionalData",
         "DiskArrays", "ImageFeatures", "ImageCore", "NearestNeighbors", "NCDatasets",
-        "Serialization", "Metal", "KernelAbstractions", "ImagePairGeometry"]
+        "Serialization", "Metal", "KernelAbstractions", "ImagePairGeometry", "FastGeoProjections"]

@@ -8,6 +8,7 @@ using AutoRIFT
 using Aqua
 using ImagePairGeometry
 using ImagePairGeometry: nodata_from, chip_size_pixels
+using Random
 using Test
 
 # Without the extension, `pointset(::PairGeometry)` does not exist and every assertion below would
@@ -147,6 +148,84 @@ end
               :chip_size_min_x, :chip_size_max_x)
         @test getfield(a, f) == getfield(b, f)
     end
+end
+
+@testset "a misregistration reaches the prior and comes back out" begin
+    # The offset between two images composes with the velocity-derived prior rather than replacing it:
+    # `offset_x`/`offset_y` say where the ice is expected to have moved, the misregistration says where
+    # the secondary's grid sits, and a chip has to be cut at the sum.
+    g = IPG_R
+    plain = AutoRIFT.pointset(g; chip_size = 32)
+
+    # A constant offset over the same window, in the correlator's own sign convention.
+    off = fill((3.0, -2.0), size(g.location_x))
+    with = AutoRIFT.pointset(g; chip_size = 32, offset = off)
+
+    # Added, not substituted: every point moves by exactly the offset, and the points geogrid marked
+    # invalid keep the zero prior they had, since those carry no velocity term to add to.
+    @test with.dx_prior ≈ plain.dx_prior .+ 3.0
+    @test with.dy_prior ≈ plain.dy_prior .- 2.0
+    # Nothing else about the grid moves — a misregistration is not a search radius or a chip bound.
+    @test with.x == plain.x && with.y == plain.y
+    @test with.radius_x == plain.radius_x && with.radius_y == plain.radius_y
+
+    # Omitting it is exactly the old behaviour, which is what makes this additive.
+    @test AutoRIFT.pointset(g; chip_size = 32).dx_prior == plain.dx_prior
+
+    # A field over the wrong window is refused rather than broadcast against a mismatched grid.
+    @test_throws DimensionMismatch AutoRIFT.pointset(g; chip_size = 32, offset = fill((0.0, 0.0), 3, 3))
+
+    # Removal is the inverse, so a displacement equal to the offset comes back as zero motion.
+    dx = fill(3.0f0, size(off)); dy = fill(-2.0f0, size(off))
+    c = AutoRIFT.remove_misregistration(dx, dy, off)
+    @test all(iszero, c.dx) && all(iszero, c.dy)
+    # And it accepts a result object as well as two arrays, since that is what a run returns.
+    @test AutoRIFT.remove_misregistration((dx = dx, dy = dy), off).dx == c.dx
+    @test_throws DimensionMismatch AutoRIFT.remove_misregistration(dx, dy, fill((0.0, 0.0), 2, 2))
+
+    # An unsolved point stays unsolved rather than becoming the negated offset, which would look like a
+    # confident measurement of the misregistration itself.
+    nan_dx = fill(NaN32, 2, 2); nan_dy = fill(NaN32, 2, 2)
+    n = AutoRIFT.remove_misregistration(nan_dx, nan_dy, fill((5.0, 5.0), 2, 2))
+    @test all(isnan, n.dx) && all(isnan, n.dy)
+end
+
+@testset "the misregistration round trip recovers the motion" begin
+    # The one test that pins every sign at once. A secondary built by shifting the reference by a known
+    # misregistration *plus* a known feature motion must, after correlation and removal, report the
+    # motion alone. Getting any sign wrong here fails; reasoning about them at each site does not.
+    #
+    # The correlator returns the offset from secondary back to reference, so a shift of `+s` is reported
+    # as `-s` (see `autorift`'s sign note). The offset field is therefore supplied in that same negated
+    # sense, which is what the extension's docstring warns about.
+    Random.seed!(42)
+    n = 400
+    ref = randn(Float32, n, n)
+    mis = (7.0, -3.0)
+    mot = (2.0, 1.0)
+    tot = mis .+ mot
+    sec = similar(ref)
+    for j in 1:n, i in 1:n
+        sec[i, j] = ref[clamp(round(Int, i - tot[2]), 1, n), clamp(round(Int, j - tot[1]), 1, n)]
+    end
+
+    r = autorift(ref, sec; chip_size = 32, search_radius = 16)
+    med(v) = (s = sort(collect(v)); isodd(length(s)) ? s[(length(s) + 1) ÷ 2] :
+                                   (s[length(s) ÷ 2] + s[length(s) ÷ 2 + 1]) / 2)
+
+    # The raw measurement carries both, negated.
+    @test med(filter(isfinite, vec(r.dx))) ≈ -tot[1] atol = 0.2
+    @test med(filter(isfinite, vec(r.dy))) ≈ -tot[2] atol = 0.2
+
+    # Removing the misregistration in the correlator's convention leaves the motion, negated.
+    off = fill((-mis[1], -mis[2]), size(r.dx))
+    c = AutoRIFT.remove_misregistration(r, off)
+    @test med(filter(isfinite, vec(c.dx))) ≈ -mot[1] atol = 0.2
+    @test med(filter(isfinite, vec(c.dy))) ≈ -mot[2] atol = 0.2
+
+    # Stated the way a user reads it: the feature motion is the negation of what comes back.
+    @test -med(filter(isfinite, vec(c.dx))) ≈ mot[1] atol = 0.2
+    @test -med(filter(isfinite, vec(c.dy))) ≈ mot[2] atol = 0.2
 end
 
 @testset "extension code quality" begin

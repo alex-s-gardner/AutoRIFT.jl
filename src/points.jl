@@ -542,3 +542,20 @@ Base.size(pts::PointSet, d::Integer) = size(pts.x, d)
 # MethodError rather than the obvious thing.
 Base.axes(pts::PointSet) = axes(pts.x)
 Base.axes(pts::PointSet, d::Integer) = axes(pts.x, d)
+
+"""
+    remove_misregistration(dx, dy, offset) -> NamedTuple
+    remove_misregistration(result, offset) -> NamedTuple
+
+The measured displacement with a geometric misregistration removed, as `(dx, dy)`. Defined when
+`ImagePairGeometry` is loaded.
+
+A correlator's output includes whatever prior its search was centred on — `track!` adds the prior back —
+so a run whose prior carried the offset between two images returns a displacement that still contains it.
+This subtracts it, leaving the motion of the imaged features, which is what a velocity conversion expects.
+
+Declared here without a method because the offset field it takes is `ImagePairGeometry`'s: that package
+computes it from the two acquisitions' orbits, and nothing here could. See
+`ext/AutoRIFTImagePairGeometryExt.jl`.
+"""
+function remove_misregistration end
