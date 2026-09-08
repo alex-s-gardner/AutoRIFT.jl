@@ -997,3 +997,27 @@ than inferred from output agreement: a filter that no-ops on both sides agrees t
 `gen_warpaffine` is generated and stands regardless, since the band masks are rotated on either route: 12
 cases across two dimensions and six angles, recording the bilinear rotation *and* the `== 1` selection the
 filter actually consumes.
+
+### Step 4, green: what it established and what Step 5 must do
+
+| # | what | measured | state |
+|---|---|---|---|
+| 4.1 | `warpAffine` of a `getRotationMatrix2D`, 12 cases | fixtures generated, recording the bilinear rotation *and* the `== 1` selection the filter consumes | **green** |
+| 4.2 | the pixel-derived footprint chain, 4 synthetic cases | `connectedComponentsWithStats`, contour moments, `minAreaRect` angle with its post-4.5 range recorded, quadrant rotation, four distance-transform extremes | **green** |
+| 4.3 | the reference's real geometry on an L4/5 scene | reproduced **exactly**: along 71.6019°, cross −20.2454°, matching its own log to 4 decimals | **green** |
+| 4.4 | the orbit route, projected into the scene CRS | cross-track to **0.03°**; along-track off by a constant **−1.89°**, attributed to `nanmax` | **green** |
+
+4.3 is the one that matters for Step 5: a standalone script reproduces every intermediate of the geometry
+half — largest region, centroid, `minAreaRect` angle and size, the four quadrant corners, and both angles —
+and lands on the reference's logged values to four decimals. So the derived route is now *specified* by
+arrays on disk rather than by a reading of Python, and Step 5 gates against those.
+
+It also corrects the earlier note: on this scene the filter **does** band-reject —
+`sA = 511`, `sB = 2373`, ratio 4.64 ≥ 2 and both above 500, so `applied: true`. The
+"does not exceed banding threshold" line in the run log belongs to a different scene, and the branch has to
+be recorded per scene rather than per pair.
+
+**Decision for Step 5, taken here rather than during implementation:** reproduce the derived route, because
+agreement is the objective and the reference's along-track is what it is. The orbit route is registered in
+`README.md` as the more correct alternative with the measurement above as its justification, to be adopted
+once the L4/5 pairs agree. `tools/golden/mtl.jl` keeps the ephemeris reader so that switch is one call.
