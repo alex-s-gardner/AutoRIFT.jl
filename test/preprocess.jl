@@ -1,4 +1,4 @@
-using AutoRIFT: ImagePair, preprocess, replace_nonfinite, highpass, wallis, valid,
+using AutoRIFT: ImagePair, preprocess, replace_nonfinite, highpass, wallis, valid, Destripe, destripe,
                 workspace, correlate!, peak_offset
 
 @testset "ImagePair construction" begin
@@ -603,4 +603,88 @@ else
             @test out != out2
         end
     end
+end
+
+# ---------------------------------------------------------------------------
+# The Landsat 4/5 destripe filter
+# ---------------------------------------------------------------------------
+
+@testset "destripe: the rotated band mask" begin
+    if !has_fixtures()
+        @info "Fixture corpus absent; skipping the warpAffine comparison."
+    else
+        # `_rotate_bilinear` reproduces `cv2.warpAffine` of a `cv2.getRotationMatrix2D`, and the fixtures
+        # record both the rotated float mask and the `== 1` selection the filter consumes. The selection is
+        # what is asserted, because that is what the filter reads.
+        #
+        # **Counts cannot catch a wrong rotation direction.** A rotation is area-preserving, so the wrong
+        # sign selects the same number of cells — 3,804 either way on the 120×160 case — with 3,120 of them
+        # in different places. Only a positional comparison discriminates, which is why this compares the
+        # masks rather than their sums.
+        for shape in ("120x160", "121x161"),
+            a in ("0p0", "8p13", "m8p13", "45p0", "90p0", "m90p0")
+
+            f = fixture("warpaffine/band_$(shape)_a$(a)")
+            ny, nx = size(f.arrays.src)
+            got = AutoRIFT._rotate_bilinear(f.arrays.src, f.params.angle, (nx / 2, ny / 2))
+            @test map(==(1.0f0), got) == (f.arrays.selected .!= 0)
+        end
+    end
+end
+
+@testset "destripe: the fixed-point interpolation is load-bearing" begin
+    if !has_fixtures()
+        @info "Fixture corpus absent; skipping."
+    else
+        # OpenCV rounds each source coordinate to 1/32 (`INTER_BITS = 5`) before interpolating, so a
+        # coordinate within 1/64 of an integer snaps onto it and the neighbour's weight is exactly zero.
+        # On a 0/1 mask read with `== 1` that decides membership: a cell at 0.993903 is excluded and one at
+        # 1.0 is kept. This asserts the quantization is present by checking the case where it bites — an
+        # odd-sized mask at 45°, where a plain `Float64` bilinear misses 60 of 3,720 cells.
+        f = fixture("warpaffine/band_121x161_a45p0")
+        ny, nx = size(f.arrays.src)
+        got = AutoRIFT._rotate_bilinear(f.arrays.src, 45.0, (nx / 2, ny / 2))
+        @test count(==(1.0f0), got) == f.params.selected_count
+        @test count(==(1.0f0), got) == 3720
+    end
+end
+
+@testset "destripe: the decline branch is not a pass-through" begin
+    # A scene with no directional banding: the two band powers are comparable, the ratio test fails, and
+    # the clamped image comes back. Asserting that it is *clamped* and not merely returned is the point —
+    # the reference clamps before it decides (`autoRIFT.py:213-216`), so a declined scene still differs
+    # from its input, and a gate that only checked "output == input on decline" would pass a filter that
+    # skipped the clamp.
+    img = 5 .* synthetic_texture((96, 96); seed = 3)
+    mask = trues(96, 96)
+    m = Destripe(; along_track = 71.6, cross_track = -20.2)
+    out = destripe(img, mask, m)
+    @test all(v -> abs(v) <= 3, out)
+    @test any(v -> abs(v) == 3, out)             # the clamp actually bit
+    @test out != Float32.(img)
+
+    # Outside the valid domain the output is zero, never a fabricated value: the reference zeroes there and
+    # a correlator must not see numbers where there was no data.
+    partial = copy(mask)
+    partial[1:10, :] .= false
+    @test all(iszero, destripe(img, partial, m)[1:10, :])
+end
+
+@testset "destripe: geometry is an argument, and a bad one is rejected" begin
+    # The angles are passed in rather than derived, which is what keeps the filter testable and lets the
+    # orbit supply them later — `tools/golden/README.md` records why the orbit is the better source. A
+    # non-finite angle would silently produce an all-zero band and a filter that never rejects anything,
+    # so it is refused at construction.
+    @test_throws "scan angles must be finite" Destripe(; along_track = NaN, cross_track = 0)
+    @test_throws "scan angles must be finite" Destripe(; along_track = 0, cross_track = Inf)
+    @test_throws "`band_half` must be positive" Destripe(; along_track = 0, cross_track = 0, band_half = 0)
+    @test_throws "`clamp` must be positive" Destripe(; along_track = 0, cross_track = 0, clamp = 0)
+    @test_throws "`ratio` must be >= 1" Destripe(; along_track = 0, cross_track = 0, ratio = 0.5)
+
+    # A whole-image transform has no window, so it erodes no mask and widens no halo.
+    @test AutoRIFT.filter_width(Destripe(; along_track = 0, cross_track = 0)) == 0
+    m = Destripe(; along_track = 10, cross_track = -80)
+    out, outmask = preprocess(synthetic_texture((64, 64); seed = 4), trues(64, 64), m)
+    @test size(out) == (64, 64)
+    @test all(outmask)
 end
