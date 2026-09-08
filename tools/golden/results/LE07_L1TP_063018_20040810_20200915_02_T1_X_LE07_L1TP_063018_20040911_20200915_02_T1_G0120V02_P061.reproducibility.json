@@ -1,0 +1,307 @@
+{
+    "provenance": {
+        "julia": "1.12.5",
+        "ncores": 8,
+        "cpu": "apple-m2",
+        "image": "ghcr.io/asfhyp3/hyp3-autorift:0.28.4",
+        "autorift_commit": "397ff7e-dirty",
+        "machine": "arm64-apple-darwin24.0.0",
+        "recorded": "2026-09-05T16:53:15.010"
+    },
+    "comparison": {
+        "vs_golden": {
+            "time_delta_s": 0.425,
+            "variables": [
+                {
+                    "name": "chip_size_height",
+                    "n_both": 931736,
+                    "only_a": 55305,
+                    "bias": 0.2168854697038646,
+                    "max_abs": 720,
+                    "only_b": 54545,
+                    "exact_fraction": 0.879529179939382,
+                    "p99": 720
+                },
+                {
+                    "name": "chip_size_width",
+                    "n_both": 931736,
+                    "only_a": 55305,
+                    "bias": 0.2168854697038646,
+                    "max_abs": 720,
+                    "only_b": 54545,
+                    "exact_fraction": 0.879529179939382,
+                    "p99": 720
+                },
+                {
+                    "name": "interp_mask",
+                    "n_both": 50488,
+                    "only_a": 60413,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 59283,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "v",
+                    "n_both": 931736,
+                    "only_a": 55305,
+                    "bias": -0.12319369435118961,
+                    "max_abs": 798,
+                    "only_b": 54545,
+                    "exact_fraction": 0.29818961594271337,
+                    "p99": 125
+                },
+                {
+                    "name": "v_error",
+                    "n_both": 931736,
+                    "only_a": 55305,
+                    "bias": -0.01109541758609735,
+                    "max_abs": 5,
+                    "only_b": 54545,
+                    "exact_fraction": 0.5885132698532631,
+                    "p99": 5
+                },
+                {
+                    "name": "vx",
+                    "n_both": 931736,
+                    "only_a": 55305,
+                    "bias": 0.3271559755123769,
+                    "max_abs": 1190,
+                    "only_b": 54545,
+                    "exact_fraction": 0.2573840658727365,
+                    "p99": 123
+                },
+                {
+                    "name": "vy",
+                    "n_both": 931736,
+                    "only_a": 55305,
+                    "bias": -0.10579928220010819,
+                    "max_abs": 743,
+                    "only_b": 54545,
+                    "exact_fraction": 0.35418401779044706,
+                    "p99": 152
+                }
+            ],
+            "identical": false,
+            "x_max": 0,
+            "b": "LE07_L1TP_063018_20040810_20200915_02_T1_X_LE07_L1TP_063018_20040911_20200915_02_T1_G0120V02_P061.nc",
+            "missing_vars": [
+            ],
+            "agrees_on_data": false,
+            "y_max": 0,
+            "attrib_diffs": {
+                "vy.error_slow": [
+                    "54.8",
+                    "54.7"
+                ],
+                "vx.error": [
+                    "49.8",
+                    "49.9"
+                ],
+                "vx.stable_shift_stationary": [
+                    "-33.1",
+                    "-32.8"
+                ],
+                "img_pair_info.roi_valid_percentage": [
+                    "61.8",
+                    "61.7"
+                ],
+                "vx.stable_count_stationary": [
+                    "441742",
+                    "442333"
+                ],
+                "vy.stable_shift": [
+                    "-17.9",
+                    "-18.0"
+                ],
+                "vx.error_stationary": [
+                    "49.8",
+                    "49.9"
+                ],
+                "vx.error_slow": [
+                    "49.7",
+                    "49.8"
+                ],
+                "vy.error_stationary": [
+                    "55.0",
+                    "54.9"
+                ],
+                "vx.stable_count_slow": [
+                    "447121",
+                    "447721"
+                ],
+                "vx.stable_shift": [
+                    "-33.1",
+                    "-32.8"
+                ],
+                "vy.error": [
+                    "55.0",
+                    "54.9"
+                ],
+                "vx.stable_shift_slow": [
+                    "-33.3",
+                    "-33.0"
+                ],
+                "vy.stable_count_stationary": [
+                    "441742",
+                    "442333"
+                ],
+                "vy.stable_shift_stationary": [
+                    "-17.9",
+                    "-18.0"
+                ],
+                "time.microseconds_added": [
+                    "862479",
+                    "437477"
+                ],
+                "vy.stable_count_slow": [
+                    "447121",
+                    "447721"
+                ]
+            },
+            "a": "LE07_L1TP_063018_20040810_20200915_02_T1_X_LE07_L1TP_063018_20040911_20200915_02_T1_G0120V02_P061_IL_ASF_OD.nc"
+        },
+        "floor": {
+            "time_delta_s": 0.601,
+            "variables": [
+                {
+                    "name": "chip_size_height",
+                    "n_both": 932756,
+                    "only_a": 54285,
+                    "bias": -0.21330337194293042,
+                    "max_abs": 720,
+                    "only_b": 55255,
+                    "exact_fraction": 0.8801648019417726,
+                    "p99": 720
+                },
+                {
+                    "name": "chip_size_width",
+                    "n_both": 932756,
+                    "only_a": 54285,
+                    "bias": -0.21330337194293042,
+                    "max_abs": 720,
+                    "only_b": 55255,
+                    "exact_fraction": 0.8801648019417726,
+                    "p99": 720
+                },
+                {
+                    "name": "interp_mask",
+                    "n_both": 51556,
+                    "only_a": 59345,
+                    "bias": 0,
+                    "max_abs": 0,
+                    "only_b": 60543,
+                    "exact_fraction": 1,
+                    "p99": 0
+                },
+                {
+                    "name": "v",
+                    "n_both": 932756,
+                    "only_a": 54285,
+                    "bias": -0.19465433618223843,
+                    "max_abs": 926,
+                    "only_b": 55255,
+                    "exact_fraction": 0.3243356247507387,
+                    "p99": 126
+                },
+                {
+                    "name": "v_error",
+                    "n_both": 932756,
+                    "only_a": 54285,
+                    "bias": -0.1228724339484281,
+                    "max_abs": 5,
+                    "only_b": 55255,
+                    "exact_fraction": 0.555757347044672,
+                    "p99": 5
+                },
+                {
+                    "name": "vx",
+                    "n_both": 932756,
+                    "only_a": 54285,
+                    "bias": 0.3524169236113196,
+                    "max_abs": 874,
+                    "only_b": 55255,
+                    "exact_fraction": 0.2914277688913285,
+                    "p99": 124
+                },
+                {
+                    "name": "vy",
+                    "n_both": 932756,
+                    "only_a": 54285,
+                    "bias": -0.05665039946138111,
+                    "max_abs": 920,
+                    "only_b": 55255,
+                    "exact_fraction": 0.3589706203980462,
+                    "p99": 152
+                }
+            ],
+            "identical": false,
+            "x_max": 0,
+            "b": "LE07_L1TP_063018_20040810_20200915_02_T1_X_LE07_L1TP_063018_20040911_20200915_02_T1_G0120V02_P061_IL_ASF_OD.nc",
+            "missing_vars": [
+            ],
+            "agrees_on_data": false,
+            "y_max": 0,
+            "attrib_diffs": {
+                "vy.error_slow": [
+                    "54.8",
+                    "54.9"
+                ],
+                "vx.error": [
+                    "49.8",
+                    "50.1"
+                ],
+                "vx.stable_shift_stationary": [
+                    "-33.1",
+                    "-32.9"
+                ],
+                "vx.stable_count_stationary": [
+                    "441742",
+                    "441651"
+                ],
+                "vy.stable_shift": [
+                    "-17.9",
+                    "-18.0"
+                ],
+                "vx.error_stationary": [
+                    "49.8",
+                    "50.1"
+                ],
+                "vx.error_slow": [
+                    "49.7",
+                    "49.9"
+                ],
+                "vx.stable_count_slow": [
+                    "447121",
+                    "447149"
+                ],
+                "vx.stable_shift": [
+                    "-33.1",
+                    "-32.9"
+                ],
+                "vx.stable_shift_slow": [
+                    "-33.3",
+                    "-33.2"
+                ],
+                "vy.stable_count_stationary": [
+                    "441742",
+                    "441651"
+                ],
+                "vy.stable_shift_stationary": [
+                    "-17.9",
+                    "-18.0"
+                ],
+                "time.microseconds_added": [
+                    "862479",
+                    "261346"
+                ],
+                "vy.stable_count_slow": [
+                    "447121",
+                    "447149"
+                ]
+            },
+            "a": "LE07_L1TP_063018_20040810_20200915_02_T1_X_LE07_L1TP_063018_20040911_20200915_02_T1_G0120V02_P061_IL_ASF_OD.nc"
+        }
+    }
+}

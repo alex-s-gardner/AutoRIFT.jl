@@ -208,7 +208,7 @@ end
     # what the `autorift(ref, sec, ::Params)` docstring promises, and what makes it safe to
     # document as the entry point a trimmed binary uses.
     ref, sec = shifted_pair(512, (6, -4); T = Float32)
-    p = Params((ZNCC(),), Highpass(), PyramidRefine(), GardnerFilter(),
+    p = Params((ZNCC(),), Highpass(), (PyramidRefine(),), GardnerFilter(),
                AutoRIFT.False(), AutoRIFT.NoRotationSearch(),
                (X = 32, Y = 32),      # chip_size_min
                (X = 128, Y = 128),    # chip_size_max

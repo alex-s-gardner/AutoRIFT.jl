@@ -82,7 +82,7 @@ nmeasured(d::DisplacementField) = count(!isnan, d.dx)
 # ---------------------------------------------------------------------------
 
 """
-    track!(out, pair, pts, p; subpixel = p.subpixel, measure = first(p.similarity))
+    track!(out, pair, pts, p; subpixel = first(p.subpixel), measure = first(p.similarity))
         -> DisplacementField
 
 Correlate `pair` at every searchable point of `pts`, writing into `out`.
@@ -118,7 +118,7 @@ no bounds test, but padding is not data, and a chip made of it would correlate w
 other such chip. See `valid` on [`ImagePair`](@ref).
 """
 function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Params;
-                subpixel::SubpixelMethod = p.subpixel,
+                subpixel::SubpixelMethod = first(p.subpixel),
                 measure::SimilarityMeasure = first(p.similarity),
                 geometry::Union{Nothing,PassGeometry} = nothing,
                 okmask::AbstractMatrix{Bool} = valid(pair))
@@ -228,7 +228,7 @@ _dispatch_pass!(::CUDAGPU, ::DisplacementField, _ref, _sec, _okmask, ::PointSet{
         "true`, which is faster than either device path on a machine with cores free."))
 
 """
-    track(pair, pts, p; subpixel = p.subpixel, measure, geometry) -> DisplacementField
+    track(pair, pts, p; subpixel = first(p.subpixel), measure, geometry) -> DisplacementField
 
 Allocating form of [`track!`](@ref).
 """

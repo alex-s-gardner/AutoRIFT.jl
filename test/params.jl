@@ -3,12 +3,14 @@
     # A tuple, one measure per chip-size level; a scalar keyword becomes a 1-tuple.
     @test p.similarity === (ZNCC(),)
     @test p.preprocess == Highpass(5)
-    @test p.subpixel == PyramidRefine(64)
+    # Also a tuple, one method per level: the reference's subpixel denominator varies with chip
+    # size, so a single method cannot express a production configuration.
+    @test p.subpixel === (PyramidRefine(64),)
     @test p.threaded === AutoRIFT.False()
 
     @test AutoRIFT.params(; similarity = :ncc).similarity === (NCC(),)
     @test AutoRIFT.params(; similarity = :coherence).similarity === (Coherence(),)
-    @test AutoRIFT.params(; subpixel = :none).subpixel === NoRefine()
+    @test AutoRIFT.params(; subpixel = :none).subpixel === (NoRefine(),)
     @test AutoRIFT.params(; preprocess = :none).preprocess === NoPreprocess()
 
     # A method object is accepted wherever a Symbol is, and is the only way to
@@ -26,8 +28,8 @@
     @test AutoRIFT.filter_width(AutoRIFT.params(;
         preprocess = :decibel, filter_width = 21).preprocess) == 0
 
-    @test AutoRIFT.upsampling(AutoRIFT.params(;
-        subpixel = :pyramid, upsampling = 32).subpixel) == 32
+    @test AutoRIFT.upsampling(only(AutoRIFT.params(;
+        subpixel = :pyramid, upsampling = 32).subpixel)) == 32
     @test AutoRIFT.upsampling(NoRefine()) == 1
 end
 
@@ -75,6 +77,49 @@ end
     @test AutoRIFT.extent((X = 16, Y = 32)) == (X = 16, Y = 32)
 end
 
+@testset "subpixel per chip-size level" begin
+    # The reference's subpixel denominator is a function of chip size, not of the run:
+    # `OverSampleRatio` may be a dict, and the production driver always passes one — `{16, 32, 64,
+    # 64}` keyed by `ChipSize0X * [1,2,4,8]` for optical input (`autoRIFT.py:652`,
+    # `testautoRIFT.py:488`). A single method cannot express that, so `subpixel` is a tuple on the
+    # same rule as `similarity`.
+    up(p, k) = AutoRIFT.upsampling(AutoRIFT.subpixel_at(p, k))
+
+    # A scalar becomes a 1-tuple, whose entry then applies to every level — the common case.
+    p1 = AutoRIFT.params(; upsampling = 16)
+    @test p1.subpixel === (PyramidRefine(16),)
+    @test all(k -> up(p1, k) == 16, 1:4)
+
+    # A tuple names one method per level, and the last entry repeats past its end. That repetition
+    # is what lets the reference's four-entry ladder be written as three when only three levels run.
+    p3 = AutoRIFT.params(; subpixel = (PyramidRefine(16), PyramidRefine(32), PyramidRefine(64)))
+    @test [up(p3, k) for k in 1:5] == [16, 32, 64, 64, 64]
+    @test AutoRIFT.chip_subpixels(p3, 3) === p3.subpixel
+
+    # Symbols resolve inside a tuple as they do alone, and the methods may differ in kind.
+    pm = AutoRIFT.params(; subpixel = (:pyramid, :none))
+    @test pm.subpixel === (PyramidRefine(), NoRefine())
+    @test up(pm, 2) == 1
+
+    # The tuple stays concrete, so the refinement kernel specializes on each level's method rather
+    # than dispatching at run time.
+    @test isconcretetype(typeof(p3.subpixel))
+    @test typeof(p3.subpixel) === Tuple{PyramidRefine,PyramidRefine,PyramidRefine}
+
+    # A tuple already carries its own factors, so a loose `upsampling` beside it would be a second
+    # source for one number.
+    @test_throws "cannot be combined with a tuple" AutoRIFT.params(;
+        subpixel = (PyramidRefine(16),), upsampling = 32)
+    @test_throws "cannot be an empty tuple" AutoRIFT.params(; subpixel = ())
+    @test_throws "must be a Symbol or a `SubpixelMethod`" AutoRIFT.params(; subpixel = (1,))
+
+    # More methods than levels means the extra ones would silently never run, which is a
+    # configuration error rather than something to ignore. Two levels here, three methods.
+    @test_throws "there are only 2 chip-size levels" AutoRIFT.chip_subpixels(
+        AutoRIFT.params(; chip_size = 32, chip_size_max = 64,
+                        subpixel = (PyramidRefine(16), PyramidRefine(32), PyramidRefine(64))))
+end
+
 @testset "chip-size levels must keep one aspect ratio" begin
     # Levels are `chip_size .* 2^k` in both axes at once, so `chip_size_max` has to be the same
     # multiple of `chip_size` in each. Otherwise x would reach its maximum after a different number
@@ -118,6 +163,10 @@ end
 
     @test_throws "must be odd" AutoRIFT.params(; outlier_window = 4)
     @test_throws "must be odd" AutoRIFT.params(; fill_window = 2)
+    @test_throws "must be >= 0" AutoRIFT.params(; fill_min_hole = -1)
+    # Zero is the documented way to disable the hole-size criterion, so it must not be rejected.
+    @test AutoRIFT.params(; fill_min_hole = 0).fill_min_hole == 0
+    @test AutoRIFT.params().fill_min_hole == 5
     @test_throws "must be odd" Wallis(; width = 6)
     @test_throws "must be >= 3" Highpass(; width = 1)
 
@@ -194,13 +243,13 @@ end
 
     # The positional constructor is stable API and predates this field, so the 19-argument form
     # must still work and must mean the CPU. `app/` calls exactly this.
-    p = AutoRIFT.Params((ZNCC(),), Highpass(), PyramidRefine(), GardnerFilter(),
+    p = AutoRIFT.Params((ZNCC(),), Highpass(), (PyramidRefine(),), GardnerFilter(),
                AutoRIFT.False(), AutoRIFT.NoRotationSearch(),
                (X = 32, Y = 32), (X = 128, Y = 128), (X = 32, Y = 32), (X = 25, Y = 25),
                6, 4, 8, 0.01, 0.0, 0.0, 3, UInt64(0), false)
     @test p.backend === AutoRIFT.CPU()
     # And the 20-argument form selects a device.
-    q = AutoRIFT.Params((ZNCC(),), Highpass(), PyramidRefine(), GardnerFilter(),
+    q = AutoRIFT.Params((ZNCC(),), Highpass(), (PyramidRefine(),), GardnerFilter(),
                AutoRIFT.False(), AutoRIFT.NoRotationSearch(),
                (X = 32, Y = 32), (X = 128, Y = 128), (X = 32, Y = 32), (X = 25, Y = 25),
                6, 4, 8, 0.01, 0.0, 0.0, 3, UInt64(0), false, AutoRIFT.MetalGPU())

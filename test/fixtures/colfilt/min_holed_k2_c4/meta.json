@@ -1,0 +1,28 @@
+{
+  "arrays": {
+    "expected": {
+      "dtype": "float32",
+      "shape": [
+        24,
+        30
+      ]
+    },
+    "src": {
+      "dtype": "float32",
+      "shape": [
+        24,
+        30
+      ]
+    }
+  },
+  "params": {
+    "border": "reflect",
+    "chunk_size": 4,
+    "even_kernel": true,
+    "has_nan": true,
+    "kernel": 2,
+    "nan_to_nan": true,
+    "option": 1,
+    "reducer": "min"
+  }
+}

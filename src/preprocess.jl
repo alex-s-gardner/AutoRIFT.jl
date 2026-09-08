@@ -830,6 +830,13 @@ a bright, low-contrast window, and in the reference it produced negative varianc
 square roots were `NaN` — which then propagated into the validity mask, silently
 discarding data. Upstream now clamps the variance at zero, which stops the `NaN`s but
 leaves the precision loss; computing the variance about the measured mean avoids both.
+
+The size of that precision loss, measured against an exact `Float64` result on a 256²
+scene of mean 130 and standard deviation 25 at `width = 5`: the reference's formula is off
+by a median of 0.54 and up to 5.79, this one by a median of 1.5e-6 and up to 9.5e-6. So
+the two cannot agree bit for bit, and the difference is ~10⁵× the size of the tolerance a
+Float32 rounding difference would justify. `tools/golden/README.md` records what that costs
+in the golden comparison.
 """
 function wallis(img::AbstractMatrix, mask::AbstractMatrix{Bool}, width::Integer,
                 min_std::Real = 0.0)
@@ -1025,3 +1032,192 @@ function replace_nonfinite(img::AbstractMatrix{<:Union{AbstractFloat,Complex}},
     end
     return out, copy(mask)
 end
+
+# ---------------------------------------------------------------------------
+# Destriping: a frequency-domain band reject along one scan direction
+# ---------------------------------------------------------------------------
+
+"""
+    destripe(img, mask, m::Destripe) -> Matrix{Float32}
+
+`img` with the stronger of its two scan-direction noise bands rejected, or merely clamped if neither
+dominates.
+
+Landsat 4 and 5's Multispectral Scanner leaves coherent banding along one scan direction. Those stripes are
+narrow in frequency and broad in space, so they occupy a thin line through the Fourier origin that can be
+excised without touching the texture correlation needs — which is why this is a frequency-domain filter where
+every other method here is a local window.
+
+The sequence is the reference's (`autoRIFT.py:207-243`), and each step is load-bearing:
+
+  1. **Clamp to `±m.clamp` and zero the non-finite.** The input is already Wallis-normalized, so this bounds
+     it at three standard deviations. It also runs on the branch that applies *no* band reject, so a declined
+     scene is still not returned unchanged.
+  2. **`fftshift(fft2)`**, putting zero frequency at the centre where the band masks are built.
+  3. **Threshold the power at `mean + m.sigma * std`.** The sums below count *cells above that threshold*,
+     not power — a spike either counts once or not at all, so a single very bright cell cannot outvote a
+     broad ridge.
+  4. **Sum inside two band masks**, one per scan direction.
+  5. **Reject the stronger band, but only if** one sum exceeds the other by `m.ratio` *and* the larger exceeds
+     `m.power_threshold`. Both conditions, and the reference's own log message misattributes a failure of the
+     first to the second.
+
+`mask` is the valid domain: the output is zeroed outside it, as the reference does, so a filtered scene
+carries no fabricated values where there was no data.
+"""
+function destripe(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::Destripe)
+    axes(img) == axes(mask) || throw(DimensionMismatch(
+        "image and mask must share axes: $(axes(img)) vs $(axes(mask))"))
+    Base.require_one_based_indexing(img, mask)
+
+    clamped = Matrix{Float32}(undef, size(img))
+    lo, hi = Float32(-m.clamp), Float32(m.clamp)
+    @inbounds for i in eachindex(clamped, img)
+        v = Float32(img[i])
+        # `NaN` to zero rather than propagating: a single non-finite cell would poison the whole
+        # transform, and the reference zeroes it for the same reason.
+        clamped[i] = isfinite(v) ? Base.clamp(v, lo, hi) : 0.0f0
+    end
+
+    band_a = _reject_band(size(img), m.cross_track, m)
+    band_b = _reject_band(size(img), m.along_track, m)
+
+    spectrum = FFTW.fftshift(FFTW.fft(clamped))
+    power = abs.(spectrum)
+    # A cell counts if it stands `sigma` deviations above the mean. Counting cells rather than summing
+    # power is what keeps one bright spike from deciding the comparison.
+    #
+    # The moments in `Float64` over a `Float32` array, and the deviation about the mean rather than
+    # `E[x²] − E[x]²`: a power spectrum spans many orders of magnitude, so the difference-of-squares form
+    # loses most of its significant digits here. `REFERENCE.md` records the same choice for `Wallis`, where
+    # it measured ~360,000x more accurate. NumPy's `std` is the population form, `n` and not `n - 1`, and
+    # that is matched — on an array of millions the distinction is immaterial to the threshold, but stating
+    # it costs nothing and guessing it wrong is invisible.
+    threshold = let n = length(power)
+        μ = sum(Float64, power) / n
+        σ² = sum(x -> (Float64(x) - μ)^2, power) / n
+        Float32(μ + m.sigma * sqrt(σ²))
+    end
+    sum_a = 0
+    sum_b = 0
+    @inbounds for i in eachindex(power)
+        power[i] > threshold || continue
+        band_a[i] && (sum_a += 1)
+        band_b[i] && (sum_b += 1)
+    end
+
+    strongest = max(sum_a, sum_b)
+    weakest = min(sum_a, sum_b)
+    # `weakest == 0` with a nonzero `strongest` is an infinite ratio, which passes; both zero does not.
+    dominates = strongest > 0 && (weakest == 0 || strongest / weakest >= m.ratio)
+    if !(dominates && strongest > m.power_threshold)
+        # Declined. The clamped image is the answer, zeroed outside the domain.
+        @inbounds for i in eachindex(clamped)
+            mask[i] || (clamped[i] = 0.0f0)
+        end
+        return clamped
+    end
+
+    keep = sum_a > sum_b ? band_a : band_b
+    @inbounds for i in eachindex(spectrum)
+        keep[i] && (spectrum[i] = zero(eltype(spectrum)))
+    end
+    out = real.(FFTW.ifft(FFTW.ifftshift(spectrum)))
+    result = Matrix{Float32}(undef, size(img))
+    @inbounds for i in eachindex(result)
+        result[i] = mask[i] ? Float32(out[i]) : 0.0f0
+    end
+    return result
+end
+
+# The band-reject mask for one scan direction: a `2 * band_half`-row horizontal band through the centre,
+# with a `2 * notch_half`-column vertical notch removed, rotated to `angle` degrees about the image centre.
+#
+# The notch is what preserves the low frequencies. A band through the origin would reject the image's own
+# broad structure along with the stripes, so the columns nearest the centre are excluded and only the
+# high-frequency wings of the band are rejected.
+#
+# **The rotation is bilinear and the consumer tests `== 1`.** `warpAffine` interpolates, so a rotated 0/1
+# mask has fractional values along its edge, and the reference keeps only the cells that stayed exactly one
+# (`autoRIFT.py:225-226`). Nearest-neighbour or rounding would select a wider band and reject more.
+function _reject_band(sz::Tuple{Int,Int}, angle::Real, m::Destripe)
+    ny, nx = sz
+    base = zeros(Float32, ny, nx)
+    # `floor` for the band's own extent and the true half-extent for the rotation centre, which differ by
+    # half a pixel on an even axis. Both are the reference's (`:207-212`).
+    cy, cx = fld(ny, 2), fld(nx, 2)
+    rows = max(cy - m.band_half + 1, 1):min(cy + m.band_half, ny)
+    cols = max(cx - m.notch_half + 1, 1):min(cx + m.notch_half, nx)
+    base[rows, :] .= 1.0f0
+    base[:, cols] .= 0.0f0
+    rotated = _rotate_bilinear(base, Float64(angle), (nx / 2, ny / 2))
+    out = BitMatrix(undef, ny, nx)
+    @inbounds for i in eachindex(out, rotated)
+        out[i] = rotated[i] == 1.0f0
+    end
+    return out
+end
+
+# `A` rotated by `angle` degrees about `centre = (x, y)`, sampled bilinearly, zero outside — which is
+# `cv2.warpAffine` of a `cv2.getRotationMatrix2D` at its defaults.
+#
+# Written here rather than through `resample`: that resizes on a size ratio and has no rotation, and the
+# matrix convention is the thing to get right. `getRotationMatrix2D(centre, angle, 1)` builds the *forward*
+# map with `+angle` counter-clockwise in a y-down image, and `warpAffine` applies it as an inverse lookup —
+# so a destination pixel reads the source at the angle's negation about the same centre.
+function _rotate_bilinear(A::AbstractMatrix{Float32}, angle::Real, centre::Tuple{Real,Real})
+    ny, nx = size(A)
+    cx, cy = Float64(centre[1]), Float64(centre[2])
+    s, c = sincosd(Float64(angle))
+    out = zeros(Float32, ny, nx)
+    @inbounds for j in 1:nx, i in 1:ny
+        # Destination centre-of-pixel in OpenCV's 0-based coordinates, then the inverse map.
+        #
+        # **The rotation direction is the trap, and matching counts hide it.**
+        # `getRotationMatrix2D(centre, angle, 1)` builds `[[c, s], [-s, c]]` with `c = cos α`,
+        # `s = sin α` — which in a y-down image is *counter-clockwise* as seen on screen — and
+        # `warpAffine` treats that as the forward map, sampling the source at `M ⋅ dst`. So the source
+        # offset is `(c·dx + s·dy, −s·dx + c·dy)` with the angle's own sign, not its negation.
+        #
+        # Getting it backwards rotates the band the other way, and the *count* of selected cells is
+        # identical either way because a rotation is area-preserving: measured on the pinned fixtures,
+        # 3,804 cells selected under both signs with 3,120 of them in different places. A comparison on
+        # counts alone passes; only the positions catch it.
+        dx, dy = (j - 1) - cx, (i - 1) - cy
+        sxf = c * dx - s * dy + cx
+        syf = s * dx + c * dy + cy
+        # **OpenCV interpolates in fixed point, and on a 0/1 mask that changes the answer.**
+        # `warpAffine` rounds each source coordinate to 1/`INTER_TAB_SIZE` = 1/32 (`INTER_BITS = 5`)
+        # before splitting it into an integer part and a weight index. A coordinate landing within
+        # 1/64 of an integer therefore snaps *onto* it and the neighbour's weight becomes exactly
+        # zero — so the interpolated value is exactly 1 where a `Float64` computation gives 0.993903.
+        #
+        # That matters here and nowhere else in this package: the consumer tests `== 1`
+        # (`autoRIFT.py:225-226`), so a cell at 0.9939 is excluded and one at 1.0 is kept. Measured on
+        # the pinned fixtures, ignoring the quantization misses 60 of 3,720 selected cells on an
+        # odd-sized mask — all of them on the band's rotated edge, which is exactly where a band-reject
+        # decides how much it rejects.
+        sx = round(sxf * 32) / 32
+        sy = round(syf * 32) / 32
+        x0, y0 = floor(Int, sx), floor(Int, sy)
+        (x0 < -1 || y0 < -1 || x0 > nx - 1 || y0 > ny - 1) && continue
+        fx, fy = sx - x0, sy - y0
+        at(yy, xx) = (0 <= xx <= nx - 1 && 0 <= yy <= ny - 1) ? Float64(A[yy + 1, xx + 1]) : 0.0
+        v = (1 - fx) * (1 - fy) * at(y0, x0) + fx * (1 - fy) * at(y0, x0 + 1) +
+            (1 - fx) * fy * at(y0 + 1, x0) + fx * fy * at(y0 + 1, x0 + 1)
+        out[i, j] = Float32(v)
+    end
+    return out
+end
+
+"""
+    preprocess(img, mask, m::Destripe) -> (Matrix{Float32}, Matrix{Bool})
+
+[`destripe`](@ref), with the mask passed through.
+
+The mask is unchanged because a frequency-domain filter has no window to erode: every output cell draws on
+the whole image, so no border ring is less trustworthy than the interior. That is the opposite of the local
+filters here, which shrink the mask by half a window.
+"""
+preprocess(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::Destripe) =
+    (destripe(img, mask, m), collect(mask))

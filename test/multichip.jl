@@ -1,6 +1,7 @@
 using AutoRIFT: ImagePair, gridpoints, params, correlate_multichip, chipsize_level,
                 MultichipResult, nmeasured, resample, resample!, Nearest, Area, Bicubic,
-                dilate_within, windowmax
+                dilate_within, small_components, windowmax,
+                DisplacementField, _fill_holes!
 
 # Same convention as track.jl's tests: the correlator returns secondary-to-reference, so the
 # feature motion is its negative.
@@ -109,14 +110,92 @@ end
     d = dilate_within(m, 3)
     # Euclidean, not chessboard: the corner of the 3x3 box is at distance sqrt(18) > 3.
     @test d[6, 6]
-    @test d[6, 9]           # exactly 3 away
+    # **Strict**, matching `distance_transform_edt(!MC) < BuffDistanceC` (`autoRIFT.py:709`). The
+    # position exactly `radius` away is excluded, and on a lattice that is a whole ring of points: at
+    # the default radius of 8 admitting them widened the searched region by 72 coarse cells on the
+    # golden Landsat case, 30,084 fine points after expansion.
+    @test !d[6, 9]          # exactly 3 away, so outside
+    @test d[6, 8]           # 2 away
     @test !d[6, 10]
     @test !d[9, 9]          # distance sqrt(18) ~ 4.24
-    @test count(d) == count(i -> (Tuple(i)[1] - 6)^2 + (Tuple(i)[2] - 6)^2 <= 9,
+    @test count(d) == count(i -> (Tuple(i)[1] - 6)^2 + (Tuple(i)[2] - 6)^2 < 9,
                             CartesianIndices(m))
 
     @test !any(dilate_within(falses(5, 5), 3))       # empty stays empty
     @test all(dilate_within(trues(5, 5), 1))
+end
+
+@testset "small_components" begin
+    # Eight-connected, which is the reference's `connectivity=2`: a diagonal pair is one
+    # component of two rather than two of one, and the size test turns on that.
+    m = falses(5, 5)
+    m[2, 2] = true
+    m[3, 3] = true
+    @test all(small_components(m, 3)[[CartesianIndex(2, 2), CartesianIndex(3, 3)]])
+    @test !any(small_components(m, 2))          # the pair is size 2, not < 2
+
+    # `minsize` is exclusive, matching `bwareaopen`'s `size < size1`.
+    row = falses(7, 7)
+    row[3, 2:6] .= true
+    @test !any(small_components(row, 5))        # exactly 5 is not smaller than 5
+    @test count(small_components(row, 6)) == 5
+
+    # Components are sized independently of each other.
+    mixed = falses(9, 9)
+    mixed[2, 2] = true
+    mixed[6:8, 6:8] .= true
+    r = small_components(mixed, 5)
+    @test r[2, 2]
+    @test !any(r[6:8, 6:8])
+
+    @test !any(small_components(falses(5, 5), 5))     # empty stays empty
+    @test !any(small_components(trues(4, 4), 5))      # one component of 16
+    @test !any(small_components(trues(3, 3), 0))      # a threshold of 0 selects nothing
+end
+
+@testset "hole size fills what neighbour count cannot" begin
+    mkfield(dx, dy) = DisplacementField(copy(dx), copy(dy), fill(NaN32, size(dx)),
+                                        fill(0.5f0, size(dx)), trues(size(dx)))
+
+    # A 2x2 hole is where the two criteria part. Each of its points has five of nine measured
+    # neighbours, one short of `fill_window`'s threshold of six, while the hole is four points
+    # and so smaller than `fill_min_hole`. Neither criterion alone closes it.
+    function twobytwo(minhole)
+        dx = fill(1.0f0, 11, 11)
+        dy = fill(2.0f0, 11, 11)
+        dx[5:6, 5:6] .= NaN32
+        dy[5:6, 5:6] .= NaN32
+        d = mkfield(dx, dy)
+        filled = _fill_holes!(d, params(; chip_size = 24, fill_min_hole = minhole))
+        return d, filled
+    end
+    @test count(!isnan, first(twobytwo(5)).dx[5:6, 5:6]) == 4
+    @test count(!isnan, first(twobytwo(0)).dx[5:6, 5:6]) == 0    # window criterion alone leaves it
+
+    # The filled value is the neighbourhood median, so a uniform field fills with its own value
+    # on both axes rather than with the other axis's or with zero.
+    d, filled = twobytwo(5)
+    @test all(d.dx[5:6, 5:6] .== 1.0f0)
+    @test all(d.dy[5:6, 5:6] .== 2.0f0)
+    # The four filled points are reported, so a caller can mark them interpolated.
+    @test length(filled) == 4
+
+    # The size criterion must not run away on a large hole: three passes close at most three
+    # rings, and the interior stays open. A hole judged by its size *before* its edge is filled
+    # would swallow the whole region.
+    dx = fill(1.0f0, 31, 31)
+    dy = fill(2.0f0, 31, 31)
+    dx[10:22, 10:22] .= NaN32
+    dy[10:22, 10:22] .= NaN32
+    big = mkfield(dx, dy)
+    _fill_holes!(big, params(; chip_size = 24, fill_min_hole = 5))
+    @test all(isnan, big.dx[14:18, 14:18])
+
+    # A hole with no measured neighbour at all stays open however small, since there is nothing
+    # for the median to take. This is the reference's `MM` term.
+    lone = mkfield(fill(NaN32, 7, 7), fill(NaN32, 7, 7))
+    _fill_holes!(lone, params(; chip_size = 24, fill_min_hole = 5))
+    @test all(isnan, lone.dx)
 end
 
 @testset "exact recovery through the pyramid" begin
@@ -164,9 +243,41 @@ end
     @test counts[1] <= counts[2] <= counts[3]
     # Permitting coarser chips must still buy something overall, or the pyramid is pointless.
     @test counts[1] < counts[3]
-    # And the featureless band is not fully resolvable at any scale, so some points remain
-    # honestly unmeasured rather than invented.
-    @test counts[3] < length(gridpoints((n, n), 32; chip_size = 32, search_radius = 25))
+
+    # The finest chip alone cannot resolve the band: a 32-wide chip that fits inside it has zero
+    # variance. That is what the coarser levels are for, and what the counts above measure.
+    fine = correlate_multichip(pair, grid, params(; chip_size = 32, chip_size_max = 32))
+    @test nmeasured(fine) < counts[3]
+    @test count(isnan, fine.dx) >= 40        # the band spans several grid rows
+
+    # With the whole pyramid most of the band is resolvable, because the points the coarse levels
+    # leave open form holes small enough for `fill_min_hole` to close. Filling is part of the answer
+    # rather than a fallback, so this asserts the measurement is right where it fills — a filled
+    # point that invented motion would fail the median checks below.
+    #
+    # **A fraction, not an exact count.** The band is set to a single constant, so a chip lying
+    # inside it has zero variance and whether it correlates at all is decided by the last bits of a
+    # variance sum. Reduction order is not fixed across Julia versions — 1.10 and 1.12 disagree on
+    # three of the 196 base-level points here, which cascades to 42 open holes against 8 — so an
+    # equality would assert one version's rounding. What the pyramid owes is that nearly every point
+    # is answered, and that is what this measures.
+    @test counts[3] >= 0.75 * length(grid.x)
+    mx, my = motion(correlate_multichip(pair, grid,
+                                        params(; chip_size = 32, chip_size_max = 128)))
+    @test med(filter(!isnan, mx)) ≈ 6 atol = 0.05
+    @test med(filter(!isnan, my)) ≈ -4 atol = 0.05
+
+    # Raising the hole-size criterion is what closes those points, which is what makes them a fill
+    # rather than a measurement. Compared across two thresholds on the same run rather than against
+    # `counts[3]`: how many holes are small enough to close at the default is float-dependent per
+    # above, and on some versions the default closes none of them.
+    unfilled = nmeasured(correlate_multichip(
+        pair, grid, params(; chip_size = 32, chip_size_max = 128, fill_min_hole = 0)))
+    generous = nmeasured(correlate_multichip(
+        pair, grid, params(; chip_size = 32, chip_size_max = 128, fill_min_hole = 16)))
+    @test unfilled < generous
+    # Filling only ever adds, so the default sits between the two.
+    @test unfilled <= counts[3] <= generous
 end
 
 @testset "chip_size records the level that won" begin
@@ -205,7 +316,7 @@ end
         # Nothing a finer level already owns may be attempted.
         @test !any(wanted .& (result.chip_size .!= 0))
         lvl = chipsize_level(AutoRIFT.WholeScene(pair), grid, p, cs, wanted,
-                             AutoRIFT.measure_at(p, k))
+                             AutoRIFT.measure_at(p, k), AutoRIFT.subpixel_at(p, k))
         isnothing(lvl) && continue
         answered[cs.X] = .!isnan.(lvl.field.dx)
         before = copy(result.chip_size)
@@ -449,6 +560,53 @@ end
     @test isnothing(chipsize_level(pair, grid, p, 32, falses(size(grid))))
 end
 
+@testset "each level quantizes at its own upsampling" begin
+    # The point of a per-level subpixel method is that the level's *answer* is quantized by it, so
+    # this asserts the quantization rather than the plumbing: displacements from a level run at
+    # `upsampling = n` are exact multiples of `1/n`.
+    #
+    # A fractional true shift is what makes the test discriminating — an integer one lands on every
+    # grid and would pass whatever the factor was.
+    ref, sec = shifted_pair(512, (5.3, -3.7); T = Float32)
+    pair = ImagePair(ref, sec)
+    grid = gridpoints((512, 512), 32; chip_size = 32, search_radius = 25)
+
+    quantized(v, n) = all(x -> abs(x * n - round(x * n)) < 1e-4, filter(!isnan, v))
+
+    # **Measured points only.** `chipsize_level` returns its field after `_reject_and_fill!` has run,
+    # so `field.dx` holds filled values beside measured ones — and a filled value is interpolated
+    # from its neighbours, never passed through the cascade, so it has no reason to land on the
+    # `1/n` grid. Two of the 196 points here fill to the midpoint of adjacent measurements, which is
+    # exactly a half-step off. Asserting over the whole field tests the fill, not the quantization
+    # this testset is named for; which points fill is float-dependent, so it also fails on one Julia
+    # version and not another.
+    measured(lvl, f) = f[setdiff(eachindex(f), lvl.filled)]
+
+    for n in (8, 16, 64)
+        p = params(; chip_size = 32, chip_size_max = 32, subpixel = (PyramidRefine(n),))
+        lvl = chipsize_level(pair, grid, p, 32, trues(size(grid)), first(p.similarity),
+                             AutoRIFT.subpixel_at(p, 1))
+        @test !isnothing(lvl)
+        @test quantized(measured(lvl, vec(lvl.field.dx)), n)
+        @test quantized(measured(lvl, vec(lvl.field.dy)), n)
+        # The shift is still recovered, so a finer grid is not being bought with accuracy.
+        @test med(filter(!isnan, -lvl.field.dx)) ≈ 5.3 atol = 0.2
+    end
+
+    # Two levels with different factors: each obeys its own, which one shared factor could not
+    # produce. Run through the whole loop rather than level by level, since that is where
+    # `subpixel_at` is consulted.
+    p2 = params(; chip_size = 32, chip_size_max = 64,
+                subpixel = (PyramidRefine(8), PyramidRefine(64)))
+    out = autorift(ref, sec, p2)
+    fine = [out.dx[i] for i in eachindex(out.dx) if out.chip_size[i] == 32 && !isnan(out.dx[i])]
+    coarse = [out.dx[i] for i in eachindex(out.dx) if out.chip_size[i] == 64 && !isnan(out.dx[i])]
+    isempty(fine) || @test quantized(fine, 8)
+    # A multiple of 1/64 need not be a multiple of 1/8, and on a fractional shift some are not —
+    # which is what shows the two levels used different factors rather than one.
+    isempty(coarse) || @test quantized(coarse, 64)
+end
+
 @testset "a level that finds nothing is skipped" begin
     # Two unrelated images: the coarse pass should find no spatial coherence and the level
     # should decline rather than emit noise.
@@ -531,6 +689,82 @@ end
         @test !isempty(AutoRIFT.chip_sizes(params(; chip_size = mn, chip_size_max = mx)))
     end
     @test_throws ArgumentError params(; chip_size = 32, chip_size_max = 96)
+end
+
+@testset "grid spacing survives a zeroed nodata margin" begin
+    # A production grid is zeroed wherever there is no data (`testautoRIFT.py:394-403`), so a scene
+    # whose first rows and columns are ocean has `x[1, 2] == x[1, 1]`. Reading the spacing from the
+    # first two points gives zero there, `_cell_centres` then shifts by nothing, and every coarse node
+    # sits at its cell's first point — half a cell from where `_undecimate_level` reads it back. On the
+    # golden Landsat case that left 99.8% of level-1 nodes 4 or 5 px from the reference's.
+    # Zero is the nodata marker, so the margin is zeroed rather than held at the first coordinate --
+    # which is what the driver writes and what makes a step touching it describe the margin.
+    x = Float64[(c <= 5 || r <= 5) ? 0.0 : 1.5 + 8 * (c - 1) for r in 1:12, c in 1:12]
+    y = Float64[(c <= 5 || r <= 5) ? 0.0 : 1.5 + 8 * (r - 1) for r in 1:12, c in 1:12]
+    @test iszero(x[1, 1]) && iszero(x[1, 2])       # the trap: adjacent margin points are equal
+    @test AutoRIFT._grid_step(x, 2) == 8
+    @test AutoRIFT._grid_step(y, 1) == 8
+
+    # A clean grid gives the same answer, so the mode is not a special case for margins.
+    xc = Float64[1.5 + 8 * (c - 1) for _ in 1:12, c in 1:12]
+    @test AutoRIFT._grid_step(xc, 2) == 8
+    # Non-square spacing is read per axis.
+    yc = Float64[1.5 + 3 * (r - 1) for r in 1:12, _ in 1:12]
+    @test AutoRIFT._grid_step(yc, 1) == 3
+
+    # **The step is signed, because the grid is rotated by an arbitrary amount.** A step along a row
+    # moves `x` by the spacing times the cosine of the rotation: 8 on a near-axis-aligned Landsat grid
+    # and −1 on a Sentinel-2 grid rotated near 90°. Keeping only positive steps sees nothing but the
+    # jumps out of the zeroed margin — on the golden S2A case that returns 10979 where the answer is −1,
+    # which puts every chip-96 coarse point outside a 10,980 px image and drops the level entirely.
+    xrot = Float64[(c <= 5 || r <= 5) ? 0.0 : 5000.0 - (c - 1) for r in 1:12, c in 1:12]
+    @test AutoRIFT._grid_step(xrot, 2) == -1
+
+    # No spacing at all: a single column, or an all-zero grid.
+    @test AutoRIFT._grid_step(zeros(4, 4), 2) == 0.0
+    @test AutoRIFT._grid_step(reshape(Float64[1.5], 1, 1), 2) == 0.0
+
+    # And the consequence the helper exists for: a decimated node lands at the cell centre, half a
+    # cell from its first point, even when the grid's first row and column are margin.
+    grid = AutoRIFT.rebuild(gridpoints((200, 200), 8; chip_size = 16, search_radius = 6)[1:12, 1:12];
+                            x, y)
+    sub = AutoRIFT._decimate_level(grid, trues(12, 12), 2)
+    @test sub !== nothing
+    # Cell (r, c) spans full columns 2c-1 and 2c, whose x differ by the spacing, so the centre is
+    # half a spacing above the first — 4 px here.
+    @test sub.grid.x[4, 4] == grid.x[7, 7] + 4
+end
+
+@testset "an even sparse stride reduces over an odd window" begin
+    # `filtWidth = stride + 1` when the stride is even and `stride` when it is odd
+    # (`autoRIFT.py:618-626`), so the coarse radius reduction is symmetric about the node it is
+    # sampled at. An even window has a left bias, which would place a coarse point's radius over a
+    # cell offset half a step from the point.
+    @test AutoRIFT._sparse_filter_width(8) == 9
+    @test AutoRIFT._sparse_filter_width(4) == 5
+    @test AutoRIFT._sparse_filter_width(2) == 3
+    @test AutoRIFT._sparse_filter_width(3) == 3
+    @test AutoRIFT._sparse_filter_width(5) == 5
+    # Odd either way, which is the property the rule exists for.
+    for stride in 1:16
+        @test isodd(AutoRIFT._sparse_filter_width(stride))
+        @test AutoRIFT._sparse_filter_width(stride) >= stride
+    end
+
+    # And the reduction itself is symmetric: a one-hot radius at a coarse node must reach the same
+    # distance either side of it. Reducing over the stride instead reaches one fewer point on the
+    # right, which under-covers the cell and always downward.
+    radius = zeros(Int, 33, 1)
+    radius[17, 1] = 5
+    stride = 8
+    rows = stride:stride:33
+    out = zeros(Int, length(rows), 1)
+    AutoRIFT._cell_max_radius!(out, radius, rows, 1:1, stride,
+                               AutoRIFT._sparse_filter_width(stride))
+    # Node 17 is `rows[2]`, so its own cell sees the 5; the neighbours either side must see it
+    # equally or not at all.
+    @test out[2, 1] == 5
+    @test out[1, 1] == out[3, 1]
 end
 
 @testset "the coarse mask sits on the lattice the radii were reduced over" begin

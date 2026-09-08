@@ -1,0 +1,91 @@
+{
+  "arrays": {
+    "fill_data": {
+      "dtype": "uint8",
+      "shape": [
+        96,
+        120
+      ]
+    },
+    "filtered": {
+      "dtype": "float32",
+      "shape": [
+        96,
+        120
+      ]
+    },
+    "invalid": {
+      "dtype": "uint8",
+      "shape": [
+        96,
+        120
+      ]
+    },
+    "low_std": {
+      "dtype": "uint8",
+      "shape": [
+        96,
+        120
+      ]
+    },
+    "missing": {
+      "dtype": "uint8",
+      "shape": [
+        96,
+        120
+      ]
+    },
+    "missing_final": {
+      "dtype": "uint8",
+      "shape": [
+        96,
+        120
+      ]
+    },
+    "potential": {
+      "dtype": "uint8",
+      "shape": [
+        96,
+        120
+      ]
+    },
+    "shifted": {
+      "dtype": "float32",
+      "shape": [
+        96,
+        120
+      ]
+    },
+    "src": {
+      "dtype": "float32",
+      "shape": [
+        96,
+        120
+      ]
+    },
+    "std": {
+      "dtype": "float32",
+      "shape": [
+        96,
+        120
+      ]
+    },
+    "zero_mask": {
+      "dtype": "uint8",
+      "shape": [
+        96,
+        120
+      ]
+    }
+  },
+  "params": {
+    "buff": 1.4242135623730952,
+    "buffer_test": "<=",
+    "fill_values_are_random": true,
+    "filter_width": 3,
+    "reach": 30,
+    "reach_test": "strict <",
+    "seed_used_for_fixture": 20260907,
+    "std_cutoff": 0.25
+  }
+}

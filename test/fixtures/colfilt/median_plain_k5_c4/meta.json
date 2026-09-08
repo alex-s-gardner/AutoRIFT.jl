@@ -1,0 +1,28 @@
+{
+  "arrays": {
+    "expected": {
+      "dtype": "float32",
+      "shape": [
+        24,
+        30
+      ]
+    },
+    "src": {
+      "dtype": "float32",
+      "shape": [
+        24,
+        30
+      ]
+    }
+  },
+  "params": {
+    "border": "constant_nan",
+    "chunk_size": 4,
+    "even_kernel": false,
+    "has_nan": false,
+    "kernel": 5,
+    "nan_to_nan": true,
+    "option": 3,
+    "reducer": "median"
+  }
+}

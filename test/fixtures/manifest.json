@@ -1,16 +1,48 @@
 {
   "generated_by": "tools/python_ref/gen_fixtures.py",
+  "group_versions": {
+    "bwareaopen": {
+      "numpy_version": "1.26.4",
+      "opencv_version": "4.13.0",
+      "python_version": "3.10.20"
+    },
+    "colfilt": {
+      "numpy_version": "1.26.4",
+      "opencv_version": "4.13.0",
+      "python_version": "3.10.20"
+    },
+    "scenegeometry": {
+      "numpy_version": "1.26.4",
+      "opencv_version": "4.13.0",
+      "python_version": "3.10.20"
+    },
+    "wallisfill": {
+      "numpy_version": "1.26.4",
+      "opencv_version": "4.13.0",
+      "python_version": "3.10.20"
+    },
+    "warpaffine": {
+      "numpy_version": "1.26.4",
+      "opencv_version": "4.13.0",
+      "python_version": "3.10.20"
+    }
+  },
   "groups": {
+    "bwareaopen": 15,
+    "colfilt": 120,
     "derivkernels": 14,
     "disttransform": 4,
     "filter2d": 128,
     "matchtemplate": 72,
     "peak": 5,
     "pyrup": 40,
-    "resize": 48
+    "resize": 48,
+    "scenegeometry": 4,
+    "wallisfill": 9,
+    "warpaffine": 12
   },
-  "numpy_version": "2.1.3",
-  "opencv_version": "4.10.0",
-  "python_version": "3.12.13",
-  "total_cases": 311
+  "numpy_version": "1.26.4",
+  "opencv_version": "4.13.0",
+  "python_version": "3.10.20",
+  "total_cases": 471
 }

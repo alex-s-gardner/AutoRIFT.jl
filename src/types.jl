@@ -393,6 +393,63 @@ end
 Sobel(; width = 5) = Sobel(width)
 
 """
+    Destripe(; along_track, cross_track, band_half = 70, notch_half = 100,
+             clamp = 3, power_threshold = 500, ratio = 2, sigma = 10)
+
+Reject the stronger of two band-limited noise directions in the frequency domain.
+
+For Landsat 4 and 5, whose Multispectral Scanner leaves coherent banding along one of the two scan
+directions. A band-reject in the Fourier domain removes it where a spatial filter cannot: the stripes are
+narrow in frequency and broad in space, so they occupy a thin line through the origin that can be excised
+without touching the texture correlation needs.
+
+`along_track` and `cross_track` are the scan directions in **degrees on the raster's own grid**, and they are
+arguments rather than derived from the image. Two reasons. It keeps this a pure function of image and
+geometry, so it is testable on a synthetic scene with known stripes. And the geometry has a better source
+than the pixels: a scene's `_ANG.txt` carries the orbit ephemeris, which gives the ground-track heading
+directly once transformed into the raster's CRS — the scene is rotated because the acquisition track does not
+align with map coordinates, and near the poles none does.
+
+Only one direction is filtered, and only sometimes. The two band powers are compared, and the reject applies
+only if one exceeds the other by `ratio` **and** the larger exceeds `power_threshold`. Otherwise the image is
+returned clamped but unfiltered — which is not a pass-through, since `clamp` still applies.
+
+The defaults are the reference's (`autoRIFT.py:153-243`). `band_half` and `notch_half` are in pixels and are
+*not* scaled to the image, so the rejected band is a fixed width in frequency regardless of scene size,
+which is a property of the reference rather than a derivation.
+"""
+struct Destripe <: PreprocessMethod
+    along_track::Float64
+    cross_track::Float64
+    band_half::Int
+    notch_half::Int
+    clamp::Float64
+    power_threshold::Float64
+    ratio::Float64
+    sigma::Float64
+
+    function Destripe(along_track::Real, cross_track::Real, band_half::Integer,
+                      notch_half::Integer, clamp::Real, power_threshold::Real,
+                      ratio::Real, sigma::Real)
+        isfinite(along_track) && isfinite(cross_track) ||
+            throw(ArgumentError("scan angles must be finite, got " *
+                                "along_track=$along_track, cross_track=$cross_track"))
+        band_half > 0 ||
+            throw(ArgumentError("`band_half` must be positive, got $band_half"))
+        notch_half >= 0 ||
+            throw(ArgumentError("`notch_half` must be >= 0, got $notch_half"))
+        clamp > 0 || throw(ArgumentError("`clamp` must be positive, got $clamp"))
+        ratio >= 1 || throw(ArgumentError("`ratio` must be >= 1, got $ratio"))
+        return new(Float64(along_track), Float64(cross_track), Int(band_half), Int(notch_half),
+                   Float64(clamp), Float64(power_threshold), Float64(ratio), Float64(sigma))
+    end
+end
+
+Destripe(; along_track, cross_track, band_half = 70, notch_half = 100, clamp = 3,
+         power_threshold = 500, ratio = 2, sigma = 10) =
+    Destripe(along_track, cross_track, band_half, notch_half, clamp, power_threshold, ratio, sigma)
+
+"""
     Laplacian(; width = 5)
 
 Laplacian (isotropic second derivative) of the log-amplitude image. Intended
@@ -618,6 +675,10 @@ Side length of the filter window, or `0` for methods that take no window.
 """
 filter_width(::Union{NoPreprocess,Decibel,Deramp}) = 0
 filter_width(m::Union{Highpass,Wallis,WallisGapfill,Sobel,Laplacian}) = m.width
+# A whole-image FFT, so there is no local window and a block halo has nothing to widen. The band masks are
+# global by construction: a frequency-domain reject cannot be computed on a tile without changing what it
+# rejects, which is why `Destripe` runs before blocking rather than inside it.
+filter_width(::Destripe) = 0
 
 """
     AutoRIFT.filter_reach(method::PreprocessMethod) -> Int
@@ -1023,10 +1084,14 @@ filtering kernels specialize on them.
 between them — coherence at the finest chip, amplitude above it. A scalar keyword resolves to a
 1-tuple, and a tuple shorter than the level list has its last entry repeated, so the common case
 of one measure everywhere is the 1-tuple and costs nothing. See [`chip_measures`](@ref).
+
+`subpixel` is a tuple for the same reason and with the same rule: the reference's subpixel
+denominator is a function of chip size rather than of the run, so a level's displacement may be
+quantized to 1/16 px at the base chip and 1/32 or 1/64 above it. See [`chip_subpixels`](@ref).
 """
 struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:PreprocessMethod,
-              R<:SubpixelMethod,O<:OutlierMethod,T<:BoolAsType,W<:RotationMethod,
-              B<:Backend}
+              R<:Tuple{SubpixelMethod,Vararg{SubpixelMethod}},O<:OutlierMethod,T<:BoolAsType,
+              W<:RotationMethod,B<:Backend}
     similarity::S
     preprocess::P
     subpixel::R
@@ -1063,8 +1128,11 @@ struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:Preproces
     dx_prior::Float64
     dy_prior::Float64
 
-    # Hole filling.
+    # Hole filling. A hole is closed if it has `fill_window`-neighbourhood support or if it is a
+    # connected region smaller than `fill_min_hole`; the two criteria are independent, and
+    # `fill_min_hole = 0` disables the second.
     fill_window::Int
+    fill_min_hole::Int
 
     # Misc.
     rng_seed::UInt64
@@ -1075,6 +1143,10 @@ struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:Preproces
     # type parameter rather than a plain field.
     backend::B
 end
+
+# Holes of one to four points are closed on size alone. The reference's `bwareaopen(..., 5)`
+# threshold (`autoRIFT.py:803`), and exclusive: a five-point hole is not small enough.
+const _DEFAULT_FILL_MIN_HOLE = 5
 
 # The positional form without a backend, which is the documented stable API and what `app/` calls.
 # Appends `CPU()`, so an existing 18-argument call is unchanged in meaning.
@@ -1087,8 +1159,20 @@ Params(similarity, preprocess, subpixel, outliers, threaded, rotation, chip_size
        progress) =
     Params(similarity, preprocess, subpixel, outliers, threaded, rotation, chip_size_min,
            chip_size_max, grid_spacing, search_radius, min_search_radius, coarse_stride,
-           coarse_buffer, min_coarse_valid_fraction, dx_prior, dy_prior, fill_window, rng_seed,
-           progress, CPU())
+           coarse_buffer, min_coarse_valid_fraction, dx_prior, dy_prior, fill_window,
+           _DEFAULT_FILL_MIN_HOLE, rng_seed, progress, CPU())
+
+# The form without `fill_min_hole`, which the 18-argument one above also routes through. Kept so a
+# caller written against the field list before hole size was a criterion still compiles, and gets
+# the reference's threshold rather than a silently disabled one.
+Params(similarity, preprocess, subpixel, outliers, threaded, rotation, chip_size_min,
+       chip_size_max, grid_spacing, search_radius, min_search_radius, coarse_stride,
+       coarse_buffer, min_coarse_valid_fraction, dx_prior, dy_prior, fill_window, rng_seed,
+       progress, backend) =
+    Params(similarity, preprocess, subpixel, outliers, threaded, rotation, chip_size_min,
+           chip_size_max, grid_spacing, search_radius, min_search_radius, coarse_stride,
+           coarse_buffer, min_coarse_valid_fraction, dx_prior, dy_prior, fill_window,
+           _DEFAULT_FILL_MIN_HOLE, rng_seed, progress, backend)
 
 """
     chip_sizes(p::Params) -> Vector{Extent}
@@ -1184,6 +1268,38 @@ the correlation kernel specializes and `--trim` can resolve the call.
 @inline measure_at(p::Params, level::Integer) =
     p.similarity[min(level, length(p.similarity))]
 
+"""
+    chip_subpixels(p::Params, nlevels = length(chip_sizes(p))) -> Tuple
+
+The subpixel method each chip-size level will use, finest first, with the last tuple entry
+repeating.
+
+The counterpart of [`chip_measures`](@ref), and for inspecting a configuration rather than running
+one — the chip-size loop calls [`subpixel_at`](@ref), which allocates nothing.
+"""
+function chip_subpixels(p::Params, nlevels::Integer = length(chip_sizes(p)))
+    _check_subpixels(p, nlevels)
+    return ntuple(k -> subpixel_at(p, k), nlevels)
+end
+
+"""
+    subpixel_at(p::Params, level::Integer) -> SubpixelMethod
+
+The subpixel method for chip-size level `level` (1 = finest), with the last tuple entry repeating.
+
+Per level because the reference's subpixel denominator is a function of chip size, not of the run:
+`OverSampleRatio` may be a dict, and the production driver always passes one — `{16, 32, 64, 64}`
+keyed by `ChipSize0X * [1,2,4,8]` for optical input and `{32, 64, 128, 128}` for radar
+(`autoRIFT.py:652-653`, `testautoRIFT.py:488-510`). So a coarse level locates its peak more finely
+than the base level does, and a single denominator cannot express that.
+
+Indexed rather than iterated for the same reason as [`measure_at`](@ref): `p.subpixel` is a tuple, so
+the result keeps its concrete type, the refinement kernel specializes, and `--trim` can resolve the
+call.
+"""
+@inline subpixel_at(p::Params, level::Integer) =
+    p.subpixel[min(level, length(p.subpixel))]
+
 # Shared by `chip_measures` and the chip-size loop. A tuple longer than the level list means the
 # extra measures would silently never run, which is a configuration error rather than something to
 # quietly ignore.
@@ -1193,6 +1309,16 @@ function _check_measures(p::Params, nlevels::Integer)
         "`similarity` names $n measures but there are only $nlevels chip-size levels. Widen " *
         "the `chip_size_min`/`chip_size_max` range, or name fewer measures — the last one " *
         "applies to every remaining level."))
+    return nothing
+end
+
+# As `_check_measures`, for the subpixel tuple.
+function _check_subpixels(p::Params, nlevels::Integer)
+    n = length(p.subpixel)
+    n <= nlevels || throw(ArgumentError(
+        "`subpixel` names $n methods but there are only $nlevels chip-size levels. Widen the " *
+        "`chip_size_min`/`chip_size_max` range, or name fewer methods — the last one applies to " *
+        "every remaining level."))
     return nothing
 end
 

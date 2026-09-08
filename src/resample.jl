@@ -237,13 +237,19 @@ end
 """
     dilate_within(mask, radius) -> BitMatrix
 
-Every position within Euclidean `radius` of a `true` in `mask`.
+Every position **strictly closer than** Euclidean `radius` to a `true` in `mask`.
 
-Used to grow the coarse pass's validity mask before it restricts the fine search: a coarse
+Grows the coarse pass's validity mask before it restricts the fine search: a coarse
 estimate is evidence that the neighbourhood is worth searching, not only that one point.
 The radius is in grid cells and is a genuine Euclidean distance rather than a chessboard
 one, which matters at the radii in use — a chessboard ball of radius 8 is 40%
 larger in area than a Euclidean one.
+
+Strict, matching the reference's `distance_transform_edt(!MC) < BuffDistanceC`
+(`autoRIFT.py:709`). The boundary carries real weight on a lattice: at the default radius of 8 the
+positions at distance *exactly* 8 are the axis-aligned ones eight cells out, and admitting them
+widens the searched region by 72 coarse cells on the golden Landsat case — 30,084 fine points once
+the mask is expanded, every one of them a point the reference leaves unsearched.
 
 Exact, via the two-pass squared-distance transform of Felzenszwalb & Huttenlocher (2012):
 separable, O(n) per row and column, and not an approximation like the chamfer masks that
@@ -254,7 +260,73 @@ function dilate_within(mask::AbstractMatrix{Bool}, radius::Real)
     r2 = Float64(radius)^2
     out = BitMatrix(undef, size(mask))
     @inbounds for i in eachindex(out)
-        out[i] = d2[i] <= r2
+        out[i] = d2[i] < r2
+    end
+    return out
+end
+
+"""
+    small_components(mask, minsize) -> BitMatrix
+
+Positions in a connected component of `mask` holding fewer than `minsize` `true`s.
+
+Eight-connected, so two positions touching only at a corner belong to one component. That is
+the reference's `connectivity=2` (`autoRIFT.py:1652`), and it is not a detail: under
+four-connectivity a diagonal pair of holes is two components of one rather than one of two, and
+the size test then gives a different answer.
+
+This selects which holes in a displacement field are interpolated across. A hole small enough to
+be surrounded by coherent motion should be filled whatever its shape, and counting a
+neighbourhood cannot express that — an L-shaped four-pixel hole has positions with too few
+neighbours to pass any count while still being a hole worth closing.
+
+`minsize` is exclusive, matching `bwareaopen(image, size1)`'s `size < size1`: at `minsize = 5`
+components of one to four positions are returned and a five-position component is not.
+
+One union-find pass over the array with union by size and full path compression, so the cost is
+effectively linear and no component is materialised as a separate array.
+"""
+function small_components(mask::AbstractMatrix{Bool}, minsize::Integer)
+    Base.require_one_based_indexing(mask)
+    out = falses(size(mask))
+    minsize <= 1 && return out          # nothing can hold fewer than one position
+
+    nr, nc = size(mask)
+    parent = collect(1:length(mask))
+    csize = ones(Int, length(mask))
+
+    # Path-halving find. Iterative rather than recursive: a component can span the array, and
+    # the recursion depth would follow it.
+    function root(a::Int)
+        while parent[a] != a
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        end
+        return a
+    end
+
+    lin = LinearIndices(mask)
+    @inbounds for j in 1:nc, i in 1:nr
+        mask[i, j] || continue
+        a = root(lin[i, j])
+        # Only the four already-visited neighbours under column-major order — up, and the three
+        # in the previous column. Their mirror images are unioned when this position is itself
+        # the neighbour, so scanning half the ring covers all eight links.
+        for (di, dj) in ((-1, 0), (-1, -1), (0, -1), (1, -1))
+            ii, jj = i + di, j + dj
+            (1 <= ii <= nr && 1 <= jj <= nc) || continue
+            mask[ii, jj] || continue
+            b = root(lin[ii, jj])
+            a == b && continue
+            # Union by size, which is what bounds the tree depth.
+            csize[a] < csize[b] && ((a, b) = (b, a))
+            parent[b] = a
+            csize[a] += csize[b]
+        end
+    end
+
+    @inbounds for i in eachindex(mask)
+        mask[i] && (out[i] = csize[root(i)] < minsize)
     end
     return out
 end

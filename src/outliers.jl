@@ -64,9 +64,14 @@ Two stages, run in sequence, both from autoRIFT's `DISP_FILT`:
      deviations of its neighbourhood median. Catches the subtler case of a false match
      that happens to sit near other false matches.
 
-A point is kept only if it passes both, and rejection is monotone across iterations: once
-a point is out it stays out, so removing one outlier can expose its neighbours in the next
-pass.
+A point is kept only if it passes both.
+
+Monotonicity differs between the stages, and matching the reference on this is what makes the
+two comparable. Stage 1 recomputes its mask from scratch each iteration — a point rejected in
+one pass can return in the next, because its neighbours' rejection changes the counts — while
+stage 2 intersects with the mask it inherits, so a rejection there is final. The reference has
+the same asymmetry: `M = (...) & (...)` in the first loop against `M = (...) & (...) & M` in the
+second (`autoRIFT.py:1610-1643`).
 
 !!! note "Why displacements are normalized by search radius"
     Both stages divide by the local search radius before comparing, but they do not

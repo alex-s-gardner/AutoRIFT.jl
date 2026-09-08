@@ -1,0 +1,76 @@
+{
+  "arrays": {
+    "distance": {
+      "dtype": "float32",
+      "shape": [
+        200,
+        240
+      ]
+    },
+    "quadrants": {
+      "dtype": "uint8",
+      "shape": [
+        200,
+        240
+      ]
+    },
+    "rotated_quadrants": {
+      "dtype": "uint8",
+      "shape": [
+        200,
+        240
+      ]
+    },
+    "single_region": {
+      "dtype": "uint8",
+      "shape": [
+        200,
+        240
+      ]
+    },
+    "valid": {
+      "dtype": "uint8",
+      "shape": [
+        200,
+        240
+      ]
+    }
+  },
+  "params": {
+    "along_track": -89.24615166692924,
+    "built_angle_hint": "swath_near0",
+    "centroid": [
+      118.99222958972234,
+      99.51320969747202
+    ],
+    "contour_points": 20,
+    "corners": {
+      "bl": [
+        164,
+        44
+      ],
+      "br": [
+        162,
+        196
+      ],
+      "tl": [
+        37,
+        42
+      ],
+      "tr": [
+        35,
+        194
+      ]
+    },
+    "cross_track": 0.902221161530156,
+    "largest_area": 19584,
+    "max_label": 1,
+    "minarearect_angle": -0.6986944079399109,
+    "minarearect_angle_range": "(0, 90] since OpenCV 4.5",
+    "minarearect_size": [
+      152.98863220214844,
+      127.99049377441406
+    ],
+    "n_labels": 2
+  }
+}

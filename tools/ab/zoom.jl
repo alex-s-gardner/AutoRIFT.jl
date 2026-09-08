@@ -15,6 +15,8 @@
 
 using CairoMakie, Printf, Statistics
 
+include(joinpath(@__DIR__, "bundle.jl"))
+
 const ZD = joinpath(@__DIR__, "stage2")
 const ZP = joinpath(@__DIR__, "plots")
 # One step of the sub-pixel search: the finest difference either implementation can express, and so the
@@ -22,18 +24,10 @@ const ZP = joinpath(@__DIR__, "plots")
 zstep(scalars) = 1 / get(scalars, "upsampling", 16)
 
 function zoom_load()
-    shapes = Dict{String,Tuple{Int,Int}}()
-    scalars = Dict{String,Int}()
-    for line in eachline(joinpath(ZD, "manifest.txt"))
-        s = strip(line)
-        (isempty(s) || startswith(s, "#")) && continue
-        parts = split(s)
-        length(parts) == 2 ? (scalars[parts[1]] = parse(Int, parts[2])) :
-                             (shapes[parts[1]] = Tuple(parse.(Int, split(parts[3], "x"))))
-    end
-    rd(name, T, dims) = reshape(collect(reinterpret(T, read(joinpath(ZD, "$name.bin")))), dims)
+    shapes, scalars = read_manifest(ZD)
+    rd(name, T, dims) = read_bin(ZD, name, T, dims)
     js = shapes["julia_dx"]
-    ps = Tuple(parse.(Int, split(strip(read(joinpath(ZD, "python_shape.txt"), String)))))
+    ps = read_python_shape(ZD)
     nr, nc = min(js[1], ps[1]), min(js[2], ps[2])
     crop(A) = A[1:nr, 1:nc]
     return (; jdx = crop(rd("julia_dx", Float32, js)), pdx = crop(rd("python_dx", Float32, ps)),

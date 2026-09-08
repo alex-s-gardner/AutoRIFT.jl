@@ -23,25 +23,11 @@ const TAG = length(ARGS) >= 1 ? ARGS[1] : "stage2"
 # statistic worth reading is the one below — the fraction agreeing *exactly*, which is 77.4%.
 const TOL = 1 / 16
 
-function manifest()
-    shapes = Dict{String,Tuple{Int,Int}}()
-    scalars = Dict{String,Int}()
-    for line in eachline(joinpath(D, "manifest.txt"))
-        line = strip(line)
-        (isempty(line) || startswith(line, "#")) && continue
-        parts = split(line)
-        if length(parts) == 2
-            scalars[parts[1]] = parse(Int, parts[2])
-        else
-            dims = parse.(Int, split(parts[3], "x"))
-            shapes[parts[1]] = (dims[1], dims[2])
-        end
-    end
-    return shapes, scalars
-end
+include(joinpath(@__DIR__, "bundle.jl"))
 
-read_bin(name, T, dims) =
-    reshape(collect(reinterpret(T, read(joinpath(D, name * ".bin")))), dims)
+manifest() = read_manifest(D)
+
+read_bin(name, T, dims) = read_bin(D, name, T, dims)
 
 python_shape() = Tuple(parse.(Int, split(strip(read(joinpath(D, "python_shape.txt"), String)))))
 

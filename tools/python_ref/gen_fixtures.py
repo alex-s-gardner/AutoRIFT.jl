@@ -428,6 +428,454 @@ def gen_disttransform() -> int:
 
 
 # ---------------------------------------------------------------------------
+# The Python autoRIFT's own window reductions
+# ---------------------------------------------------------------------------
+#
+# These two need the reference installed, not just OpenCV, so they are generated in an environment
+# that has `autoRIFT` importable and skipped otherwise. Unlike the OpenCV fixtures above, they pin
+# the *reference implementation's* behaviour rather than the math: `colfilt` is where the pyramid's
+# grid resize, search-radius widening, prior averaging and hole filling all come from
+# (`autoRIFT.py:509-808`), and a difference in any of its five options moves the answer at every
+# level. These are the only fixtures that constrain those reductions, so `src/window.jl` is held to
+# measured output rather than to a reading of the argument list.
+
+
+def _reference_colfilt():
+    """The reference's `colfilt` and `bwareaopen`, or `None` when autoRIFT is not importable."""
+    try:
+        import sys
+
+        import autoRIFT.autoRIFT  # noqa: F401  -- for its side effect on sys.modules
+
+        mod = sys.modules["autoRIFT.autoRIFT"]
+        return mod.colfilt, mod.bwareaopen
+    except Exception:
+        return None
+
+
+# `colfilt`'s `option` argument. Names are the Julia-side spelling.
+COLFILT_OPTIONS = {0: "max", 1: "min", 2: "mean", 3: "median", 4: "range", 6: "mad"}
+
+
+def gen_colfilt() -> int:
+    """Every `colfilt` option, at odd and even kernels, with and without NaNs.
+
+    Four properties of this function are load-bearing and none is visible in its signature:
+
+    **The border mode differs per option.** Options 0, 1 and 4 call `generic_filter` with its default
+    mode, which is `reflect`; options 2, 3 and 6 pass `mode='constant', cval=np.nan`. So a max and a
+    mean of the same window disagree at the border by construction, and a port that picks one
+    convention for all of them is wrong for the others.
+
+    **NaN is not handled uniformly either.** `fmean`, `fMAD` and the median skip NaNs and return NaN
+    only for an all-NaN window, while `fmax`/`fmin`/`frange` compare against NaN directly — and
+    `v > result` is false for a NaN, so a NaN is simply never selected. Option 0 then converts a
+    leftover `-inf` (an all-NaN window) back to NaN, and **option 4 does not**, so a range over an
+    all-NaN window returns `-inf - inf = -inf` rather than NaN. That asymmetry is the reference's,
+    and a reader who assumes symmetry gets a different mask.
+
+    **Even kernels have a chunk seam.** The left margin is `(k-1)//2` where `generic_filter` centres
+    at `k//2`, so for even `k` the first output column of each chunk after the first reads padding
+    where it should read data. Only the non-base pyramid levels use even kernels. The fixtures record
+    the output *including* that artifact, because the question of whether to reproduce it is decided
+    by measurement against a case that exercises it, not in advance.
+
+    **The chunk count changes the answer.** `chunkSize` defaults to 4 but is a parameter, and the
+    seam above is per chunk — so a fixture that only ever ran one chunk would hide it. Both are
+    generated.
+    """
+    ref = _reference_colfilt()
+    if ref is None:
+        print("  colfilt: skipped, autoRIFT not importable in this environment")
+        return 0
+    colfilt, _ = ref
+
+    n = 0
+    # 24x30, deliberately non-square and not a multiple of any kernel below, so a transposed or
+    # off-by-one read fails on the shape as well as the values.
+    base = (texture((24, 30), seed=11) * 20 - 10).astype(np.float32)
+
+    holed = base.copy()
+    rng = np.random.default_rng(12)
+    holed[rng.random(holed.shape) < 0.25] = np.nan
+    # One all-NaN window at every kernel below, which is the case that separates option 0 from
+    # option 4 and is the one a random hole pattern is unlikely to produce.
+    holed[2:10, 2:10] = np.nan
+
+    fields = {"plain": base, "holed": holed}
+    for field_name, src in fields.items():
+        for k in (2, 3, 4, 5, 9):
+            for chunks in (4, 1):
+                for option, opt_name in COLFILT_OPTIONS.items():
+                    out = colfilt(src.copy(), (k, k), option, chunks)
+                    write_case(
+                        f"colfilt/{opt_name}_{field_name}_k{k}_c{chunks}",
+                        {"src": src, "expected": np.asarray(out, dtype=np.float32)},
+                        {
+                            "option": option,
+                            "reducer": opt_name,
+                            "kernel": k,
+                            "chunk_size": chunks,
+                            "even_kernel": k % 2 == 0,
+                            "has_nan": bool(np.isnan(src).any()),
+                            # Recorded rather than inferred: the two differ per option and that is
+                            # the whole point of pinning them.
+                            "border": "reflect" if option in (0, 1, 4) else "constant_nan",
+                            "nan_to_nan": option != 4,
+                        },
+                    )
+                    n += 1
+    return n
+
+
+def gen_bwareaopen() -> int:
+    """`bwareaopen(image, size1)`: drop connected components smaller than `size1`.
+
+    The reference calls it as `bwareaopen(!foo1, 5)` (`autoRIFT.py:803`) to decide whether a hole is
+    small enough to interpolate across, on **8-connectivity** (`connectivity=2`). Connectivity is the
+    detail that matters and it is not symmetric in its consequences: under 4-connectivity a diagonal
+    pair of holes is two components of one pixel instead of one component of two, so the size test
+    answers differently on exactly the shapes the criterion exists to catch.
+
+    The `diagonal` case is the discriminating one — a pure diagonal chain is one component at 8 and
+    `n` at 4 — so a fixture set without it would pass under either convention.
+    """
+    ref = _reference_colfilt()
+    if ref is None:
+        print("  bwareaopen: skipped, autoRIFT not importable in this environment")
+        return 0
+    _, bwareaopen = ref
+
+    rng = np.random.default_rng(13)
+    cases = {
+        "speckle": (rng.random((32, 40)) < 0.35).astype(np.uint8),
+        "diagonal": np.zeros((16, 16), dtype=np.uint8),
+        "blocks": np.zeros((20, 20), dtype=np.uint8),
+        "empty": np.zeros((8, 8), dtype=np.uint8),
+        "full": np.ones((8, 8), dtype=np.uint8),
+    }
+    for i in range(16):
+        cases["diagonal"][i, i] = 1
+    # A 2x2 hole is the shape the neighbour-count criterion cannot close and the size test can, so
+    # it is the case the fill criterion turns on. Sizes 1, 4 and 9 beside it bracket `size1 = 5`.
+    cases["blocks"][2:4, 2:4] = 1
+    cases["blocks"][8, 8] = 1
+    cases["blocks"][12:14, 12:14] = 1
+    cases["blocks"][12:15, 2:5] = 1
+
+    n = 0
+    for name, src in cases.items():
+        for size1 in (2, 5, 9):
+            out = bwareaopen(src.copy(), size1)
+            write_case(
+                f"bwareaopen/{name}_s{size1}",
+                {"src": src, "expected": np.asarray(out).astype(np.uint8)},
+                {"size1": size1, "connectivity": 8},
+            )
+            n += 1
+    return n
+
+
+def gen_wallisfill() -> int:
+    """`_wallis_filter_fill` (`autoRIFT.py:69-126`), the Landsat 7 scan-line-gap filter.
+
+    The one preprocessing method with no fixture, and the only one that draws random numbers — which is
+    exactly why its *deterministic* parts have to be pinned separately. The reference fills the gaps from
+    an unseeded `np.random.default_rng`, so two of its own runs disagree there and no comparison of the
+    filled values means anything. Everything else about the filter is deterministic and is what this
+    fixture covers:
+
+      * `invalid_data`, from `isclose(image, 0)` — the gap set as the filter sees it.
+      * `potential_data`, an exact Euclidean `distanceTransform` of the gaps thresholded at **30** — the
+        reach that makes an interior scan-line gap fillable while leaving a whole outer margin alone.
+      * `missing_data`, that set grown by `buff = sqrt(2*((w-1)/2)^2) + 0.01`, and `zero_mask`, the
+        complement of the valid domain — the mask the *pipeline* consumes, written to disk beside the
+        filtered scene.
+      * `low_std`, the sub-`std_cutoff` set grown by the same buffer.
+      * The Wallis output itself wherever the fill did not draw.
+
+    **Two thresholds and one comparison direction are load-bearing**, and each is easy to transcribe
+    wrongly in a way that changes which pixels get noise rather than data: `< 30` is strict where the two
+    buffer tests are `<= buff`, and `low_std` is `std < std_cutoff` on a standard deviation that can be
+    `NaN` — where a `NaN` fails `<` and so counts as *passing*, the opposite of what a missing-data test
+    should conclude. AutoRIFT.jl writes `!(sd >= cutoff)` deliberately so a `NaN` counts as low contrast;
+    the fixture records what the reference actually does so the difference is measured rather than assumed.
+
+    The scene has real scan-line gaps — every eighth column, the pattern `gen_disttransform`'s `stripes`
+    case uses — because that is the shape the filter exists for, and a random hole pattern does not
+    exercise the 30-pixel reach at all.
+    """
+    ref = _reference_colfilt()
+    if ref is None:
+        print("  wallisfill: skipped, autoRIFT not importable in this environment")
+        return 0
+
+    import sys
+
+    mod = sys.modules["autoRIFT.autoRIFT"]
+
+    n = 0
+    # Non-square and not a multiple of the stripe period, so an off-by-one or a transpose fails on the
+    # shape as well as the values.
+    base = (texture((96, 120), seed=21) * 400 + 100).astype(np.float32)
+
+    cases = {}
+    # Scan-line gaps: whole columns of zero, which is what the SLC failure produces.
+    stripes = base.copy()
+    stripes[:, ::8] = 0.0
+    cases["stripes"] = stripes
+    # A wide margin plus interior gaps: the discriminating case for the 30-pixel reach, since the margin
+    # must stay unfilled while the interior gaps are filled.
+    margin = base.copy()
+    margin[:, :35] = 0.0
+    margin[:, 60::8] = 0.0
+    cases["margin"] = margin
+    # A flat patch, so `low_std` has something to find beyond the gaps themselves.
+    flat = base.copy()
+    flat[:, ::8] = 0.0
+    flat[20:40, 20:50] = 250.0
+    cases["flatpatch"] = flat
+
+    for name, image in cases.items():
+        for width, cutoff in ((5, 0.25), (5, 1.0), (3, 0.25)):
+            buff = float(np.sqrt(2 * ((width - 1) / 2) ** 2) + 0.01)
+            invalid = np.isclose(image, 0.0)
+            potential = (
+                cv2.distanceTransform(invalid.astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE) < 30
+            )
+            missing0 = potential & invalid
+            missing = (
+                cv2.distanceTransform((~missing0).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+                <= buff
+            )
+            valid_domain = ~invalid | missing
+            zero_mask = ~valid_domain
+
+            kernel = np.ones((width, width), dtype=np.float32) / (width * width)
+            shifted = mod._remove_local_mean(image, kernel)
+            std = mod._preprocess_filt_std(image, kernel)
+            low_std_raw = std < cutoff
+            low_std = (
+                cv2.distanceTransform((~low_std_raw).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+                <= buff
+            )
+            missing_final = (missing | low_std) & valid_domain
+
+            # The filter's own output, with the RNG seeded so the case is reproducible. The drawn
+            # positions are `fill_data`; their values are recorded but must not be compared.
+            saved = np.random.default_rng
+            np.random.default_rng = lambda seed=None: saved(20260907 if seed is None else seed)
+            try:
+                filtered, zm = mod._wallis_filter_fill(image.copy(), width, cutoff)
+            finally:
+                np.random.default_rng = saved
+
+            write_case(
+                f"wallisfill/{name}_w{width}_c{str(cutoff).replace('.', 'p')}",
+                {
+                    "src": image,
+                    "invalid": invalid.astype(np.uint8),
+                    "potential": potential.astype(np.uint8),
+                    "missing": missing.astype(np.uint8),
+                    "low_std": low_std.astype(np.uint8),
+                    "missing_final": missing_final.astype(np.uint8),
+                    "zero_mask": zero_mask.astype(np.uint8),
+                    "shifted": np.asarray(shifted, dtype=np.float32),
+                    "std": np.asarray(std, dtype=np.float32),
+                    "filtered": np.asarray(filtered, dtype=np.float32),
+                    "fill_data": (valid_domain & missing_final).astype(np.uint8),
+                },
+                {
+                    "filter_width": width,
+                    "std_cutoff": cutoff,
+                    "buff": buff,
+                    "reach": 30,
+                    # Recorded because the two are different comparisons and a port that uses one for
+                    # both changes which pixels are filled.
+                    "reach_test": "strict <",
+                    "buffer_test": "<=",
+                    # The filled values come from an unseeded generator in production; this case seeded
+                    # it only so the fixture is reproducible. Compare the positions, never the values.
+                    "fill_values_are_random": True,
+                    "seed_used_for_fixture": 20260907,
+                },
+            )
+            n += 1
+    return n
+
+
+def gen_warpaffine() -> int:
+    """`warpAffine` of a `getRotationMatrix2D`, which is the only OpenCV call the destripe filter keeps.
+
+    `_fft_filter` builds two band-reject masks by rotating one base mask to the along- and cross-track
+    angles (`autoRIFT.py:207-215`): a 140-row horizontal band with a 200-column vertical notch removed,
+    rotated about the *image* centre. Everything else the filter does with OpenCV — connected components,
+    contours, moments, `minAreaRect`, a rotated quadrant map, four distance-transform argmaxes — exists only
+    to recover the scene footprint from pixels, and the MTL corners give that directly.
+
+    Three properties are pinned because each changes which frequencies the filter rejects:
+
+      * **The interpolation of a 0/1 mask.** `warpAffine` defaults to bilinear, so a rotated mask is *not*
+        binary — its edge carries fractional values, and `_fft_filter` then compares `filter_a == 1`, which
+        keeps only the pixels that stayed exactly 1. A port that rounds or nearest-samples the rotation
+        selects a different, larger band.
+      * **The centre convention.** `getRotationMatrix2D` takes `(x, y)` and the filter passes
+        `(center_x, center_y) = (x/2, y/2)` — the true half-extent, not the integer `floor` it uses for the
+        band's own row range. So the mask is built about a truncated centre and rotated about an untruncated
+        one, which for an even dimension differ by half a pixel.
+      * **The sign of the angle.** The quadrant rotation uses `-angle` and the two band rotations use
+        `+cross_track` / `+along_track` (`:178`, `:211-212`), so a single convention for both is wrong.
+
+    Cases cover the angles these scenes actually produce — near 0, near ±8 (a Landsat descending pass is
+    about 8 degrees off north), and ±90 — on both an even and an odd dimension so the centre convention is
+    exercised where it bites.
+    """
+    n = 0
+    shapes = ((120, 160), (121, 161))
+    for (y, x) in shapes:
+        # The filter's own base mask, so the fixture pins the rotation of the array that is actually rotated
+        # rather than of a generic test pattern.
+        base = np.zeros((y, x), dtype=np.float32)
+        cy, cx = int(np.floor(y / 2)), int(np.floor(x / 2))
+        half_band, half_notch = 20, 30          # scaled from the filter's 70 and 100 for this size
+        base[max(cy - half_band, 0):cy + half_band, :] = 1
+        base[:, max(cx - half_notch, 0):cx + half_notch] = 0
+
+        for angle in (0.0, 8.13, -8.13, 45.0, 90.0, -90.0):
+            rot = cv2.getRotationMatrix2D(center=(x / 2, y / 2), angle=angle, scale=1)
+            out = cv2.warpAffine(src=base, M=rot, dsize=(x, y))
+            write_case(
+                f"warpaffine/band_{y}x{x}_a{str(angle).replace('.', 'p').replace('-', 'm')}",
+                {"src": base, "matrix": np.asarray(rot, dtype=np.float64),
+                 "expected": np.asarray(out, dtype=np.float32),
+                 # What the filter actually consumes: the strict `== 1` test, not the rotated float mask.
+                 "selected": (out == 1).astype(np.uint8)},
+                {"angle": angle, "center": [x / 2, y / 2],
+                 "interpolation": "bilinear (warpAffine default)",
+                 "band_half_rows": half_band, "notch_half_cols": half_notch,
+                 # Recorded because it is the comparison the filter makes and the reason bilinear matters.
+                 "consumer_test": "filter == 1",
+                 "selected_count": int((out == 1).sum())},
+            )
+            n += 1
+    return n
+
+
+def gen_scenegeometry() -> int:
+    """The pixel-derived scene footprint: connected components, contour moments, `minAreaRect`.
+
+    `_fft_filter` recovers the imaged swath from the valid-data mask (`autoRIFT.py:153-206`), and it has to:
+    a Landsat L1T product is `ORIENTATION = NORTH_UP`, so its MTL corners are the axis-aligned bounding box
+    and carry no rotation at all — measured, on `LT05_L1TP_060018_19851028`, as 0.00/90.00 against the
+    71.60/−20.25 the reference logs. The swath is a rotated quadrilateral inside that raster and exists only
+    in the pixels.
+
+    Four primitives, each pinned because each can differ between OpenCV builds in a way that moves the
+    angles:
+
+      * `connectedComponentsWithStats` and `_find_largest_region`'s `area[1:].argmax() + 1` — the `1:` skips
+        the background label, and an off-by-one there selects the background and returns an empty region.
+      * `findContours` with `RETR_EXTERNAL` + `CHAIN_APPROX_SIMPLE`, whose point *order* and count depend on
+        the approximation, and `moments`' `m01/m00` centroid computed from it.
+      * **`minAreaRect`'s angle, whose convention changed in OpenCV 4.5.** Before, it returned
+        `[-90, 0)`; from 4.5 it returns `(0, 90]`. The filter uses `-angle` to rotate its quadrant map, so
+        the two conventions rotate opposite ways. The fixture records what the pinned build returns rather
+        than assuming either.
+      * `distanceTransform` from a single seed pixel, which is how the filter finds the extreme point of
+        each quadrant.
+
+    The cases are the shapes the filter meets: a rotated quadrilateral on fill (a north-up L1T scene), the
+    same with a second smaller region so `_find_largest_region` has to choose, and a near-axis-aligned one
+    where the angle convention is most visible.
+    """
+    n = 0
+    rng = np.random.default_rng(31)
+
+    def rotated_quad(shape, angle, inset=0.18):
+        """A filled rotated rectangle on a zero background, as a north-up scene's valid data looks."""
+        y, x = shape
+        canvas = np.zeros(shape, dtype=np.uint8)
+        h, w = int(y * (1 - 2 * inset)), int(x * (1 - 2 * inset))
+        rect = np.zeros(shape, dtype=np.uint8)
+        rect[(y - h) // 2:(y + h) // 2, (x - w) // 2:(x + w) // 2] = 255
+        m = cv2.getRotationMatrix2D(center=(x / 2, y / 2), angle=angle, scale=1)
+        cv2.warpAffine(src=rect, M=m, dsize=(x, y), dst=canvas, flags=cv2.INTER_NEAREST)
+        return canvas
+
+    cases = {}
+    cases["swath_18deg"] = rotated_quad((200, 240), 18.0)
+    cases["swath_m8deg"] = rotated_quad((200, 240), -8.13)
+    cases["swath_near0"] = rotated_quad((200, 240), 0.7)
+    # Two regions: the filter must keep the larger. The smaller is deliberately not tiny, so an
+    # argmax on the wrong axis or including the background picks it.
+    two = rotated_quad((200, 240), 18.0).copy()
+    two[8:60, 8:70] = 255
+    cases["two_regions"] = two
+
+    for name, valid in cases.items():
+        regions = (valid != 0).astype("uint8") * 255
+        n_labels, label_arr, stats, centroids = cv2.connectedComponentsWithStats(regions)
+        area = stats[:, cv2.CC_STAT_AREA]
+        max_label = int(area[1:].argmax() + 1)
+        largest = label_arr.copy()
+        largest[largest != max_label] = 0
+        single = np.uint8((largest != 0) * 255)
+
+        contours, hierarchy = cv2.findContours(single, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contour = contours[0]
+        moment = cv2.moments(contour)
+        centroid_y = moment["m01"] / moment["m00"]
+        centroid_x = moment["m10"] / moment["m00"]
+        rect = cv2.minAreaRect(contour)
+        angle = rect[2]
+
+        # The quadrant map and its rotation, which is how each quadrant's extreme point is found.
+        quadrants = np.ones(single.shape, dtype="uint8")
+        quadrants[:, int(np.floor(centroid_x)):] += 1
+        quadrants[int(np.floor(centroid_y)):, :] += 2
+        rot = cv2.getRotationMatrix2D(center=(centroid_x, centroid_y), angle=-angle, scale=1)
+        rotated = cv2.warpAffine(src=quadrants, M=rot, dsize=(single.shape[1], single.shape[0]))
+
+        centroid_array = np.ones(single.shape, dtype="uint8")
+        centroid_array[int(np.floor(centroid_y)), int(np.floor(centroid_x))] = 0
+        dist = cv2.distanceTransform(centroid_array, cv2.DIST_L2, 5)
+        dist[single != 255] = 0
+
+        corners = {}
+        for label, q in (("tl", 1), ("tr", 2), ("bl", 3), ("br", 4)):
+            window = np.zeros(dist.shape, dtype=np.float32)
+            roi = rotated == q
+            window[roi] = dist[roi]
+            corners[label] = [int(v) for v in np.unravel_index(int(np.argmax(window)), window.shape)]
+
+        def slope(p1, p2):
+            return float(np.rad2deg(np.arctan((p1[1] - p2[1]) / (p1[0] - p2[0]))))
+
+        along = float(np.nanmax([slope(corners["bl"], corners["br"]), slope(corners["tl"], corners["tr"])]))
+        cross = float(np.nanmax([slope(corners["br"], corners["tr"]), slope(corners["bl"], corners["tl"])]))
+
+        write_case(
+            f"scenegeometry/{name}",
+            {"valid": valid, "single_region": single,
+             "quadrants": quadrants, "rotated_quadrants": rotated,
+             "distance": np.asarray(dist, dtype=np.float32)},
+            {"built_angle_hint": name,
+             "n_labels": int(n_labels), "max_label": max_label,
+             "largest_area": int(area[max_label]),
+             "contour_points": int(len(contour)),
+             "centroid": [centroid_x, centroid_y],
+             # Recorded, never assumed: OpenCV changed this range in 4.5.
+             "minarearect_angle": float(angle),
+             "minarearect_angle_range": "(0, 90] since OpenCV 4.5",
+             "minarearect_size": [float(rect[1][0]), float(rect[1][1])],
+             "corners": corners,
+             "along_track": along, "cross_track": cross},
+        )
+        n += 1
+    return n
+
+
+# ---------------------------------------------------------------------------
 
 
 GENERATORS = (
@@ -438,6 +886,11 @@ GENERATORS = (
     ("matchtemplate", gen_matchtemplate),
     ("peak", gen_peak),
     ("disttransform", gen_disttransform),
+    ("colfilt", gen_colfilt),
+    ("bwareaopen", gen_bwareaopen),
+    ("wallisfill", gen_wallisfill),
+    ("warpaffine", gen_warpaffine),
+    ("scenegeometry", gen_scenegeometry),
 )
 
 
@@ -462,18 +915,42 @@ def main() -> None:
         total += count
         print(f"  {name}: {count} cases")
 
-    manifest = {
-        "generated_by": "tools/python_ref/gen_fixtures.py",
+    # A named-group run *merges* into the manifest rather than replacing it. Regenerating one group
+    # leaves the other groups' case directories on disk untouched, so a manifest listing only the
+    # groups just run would understate what the corpus holds and drop the versions the rest were
+    # pinned against — and `fixtures_test.jl` gates on the total. Groups are recorded with the
+    # library versions that produced *them*, since the corpus can legitimately span two OpenCV
+    # builds: a fixture is a record of one library's output, and rewriting all of them to match a
+    # newer build would move the target the suite is held to.
+    path = FIXTURE_DIR / "manifest.json"
+    previous = {}
+    if path.exists():
+        try:
+            previous = json.loads(path.read_text())
+        except ValueError:
+            previous = {}
+
+    versions = {
         "opencv_version": cv2.__version__,
         "numpy_version": np.__version__,
         "python_version": sys.version.split()[0],
-        "groups": written,
-        "total_cases": total,
     }
-    (FIXTURE_DIR / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True)
-    )
-    print(f"\n{total} cases written to {FIXTURE_DIR}")
+    groups = dict(previous.get("groups", {}))
+    group_versions = dict(previous.get("group_versions", {}))
+    groups.update(written)
+    for name in written:
+        group_versions[name] = versions
+
+    manifest = {
+        "generated_by": "tools/python_ref/gen_fixtures.py",
+        **versions,
+        "groups": groups,
+        "group_versions": group_versions,
+        "total_cases": sum(groups.values()),
+    }
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    print(f"\n{total} cases written to {FIXTURE_DIR}"
+          f" ({manifest['total_cases']} in the corpus)")
     print(f"opencv {cv2.__version__}, numpy {np.__version__}")
 
 

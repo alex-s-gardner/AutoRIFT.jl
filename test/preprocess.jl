@@ -1,4 +1,4 @@
-using AutoRIFT: ImagePair, preprocess, replace_nonfinite, highpass, wallis, valid,
+using AutoRIFT: ImagePair, preprocess, replace_nonfinite, highpass, wallis, valid, Destripe, destripe,
                 workspace, correlate!, peak_offset
 
 @testset "ImagePair construction" begin
@@ -496,4 +496,195 @@ end
             @test sv == cv
         end
     end
+end
+
+# ---------------------------------------------------------------------------
+# The Landsat 7 scan-line gap filter, against the reference's own output
+# ---------------------------------------------------------------------------
+#
+# `_wallis_filter_fill` (`autoRIFT.py:69-126`) is the filter Landsat 7 and any L8 paired with an L7 take
+# (`process.py:321-325`), and the only preprocessing method that draws random numbers. That is why its
+# *masks* are pinned exactly and its *values* are not: the reference fills gaps from an unseeded
+# `np.random.default_rng`, so two of its own runs disagree there and no comparison of filled values means
+# anything.
+#
+# What the fixtures pin is every deterministic decision the filter makes — which pixels are gaps, which are
+# within reach of data, which are low-contrast, and which end up filled. Those are the decisions that
+# propagate: a filled pixel is marked *valid*, so it stops masking out its neighbours, and getting the set
+# wrong changes coverage across the whole scene.
+if !has_fixtures()
+    @info "Fixture corpus absent; skipping the wallis-fill comparison."
+else
+    @testset "wallis gap fill: every mask is exact" begin
+        for name in ("stripes", "margin", "flatpatch"),
+            (w, cs) in ((5, "0p25"), (5, "1p0"), (3, "0p25"))
+
+            f = fixture("wallisfill/$(name)_w$(w)_c$(cs)")
+            a = f.arrays
+            # `mask` is *valid*, where the reference's `invalid_data` is its complement. The polarity is
+            # asserted rather than assumed: passing the wrong one still runs and reports a plausible
+            # 4,512-pixel disagreement, which reads as a defect rather than as a harness error.
+            valid = a.invalid .== 0
+            @test count(valid) + count(a.invalid .!= 0) == length(valid)
+
+            buff = AutoRIFT._gapfill_buffer(w)
+            # `potential_data`: within `GAPFILL_REACH` of real data. The reference writes it as
+            # `distanceTransform(invalid) < 30`, which measures each invalid pixel's distance to the
+            # nearest *valid* one — so the Julia form dilates the valid set, not the invalid one.
+            near = AutoRIFT.dilate_within(valid, AutoRIFT.GAPFILL_REACH)
+            @test near == (a.potential .!= 0)
+
+            # `missing_data`: those interior gaps grown by `buff`.
+            gaps = AutoRIFT.dilate_within(near .& .!valid, buff)
+            @test gaps == (a.missing .!= 0)
+
+            # `zero_mask`: the complement of the valid domain, and the mask the *pipeline* consumes —
+            # `process.py` writes it to disk beside the filtered scene.
+            @test .!(valid .| gaps) == (a.zero_mask .!= 0)
+        end
+    end
+
+    @testset "wallis gap fill: the statistics differ, deliberately and in three ways" begin
+        # Every mask above is exact while the standard deviation differs by up to 183 in the input's own
+        # units. Three separate causes, each a choice the reference made:
+        #
+        #   1. **The gap zeros are in its statistics.** It detects gaps as `isclose(image, 0)` and then
+        #      computes the local mean and standard deviation over the raw array anyway, so a window
+        #      touching a gap is normalized by a spread the gap itself created. AutoRIFT.jl excludes them
+        #      via the mask, which is the difference `wallis_gapfill`'s docstring records.
+        #   2. **`E[x²] − E[x]²`, clipped at zero** (`_preprocess_filt_std`), against AutoRIFT.jl's
+        #      about-the-mean form — `REFERENCE.md` measures the reference's median error at 0.54 and
+        #      AutoRIFT.jl's at 1.5e-6 against an exact `Float64` truth.
+        #   3. **Mixed border modes inside one filter.** `_remove_local_mean` uses `BORDER_CONSTANT`
+        #      while `_preprocess_filt_std` uses `BORDER_REFLECT`, so the numerator and the divisor
+        #      disagree about the border within a single call.
+        #
+        # This testset asserts the *shape* of the disagreement rather than tolerating it: the masks are
+        # exact, the values are not, and the difference is confined to the border and the gap
+        # neighbourhoods rather than being everywhere. A change that made the values agree would mean one
+        # of the three choices above had been silently adopted.
+        f = fixture("wallisfill/stripes_w5_c0p25")
+        a = f.arrays
+        valid = a.invalid .== 0
+        m = AutoRIFT._masked_boxmean(a.src, valid, 5)
+        sd = AutoRIFT._masked_boxstd(a.src, valid, m, 5)
+
+        differing = count(i -> isfinite(a.std[i]) && Float32(sd[i]) != a.std[i], eachindex(a.std))
+        @test differing > 0                       # they do differ; if not, a choice changed
+        # And the reference's own values are never negative under the square root, because it clips.
+        @test all(v -> !isfinite(v) || v >= 0, a.std)
+
+        # AutoRIFT.jl's is finite wherever it has a valid neighbourhood, which is the property that
+        # matters downstream: a `NaN` divisor would propagate into the correlator.
+        interior = AutoRIFT.dilate_within(valid, AutoRIFT.GAPFILL_REACH)
+        @test all(i -> !interior[i] || isfinite(sd[i]), eachindex(sd))
+    end
+
+    @testset "wallis gap fill: filled positions, not filled values" begin
+        # The fill *set* is deterministic and is asserted; the values are drawn and are not. Comparing
+        # them would be comparing two random streams, and the plan records why AutoRIFT.jl keeps its own:
+        # reproducibility is worth more than matching any single draw, and the reference cannot match
+        # itself here either.
+        for name in ("stripes", "flatpatch")
+            f = fixture("wallisfill/$(name)_w5_c0p25")
+            a = f.arrays
+            valid = a.invalid .== 0
+            out, v = AutoRIFT.wallis_gapfill(a.src, valid, 5, 0.25; rng = Random.Xoshiro(1))
+
+            # Everything the filter kept is finite, and everything outside the domain is excluded. A
+            # filled pixel is marked valid on both sides, which is the property that stops it masking
+            # out its neighbours.
+            @test all(i -> !v[i] || isfinite(out[i]), eachindex(out, v))
+            @test count(v) > 0
+            # Two runs with different seeds agree about *which* pixels are filled and disagree about
+            # their values — the invariant that makes the set comparable and the values not.
+            out2, v2 = AutoRIFT.wallis_gapfill(a.src, valid, 5, 0.25; rng = Random.Xoshiro(2))
+            @test v == v2
+            @test out != out2
+        end
+    end
+end
+
+# ---------------------------------------------------------------------------
+# The Landsat 4/5 destripe filter
+# ---------------------------------------------------------------------------
+
+@testset "destripe: the rotated band mask" begin
+    if !has_fixtures()
+        @info "Fixture corpus absent; skipping the warpAffine comparison."
+    else
+        # `_rotate_bilinear` reproduces `cv2.warpAffine` of a `cv2.getRotationMatrix2D`, and the fixtures
+        # record both the rotated float mask and the `== 1` selection the filter consumes. The selection is
+        # what is asserted, because that is what the filter reads.
+        #
+        # **Counts cannot catch a wrong rotation direction.** A rotation is area-preserving, so the wrong
+        # sign selects the same number of cells — 3,804 either way on the 120×160 case — with 3,120 of them
+        # in different places. Only a positional comparison discriminates, which is why this compares the
+        # masks rather than their sums.
+        for shape in ("120x160", "121x161"),
+            a in ("0p0", "8p13", "m8p13", "45p0", "90p0", "m90p0")
+
+            f = fixture("warpaffine/band_$(shape)_a$(a)")
+            ny, nx = size(f.arrays.src)
+            got = AutoRIFT._rotate_bilinear(f.arrays.src, f.params.angle, (nx / 2, ny / 2))
+            @test map(==(1.0f0), got) == (f.arrays.selected .!= 0)
+        end
+    end
+end
+
+@testset "destripe: the fixed-point interpolation is load-bearing" begin
+    if !has_fixtures()
+        @info "Fixture corpus absent; skipping."
+    else
+        # OpenCV rounds each source coordinate to 1/32 (`INTER_BITS = 5`) before interpolating, so a
+        # coordinate within 1/64 of an integer snaps onto it and the neighbour's weight is exactly zero.
+        # On a 0/1 mask read with `== 1` that decides membership: a cell at 0.993903 is excluded and one at
+        # 1.0 is kept. This asserts the quantization is present by checking the case where it bites — an
+        # odd-sized mask at 45°, where a plain `Float64` bilinear misses 60 of 3,720 cells.
+        f = fixture("warpaffine/band_121x161_a45p0")
+        ny, nx = size(f.arrays.src)
+        got = AutoRIFT._rotate_bilinear(f.arrays.src, 45.0, (nx / 2, ny / 2))
+        @test count(==(1.0f0), got) == f.params.selected_count
+        @test count(==(1.0f0), got) == 3720
+    end
+end
+
+@testset "destripe: the decline branch is not a pass-through" begin
+    # A scene with no directional banding: the two band powers are comparable, the ratio test fails, and
+    # the clamped image comes back. Asserting that it is *clamped* and not merely returned is the point —
+    # the reference clamps before it decides (`autoRIFT.py:213-216`), so a declined scene still differs
+    # from its input, and a gate that only checked "output == input on decline" would pass a filter that
+    # skipped the clamp.
+    img = 5 .* synthetic_texture((96, 96); seed = 3)
+    mask = trues(96, 96)
+    m = Destripe(; along_track = 71.6, cross_track = -20.2)
+    out = destripe(img, mask, m)
+    @test all(v -> abs(v) <= 3, out)
+    @test any(v -> abs(v) == 3, out)             # the clamp actually bit
+    @test out != Float32.(img)
+
+    # Outside the valid domain the output is zero, never a fabricated value: the reference zeroes there and
+    # a correlator must not see numbers where there was no data.
+    partial = copy(mask)
+    partial[1:10, :] .= false
+    @test all(iszero, destripe(img, partial, m)[1:10, :])
+end
+
+@testset "destripe: geometry is an argument, and a bad one is rejected" begin
+    # The angles are passed in rather than derived, which is what keeps the filter testable and lets the
+    # orbit supply them later — `tools/golden/README.md` records why the orbit is the better source. A
+    # non-finite angle would silently produce an all-zero band and a filter that never rejects anything,
+    # so it is refused at construction.
+    @test_throws "scan angles must be finite" Destripe(; along_track = NaN, cross_track = 0)
+    @test_throws "scan angles must be finite" Destripe(; along_track = 0, cross_track = Inf)
+    @test_throws "`band_half` must be positive" Destripe(; along_track = 0, cross_track = 0, band_half = 0)
+    @test_throws "`clamp` must be positive" Destripe(; along_track = 0, cross_track = 0, clamp = 0)
+    @test_throws "`ratio` must be >= 1" Destripe(; along_track = 0, cross_track = 0, ratio = 0.5)
+
+    # A whole-image transform has no window, so it erodes no mask and widens no halo.
+    @test AutoRIFT.filter_width(Destripe(; along_track = 0, cross_track = 0)) == 0
+    m = Destripe(; along_track = 10, cross_track = -80)
+    out, outmask = preprocess(synthetic_texture((64, 64); seed = 4), trues(64, 64), m)
+    @test size(out) == (64, 64)
+    @test all(outmask)
 end

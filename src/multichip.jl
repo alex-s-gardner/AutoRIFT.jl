@@ -137,6 +137,7 @@ function _level_sizes(p::Params)
     @assert !isempty(sizes) "no chip-size levels between $(p.chip_size_min.X)x$(p.chip_size_min.Y) " *
                             "and $(p.chip_size_max.X)x$(p.chip_size_max.Y)"
     _check_measures(p, length(sizes))
+    _check_subpixels(p, length(sizes))
     return sizes
 end
 
@@ -238,7 +239,8 @@ function _multichip(runner::PassRunner, grid::PointSet{2}, p::Params)
         any(wanted) || break                     # every point resolved
         # `result.dx`/`result.dy` are passed in as the finer levels' standing answer, which a
         # decimated level fills its holes from before interpolating — see `_undecimate_level`.
-        level = chipsize_level(runner, grid, p, cs, wanted, measure_at(p, k), result.dx, result.dy)
+        level = chipsize_level(runner, grid, p, cs, wanted, measure_at(p, k),
+                               subpixel_at(p, k), result.dx, result.dy)
         isnothing(level) && continue              # level found nothing coherent
         _merge_level!(result, level.field, level.filled, cs)
     end
@@ -255,9 +257,12 @@ Returns `(; field, filled)` — the displacement field, and the linear indices t
 from neighbours rather than measured — or `nothing` if the level found nothing worth
 continuing.
 
-`measure` is the similarity measure for this level. Positional rather than a keyword because
-`p.similarity` is a tuple and a keyword carrying an abstract `SimilarityMeasure` is unresolvable
-under `--trim` — see [`measure_at`](@ref).
+`measure` is the similarity measure for this level, and `subpixel` its refinement method. Positional
+rather than keywords because `p.similarity` and `p.subpixel` are tuples and a keyword carrying an
+abstract type is unresolvable under `--trim` — see [`measure_at`](@ref) and [`subpixel_at`](@ref).
+
+`subpixel` is per level because the reference's subpixel denominator is a function of chip size: a
+coarse level locates its peak to a finer fraction of a pixel than the base level does.
 
 `wanted` marks the points this level should attempt — in the loop, those no finer level
 resolved. Returns `nothing` if the coarse pass found too little to be worth continuing,
@@ -278,9 +283,10 @@ Separately callable so a caller can run one chip size without the loop.
 chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size,
                wanted::AbstractMatrix{Bool},
                measure::SimilarityMeasure = first(p.similarity),
+               subpixel::SubpixelMethod = first(p.subpixel),
                prior_dx::Union{Nothing,AbstractMatrix} = nothing,
                prior_dy::Union{Nothing,AbstractMatrix} = nothing) =
-    chipsize_level(WholeScene(pair), grid, p, extent(chip_size), wanted, measure,
+    chipsize_level(WholeScene(pair), grid, p, extent(chip_size), wanted, measure, subpixel,
                    prior_dx, prior_dy)
 
 # One chip-size level, however its passes are executed.
@@ -298,12 +304,13 @@ chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size,
 function chipsize_level(runner::PassRunner, grid::PointSet{2}, p::Params,
                         chip_size::Extent, wanted::AbstractMatrix{Bool},
                         measure::SimilarityMeasure,
+                        subpixel::SubpixelMethod = first(p.subpixel),
                         prior_dx::Union{Nothing,AbstractMatrix} = nothing,
                         prior_dy::Union{Nothing,AbstractMatrix} = nothing)
     # The grid this level runs on. A chip wider than the finest one gets a proportionally coarser
     # grid, so every level posts one estimate per chip rather than several per chip.
     decim = _level_decimation(p, chip_size)
-    decim == 1 && return _level_on_grid(runner, grid, p, chip_size, wanted, measure)
+    decim == 1 && return _level_on_grid(runner, grid, p, chip_size, wanted, measure, subpixel)
 
     sub = _decimate_level(grid, wanted, decim)
     isnothing(sub) && return nothing
@@ -316,7 +323,7 @@ function chipsize_level(runner::PassRunner, grid::PointSet{2}, p::Params,
     # result again, in the decimated space — which composes because `restrict` derives from the
     # runner's current blocks rather than from the full layout.
     got = _level_on_grid(restrict(runner, sub, size(grid)), sub.grid, p, chip_size,
-                         sub.wanted, measure)
+                         sub.wanted, measure, subpixel)
     isnothing(got) && return nothing
     return _undecimate_level(got, size(grid), sub.rows, sub.cols, prior_dx, prior_dy)
 end
@@ -328,17 +335,17 @@ end
 # whether its caller decimated. The caller owns that.
 function _level_on_grid(runner::PassRunner, grid::PointSet{2}, p::Params,
                         chip_size::Extent, wanted::AbstractMatrix{Bool},
-                        measure::SimilarityMeasure)
+                        measure::SimilarityMeasure, subpixel::SubpixelMethod)
     # A level's points: the requested ones, at this level's chip size.
     pts = _level_points(grid, p, chip_size, wanted)
     nsearchable(pts) == 0 && return nothing
 
-    coarse_mask = _coarse_mask(runner, pts, p, chip_size, measure)
+    coarse_mask = _coarse_mask(runner, pts, p, chip_size, measure, subpixel)
     isnothing(coarse_mask) && return nothing
     _apply_coarse_mask!(pts, coarse_mask) == 0 && return nothing
 
-    fine = run_pass(runner, pts, p, measure, p.subpixel)
-    filled = _reject_and_fill!(fine, pts, p)
+    fine = run_pass(runner, pts, p, measure, subpixel)
+    filled = _reject_and_fill!(fine, pts, p, subpixel)
     return (; field = fine, filled)
 end
 
@@ -407,7 +414,32 @@ function _decimate_level(grid::PointSet{2}, wanted::AbstractMatrix{Bool}, stride
     # reaching the merge at all.
     want = windowmax(map(w -> w ? 1.0f0 : 0.0f0, wanted), 6 * stride)
     keep = [want[i, j] > 0.5f0 for i in rows, j in cols]
-    return (; grid = _cell_centres(grid[rows, cols], grid, rows, cols, stride),
+
+    # A decimated point stands for a whole cell, so its search window has to cover every fine point
+    # in that cell — both the widest radius any of them asked for and the spread of their priors,
+    # since two fine points with different priors search around different centres. The reference adds
+    # exactly those two terms, over `1 / Scale` cells:
+    #
+    #     SearchLimitX0 = colfilt(SearchLimitX, (1/Scale, 1/Scale), 0)   # 0 = max
+    #                   + colfilt(Dx0,          (1/Scale, 1/Scale), 4)   # 4 = range
+    #     Dx00          = colfilt(Dx0,          (1/Scale, 1/Scale), 2)   # 2 = mean
+    #
+    # (`autoRIFT.py:546-578`.) Sampling the radius at the node instead — its own value, for fifteen
+    # neighbours it speaks for — under-covers a cell whose prior varies across it, and the level then
+    # rails out or misses the peak at exactly the points where the prior was doing useful work.
+    rx = windowmax(grid.radius_x, stride) .+ windowrange(grid.dx_prior, stride)
+    ry = windowmax(grid.radius_y, stride) .+ windowrange(grid.dy_prior, stride)
+    mx = windowmean(grid.dx_prior, stride)
+    my = windowmean(grid.dy_prior, stride)
+    # `ceil` as the reference does, so a fractional widening never shrinks the window. A `NaN` mean —
+    # a cell whose priors are all missing — carries through as the missing prior it is.
+    sub = rebuild(grid[rows, cols];
+                  radius_x = [ceil(Int, rx[i, j]) for i in rows, j in cols],
+                  radius_y = [ceil(Int, ry[i, j]) for i in rows, j in cols],
+                  dx_prior = [Float64(mx[i, j]) for i in rows, j in cols],
+                  dy_prior = [Float64(my[i, j]) for i in rows, j in cols])
+
+    return (; grid = _cell_centres(sub, grid, rows, cols, stride),
             wanted = keep, rows, cols)
 end
 
@@ -448,13 +480,77 @@ end
 # survives untouched, and `_shift_points` applies the `+ 0.5` at correlation time for every level
 # alike. Snapping on top of that would move a coarse centre half a pixel off the lattice the finest
 # level uses.
+# How far one step along `dim` moves this coordinate, as the modal signed step between adjacent points
+# that both carry a coordinate.
+#
+# Three properties of a production grid make the obvious readings wrong, and each has been measured:
+#
+#   * **It is zeroed at nodata.** The driver clears `xGrid` wherever there is no data
+#     (`testautoRIFT.py:394-403`), so `x[1, 2] - x[1, 1]` is `0` on a scene whose first row and column
+#     are ocean. Reading the spacing there gives zero, `_cell_centres` shifts by nothing, and every
+#     coarse node sits at its cell's first point — half a cell from where `_undecimate_level` reads it
+#     back.
+#   * **It is rotated, by an arbitrary amount.** A step along a row moves `x` by the spacing times the
+#     cosine of the rotation, which is `8` on a near-axis-aligned Landsat grid and `-1` on a Sentinel-2
+#     grid rotated near 90°. So the step is not the grid spacing, it is *signed*, and a rule that keeps
+#     only positive steps sees nothing but the jumps out of the margin — on the S2A case that returned
+#     `10979` where the answer is `-1`, and put every chip-96 coarse point outside the image.
+#   * **A step straddling the margin boundary is neither.** Those are the large spurious values, and
+#     they are always a minority of the array, so the mode excludes them without needing to identify
+#     them.
+#
+# Zero only when no two adjacent points both carry a coordinate, which means the caller has no grid.
+# `_cell_centres` then shifts by nothing, which is right for a grid with no spacing to speak of.
+function _grid_step(x::AbstractMatrix, dim::Int)
+    n = size(x, dim)
+    n > 1 || return 0.0
+    counts = Dict{Float64,Int}()
+    @inbounds for j in axes(x, 3 - dim), i in 1:(n - 1)
+        a, b = dim == 2 ? (x[j, i], x[j, i + 1]) : (x[i, j], x[i + 1, j])
+        # Both endpoints must be on the grid. A zero is the nodata marker, not a coordinate, so a step
+        # touching one describes the margin rather than the spacing.
+        (iszero(a) || iszero(b)) && continue
+        d = Float64(b) - Float64(a)
+        counts[d] = get(counts, d, 0) + 1
+    end
+    isempty(counts) && return 0.0
+    best = 0.0
+    bestn = 0
+    for (d, c) in counts
+        c > bestn && (best = d; bestn = c)
+    end
+    return best
+end
+
 function _cell_centres(sub::PointSet{2}, full::PointSet{2}, rows, cols, stride::Int)
     stride == 1 && return sub
-    # From the first two points along each axis, so a non-square spacing shifts by the right amount on
-    # each. A single-point axis cannot happen: `_decimate_level` requires at least three coarse points.
+    # The grid's spacing, taken as the most common step between adjacent points rather than from the
+    # first two. A production grid is **zeroed wherever there is no data** — the driver clears `xGrid`,
+    # `yGrid`, the priors and the search limits at nodata before correlating
+    # (`testautoRIFT.py:394-403`) — so a scene whose first row and column are ocean has
+    # `x[1, 2] - x[1, 1] == 0`, and reading the spacing there gives zero. The shift then vanishes and
+    # every coarse node stays at its cell's first point, half a cell from where `_undecimate_level`
+    # reads it back.
+    #
+    # That is a silent, systematic offset: on the golden Landsat case it left 99.8% of level-1 nodes 4
+    # or 5 pixels from the reference's, which reads as a correlator disagreement concentrated where the
+    # velocity field varies.
     nr, nc = size(full)
-    sx = nc > 1 ? full.x[1, 2] - full.x[1, 1] : 0.0
-    sy = nr > 1 ? full.y[2, 1] - full.y[1, 1] : 0.0
+    sx = _grid_step(full.x, 2)
+    sy = _grid_step(full.y, 1)
+    # The reference reaches the same cell centre by a different route and lands half a pixel away on a
+    # **rotated** grid. Its `INTER_AREA` averages a `stride`-by-`stride` block, so on a grid whose `x`
+    # varies down a column — which a projected grid's does, by 1 px per row on the golden Landsat case —
+    # the block mean is not the x-centre of the column pair, and `round(x + 0.5) - 0.5` then snaps it to
+    # the next half-integer up. Measured at level 1: the cell centre is 3992.5 on both sides, the
+    # reference's block mean is exactly 3993.0, and its snapped node is 3993.5.
+    #
+    # The half pixel is *not* reproduced here. `_undecimate_level` reads a coarse node back from the cell
+    # centre, so shifting the correlation position without shifting the read-back would measure the field
+    # in one place and attribute it to another — and `src/multichip.jl` records the measurement that
+    # self-consistency between the two halves is what the accuracy depends on, not agreement with either
+    # of the reference's halves separately. `tools/golden/README.md` carries this as matched-not-endorsed
+    # in the other direction: a deliberate difference, with the reason it is deliberate.
     # Half the span of this cell, which is `stride` points except where the grid ran out.
     halfx = [(min(c + stride - 1, nc) - c) / 2 for c in cols]
     halfy = [(min(r + stride - 1, nr) - r) / 2 for r in rows]
@@ -672,23 +768,45 @@ end
 # Points for one level: the caller's grid with this level's chip size, and the radius zeroed
 # wherever the level should not attempt a point.
 #
-# A point is attempted only when the level's chip size lies within that point's own
-# `chip_size_min_x`/`chip_size_max_x`, matching the reference's per-level mask
-# (`autoRIFT.py:534`). Zero in either means unbounded, which is the default, so a grid that
-# carries no bounds admits every level exactly as it did before the fields existed.
+# **The base level ignores the per-point chip-size bounds entirely, and so does this.** The
+# reference's `M0` gate — `(ChipSizeMinX <= ChipSizeUniX[i]) & (ChipSizeMaxX >= ChipSizeUniX[i])` —
+# sits inside `if self.ChipSize0X != ChipSizeUniX[i]` (`autoRIFT.py:509-539`). The `else` branch that
+# runs at the base chip size copies the search limits unchanged (`:587-593`), with no bounds test at
+# all. So every point with a positive radius is attempted at the finest chip whatever its
+# `chip_size_min_x` says, and the bounds restrict only the coarser levels.
 #
-# The bound earns its place on real data. ITS_LIVE's parameter rasters permit a 960 m chip at
-# 1.7% of points over Jakobshavn, and running it everywhere instead produces estimates from a
+# Applying the bound at every level costs a great deal on production data, because the bounds are
+# spatially clustered: on the golden Sentinel-2 case the reference answers 136,800 points at its base
+# chip size whose own `chip_size_min_x` is 48, 96 or 192. Gating them out left them unsearched there
+# and falling through to a coarser level, which produced a 148,048-point skew toward coarser chips and
+# 27% of shared points disagreeing about which level owns them.
+#
+# Coarser levels do apply it, and it earns its place there. ITS_LIVE's parameter rasters permit a 960 m
+# chip at 1.7% of points over Jakobshavn, and running it everywhere instead produces estimates from a
 # chip far larger than the ice structure it covers — measured at a 0.73 correlation against the
-# reference where the finest level reaches 0.99.
+# reference where the finest level reaches 0.99. The reference additionally *dilates* the coarse
+# mask with `colfilt(..., 0)`, a maximum over `6 / Scale` cells (`:534-539`), which `_decimate_level`
+# reproduces on the `wanted` mask.
+#
+# **This asymmetry is matched, not endorsed.** A parameter file that sets `chip_size_min_x` to 480 m at
+# a point is asking for no smaller chip there, and honouring that at every level except the finest is
+# hard to defend on its own terms — the finest level is where a too-small chip does the most damage.
+# It is reproduced here because agreeing with the reference is a prerequisite for telling a real
+# difference from a bug, and diverging deliberately before that point makes every later comparison
+# ambiguous. `REFERENCE.md` records it as a candidate to revisit once the two agree.
+#
+# Zero in either bound means unbounded, which is the default, so a grid carrying no bounds admits
+# every level exactly as it did before the fields existed.
 function _level_points(grid::PointSet{2}, p::Params, chip_size::Extent,
                        wanted::AbstractMatrix{Bool})
     n = size(grid)
+    base = chip_size.X == p.chip_size_min.X
     rx = Matrix{Int}(undef, n)
     ry = Matrix{Int}(undef, n)
     @inbounds for i in eachindex(grid)
         lo, hi = grid.chip_size_min_x[i], grid.chip_size_max_x[i]
-        permitted = (lo == 0 || chip_size.X >= lo) && (hi == 0 || chip_size.X <= hi)
+        permitted = base ||
+                    ((lo == 0 || chip_size.X >= lo) && (hi == 0 || chip_size.X <= hi))
         if wanted[i] && permitted
             rx[i] = grid.radius_x[i]
             ry[i] = grid.radius_y[i]
@@ -746,6 +864,20 @@ end
 # against the rate rather than against the step.
 _sparse_stride(p::Params) = p.coarse_stride * _oversample(p)
 
+# How wide a window the coarse radius is reduced over: the sparse stride, rounded **up to odd**.
+#
+# The reference does exactly this and says why by construction — `filtWidth = stride + 1` when the
+# stride is even and `stride` when it is odd (`autoRIFT.py:618-626`) — so the window is always
+# symmetric about the node it is sampled at. An even window has a left bias, which would place a
+# coarse point's radius over a cell offset half a step from the point itself.
+#
+# This is not the same quantity as the stride, and using the stride binds a coarse point's radius to a
+# window one short of the reference's: at stride 8 that under-covers 1,809 of 85,556 coarse points on
+# the golden Landsat case, by up to 152 pixels, always downward. A point whose radius is too small
+# searches a narrower window than the reference did and rails out or misses the peak wherever the
+# prior was doing work.
+_sparse_filter_width(stride::Int) = iseven(stride) ? stride + 1 : stride
+
 # Which points the coarse pass correlates, and where they sit on the full grid.
 #
 # `nothing` when the coarse grid is too small for the filter to judge consistency on — the caller
@@ -771,13 +903,17 @@ function _coarse_points(pts::PointSet{2}, p::Params, chip_size::Extent)
     # The coarse point's radius must cover its whole cell, since it stands in for every fine
     # point inside it — hence the max over the cell rather than a sample of one point.
     #
+    # Over `_sparse_filter_width(stride)` and not `stride`: the window is symmetric about the node,
+    # which for an even stride is one wider than the step. See there.
+    #
     # Computed per coarse cell rather than by a full-grid sliding max that is then decimated:
     # the latter discards fifteen sixteenths of its work at stride 4, and measured 113 us and
     # 405 KB per level against 7.9 us here. It also stays in `Int` throughout, where the
     # sliding form needed a Float32 round trip in each direction.
     coarse = pts[rows, cols]
-    _cell_max_radius!(coarse.radius_x, pts.radius_x, rows, cols, stride)
-    _cell_max_radius!(coarse.radius_y, pts.radius_y, rows, cols, stride)
+    fw = _sparse_filter_width(stride)
+    _cell_max_radius!(coarse.radius_x, pts.radius_x, rows, cols, stride, fw)
+    _cell_max_radius!(coarse.radius_y, pts.radius_y, rows, cols, stride, fw)
     fill!(coarse.chip_size_x, chip_size.X)
     fill!(coarse.chip_size_y, chip_size.Y)
     return (; coarse, rows, cols, filt)
@@ -789,12 +925,13 @@ end
 # Every operation here is a neighbourhood or a whole-grid reduction, which is why this must see the
 # assembled coarse grid rather than one block of it.
 function _coarse_decide(cd::DisplacementField, coarse::PointSet{2}, p::Params,
-                        filt::OutlierMethod, gridsize::Tuple{Int,Int}, stride::Int)
+                        filt::OutlierMethod, gridsize::Tuple{Int,Int}, stride::Int,
+                        subpixel::SubpixelMethod)
     measured = map(!isnan, cd.dx)
     any(measured) || return nothing
 
     keep = reject_outliers(cd.dx, cd.dy, coarse.radius_x, coarse.radius_y,
-                           measured, upsampling(p.subpixel), filt)
+                           measured, upsampling(subpixel), filt)
     @inbounds for i in eachindex(keep)
         measured[i] || (keep[i] = false)
     end
@@ -859,7 +996,7 @@ end
 # `measure` is positional and has no default: the one caller always knows the level's measure, and a
 # default here would be a second spelling of `chipsize_level`'s that could silently diverge from it.
 function _coarse_mask(runner::PassRunner, pts::PointSet{2}, p::Params, chip_size::Extent,
-                      measure::SimilarityMeasure)
+                      measure::SimilarityMeasure, subpixel::SubpixelMethod)
     setup = _coarse_points(pts, p, chip_size)
     if isnothing(setup)
         # Too few coarse points to judge consistency against their neighbours, so there is no
@@ -882,17 +1019,26 @@ function _coarse_mask(runner::PassRunner, pts::PointSet{2}, p::Params, chip_size
     # The whole-grid half, once.
     # The same stride `_coarse_points` sliced with, so the mask expands back onto the lattice the
     # evidence was gathered on.
-    return _coarse_decide(cd, coarse, p, setup.filt, size(pts), _sparse_stride(p))
+    #
+    # `subpixel` is this level's *fine* method even though the pass above ran `NoRefine`: the outlier
+    # threshold is expressed in units of the quantization step the level's estimates will carry
+    # (`reject_outliers`), which is the fine method's, not the coarse pass's.
+    return _coarse_decide(cd, coarse, p, setup.filt, size(pts), _sparse_stride(p), subpixel)
 end
 
 # Maximum radius over each coarse cell, matching the left-biased window convention the sliding
 # reductions use so the two agree at the boundaries.
-function _cell_max_radius!(out, radius, rows, cols, stride::Int)
+#
+# `width` is the window, which is not the same as `stride`: the reduction is symmetric about the node,
+# so an even stride reduces over one more point than it steps. `_sparse_filter_width` derives it, and
+# it defaults to `stride` for the callers whose cells genuinely are `stride` wide — the mask expansion
+# in `_expand_coarse_mask` inverts *that* assignment and must keep using it.
+function _cell_max_radius!(out, radius, rows, cols, stride::Int, width::Int = stride)
     nr, nc = size(radius)
     # The cell's extent about its centre, from the one place that convention lives. Writing it out
     # here would be a third transcription of a rule `window.jl` documents as the easiest in the
     # package to get backwards.
-    lo, _, hi, _ = _window_margins(stride, stride)
+    lo, _, hi, _ = _window_margins(width, width)
     @inbounds for (jo, j) in enumerate(cols), (io, i) in enumerate(rows)
         m = 0
         for jj in max(j - lo, 1):min(j + hi, nc)
@@ -915,10 +1061,11 @@ end
 # Filling is worth doing at this stage rather than at the end: a hole filled here can be
 # resampled coherently into the next level's prior, whereas a hole left open forces that
 # level to search blind.
-function _reject_and_fill!(d::DisplacementField, pts::PointSet, p::Params)
+function _reject_and_fill!(d::DisplacementField, pts::PointSet, p::Params,
+                          subpixel::SubpixelMethod = first(p.subpixel))
     measured = map(!isnan, d.dx)
     keep = reject_outliers(d.dx, d.dy, pts.radius_x, pts.radius_y,
-                           measured, upsampling(p.subpixel),
+                           measured, upsampling(subpixel),
                            rescale(p.outliers, _oversample(p)))
     @inbounds for i in eachindex(keep)
         if !keep[i]
@@ -931,12 +1078,44 @@ function _reject_and_fill!(d::DisplacementField, pts::PointSet, p::Params)
     return _fill_holes!(d, p)
 end
 
-# Fill points surrounded by enough measured neighbours with the neighbourhood median.
+# The holes that the neighbour-count criterion leaves open: `NaN` in `dx` with fewer than
+# `needed` measured neighbours in a `w`-wide window.
 #
-# Three passes, because each fills only points that are already well surrounded: filling one
-# ring makes the next ring well surrounded in turn, so a small hole closes from its edge
-# inward while a large one is left alone. A single pass with a looser threshold would instead
-# invent values in the middle of genuinely empty regions.
+# This is the set whose connected components are sized, so the size test judges what actually
+# remains rather than what the count is about to close. The reference's equivalent is
+# `!foo1 = !((filter2D(foo, ones(3,3)) >= 6) | foo)` (`autoRIFT.py:798-803`).
+function _open_after_count(dx::AbstractMatrix, w::Integer, needed::Integer)
+    lo, _, hi, _ = _window_margins(w, w)
+    nr, nc = size(dx)
+    open = falses(nr, nc)
+    @inbounds for j in 1:nc, i in 1:nr
+        isnan(dx[i, j]) || continue
+        n = 0
+        for jj in max(j - lo, 1):min(j + hi, nc), ii in max(i - lo, 1):min(i + hi, nr)
+            isnan(dx[ii, jj]) || (n += 1)
+        end
+        open[i, j] = n < needed
+    end
+    return open
+end
+
+# Fill a hole with the median of its neighbourhood, on either of two criteria.
+#
+# A point is filled if it has enough measured neighbours, *or* if it belongs to a connected hole
+# smaller than `fill_min_hole` — matching the reference, which tests both
+# (`autoRIFT.py:792-808`). The two are not redundant, and a 2x2 hole is where they part: each of
+# its points has five of nine neighbours measured, one short of the count, while the hole itself
+# is four points and so small enough to close. Neither criterion alone fills it.
+#
+# What each expresses: the count asks whether there is enough local evidence to interpolate from,
+# and the size asks whether the gap is small enough that interpolating across it is meaningful at
+# all. A hole's shape can satisfy the second while no point in it satisfies the first, which is
+# why an L-shaped or diagonal hole needs the size test.
+#
+# Three passes, because each fills only points that already qualify: filling one ring makes the
+# next ring well surrounded in turn, so a large hole closes from its edge inward while its
+# interior is left alone. A single pass with a looser threshold would instead invent values in
+# the middle of genuinely empty regions.
 #
 # Visits the holes rather than the grid. Sweeping the whole grid with `windowmedian` cost
 # 0.76 ms per pass on a 118x118 level with 9% holes — and on that level the first pass fills
@@ -968,6 +1147,16 @@ function _fill_holes!(d::DisplacementField, p::Params)
     filled = Int[]
 
     for _ in 1:3
+        # Which holes are small enough to close regardless of neighbour count. Recomputed each
+        # pass because the previous pass's fills split and shrink the holes that remain.
+        #
+        # Taken on the holes *after* this pass's count criterion would close them, as the
+        # reference does: it labels `!foo1`, the invalid set with the well-surrounded points
+        # already removed (`autoRIFT.py:803`). Labelling the raw hole set instead would judge a
+        # large hole by a size it only has before its edge is filled.
+        small = p.fill_min_hole <= 1 ? nothing :
+                small_components(_open_after_count(d.dx, w, needed), p.fill_min_hole)
+
         # Two-phase: collect this pass's fills before applying any, so every point in a pass
         # sees the same field. Filling in place would let one fill seed the next within a
         # single pass, which is what the three-pass structure exists to control.
@@ -1001,7 +1190,10 @@ function _fill_holes!(d::DisplacementField, p::Params)
                     end
                 end
             end
-            n >= needed || continue
+            # Either criterion admits the point, but a median still needs something to take it
+            # over: a hole small enough to close with no measured neighbour at all stays open.
+            # That is the reference's `MM` term, which requires its 3x3 median to exist.
+            (n >= needed || (small !== nothing && small[i, j])) && n > 0 || continue
             # `_select_median!` rather than a sort here: it picks the cheaper selection for `n`,
             # which at the default 3-wide window is an insertion sort.
             push!(pending, (LinearIndices(d.dx)[i, j],

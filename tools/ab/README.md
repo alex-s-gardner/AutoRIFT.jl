@@ -119,17 +119,69 @@ Stage 1, the correlator, one level at a time on a 512² window:
 The correlator is **bit-identical** — not merely close — at every chip size, on both axes, at every
 point. Same for `dy`, and at every correlation gate.
 
-Stage 2, the whole pipeline on the full 3072² window, 87,814 shared points: **77.4% exact**, 97.3%
-within one step, median radial 0.0000 px, bias `+0.0000` on both axes, p99 0.1411 px. Exact agreement
+### The element type is part of the comparison, and `UInt8` is the production path
+
+```bash
+julia --project=tools/ab tools/ab/stage1_julia.jl 1024 16 20 1678 2495 UInt8
+micromamba run -n arift-ref python tools/ab/stage1_python.py
+```
+
+Stage 1 runs on either element type, because the reference has two correlators and production uses the
+one this harness originally never called. `uniform_data_type` rescales each image by its own mean and
+standard deviation and quantizes to 256 levels before `runAutorift` is reached
+(`autoRIFT.py:359-384`), so the C++ entry point is `arImgDisp_u` on bytes rather than `arImgDisp_s` on
+floats. They are separate templates; agreement on one carries no information about the other.
+
+Measured on the same 1024² window at chip 16, 3,721 shared points:
+
+| path | median | p95 | **max** | within 0.2 px |
+|---|---:|---:|---:|---:|
+| `Float32`, `arImgDisp_s` | 0.0000 | 0.0000 | **0.0000** | **100.00%** |
+| `UInt8`, `arImgDisp_u` | 0.0000 | 0.0625 | **35.81** | 98.60% |
+
+The float path is bit-identical at every point. The byte path agrees on 98.3% and the remaining 1.7%
+are wrong by up to 36 pixels — a different match, not a rounded one. Those failures are not spread
+evenly: they cluster where the correlation surface has competing maxima, which is why a high-shear
+block of a golden scene can score 18% while the scene averages 55%, and why a bad point at the base
+level propagates into its neighbours through the prior.
+
+The quantizer itself is verified against the reference's own `uniform_data_type` rather than against a
+reading of it, because two details in that function are easy to transcribe wrongly and both change the
+answer. The scale is `2**8 - 0` — **256, not 255**, which reads like a typo and is not one; using 255
+matches only 49.7% of values. And the arithmetic is `Float32`, since `self.I1` is single precision.
+With both right, 99.9975% of levels match on a 200² test field, and the one remaining value sits
+1.5e-5 below a `.5` tie that NumPy's pairwise `Float32` accumulation of the mean and standard deviation
+puts on the other side.
+
+**The arithmetic is `Float32` on both sides, so this is not byte precision.** OpenCV's `matchTemplate`
+on a `CV_8UC1` input computes in float and returns `CV_32FC1` (the C++ stores the imagery as
+`CV_8UC1` and only the result as `CV_32FC1`), and AutoRIFT.jl promotes at the multiply and before the
+forward transform. What quantizing changes is the *surface*: collapsing a filtered float field onto 256
+levels creates ties and near-ties that the float field does not have, and a tie broken differently at a
+plateau puts the peak far away rather than one step away. That is the mechanism the 36-pixel maximum
+points at, and it predicts the failures concentrate where contrast is small relative to one
+quantization level.
+
+**Quantizing to `UInt8` is a version-matching requirement, not a claim that it is correct.** Throwing
+a filtered float field down to 256 levels before correlating discards precision the correlator could
+otherwise use, and AutoRIFT.jl has no need to do it. It is reproduced because agreement with the
+reference is the current objective, and because a deliberate difference and a bug are
+indistinguishable in a comparison — every difference has to be removed before the remaining ones mean
+anything. Once the two agree, this is a candidate to drop in favour of correlating the float field
+directly; `tools/golden/README.md` keeps that register.
+
+Stage 2, the whole pipeline on the full 3072² window, 88,123 shared points: **81.8% exact** on `dx`
+and 82.2% on `dy`, 98.7% within one step, median 0.0000 px, bias `+0.0000` on both axes, p99 0.0752 px,
+correlation 0.99964. Radial: 79.9% exact, 98.0% within one step. Exact agreement
 rises with peak strength, which is the shape to expect — a weak peak is where a tie can break either
 way:
 
 | correlation gate | points | exact | within step | p99 | max |
 |---|---:|---:|---:|---:|---:|
-| ≥ 0.0 | 85,098 | 77.3% | 97.5% | 0.1363 | 6.3408 |
-| ≥ 0.2 | 69,337 | 86.1% | 98.3% | 0.1029 | 2.3138 |
-| ≥ 0.4 | 39,142 | 96.0% | 99.4% | 0.0319 | 1.0923 |
-| ≥ 0.5 | 17,516 | **97.6%** | 99.7% | 0.0113 | 0.3653 |
+| ≥ 0.0 | 85,227 | 79.7% | 98.1% | 0.1082 | 6.3408 |
+| ≥ 0.2 | 69,313 | 88.0% | 98.8% | 0.0721 | 2.3135 |
+| ≥ 0.4 | 39,091 | 96.9% | 99.7% | 0.0123 | 1.0913 |
+| ≥ 0.5 | 17,511 | **98.3%** | 99.9% | 0.0031 | 0.3653 |
 
 The `≥ 0.0` row is 85,098 against the 87,814 above because a gate on correlation drops the points an
 interpolated fill answered: those carry a displacement but no peak of their own.

@@ -94,13 +94,37 @@ function _preprocess(x::Symbol, width)
 end
 _preprocess(x, _width) = _badtype(:preprocess, x, "a Symbol or a `PreprocessMethod`")
 
-_subpixel(x::SubpixelMethod, _upsampling) = x
-function _subpixel(x::Symbol, up)
+# `subpixel` resolves to a *tuple*, one method per chip-size level, on the same rule as
+# `similarity`: a scalar becomes a 1-tuple whose last entry applies to every level, so the
+# single-method case — nearly every call — is unchanged and stays concretely typed.
+#
+# A tuple is what expresses the reference's per-chip-size `OverSampleRatio`; see `subpixel_at`.
+_subpixel(x::SubpixelMethod, _upsampling) = (x,)
+_subpixel(x::Symbol, up) = (_one_subpixel(x, up),)
+# `map` rather than a comprehension, so `R` stays a concrete `Tuple{PyramidRefine,PyramidRefine}`
+# that the refinement kernel can specialize on. `upsampling` is not forwarded to the elements: a
+# tuple names its methods, and each carries its own factor, so a loose keyword alongside would have
+# two sources for one number.
+function _subpixel(x::Tuple, up)
+    isempty(x) && throw(ArgumentError(
+        "`subpixel` cannot be an empty tuple; name at least one method."))
+    isnokw(up) || throw(ArgumentError(
+        "`upsampling` cannot be combined with a tuple of `subpixel` methods, which already carry " *
+        "their own factors. Drop `upsampling`, or pass a single method."))
+    return map(_one_subpixel, x)
+end
+_subpixel(x, _upsampling) = _badtype(:subpixel, x,
+                                    "a Symbol, a `SubpixelMethod`, or a tuple of either")
+
+# One element of a subpixel tuple. Separate from `_subpixel` because that returns a tuple and this
+# must not, or nesting would compound.
+_one_subpixel(x::SubpixelMethod, _up = nokw) = x
+function _one_subpixel(x::Symbol, up = nokw)
     T = _resolve(SYMBOL2SUBPIXEL, x, :subpixel)
     return T === NoRefine ? NoRefine() :
            isnokw(up) ? T() : T(; upsampling = up)
 end
-_subpixel(x, _upsampling) = _badtype(:subpixel, x, "a Symbol or a `SubpixelMethod`")
+_one_subpixel(x, _up = nokw) = _badtype(:subpixel, x, "a Symbol or a `SubpixelMethod`")
 
 # An instance already carries its own parameters, so the loose keywords would have nothing to
 # apply to. Passing both is a contradiction rather than a merge, and saying so beats silently
@@ -262,6 +286,11 @@ function _check_positive(name::Symbol, v::Real)
     return v
 end
 
+function _check_nonnegative(name::Symbol, v::Real)
+    v >= 0 || throw(ArgumentError("`$name` must be >= 0, got $v"))
+    return v
+end
+
 function _check_odd_window(name::Symbol, w::Integer)
     w >= 1 || throw(ArgumentError("`$name` must be >= 1, got $w"))
     isodd(w) ||
@@ -350,6 +379,10 @@ chip_size = (X = 16, Y = 32)   # taller than wide
 - `agree_tolerance = 0.2`: agreement threshold, as a fraction of search radius.
 - `mad_scale = 4.0`: median-absolute-deviation multiplier.
 - `fill_window = 3`: window for median hole filling. Must be odd.
+- `fill_min_hole = 5`: a connected hole smaller than this is filled whatever its neighbour
+  count, which is what closes a hole whose shape leaves every point short of the window
+  criterion. Exclusive, so the default closes holes of one to four points. `0` disables it and
+  leaves filling to the window criterion alone.
 
 The five keywords after `outliers` are [`GardnerFilter`](@ref)'s own parameters, offered at
 the top level for convenience. They cannot be combined with an `outliers` *instance*, which
@@ -399,6 +432,7 @@ function params(;
     agree_tolerance = nokw,
     mad_scale = nokw,
     fill_window = 3,
+    fill_min_hole = 5,
     threaded = false,
     backend = :cpu,
     progress = false,
@@ -439,6 +473,7 @@ function params(;
         _check_fraction(:min_coarse_valid_fraction, min_coarse_valid_fraction),
         Float64(dx_prior), Float64(dy_prior),
         _check_odd_window(:fill_window, fill_window),
+        Int(_check_nonnegative(:fill_min_hole, fill_min_hole)),
         UInt64(rng_seed),
         Bool(progress),
         back,

@@ -1,7 +1,13 @@
 """Stage 1 of the A/B: the reference correlator on the arrays AutoRIFT.jl filtered.
 
-Reads the bundle `stage1_julia.jl` wrote, calls `arImgDisp_s` on the *same* Float32 arrays at the
+Reads the bundle `stage1_julia.jl` wrote, calls the reference correlator on the *same* arrays at the
 *same* grid points, and writes `python_dx`/`python_dy` beside the Julia ones.
+
+Which entry point is decided by the bundle, not by this file. `arImgDisp_s` takes Float32 and
+`arImgDisp_u` takes UInt8, and production reaches the *second* one: `uniform_data_type` rescales and
+quantizes to 256 levels before `runAutorift` is called (`autoRIFT.py:359-384`). They are separate C++
+templates, so agreement on one does not carry to the other, and a harness that only ever ran the float
+path leaves the production path unmeasured.
 
 `arImgDisp_s` and not `runAutorift`: stage 1 isolates the correlator, so the pyramid loop, the
 coarse pass, the outlier filter and the grid truncation are all deliberately bypassed. Those are
@@ -18,7 +24,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUNDLE = os.path.join(HERE, "stage1")
 
-DTYPES = {"Float32": np.float32, "Float64": np.float64}
+DTYPES = {"Float32": np.float32, "Float64": np.float64, "UInt8": np.uint8}
 
 
 def read_bundle(path):
@@ -36,7 +42,11 @@ def read_bundle(path):
                 continue
             parts = line.split()
             if len(parts) == 2:
-                scalars[parts[0]] = int(parts[1])
+                # `dtype` is the one non-numeric scalar, and it selects the entry point below.
+                try:
+                    scalars[parts[0]] = int(parts[1])
+                except ValueError:
+                    scalars[parts[0]] = parts[1]
                 continue
             name, dtype, shape = parts
             dims = tuple(int(v) for v in shape.split("x"))
@@ -46,15 +56,22 @@ def read_bundle(path):
 
 
 def main():
-    from autoRIFT.autoRIFT import arImgDisp_s
+    from autoRIFT.autoRIFT import arImgDisp_s, arImgDisp_u
 
     arrays, scalars = read_bundle(BUNDLE)
     chip = scalars["chip"]
     radius = scalars["radius"]
     oversample = scalars["upsampling"]
+    dtype = scalars.get("dtype", "Float32")
 
-    ref = np.ascontiguousarray(arrays["filtered_reference"], dtype=np.float32)
-    sec = np.ascontiguousarray(arrays["filtered_secondary"], dtype=np.float32)
+    # The bytes are already quantized on the Julia side when the bundle is UInt8, so nothing is
+    # rescaled here: rescaling again would compare two different images rather than two correlators.
+    if dtype == "UInt8":
+        correlate, np_dtype = arImgDisp_u, np.uint8
+    else:
+        correlate, np_dtype = arImgDisp_s, np.float32
+    ref = np.ascontiguousarray(arrays["filtered_reference"], dtype=np_dtype)
+    sec = np.ascontiguousarray(arrays["filtered_secondary"], dtype=np_dtype)
 
     # Julia's grid is 1-based pixel centres; the reference's is 0-based. `arImgDisp_s` then adds
     # its own +0.5 internally (`xGrid += Px + 0.5`), which is how an even chip's estimate is
@@ -74,7 +91,7 @@ def main():
     # AutoRIFT.jl. Reversing it is not a sign error: the chip then comes from the other image, so the
     # estimate describes different ground, and the residual grows with displacement wherever the field
     # deforms while staying exactly zero under uniform motion.
-    dx, dy = arImgDisp_s(
+    dx, dy = correlate(
         ref,
         sec,
         x_grid.copy(),
@@ -92,7 +109,8 @@ def main():
     dx = np.asarray(dx, dtype=np.float32).reshape(shape)
     dy = np.asarray(dy, dtype=np.float32).reshape(shape)
 
-    # `arImgDisp_s` returns cartesian y (up positive); AutoRIFT.jl reports dy down rows. Undo the
+    # Both entry points return cartesian y (up positive) — `autoRIFT.py:1142-1143` for the signed
+    # form and `:1308-1309` for the unsigned one — while AutoRIFT.jl reports dy down rows. Undo the
     # reference's own final `Dy = -Dy` so both sides are in the matrix convention.
     dy = -dy
 
@@ -101,6 +119,7 @@ def main():
         np.asfortranarray(A).T.tofile(os.path.join(BUNDLE, name + ".bin"))
 
     finite = np.isfinite(dx)
+    print("entry point     ", "arImgDisp_u (UInt8)" if dtype == "UInt8" else "arImgDisp_s (Float32)")
     print("grid            ", shape)
     print("python measured ", int(finite.sum()),
           "({:.1f}%)".format(100.0 * finite.mean()))

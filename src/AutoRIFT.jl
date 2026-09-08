@@ -143,7 +143,7 @@ end
 export autorift, autorift!, reinit!
 export SimilarityMeasure, ZNCC, NCC, Coherence
 export PreprocessMethod, Highpass, Wallis, WallisGapfill, Sobel, Laplacian,
-       Decibel, Deramp, NoPreprocess
+       Destripe, Decibel, Deramp, NoPreprocess
 export SubpixelMethod, PyramidRefine, NoRefine
 export OutlierMethod, GardnerFilter, NoOutlierFilter
 export ImagePair
@@ -176,6 +176,10 @@ const PUBLIC_NAMES = (
     # The grid, which is how per-point fields reach the correlator.
     :PointSet, :pointset, :gridpoints, :scatter, :rebuild, :sanitize!,
     :npoints, :nsearchable, :issearchable, :chip_bounds, :search_bounds,
+    # Removing a geometric misregistration from a measured displacement. Defined only when
+    # `ImagePairGeometry` is loaded, since that is what computes the offset field — the method lives in
+    # the extension, and the name is declared here so the extension has something to extend.
+    :remove_misregistration,
     # Running it, and the results.
     :init, :autorift_with_grid, :Cache, :imagepair, :MultichipResult, :nmeasured,
     :DisplacementField, :displacement_field, :track, :track!,
@@ -185,7 +189,7 @@ const PUBLIC_NAMES = (
     :wallis_gapfill, :decibel, :sobel, :laplacian, :deramp, :ramp_phase,
     :FiniteMask, :resident,
     # Post-processing steps a caller may want on their own.
-    :reject_outliers, :outlier_filter, :dilate_within, :resample, :resample!,
+    :reject_outliers, :outlier_filter, :dilate_within, :small_components, :resample, :resample!,
     :Nearest, :Area, :Bicubic, :window, :relax, :rescale,
     # Blocked processing: `halo` says how much overlap a block size costs. The layout types are
     # deliberately absent — they are the part free to change.

@@ -25,6 +25,15 @@ const RADIUS = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 20
 # Centred on Jakobshavn's trunk, where ITS_LIVE reports 3,000-11,800 m/yr over crevassed ice.
 const CROW = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : 1678
 const CCOL = length(ARGS) >= 5 ? parse(Int, ARGS[5]) : 2495
+
+# Which element type the correlator is handed. `Float32` is the filtered high-pass field; `UInt8` is
+# what *production* correlates, because `uniform_data_type` rescales and quantizes to 256 levels
+# before `runAutorift` is reached (`autoRIFT.py:359-384`). The reference dispatches on it —
+# `arImgDisp_s` for float, `arImgDisp_u` for bytes — so the two are different code paths on both
+# sides, and a comparison on one says nothing about the other.
+const DTYPE = length(ARGS) >= 6 ? ARGS[6] : "Float32"
+DTYPE in ("Float32", "UInt8") ||
+    error("dtype must be Float32 or UInt8, got $DTYPE")
 const OUT = joinpath(@__DIR__, "stage1")
 
 const CACHE = get(ENV, "AUTORIFT_TESTDATA", expanduser("~/data/autorift/tests"))
@@ -36,6 +45,43 @@ function dump_array(dir, name, A)
         write(io, A)
     end
     return (name, string(eltype(A)), size(A))
+end
+
+# `uniform_data_type`'s `DataType == 0` branch (`autoRIFT.py:359-384`): centre on the mean, span six
+# standard deviations, scale, clip, round.
+#
+# Three details each change the output, and each was established by comparing against the reference's
+# own `uniform_data_type` on the same input rather than by reading:
+#
+#   **The scale is 2^8 = 256, not 255.** The reference writes `* (2**8 - 0)`, which reads like a typo
+#   for `2**8 - 1` and is not one. Using 255 matches only **49.7%** of values — the two disagree by one
+#   level across half the image, because a factor of 256/255 shifts most values past a rounding
+#   boundary somewhere in the range.
+#
+#   **The arithmetic is `Float32`.** `self.I1` is `float32`, so NumPy computes the whole expression in
+#   single precision and the `.5` ties fall where `Float32` puts them. In `Float64` two values out of
+#   40,000 land on the other side of a tie: one is exactly `103.5` in `Float32` and `103.4999983` in
+#   `Float64`, which round to 104 and 103.
+#
+#   **Clip before round**, as the reference does — `np.round(np.clip(x, 0, 255))`. Rounding first would
+#   let 255.6 become 256 and wrap to 0 in a `UInt8`.
+#
+# `round` and not `trunc`: NumPy's `np.round` is round-half-to-even and Julia's `round` defaults to the
+# same, so the tie rule matches with no explicit mode. `trunc` would bias every value half a level low.
+function _quantize_u8(A::AbstractMatrix{Float32})
+    n = length(A)
+    m = Float32(sum(Float64, A) / n)
+    # The reference's `np.std(temp) * sqrt(n/(n-1))` is the sample standard deviation, computed here
+    # directly. The sum is accumulated in `Float64` because a 3072² `Float32` sum loses digits, then
+    # narrowed so the per-pixel arithmetic below is single precision as NumPy's is.
+    s = Float32(sqrt(sum(x -> (Float64(x) - Float64(m))^2, A) / (n - 1)))
+    lo = m - 3f0 * s
+    span = 6f0 * s
+    out = Matrix{UInt8}(undef, size(A))
+    @inbounds for i in eachindex(A, out)
+        out[i] = round(UInt8, clamp((A[i] - lo) / span * 256f0, 0f0, 255f0))
+    end
+    return out
 end
 
 function main()
@@ -70,6 +116,15 @@ function main()
     fref = Matrix{Float32}(pair.reference)
     fsec = Matrix{Float32}(pair.secondary)
 
+    # Production's quantization, applied here so both sides correlate the same bytes. Each image is
+    # scaled by its *own* mean and standard deviation — the reference uses the sample standard
+    # deviation (`ddof = 1`, written there as `std * sqrt(n/(n-1))`), and using the population form
+    # instead shifts every value by a fraction of a level on a large image but does change some.
+    if DTYPE == "UInt8"
+        fref = _quantize_u8(fref)
+        fsec = _quantize_u8(fsec)
+    end
+
     grid = gridpoints(size(fref), p.grid_spacing;
                       chip_size = p.chip_size_max, search_radius = p.search_radius)
     out = displacement_field(grid)
@@ -99,6 +154,7 @@ function main()
         println(io, "npix ", n)
         println(io, "filter_width 5")
         println(io, "upsampling 16")
+        println(io, "dtype ", DTYPE)
     end
 
     ok = count(!isnan, out.dx)
