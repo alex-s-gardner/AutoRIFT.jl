@@ -1260,3 +1260,86 @@ Two structural differences from every optical case, stated as expectations for s
 **`STAGES: 0`** — this capture was taken without `CAPTURE_STAGES=1`, so the loop-local trace is
 absent and the stage-by-stage rungs cannot run against it. Re-capturing costs another 2h15m; step 3
 records what the ladder can and cannot check without it.
+
+## Step 3 — what the ladder opened, and the two fixes it forced
+
+The ladder itself **cannot run on this capture**: it needs `CAPTURE_STAGES=1`, and taking that trace is
+another 2h15m. It fails fast and says so, which is the right behaviour — the message names the
+environment variable and the 0-based level index. So step 3's findings came from the endpoint instead,
+and both are real.
+
+### The harness: an anisotropic chip could not even be configured
+
+`kwargs_from_capture` scaled `chip_size` by `ScaleChipSizeY` but set `chip_size_max` isotropically from
+`in_ChipSizeMaxX`. That is the X-axis maximum — the array's name says so — so Y's bound was 4x too
+large and the two axes reached their maxima after different numbers of doublings. `_check_levels`
+rejects that outright:
+
+```
+`chip_size_max` must be the same multiple of `chip_size` in both axes ...
+Got 8 in X and 32 in Y
+```
+
+Invisible on all twelve optical pairs, where `ScaleChipSizeY = 1.0` and the two forms coincide.
+
+### The package: `_oversample` consulted the wrong axis
+
+`_oversample` returned `clamp(min(ox, oy), 1, 2)`. The reference's ratio is
+`int(self.ChipSize0X / self.GridSpacingX)` (`autoRIFT.py:481`) — **X alone, with no Y term anywhere**.
+On a square chip the two agree, which is why twelve optical pairs never caught it. On this pair, 64x16
+on a grid spaced 32 gives 2 in X and **0** in Y, so the minimum collapsed the ratio to 1 and the
+outlier filter judged over a 5-wide window at `FracValid = 0.32` where the reference used 9 at a
+threshold raised by its overlap term.
+
+What the fix bought, same capture, same command:
+
+| | before | after |
+|---|---:|---:|
+| only jl | 116,948 | **44,208** |
+| only ref | 11,245 | **9,897** |
+| corr dx | +0.9416 | **+0.9622** |
+| corr dy | +0.8430 | **+0.9086** |
+| julia measured | 176,211 | 104,819 |
+
+**Matched, not endorsed.** A window derived from X and applied to both axes of a 4:1 chip covers four
+times as much ground across track as along it, which is not obviously the right neighbourhood for
+judging consistency. Registered in `README.md`; agreement is the objective here.
+
+`test/outliers.jl`'s `rescale matches the reference's grid scaling` asserted the old rule and was
+updated to the reference's, with the Sentinel-1 geometry asserted directly.
+
+## Step 4 — the endpoint, green on bias and correlation
+
+```bash
+julia --project=tools/golden -t 6 tools/golden/correlator.jl S1A_IW_SLC__1SSH_20151120T080202 --run 200
+```
+
+| axis | sign | both | only jl | only ref | median | p99 | corr | bias |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| dx | + | 60,611 | 44,208 | 9,897 | 0.331 | 6.355 | **+0.9622** | **+0.0271** |
+| dy | **−** | 60,611 | 44,208 | 9,897 | 0.133 | 1.240 | **+0.9086** | **−0.0030** |
+
+Threshold stated in advance was `|bias|` under 0.035 px, the optical figure. **Both axes meet it** —
+0.027 and 0.003 — at correlation 0.91–0.96.
+
+- **The `dy` sign resolves to `−`, measured not asserted.** This is the one radar-specific expectation
+  the plan named: `optflag == 0` pre-flips `Dy0` at `testautoRIFT.py:402`. The selector discriminates
+  on correlation, and `dy` correlates +0.909 at `−` — so the flip is confirmed by measurement on a
+  60,611-point population, not inferred from the source.
+- **`exact` is 0 by construction and is not the gate.** The base level (64x16) runs a coarse pass and
+  a `filtDisp` but *no* fine pass, so every reported point comes from the 128x32 level and was
+  bicubic-resized rather than quantized. This is the documented `†` case that two optical pairs also
+  hit.
+- **Julia answers 1.49x the reference's points, and that is the reference rejecting.** Its own
+  `filtDisp` records keep 132 of 40,105 at the coarse pass, 15,703 of 128,825 at the fine one, and 0
+  at both coarser levels. Julia recovers **86.0%** of what the reference kept; the excess is points
+  the reference's filter discarded, not points the correlator disagreed about.
+
+### Not done: the byte-vs-float floor
+
+`--dtype-pair` needs a second capture at `CAPTURE_FLOAT32=1`, which is another ~26 GB and 2h15m.
+**Disk is the binding constraint**: 35 GB free with the twelve optical runs holding 63 GB, and this
+pair's run reduced from 59 GB to 11 GB by deleting `product/` and `product_sec/` — the per-burst ISCE3
+intermediates, which are regenerable and read by no gate. The floor matters more on radar than optical
+because SAR amplitude has a long right tail, so `uniform_data_type`'s `mean ± 3σ` clips differently.
+Recorded as the one plan item not executed.
