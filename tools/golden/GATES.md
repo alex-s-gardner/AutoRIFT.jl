@@ -943,28 +943,32 @@ acquisition track does not line up with map coordinates, and at high latitude no
 to look is not the corners but the orbit. Every Landsat L1 product ships an `_ANG.txt` beside the MTL
 carrying `EPHEMERIS_ECEF_{X,Y,Z}` at 1 s spacing, which is the satellite's actual trajectory.
 
-Differencing consecutive ECEF positions and rotating into local ENU at the mid-orbit point gives the
-ground-track azimuth, and its `atan(north/east)` is the along-track slope in a north-up raster's own terms:
+**The heading must be projected into the scene's own CRS, not left in true-north terms.** A slope measured
+on a UTM raster is a *grid* bearing, and grid north departs from true north by the meridian convergence —
+3.2° at 3.7° off the central meridian at latitude 60, and much more near the poles, which is where this data
+lives. Transforming two consecutive ECEF positions straight into the raster's CRS and differencing gets that
+right without deriving a convergence formula, because the projection applies it.
 
-| scene | ephemeris `atan(n/e)` | reference logged along | Δ |
-|---|---:|---:|---:|
-| `LT05_L1TP_060018_19851028` | **71.63°** | **71.60°** | **0.03°** |
-| `LT05_L1GS_061018_19860123` | **71.65°** | 75.49° | 3.84° |
+| scene | orbit along | orbit cross | reference along | reference cross | Δ along | Δ cross |
+|---|---:|---:|---:|---:|---:|---:|
+| `LT05_L1TP_060018_19851028` | 69.725° | **−20.275°** | 71.602° | **−20.245°** | −1.877° | **−0.030°** |
+| `LT05_L1GS_061018_19860123` | 73.589° | **−16.411°** | 75.490° | **−16.370°** | −1.901° | **−0.041°** |
 
-**The orbit is the right quantity and the reference's derivation is the approximation.** Both scenes are the
-same descending pass — azimuth 198.37° and 198.35°, differing by 0.02° — so the true heading is essentially
-constant, while the reference's estimate moves 3.9°. That variation is the signature of a pixel-derived
-value: it follows how the valid region happens to be clipped. Scene 2 is `L1GS` — systematic correction, not
-terrain-corrected — at quality tier T2, so its footprint is the less regular one.
+**Cross-track agrees to 0.03–0.04° on both scenes.** That is the confirmation: the orbit, projected into the
+scene CRS, is measuring the same physical direction the reference recovers from pixels. An unprojected
+true-north heading gives 71.63° for both scenes — which appeared to match scene 1's along-track to 0.03° and
+was a coincidence, since the two scenes' grid bearings differ by 3.9° while their true bearings differ by
+0.02°.
 
-Two further checks say the same. The reference's cross-track values are **not perpendicular** to its
-along-track ones — −20.25° against 71.60° − 90° = −18.40°, and −16.37° against −14.51° — off by 1.85° and
-2.03°, where a real cross-track direction is perpendicular by definition. And a 0.03° agreement on the
-well-conditioned scene is far too close to be coincidence.
+**Along-track is off by a constant −1.89°** on both scenes, same sign and magnitude. That is not noise: the
+reference takes `nanmax` of *two* edge slopes per axis (`autoRIFT.py:143-151`), so its along-track is biased
+toward whichever edge is worse-conditioned, while its cross-track happens to land on the good edge. The
+orbit's two axes are exactly perpendicular by construction; the reference's are not — −20.245° against
+71.602° − 90° = −18.398°, off by 1.85°, which a real cross-track direction cannot be.
 
-So the metadata route is viable after all, and better: `_ANG.txt` carries the geometry, the MTL corners
-simply do not. What it cannot do is *match* the reference on a scene where the reference's own estimate is
-3.8° off the truth.
+So the metadata route is viable and better: `_ANG.txt` carries the geometry once projected, and the MTL
+corners do not carry it at all. What it cannot do is *match* the reference's along-track, because that value
+is a biased estimator rather than a measurement of anything.
 
 **That is the trade this step exists to surface, and it is the plan's pre-committed decision point.**
 Agreement is the current objective, so the derived route is what a matched filter must use — and the four
