@@ -1104,3 +1104,67 @@ size: 17,764 points against 4.4 million across the twelve pairs. Recorded rather
 skipped-level cases the figure is comparable — and it is the pair whose destripe filter **declines** on both
 scenes, so both sides correlate a clamped-but-unfiltered field. Bias is nonetheless −0.005 px and
 correlation +0.993, so the two agree about position and disagree about the last quantization step.
+
+## Step 7 — all twelve optical pairs, and no slide
+
+```bash
+julia --project=tools/golden tools/golden/regate.jl --all
+julia --project=. -e 'import Pkg; Pkg.test()'
+```
+
+| gate | measured |
+|---|---|
+| 2.x colfilt, bwareaopen, window reductions | **green** |
+| 0.1 the correlator alone | **green** — exact 100.0% |
+| 0.2 the whole pipeline, 3072² | **green** — exact 81.8%, within step 98.7% |
+| 0.3 the ITS_LIVE granule | **green** |
+| **3.opt the stage ladder on every optical case** | **green — 12/12** |
+| 3.x the stage ladder, base case | **green** — 23 rungs |
+
+**6 ran, 6 green, 0 red.** `Pkg.test()` passes.
+
+`regate.jl` now runs the ladder over **all twelve** optical cases rather than one. That is deliberate: a rung
+is only as good as the case classes it has met, and both harness bugs in step 3 — the `filtDisp` index and
+the sign selector — were invisible on the five `hps` cases and surfaced only on an L7 pair whose base level is
+skipped.
+
+### The twelve optical pairs
+
+| # | case | filter | rungs | both | exact | only jl | only ref | bias dx | corr dx |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|
+| 1 | S2A Malaspina | `hps` | 21 | 586,090 | 92.65% | 6,632 | 10,438 | +0.001 | +0.997 |
+| 2 | LC09 Antarctic | `hps` | 23 | 460,136 | 68.42% | 6,145 | 10,629 | — | +0.976 |
+| 3 | S2B Jakobshavn | `hps` | 23 | 605,145 | 67.34% | 7,376 | 12,735 | — | +0.997 |
+| 4 | LC08 East Greenland | `hps` | 23 | 691,232 | 63.21% | 38,220 | 35,335 | — | +0.985 |
+| 5 | LC08 Jakobshavn | `hps` | 23 | 1,681,367 | 54.45% | 25,591 | 34,693 | — | +0.997 |
+| 6 | `LE07_..._20130314` | `wallis_fill` | 23 | 713,312 | 59.83% | 24,893 | 47,474 | −0.035 | +0.920 |
+| 7 | `LC08_060018` × `LE07` | `wallis_fill` | 23 | 672,901 | 58.49% | 26,607 | 49,674 | +0.011 | +0.955 |
+| 8 | `LE07_..._20040810` | `wallis_fill` | 23 | 918,395 | 50.18% | 55,935 | 69,334 | −0.010 | +0.973 |
+| 9 | `LE07_..._20120428` | `wallis_fill` | 13 | 106,232 | 0.00% † | 11,000 | 32,552 | +0.008 | +0.891 |
+| 10 | `LT04_063018` | `fft` | 23 | 272,917 | 55.95% | 23,374 | 25,681 | **+0.0004** | +0.982 |
+| 11 | `LT05_060018` | `fft` | 23 | 124,397 | 27.09% | 17,113 | 33,460 | −0.005 | +0.993 |
+| 12 | `LT05_001013` (`P000`) | `fft` | 13 | 17,764 | 0.00% † | 1,940 | 2,252 | −0.140 | +0.987 |
+
+† base level skipped on both sides, so every point is coarse and unquantized and `exact` is 0 by
+construction. Bias and correlation are the gate there.
+
+**Every stage of every pair is exact or reported-as-designed.** `|bias|` is under 0.035 px on eleven of
+twelve and correlation is 0.89–0.997 across the set. `exact` spans 27–93% and tracks the *scene* rather than
+the code: it is highest on the two Sentinel-2 pairs and lowest where the base chip size resolves fewest
+points, which is the `UInt8` quantization interacting with scene contrast — `tools/ab` stage 1 measures that
+path at 84.8% exact with a 35.8 px maximum against 100% on the float path.
+
+### What this phase added
+
+| | |
+|---|---|
+| optical pairs validated | 5 → **12 of 12** |
+| new preprocessing filters | `Destripe`, exact on 38,707,144 pixels |
+| new fixture groups | `wallisfill` (9), `warpaffine` (12), `scenegeometry` (4) |
+| package bugs found | the rotation direction and the fixed-point interpolation, both in new code |
+| harness bugs found | the `filtDisp` index, the sign selector, and a probe fed a doubly-filtered scene |
+| reference behaviours recorded | mixed border modes in one Wallis call; swapped power labels in the log; a misleading decline message; the `nanmax` along-track bias |
+
+The three remaining phase-3-and-beyond groups are unchanged in status: eight Sentinel-1 pairs and two NISAR
+pairs need the radar geogrid path, and no golden pair has been compared as a *product* because the
+post-correlation chain does not exist in Julia. Those are the next two gates, in that order.

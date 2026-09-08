@@ -135,6 +135,38 @@ const GATES = Gate[
         end
     end),
 
+    Gate("3.opt", "the stage ladder on every captured optical case", true, function ()
+        # **All twelve, not one.** A rung is only as good as the case classes it has met: the `filtDisp`
+        # index bug and the sign-selector bug were both invisible on the five `hps` cases and surfaced only
+        # on an L7 pair whose base level is skipped. So the no-slide check runs the ladder over every case
+        # with a capture on disk rather than over a representative one.
+        cases = ["LC08_L1TP_009011", "LC08_L1TP_062018", "LC09_L1GT_215109",
+                 "S2A_MSIL1C_20200626", "S2B_MSIL1C_20200612",
+                 "LE07_L1TP_061018_20120428", "LE07_L1TP_061018_20130314",
+                 "LE07_L1TP_063018_20040810", "LC08_L1TP_060018_20130330_20200912_02_T1_X_LE07",
+                 "LT05_L1TP_060018_19851028", "LT04_L1TP_063018_19880611",
+                 "LT05_L1GS_001013_19920425"]
+        results = String[]
+        red = 0
+        skipped = 0
+        for c in cases
+            cmd = `julia --project=$(@__DIR__) -t 8 $(joinpath(@__DIR__, "stages.jl")) $c --run 200 --all`
+            state, detail = capture_run(cmd) do t
+                occursin("no stage trace", t) && return (:skipped, "no capture")
+                m = match(r"(\d+) rungs?, (\d+) green, (\d+) red", t)
+                m === nothing && return (:red, last_line(t))
+                (parse(Int, m.captures[3]) == 0 ? :green : :red, m.match)
+            end
+            state === :red && (red += 1)
+            state === :skipped && (skipped += 1)
+            push!(results, "$(first(c, 22)) $(state === :green ? "ok" : String(state))")
+        end
+        return (red == 0 ? :green : :red,
+                "$(length(cases) - red - skipped)/$(length(cases)) green" *
+                (skipped > 0 ? ", $skipped without a capture" : "") *
+                (red > 0 ? ": " * join(filter(r -> !endswith(r, "ok"), results), ", ") : ""))
+    end),
+
     Gate("3.x", "the stage ladder on the golden Landsat case", false, function ()
         # Run 200 holds the base-level trace; 201..203 hold the coarser levels. Named explicitly because
         # the default run has no stage trace, and a gate that skips is a gate that never runs.
