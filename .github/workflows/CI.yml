@@ -42,31 +42,71 @@ jobs:
         with:
           version: ${{ matrix.version }}
       - uses: julia-actions/cache@v2
-      # The geogrid handoff tests need `ImagePairGeometry`, which is unregistered. `[sources]` in
-      # `Project.toml` names where it comes from, and Julia 1.11 and later resolve it from there.
+      # The geogrid handoff tests need `ImagePairGeometry`, which is unregistered, and it pulls
+      # `FastGeoProjections`, which is registered only at 0.0.2 against the 0.1/0.2 it requires.
+      # `[sources]` in `Project.toml` names where both come from, and Julia 1.11 and later resolve
+      # them from there.
       #
-      # Julia 1.10 has no `sources` field in `Pkg.Types.Project`, so it ignores that table, sees an
-      # unregistered name in `[extras]`, and refuses to build a test environment at all — the whole
-      # suite fails, not just the one testset. Dropping the `[extras]` entry is what lets the rest of
-      # the suite run there; `test/runtests.jl` then finds the package absent and skips the handoff
-      # testset with a message. Removing this step and the `[extras]` edit is the first thing to do
-      # once ImagePairGeometry is registered.
-      - name: Drop the unregistered test dependency on Julia LTS
+      # Julia 1.10 has no `sources` field in `Pkg.Types.Project`, so it ignores that table, sees a
+      # name it cannot resolve in `[extras]`, and refuses to build a test environment at all — the
+      # whole suite fails, not just the one testset. Dropping those `[extras]` entries is what lets
+      # the rest of the suite run there; `test/runtests.jl` then finds the package absent and skips
+      # the handoff testset with a message.
+      #
+      # **Every name in `[sources]` has to be dropped, not just the one the tests import.** A
+      # `[sources]` entry exists precisely because 1.10 cannot resolve that name, so leaving one
+      # behind reproduces the failure this step exists to prevent — `FastGeoProjections` is listed
+      # only so its pin has somewhere to attach, and forgetting it fails the LTS jobs at
+      # `expected package ImagePairGeometry [7d3defa8] to be registered`. The list is read from
+      # `[sources]` rather than written out again so the two cannot drift.
+      #
+      # Removing this step and the `[extras]` entries is the first thing to do once both packages are
+      # registered at the versions `[compat]` asks for.
+      - name: Drop the unregistered test dependencies on Julia LTS
         if: matrix.version == 'lts'
         run: |
           julia -e '
-            function strip_entry(path)
+            function strip_sources(path)
+                lines = readlines(path)
+                # The names `[sources]` pins: exactly those Julia 1.10 cannot resolve.
+                pinned = String[]
+                section = ""
+                for line in lines
+                    startswith(line, "[") && (section = strip(line))
+                    section == "[sources]" && occursin("=", line) && !startswith(line, "[") &&
+                        push!(pinned, strip(first(split(line, "="))))
+                end
+                isempty(pinned) && error("no [sources] entries found; this step is now misplaced")
+                println("dropping from the LTS test target: ", join(pinned, ", "))
                 out = String[]
                 section = ""
-                for line in eachline(path)
+                for line in lines
                     startswith(line, "[") && (section = strip(line))
-                    section == "[extras]" && startswith(line, "ImagePairGeometry ") && continue
-                    section == "[targets]" && (line = replace(line, ", \"ImagePairGeometry\"]" => "]"))
+                    # A dropped entry takes the comment block above it, which documents a name that
+                    # is no longer there, and its `[compat]` bound with it: Julia 1.10 rejects a
+                    # bound whose name is in none of `deps`, `weakdeps` or `extras` with
+                    # `Compat <name> not listed`, so leaving the bound behind trades one resolve
+                    # failure for another.
+                    if (section == "[extras]" || section == "[compat]") &&
+                            any(p -> startswith(line, p * " "), pinned)
+                        while !isempty(out) && startswith(lstrip(last(out)), "#")
+                            pop!(out)
+                        end
+                        continue
+                    end
+                    # Quoted-name removal, not `, \"name\"]`: a pinned name anywhere but last in the
+                    # list would otherwise survive, which makes the result depend on the order
+                    # `[targets]` happens to be written in.
+                    if section == "[targets]"
+                        for p in pinned
+                            line = replace(line, ", \"$p\"" => "", "\"$p\", " => "")
+                        end
+                    end
                     push!(out, line)
                 end
                 write(path, join(out, "\n") * "\n")
             end
-            strip_entry("Project.toml")'
+            strip_sources("Project.toml")'
       - uses: julia-actions/julia-buildpkg@v1
       # Coverage on one job, not all seven, and it is the dominant cost of this workflow:
       # `test/tile.jl` takes 47.5 s uninstrumented and 469.9 s instrumented on 1.12, a 9.9x
