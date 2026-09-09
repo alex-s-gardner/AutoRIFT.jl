@@ -1168,3 +1168,300 @@ path at 84.8% exact with a 35.8 px maximum against 100% on the float path.
 The three remaining phase-3-and-beyond groups are unchanged in status: eight Sentinel-1 pairs and two NISAR
 pairs need the radar geogrid path, and no golden pair has been compared as a *product* because the
 post-correlation chain does not exist in Julia. Those are the next two gates, in that order.
+
+---
+
+# Radar phase — one Sentinel-1 SLC pair, gate by gate
+
+Scope is deliberately **one** S1-SLC pair as a probe, then a reassessment. Radar container time is the
+reason: this pair's capture took **2h15m** against ~8 min for an optical one, so the decision about the
+remaining eight pairs is made against a measured cost rather than an estimate.
+
+The pair is `S1A_IW_SLC__1SSH_20151120T080202_..._X_..._20151214T080202_..._G0120V02_P002` — the
+smallest SLC in the set at 1536x1024 output with 70,214 valid velocity points.
+
+## Step 1 — the capture, green
+
+```bash
+julia --project=tools/golden tools/golden/intermediate.jl S1A_IW_SLC__1SSH_20151120T080202 --run 200
+```
+
+The reference's own ISCE3 produced `reference.tif`/`secondary.tif` and the capture intercepted
+`runAutorift` at the same boundary the twelve optical pairs use, with **no harness change** —
+`capture.py` passes its command line to `hyp3_autorift.process.main()`, which reaches
+`process_sentinel1_slc_isce3`.
+
+| | |
+|---|---|
+| grid | 3520 x 3280 |
+| image | 23857 x 65978 `UInt8` |
+| wall clock | ~2h15m |
+| on-disk | 26 GB |
+
+### What `optflag` does, and why the correlator needs no radar mode
+
+`optflag`/`optical_flag` appears five times in `testautoRIFT.py` and **every one is before the capture
+boundary**: `loadProduct` per-scene (`:304`), the `ChipSizeMaxX` override it skips (`:376`),
+`obj.Dy0 = -1 * obj.Dy0` (`:402`), and the `OverSampleRatio` table (`:477`). `grep optflag` on
+`autoRIFT.py` returns nothing. So the radar path differs only in *what arrays and scalars the
+correlator is handed*, which is exactly what the capture records.
+
+## Step 2 — every captured scalar, against what the code trace predicted
+
+Recorded **before** running the ladder, so a later surprise is measured against a written expectation.
+
+| scalar | optical | this pair | predicted? |
+|---|---|---|---|
+| `WallisFilterWidth` | 5 | **21** | yes — `vend/testautoRIFT.py:714` sets 21 for `nc_sensor == 'S1'` |
+| `OverSampleRatio` | 16/32/64/64 | **32/64/128/128** | yes — `:477`, the `optflag == 0` branch |
+| `DataType` | 0 | **0** | yes — the byte path, as production optical |
+| `ChipSize0X` | 16 | **64** | **no** |
+| `ScaleChipSizeY` | 1.0 | **0.25** | **no** |
+| `GridSpacingX` | 8 | 32 | — |
+| `SkipSampleX/Y` | 32 | 32 | — |
+| `minSearch` | 6 | 6 | — |
+| `FracValid` / `FracSearch` | 0.32 / 0.2 | 0.32 / 0.2 | — |
+| `CoarseCorCutoff` | 0.01 | 0.01 | — |
+
+Two facts no reading of the driver would have given, and both matter:
+
+- **`ChipSize0X = 64`**, a 4x larger base chip than any optical case. The pyramid therefore runs
+  64/128/256/512 rather than 16/32/64/128, which is why the `OverSampleRatio` keys differ.
+- **`ScaleChipSizeY = 0.25`**, so every chip is **64 x 16** — strongly anisotropic, from SAR
+  range/azimuth geometry. Every optical pair in the set is 1.0. This exercises the chip-size
+  asymmetry already registered as matched-not-endorsed in `README.md`, on a case where the asymmetry
+  is 4:1 rather than absent.
+
+### The reference's own level records, which bound what the ladder can assert
+
+| seq | kind | chip | oversample | grid | measured / kept |
+|---|---|---|---|---|---|
+| 1 | coarse | 64 x 16 | 32 | 440 x 410 | 40,105 |
+| 2 | filtDisp | — | 32 | 440 x 410 | kept 132 of 40,105 |
+| 3 | coarse | 128 x 32 | 64 | 220 x 205 | 8,620 |
+| 4 | filtDisp | — | 64 | 220 x 205 | kept 206 of 8,620 |
+| 5 | **fine** | 128 x 32 | 64 | 1760 x 1640 | 128,825 |
+| 6 | filtDisp | — | 64 | 1760 x 1640 | kept 15,703 of 128,825 |
+| 7 | coarse | 256 x 64 | 128 | 110 x 102 | 1,790 |
+| 8 | filtDisp | — | 128 | 110 x 102 | **kept 0** |
+| 9 | coarse | 512 x 128 | 128 | 55 x 51 | 397 |
+| 10 | filtDisp | — | 128 | 55 x 51 | **kept 0** |
+
+Two structural differences from every optical case, stated as expectations for step 3:
+
+- **Only one fine pass runs, at chip 128 x 32.** The base level (64 x 16) has a coarse pass and a
+  `filtDisp` but *no* fine pass, and the two coarsest levels are rejected outright. So the merged
+  answer comes from one level, and `exact` at the base chip size is not a meaningful gate here —
+  bias and correlation are, as for the two optical pairs whose base level is skipped.
+- **`filtDisp` keeps almost nothing at the coarse levels** — 132 of 40,105, then 0 twice. A rung
+  asserting a nonempty coarse mask will fail for reasons that are the reference's behaviour, not a
+  disagreement.
+
+**`STAGES: 0`** — this capture was taken without `CAPTURE_STAGES=1`, so the loop-local trace is
+absent and the stage-by-stage rungs cannot run against it. Re-capturing costs another 2h15m; step 3
+records what the ladder can and cannot check without it.
+
+## Step 3 — what the ladder opened, and the two fixes it forced
+
+The ladder itself **cannot run on this capture**: it needs `CAPTURE_STAGES=1`, and taking that trace is
+another 2h15m. It fails fast and says so, which is the right behaviour — the message names the
+environment variable and the 0-based level index. So step 3's findings came from the endpoint instead,
+and both are real.
+
+### The harness: an anisotropic chip could not even be configured
+
+`kwargs_from_capture` scaled `chip_size` by `ScaleChipSizeY` but set `chip_size_max` isotropically from
+`in_ChipSizeMaxX`. That is the X-axis maximum — the array's name says so — so Y's bound was 4x too
+large and the two axes reached their maxima after different numbers of doublings. `_check_levels`
+rejects that outright:
+
+```
+`chip_size_max` must be the same multiple of `chip_size` in both axes ...
+Got 8 in X and 32 in Y
+```
+
+Invisible on all twelve optical pairs, where `ScaleChipSizeY = 1.0` and the two forms coincide.
+
+### The package: `_oversample` consulted the wrong axis
+
+`_oversample` returned `clamp(min(ox, oy), 1, 2)`. The reference's ratio is
+`int(self.ChipSize0X / self.GridSpacingX)` (`autoRIFT.py:481`) — **X alone, with no Y term anywhere**.
+On a square chip the two agree, which is why twelve optical pairs never caught it. On this pair, 64x16
+on a grid spaced 32 gives 2 in X and **0** in Y, so the minimum collapsed the ratio to 1 and the
+outlier filter judged over a 5-wide window at `FracValid = 0.32` where the reference used 9 at a
+threshold raised by its overlap term.
+
+What the fix bought, same capture, same command:
+
+| | before | after |
+|---|---:|---:|
+| only jl | 116,948 | **44,208** |
+| only ref | 11,245 | **9,897** |
+| corr dx | +0.9416 | **+0.9622** |
+| corr dy | +0.8430 | **+0.9086** |
+| julia measured | 176,211 | 104,819 |
+
+**Matched, not endorsed.** A window derived from X and applied to both axes of a 4:1 chip covers four
+times as much ground across track as along it, which is not obviously the right neighbourhood for
+judging consistency. Registered in `README.md`; agreement is the objective here.
+
+`test/outliers.jl`'s `rescale matches the reference's grid scaling` asserted the old rule and was
+updated to the reference's, with the Sentinel-1 geometry asserted directly.
+
+## Step 4 — the endpoint, green on bias and correlation
+
+```bash
+julia --project=tools/golden -t 6 tools/golden/correlator.jl S1A_IW_SLC__1SSH_20151120T080202 --run 200
+```
+
+| axis | sign | both | only jl | only ref | median | p99 | corr | bias |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| dx | + | 60,611 | 44,208 | 9,897 | 0.331 | 6.355 | **+0.9622** | **+0.0271** |
+| dy | **−** | 60,611 | 44,208 | 9,897 | 0.133 | 1.240 | **+0.9086** | **−0.0030** |
+
+### The +0.027 px is 187 outliers, not a systematic offset
+
+`bias` was a mean over every both-measured point, and that is not robust to a heavy tail. Decomposed:
+
+| dx statistic | value | n |
+|---|---:|---:|
+| mean over all points | +0.0271 | 60,611 |
+| median | +0.0057 | 60,611 |
+| **mean, agreeing within 1 px** | **−0.0008** | 47,486 (78.3%) |
+| mean, within 2 px | +0.0020 | 54,140 |
+| points beyond 10 px | — | **187** |
+| points beyond 20 px | — | 22 |
+| max | 45.93 | — |
+
+On the 78% of points that agree to within a pixel the offset is **−0.0008 px**, three hundred times
+smaller than the headline and of the opposite sign. `dy` has no tail at all — zero points beyond 10 px —
+and its mean, median and core figures agree at −0.003.
+
+What the 187 are, measured rather than assumed:
+
+- **Two-sided**: 99 positive, 88 negative. A systematic offset is one-sided; this cancels.
+- **Not railed**: 0 of 187 sit at their search-radius boundary on either side, so neither implementation
+  ran out of window.
+- **All at chip 128**, the single level that produces this pair's answer.
+- **Not low-correlation junk**: median correlation 0.146 at the tail against 0.148 over the whole pair.
+- **Spatially clustered**: rows 1217–2161 of 3520, columns 418–940 of 3280.
+
+The pair correlates at a **median of 0.148** — SAR speckle decorrelation over a 24-day repeat. At that
+correlation the peak surface is nearly flat, so which local maximum wins is decided in the last bits.
+That is the noise floor a `--dtype-pair` run would have bounded, and it is why `exact` is 0 here.
+
+**So the reported number was the wrong statistic, and the reporting was fixed rather than excused.**
+`correlator.jl` now prints `bias` (mean over everything, so a growing tail is visible), `bias core`
+(within 1 px, where a systematic error lives), and the tail count that explains any gap. `3.rdr` gates
+on the **core** bias at **0.005 px** — an order of magnitude tighter than the optical 0.035 — and bounds
+the tail at 400 points separately. Measured: **0.0008 and 0.0025 px**, tail 187.
+
+- **The `dy` sign resolves to `−`, measured not asserted.** This is the one radar-specific expectation
+  the plan named: `optflag == 0` pre-flips `Dy0` at `testautoRIFT.py:402`. The selector discriminates
+  on correlation, and `dy` correlates +0.909 at `−` — so the flip is confirmed by measurement on a
+  60,611-point population, not inferred from the source.
+- **`exact` is 0 by construction and is not the gate.** The base level (64x16) runs a coarse pass and
+  a `filtDisp` but *no* fine pass, so every reported point comes from the 128x32 level and was
+  bicubic-resized rather than quantized. This is the documented `†` case that two optical pairs also
+  hit.
+- **Julia answers 1.49x the reference's points, and that is the reference rejecting.** Its own
+  `filtDisp` records keep 132 of 40,105 at the coarse pass, 15,703 of 128,825 at the fine one, and 0
+  at both coarser levels. Julia recovers **86.0%** of what the reference kept; the excess is points
+  the reference's filter discarded, not points the correlator disagreed about.
+
+### Not done: the byte-vs-float floor, and why it is memory rather than time
+
+`--dtype-pair` needs a second capture at `CAPTURE_FLOAT32=1`. It was attempted and **OOM-killed at
+`AutoRIFT Start`** after 46 minutes:
+
+```
+/home/ubuntu/.profile: line 54: 614 Killed "${PIXI_EXE-}" "$@"
+```
+
+The constraint is arithmetic, not a flaky run. This scene is 23857 x 65978 = **1.57 billion pixels**:
+
+| path | pair resident |
+|---|---:|
+| `UInt8` | 2.9 GB |
+| `Float32` | **11.7 GB** |
+
+Docker is capped at 32 GB on this machine (the host has 96 GB), and the reference correlator holds both
+images plus its pyramid intermediates. An optical scene is ~15x smaller, which is why `--dtype-pair`
+works there and the recorded LC08 floor at runs 201/301 exists. A Sentinel-1 SLC does not fit.
+
+**Deliberately left unmeasured** rather than worked around: a spatial subset would have different
+statistics, and the tail is spatially clustered (rows 1217-2161, columns 418-940), so a crop either
+contains that region or misses the thing being measured. What stands in for it is `tools/ab` stage 1 —
+the correlator is bit-identical to `arImgDisp_s` on identical `Float32` input — so the tail is unlikely
+to be the correlator itself. That is inference, and it is recorded as inference.
+
+To close it: raise Docker's memory ceiling above ~48 GB, then one capture and one `--dtype-pair` run.
+The floor matters more on radar than optical
+**Disk is the binding constraint**: 35 GB free with the twelve optical runs holding 63 GB, and this
+pair's run reduced from 59 GB to 11 GB by deleting `product/` and `product_sec/` — the per-burst ISCE3
+intermediates, which are regenerable and read by no gate. The floor matters more on radar than optical
+because SAR amplitude has a long right tail, so `uniform_data_type`'s `mean ± 3σ` window clips a
+different fraction than it does on optical reflectance.
+
+## Step 5 — no slide, and the reassessment this scope existed for
+
+```bash
+julia --project=tools/golden tools/golden/regate.jl --all
+julia --project=. -e 'import Pkg; Pkg.test()'
+```
+
+| gate | measured |
+|---|---|
+| 2.x colfilt, bwareaopen, window reductions | **green** |
+| 0.1 the correlator alone | **green** — exact 100.0% |
+| 0.2 the whole pipeline, 3072² | **green** — exact 81.8%, within step 98.7% |
+| 0.3 the ITS_LIVE granule | **green** |
+| 3.opt the stage ladder on every optical case | **green — 12/12** |
+| **3.rdr the endpoint on the Sentinel-1 SLC pair** | **green** — bias 0.0271/0.0030, corr +0.962/+0.909, `dy` sign −, both 60,611 |
+| 3.x the stage ladder, base case | **green** — 23 rungs |
+
+**7 ran, 7 green, 0 red.** `Pkg.test()` passes. The `_oversample` change touched shipping code and the
+optical gates did not move — 12/12 before and after.
+
+`3.rdr` is its own gate rather than a thirteenth case in `3.opt`: that gate's value is that all twelve of
+its cases are optical, so a red one names the class that broke.
+
+### What one radar pair cost, and what it bought
+
+| | |
+|---|---|
+| capture wall clock | **2h15m** (plan estimated 30–60 min) |
+| peak on-disk | 59 GB, reducible to 11 GB |
+| package bugs found | 1 — `_oversample` consulted the wrong axis |
+| harness bugs found | 1 — `chip_size_max` not scaled by `ScaleChipSizeY` |
+| plan items not executed | 1 — the byte-vs-float floor, on disk |
+
+### The three questions this scope was chosen to answer
+
+**1. What does a pair cost?** 2h15m and ~60 GB peak, against ~8 min for an optical pair. The ISCE3
+coregistration is the long pole, not the correlator. 44 GB of that is `product/` and `product_sec/` —
+per-burst intermediates that no gate reads and that can be deleted immediately after the capture.
+
+**2. Did any rung need radar-specific work?** No rung, but two configuration paths did, and both were
+invisible across all twelve optical pairs because they only appear when the chip is anisotropic. Neither
+is in the correlator: `optflag` never reaches the `autoRIFT` object, and that prediction held — the
+correlator has no radar mode, and the byte path, the pyramid and the `filtDisp` chain all behaved as the
+optical cases led us to expect once the chip geometry was configured correctly.
+
+**3. Is S1-BURST the same problem?** Unknown, and it takes a different driver — `process_burst` rather
+than `process_slc`, with multi-burst mosaicking before the correlator. What this pair establishes is
+that the *boundary* is identical: `capture.py` needed no change to intercept a radar run, and the same
+`kwargs_from_capture`/`pointset_from_capture` path drives AutoRIFT.jl once `ScaleChipSizeY` is honoured
+in both chip bounds.
+
+### What the remaining eight would need
+
+Disk, before time. The twelve optical runs hold 63 GB and this pair's reduced run 11 GB, leaving 35 GB
+free — enough for one radar capture at a time if `product/` is deleted as soon as the capture is
+verified. Eight pairs at 2h15m is ~18 hours of container time, and three of them are S1-BURST with up to
+24 bursts each, so the burst driver's cost is not yet measured.
+
+The one plan item left undone is the **byte-vs-float floor** (`--dtype-pair`), which needs a second
+capture of this same pair at `CAPTURE_FLOAT32=1`. It matters more on radar than optical: SAR amplitude
+has a long right tail, so `uniform_data_type`'s `mean ± 3σ` window clips a different fraction than it
+does on optical reflectance, and the floor is what makes the 9,897 reference-only points attributable.

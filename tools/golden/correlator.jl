@@ -216,8 +216,14 @@ function kwargs_from_capture(k::Capture)
     spacing = Int(k.scalars["GridSpacingX"])
     maxchip = Int(maximum(k.arrays["in_ChipSizeMaxX"]))
 
+    # **Both chip bounds carry `ScaleChipSizeY`, not just the minimum.** `in_ChipSizeMaxX` is the X
+    # axis alone — the array's name says so — and the pyramid doubles both axes together, so Y's
+    # maximum is Y's minimum times the same number of doublings. Scaling only `chip_size` leaves the
+    # two axes reaching their maxima after different doublings, which `_check_levels` rejects: on a
+    # Sentinel-1 pair at `ScaleChipSizeY = 0.25` that is `8` in X against `32` in Y. Invisible on
+    # every optical case, where the scale is 1.0 and the two forms coincide.
     return (; chip_size = (X = chip0, Y = round(Int, chip0 * scale_y)),
-            chip_size_max = (X = maxchip, Y = maxchip),
+            chip_size_max = (X = maxchip, Y = round(Int, maxchip * scale_y)),
             grid_spacing = (X = spacing, Y = spacing),
             subpixel = subpixel_from_capture(k),
             preprocess = :none)
@@ -317,12 +323,28 @@ function _axis_stats(name, jul, ref, sign::Int)
         end
     end
     ad = abs.(d)
+    # **Two biases, because one mean cannot answer the question.** A mean over every both-measured
+    # point is not robust to a heavy tail, and these comparisons have one: on the Sentinel-1 SLC pair
+    # 187 of 60,611 points disagree by up to 45.9 px and drag `bias` to +0.027 px while the 78% that
+    # agree within a pixel sit at −0.0008. Those 187 are two-sided (99 positive, 88 negative), so they
+    # are the peak picked on the other side of a nearly flat surface — this pair correlates at a median
+    # of 0.148, SAR speckle over a 24-day repeat — and not a systematic offset that a mean should be
+    # reporting as one.
+    #
+    # `bias` stays the mean over everything, because a tail that grew would otherwise go unnoticed.
+    # `bias_core` is the same mean over points agreeing within one pixel: that is the population a
+    # *systematic* error lives in, and it is the number to read when asking whether the correlator is
+    # offset. Reporting only one of the two invites the wrong conclusion in whichever direction that
+    # comparison happens to be tailed.
+    core = d[ad .<= 1.0]
     return (; name, sign, both, only_julia = only_j, only_reference = only_r, exact,
             exact_fraction = both == 0 ? 1.0 : exact / both,
             max_abs = isempty(ad) ? 0.0 : maximum(ad),
             p99 = isempty(ad) ? 0.0 : quantile(ad, 0.99),
             median = isempty(ad) ? 0.0 : median(ad),
             bias = isempty(d) ? 0.0 : mean(d),
+            bias_core = isempty(core) ? 0.0 : mean(core),
+            n_core = length(core), n_tail = count(>(10.0), ad),
             correlation = length(va) < 2 ? NaN : cor(va, vb))
 end
 
@@ -346,7 +368,14 @@ function report(r)
     end
     @printf("\nmeasured by julia %d, by reference %d\n",
             r.dx.both + r.dx.only_julia, r.dx.both + r.dx.only_reference)
-    @printf("\nbias: dx %+.6g, dy %+.6g\n", r.dx.bias, r.dy.bias)
+    # Both biases, and the tail count that explains any gap between them. See `_axis_stats`: the mean
+    # over everything is not robust to a heavy tail, so a reader given only that number reads a
+    # cancelling tail as a systematic offset.
+    @printf("\nbias:      dx %+.6g, dy %+.6g   (mean over all both-measured points)\n",
+            r.dx.bias, r.dy.bias)
+    @printf("bias core: dx %+.6g, dy %+.6g   (within 1 px: %d and %d points)\n",
+            r.dx.bias_core, r.dy.bias_core, r.dx.n_core, r.dy.n_core)
+    @printf("tail >10px: dx %d, dy %d of %d\n", r.dx.n_tail, r.dy.n_tail, r.dx.both)
     return nothing
 end
 

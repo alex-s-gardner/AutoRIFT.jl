@@ -48,12 +48,15 @@ let g = addgroup!(SUITE, "multichip")
             # A `WholeScene` runner, because that is how a whole-scene pass is executed — the same
             # `_coarse_mask` serves a blocked run through a `Blocked` runner instead.
             #
-            # `measure` is positional and has no default — the level's measure is passed explicitly,
-            # since `p.similarity` is a tuple and a single level cannot read it without knowing which
-            # level it is. Kept in step with `chipsize_level`'s call rather than relying on a default.
+            # `measure` and `subpixel` are positional and have no defaults — the level's own are passed
+            # explicitly, since `p.similarity` and `p.subpixel` are tuples and a single level cannot
+            # read either without knowing which level it is. Kept in step with `chipsize_level`'s call
+            # (`src/multichip.jl`) rather than relying on a default: without a default, a signature that
+            # gains a parameter fails this suite with a `MethodError` instead of silently benchmarking a
+            # different configuration.
             runner = AutoRIFT.WholeScene(prepared)
             g["coarse pass c32 $(n)x$(n)"] = @benchmarkable AutoRIFT._coarse_mask(
-                $runner, $pts, $p, $cs, AutoRIFT.measure_at($p, 1))
+                $runner, $pts, $p, $cs, AutoRIFT.measure_at($p, 1), AutoRIFT.subpixel_at($p, 1))
         end
     end
 

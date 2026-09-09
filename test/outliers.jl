@@ -329,7 +329,16 @@ end
     @test AutoRIFT._oversample(params(; chip_size = 64, grid_spacing = 8)) == 2
     # A spacing coarser than the chip has no overlap to correct for.
     @test AutoRIFT._oversample(params(; chip_size = 16, grid_spacing = 32)) == 1
-    # Non-square: the smaller ratio wins, so neither axis is over-widened.
+    # Non-square: the X ratio alone decides, because the reference's is
+    # `int(ChipSize0X / GridSpacingX)` with no Y term (`autoRIFT.py:481`). Y is not consulted even
+    # when it would give a smaller answer, which is what a Sentinel-1 chip does — 64x16 on a grid
+    # spaced 32 is 2 in X and 0 in Y, and honouring Y there collapses the ratio to 1 and leaves the
+    # outlier filter judging over a 5-wide window where the reference uses 9.
     @test AutoRIFT._oversample(params(; chip_size = (X = 32, Y = 32),
-                                      grid_spacing = (X = 8, Y = 32))) == 1
+                                      grid_spacing = (X = 8, Y = 32))) == 2
+    @test AutoRIFT._oversample(params(; chip_size = (X = 64, Y = 16),
+                                      grid_spacing = (X = 32, Y = 32))) == 2
+    # And X alone still governs when it is X that is coarse relative to the grid.
+    @test AutoRIFT._oversample(params(; chip_size = (X = 32, Y = 128),
+                                      grid_spacing = (X = 32, Y = 32))) == 1
 end
