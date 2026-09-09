@@ -1480,26 +1480,32 @@ ISCE3 per-burst intermediates, then the endpoint. Sequential, because a capture 
 | 1 | `S1A_..._20150828T162412` | SLC | 1,327,618 | 29.03% | 77,340 | 69,830 | −0.0009 / +0.0020 | +0.820 / +0.825 | **0** |
 | 2 | `S1A_..._20151120T080202` | SLC | 60,611 | 0.00% † | 44,208 | 9,897 | −0.0008 / −0.0025 | +0.962 / +0.909 | 187 |
 | 3 | `S1A_..._20170221T204710` | SLC | 1,534,262 | 74.24% | 42,109 | 182,877 | +0.0040 / −0.0016 | +0.992 / +0.942 | 39 |
-| 4 | `S1B_..._20180809T204617` | SLC | 454,314 | — | — | — | −0.0042 / +0.0065 | — | **0** |
-| 5 | `S1C_..._20250416T010214` | SLC | 476,406 | — | — | — | +0.0032 / +0.0003 | — | **0** |
-| 6 | `S1C_..._20250416T010159` | BURST 7 | 33,213 | — | — | — | −0.0007 / −0.0011 | — | **0** |
-| 7 | `S1A_..._20240618T025533` | BURST 10 | 440,024 | — | — | — | +0.0011 / −0.0004 | — | 9 |
+| 4 | `S1B_..._20180809T204617` | SLC | 454,314 | 73.53% | 132,083 | 71,160 | −0.0042 / +0.0065 | +0.955 / +0.880 | **0** |
+| 5 | `S1C_..._20250416T010214` | SLC | 476,406 | 47.29% | 54,461 | 54,427 | +0.0032 / +0.0003 | +0.981 / +0.846 | **0** |
+| 6 | `S1C_..._20250416T010159` | BURST 7 | 33,213 | 38.45% | 13,813 | 8,722 | −0.0007 / −0.0011 | +0.932 / +0.835 | **0** |
+| 7 | `S1A_..._20240618T025533` | BURST 10 | 440,025 | **75.81%** | 33,828 | 143,030 | +0.0011 / −0.0004 | +0.993 / +0.982 | 9 |
 | 8 | `S1A_..._20240618T025528` | BURST 24 | 1,231,710 | 65.81% | 67,461 | 358,526 | −0.0022 / −0.0013 | +0.988 / +0.951 | 7 |
 
 † Base level runs a coarse pass and a `filtDisp` but **no fine pass**, so every reported point is
 bicubic-resized rather than quantized and `exact` is 0 by construction.
 
-**Core bias spans 0.0002 to 0.0065 px across all sixteen axes.** Six of eight report a zero tail beyond
-10 px; the two largest tails are 187 (case 2) and 39 (case 3), against populations of 60,611 and
-1,534,262.
+**Core bias spans 0.0002 to 0.0065 px across all sixteen axes.** Four of eight report a zero tail beyond
+10 px; the two largest are 187 (case 2) and 39 (case 3), against populations of 60,611 and 1,534,262.
+
+**`exact` spans 29% to 76% on the seven that quantize**, tracking the scene rather than the code — the
+same pattern the optical set shows at 27–93%. Case 2 is 0 by construction and is the only one.
+
+One reporting note worth keeping: the two 2024-06-18 burst cases share a filename prefix, so an
+endpoint log written per-case-prefix silently overwrites one with the other. Both were re-run to
+distinct logs to fill this table; a per-case log path should carry the full product name.
 
 ## What the eight added over the probe
 
 **The probe was the weakest case in the set, not a typical one.** Its `exact` of 0% and its 187-point
 tail both come from the same fact — its base level runs no fine pass, so its answer comes from one
-level at a median correlation of 0.148. The others run all four levels and reach `exact` of 29%, 66% and
-74%, with correlations of 0.95–0.99 and tails of 0, 7 and 39. Reading the phase off the probe alone
-would have understated agreement substantially.
+level at a median correlation of 0.148. The other seven run all four levels and reach `exact` of **29% to 76%**, with
+correlations of 0.82–0.99. Reading the phase off the probe alone would have understated agreement
+substantially: it is the only case at 0%, and the only one whose base level is skipped.
 
 **`process_burst` needs no harness change either.** Three burst pairs — 7, 10 and 24 bursts mosaicked
 before the correlator — reach the same `runAutorift` boundary through a different driver, and
