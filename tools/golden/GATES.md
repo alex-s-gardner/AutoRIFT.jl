@@ -1319,8 +1319,42 @@ julia --project=tools/golden -t 6 tools/golden/correlator.jl S1A_IW_SLC__1SSH_20
 | dx | + | 60,611 | 44,208 | 9,897 | 0.331 | 6.355 | **+0.9622** | **+0.0271** |
 | dy | **−** | 60,611 | 44,208 | 9,897 | 0.133 | 1.240 | **+0.9086** | **−0.0030** |
 
-Threshold stated in advance was `|bias|` under 0.035 px, the optical figure. **Both axes meet it** —
-0.027 and 0.003 — at correlation 0.91–0.96.
+### The +0.027 px is 187 outliers, not a systematic offset
+
+`bias` was a mean over every both-measured point, and that is not robust to a heavy tail. Decomposed:
+
+| dx statistic | value | n |
+|---|---:|---:|
+| mean over all points | +0.0271 | 60,611 |
+| median | +0.0057 | 60,611 |
+| **mean, agreeing within 1 px** | **−0.0008** | 47,486 (78.3%) |
+| mean, within 2 px | +0.0020 | 54,140 |
+| points beyond 10 px | — | **187** |
+| points beyond 20 px | — | 22 |
+| max | 45.93 | — |
+
+On the 78% of points that agree to within a pixel the offset is **−0.0008 px**, three hundred times
+smaller than the headline and of the opposite sign. `dy` has no tail at all — zero points beyond 10 px —
+and its mean, median and core figures agree at −0.003.
+
+What the 187 are, measured rather than assumed:
+
+- **Two-sided**: 99 positive, 88 negative. A systematic offset is one-sided; this cancels.
+- **Not railed**: 0 of 187 sit at their search-radius boundary on either side, so neither implementation
+  ran out of window.
+- **All at chip 128**, the single level that produces this pair's answer.
+- **Not low-correlation junk**: median correlation 0.146 at the tail against 0.148 over the whole pair.
+- **Spatially clustered**: rows 1217–2161 of 3520, columns 418–940 of 3280.
+
+The pair correlates at a **median of 0.148** — SAR speckle decorrelation over a 24-day repeat. At that
+correlation the peak surface is nearly flat, so which local maximum wins is decided in the last bits.
+That is the noise floor a `--dtype-pair` run would have bounded, and it is why `exact` is 0 here.
+
+**So the reported number was the wrong statistic, and the reporting was fixed rather than excused.**
+`correlator.jl` now prints `bias` (mean over everything, so a growing tail is visible), `bias core`
+(within 1 px, where a systematic error lives), and the tail count that explains any gap. `3.rdr` gates
+on the **core** bias at **0.005 px** — an order of magnitude tighter than the optical 0.035 — and bounds
+the tail at 400 points separately. Measured: **0.0008 and 0.0025 px**, tail 187.
 
 - **The `dy` sign resolves to `−`, measured not asserted.** This is the one radar-specific expectation
   the plan named: `optflag == 0` pre-flips `Dy0` at `testautoRIFT.py:402`. The selector discriminates

@@ -185,9 +185,18 @@ const GATES = Gate[
             occursin("no call1.json", t) && return (:skipped, "no capture on disk")
             rows = collect(eachmatch(r"^(dx|dy)\s+([+-])\s+(\d+)\s+\d+\s+\d+\s+[\d.]+%\s+\d+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+([+-][\d.]+)"m, t))
             length(rows) == 2 || return (:red, "could not read both axes: " * last_line(t))
-            bm = match(r"bias: dx ([+-]?[\d.e-]+), dy ([+-]?[\d.e-]+)", t)
-            bm === nothing && return (:red, "no bias line: " * last_line(t))
+            # **The core bias, not the mean over everything.** This pair correlates at a median of
+            # 0.148 — SAR speckle over a 24-day repeat — so 187 of 60,611 points land on the other side
+            # of a nearly flat peak surface, two-sided, by up to 45.9 px. They drag the plain mean to
+            # +0.027 px while the 78% agreeing within a pixel sit at −0.0008. Gating on the plain mean
+            # would set a threshold around the tail's cancellation, which is noise; gating on the core
+            # catches the systematic offset the threshold is for. The tail is bounded separately below.
+            bm = match(r"bias core: dx ([+-]?[\d.e-]+), dy ([+-]?[\d.e-]+)", t)
+            bm === nothing && return (:red, "no bias core line: " * last_line(t))
             bx, by = abs(parse(Float64, bm.captures[1])), abs(parse(Float64, bm.captures[2]))
+            tm = match(r"tail >10px: dx (\d+), dy (\d+) of (\d+)", t)
+            tm === nothing && return (:red, "no tail line: " * last_line(t))
+            tailx = parse(Int, tm.captures[1])
             corr = Dict(r.captures[1] => parse(Float64, r.captures[4]) for r in rows)
             sign = Dict(r.captures[1] => r.captures[2] for r in rows)
             both = parse(Int, first(rows).captures[3])
@@ -195,15 +204,21 @@ const GATES = Gate[
             # regression does. Bias 0.035 px is the optical figure; correlation and coverage are this
             # pair's own, recorded in GATES.md.
             fails = String[]
-            bx <= 0.035 || push!(fails, "dx bias $bx > 0.035")
-            by <= 0.035 || push!(fails, "dy bias $by > 0.035")
+            # A systematic offset over the agreeing population is held an order of magnitude tighter
+            # than the optical 0.035 px, because that is what the measurement supports: 0.0008 and
+            # 0.0025 px here.
+            bx <= 0.005 || push!(fails, "dx core bias $bx > 0.005")
+            by <= 0.005 || push!(fails, "dy core bias $by > 0.005")
             corr["dx"] >= 0.93 || push!(fails, "dx corr $(corr["dx"]) < 0.93")
             corr["dy"] >= 0.87 || push!(fails, "dy corr $(corr["dy"]) < 0.87")
             sign["dy"] == "-" || push!(fails, "dy sign $(sign["dy"]), expected -")
             both >= 55_000 || push!(fails, "both $both < 55000")
+            # The tail is bounded rather than ignored: it cancels today, and a tail that grew would
+            # otherwise hide behind a core bias that stayed small.
+            tailx <= 400 || push!(fails, "dx tail $tailx > 400 points beyond 10 px")
             isempty(fails) ||  return (:red, join(fails, "; "))
-            return (:green, @sprintf("bias %.4f/%.4f, corr %+.3f/%+.3f, dy sign %s, both %d",
-                                     bx, by, corr["dx"], corr["dy"], sign["dy"], both))
+            return (:green, @sprintf("core bias %.4f/%.4f, corr %+.3f/%+.3f, dy sign %s, both %d, tail %d",
+                                     bx, by, corr["dx"], corr["dy"], sign["dy"], both, tailx))
         end
     end),
 
