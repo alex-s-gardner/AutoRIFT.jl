@@ -23,7 +23,11 @@ using CairoMakie, Statistics, Printf
 
 name = length(ARGS) >= 1 ? ARGS[1] : "S2B_MSIL1C_20200612"
 c = only(cases(name))
-r = compare_correlator(c)
+# `--run N` because a capture is not always at the default: the radar cases live at 200, and reading
+# the wrong run number fails on a missing directory rather than silently mapping another comparison.
+i = findfirst(==("--run"), ARGS)
+run = i === nothing ? 100 : parse(Int, ARGS[i + 1])
+r = compare_correlator(c; n = run)
 ny, nx = r.overlap
 jdx = r.result.dx[1:ny, 1:nx];  jdy = r.result.dy[1:ny, 1:nx]
 rdx = r.capture.arrays["out_Dx"][1:ny, 1:nx]
