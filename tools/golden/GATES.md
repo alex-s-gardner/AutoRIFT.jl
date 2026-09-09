@@ -1369,14 +1369,39 @@ the tail at 400 points separately. Measured: **0.0008 and 0.0025 px**, tail 187.
   at both coarser levels. Julia recovers **86.0%** of what the reference kept; the excess is points
   the reference's filter discarded, not points the correlator disagreed about.
 
-### Not done: the byte-vs-float floor
+### Not done: the byte-vs-float floor, and why it is memory rather than time
 
-`--dtype-pair` needs a second capture at `CAPTURE_FLOAT32=1`, which is another ~26 GB and 2h15m.
+`--dtype-pair` needs a second capture at `CAPTURE_FLOAT32=1`. It was attempted and **OOM-killed at
+`AutoRIFT Start`** after 46 minutes:
+
+```
+/home/ubuntu/.profile: line 54: 614 Killed "${PIXI_EXE-}" "$@"
+```
+
+The constraint is arithmetic, not a flaky run. This scene is 23857 x 65978 = **1.57 billion pixels**:
+
+| path | pair resident |
+|---|---:|
+| `UInt8` | 2.9 GB |
+| `Float32` | **11.7 GB** |
+
+Docker is capped at 32 GB on this machine (the host has 96 GB), and the reference correlator holds both
+images plus its pyramid intermediates. An optical scene is ~15x smaller, which is why `--dtype-pair`
+works there and the recorded LC08 floor at runs 201/301 exists. A Sentinel-1 SLC does not fit.
+
+**Deliberately left unmeasured** rather than worked around: a spatial subset would have different
+statistics, and the tail is spatially clustered (rows 1217-2161, columns 418-940), so a crop either
+contains that region or misses the thing being measured. What stands in for it is `tools/ab` stage 1 —
+the correlator is bit-identical to `arImgDisp_s` on identical `Float32` input — so the tail is unlikely
+to be the correlator itself. That is inference, and it is recorded as inference.
+
+To close it: raise Docker's memory ceiling above ~48 GB, then one capture and one `--dtype-pair` run.
+The floor matters more on radar than optical
 **Disk is the binding constraint**: 35 GB free with the twelve optical runs holding 63 GB, and this
 pair's run reduced from 59 GB to 11 GB by deleting `product/` and `product_sec/` — the per-burst ISCE3
 intermediates, which are regenerable and read by no gate. The floor matters more on radar than optical
-because SAR amplitude has a long right tail, so `uniform_data_type`'s `mean ± 3σ` clips differently.
-Recorded as the one plan item not executed.
+because SAR amplitude has a long right tail, so `uniform_data_type`'s `mean ± 3σ` window clips a
+different fraction than it does on optical reflectance.
 
 ## Step 5 — no slide, and the reassessment this scope existed for
 
