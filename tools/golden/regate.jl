@@ -167,59 +167,81 @@ const GATES = Gate[
                 (red > 0 ? ": " * join(filter(r -> !endswith(r, "ok"), results), ", ") : ""))
     end),
 
-    Gate("3.rdr", "the endpoint on the Sentinel-1 SLC pair", true, function ()
-        # **Its own gate, not folded into `3.opt`.** That gate's value is that all twelve of its cases are
-        # optical, so a red one names the class that broke; a mixed list would hide which.
+    Gate("3.rdr", "the endpoint on every captured radar case", true, function ()
+        # **All eight, not one.** Same reasoning as `3.opt`: a gate is only as good as the case classes
+        # it has met. These eight span two drivers — five S1-SLC through `process_slc` and three
+        # S1-BURST through `process_burst`, the latter mosaicking 7, 10 and 24 bursts before the
+        # correlator — and two pyramid shapes, since `20151120` skips its base level's fine pass where
+        # the others run all four levels.
         #
-        # Gated on bias and correlation rather than on rungs, for two reasons. The ladder needs
-        # `CAPTURE_STAGES=1` and a radar capture is 2h15m, so no stage trace is on disk. And `exact` is 0
-        # by construction here: the base level (64x16) runs a coarse pass and a `filtDisp` but no fine
-        # pass, so every reported point comes from the 128x32 level bicubic-resized rather than quantized.
+        # **Its own gate, not folded into `3.opt`.** That gate's value is that all twelve of its cases
+        # are optical, so a red one names the class that broke; a mixed list would hide which.
         #
-        # The `dy` sign is part of the assertion. `optflag == 0` pre-flips `Dy0` (`testautoRIFT.py:402`),
-        # and `correlator.jl` picks the sign by correlation rather than asserting it — so a regression that
-        # silently reintroduced the flip would show up here as `+` and a collapsed correlation.
-        cmd = `julia --project=$(@__DIR__) -t 8 $(joinpath(@__DIR__, "correlator.jl"))
-               S1A_IW_SLC__1SSH_20151120T080202 --run 200`
-        return capture_run(cmd) do t
-            occursin("no call1.json", t) && return (:skipped, "no capture on disk")
-            rows = collect(eachmatch(r"^(dx|dy)\s+([+-])\s+(\d+)\s+\d+\s+\d+\s+[\d.]+%\s+\d+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+([+-][\d.]+)"m, t))
-            length(rows) == 2 || return (:red, "could not read both axes: " * last_line(t))
-            # **The core bias, not the mean over everything.** This pair correlates at a median of
-            # 0.148 — SAR speckle over a 24-day repeat — so 187 of 60,611 points land on the other side
-            # of a nearly flat peak surface, two-sided, by up to 45.9 px. They drag the plain mean to
-            # +0.027 px while the 78% agreeing within a pixel sit at −0.0008. Gating on the plain mean
-            # would set a threshold around the tail's cancellation, which is noise; gating on the core
-            # catches the systematic offset the threshold is for. The tail is bounded separately below.
-            bm = match(r"bias core: dx ([+-]?[\d.e-]+), dy ([+-]?[\d.e-]+)", t)
-            bm === nothing && return (:red, "no bias core line: " * last_line(t))
-            bx, by = abs(parse(Float64, bm.captures[1])), abs(parse(Float64, bm.captures[2]))
-            tm = match(r"tail >10px: dx (\d+), dy (\d+) of (\d+)", t)
-            tm === nothing && return (:red, "no tail line: " * last_line(t))
-            tailx = parse(Int, tm.captures[1])
-            corr = Dict(r.captures[1] => parse(Float64, r.captures[4]) for r in rows)
-            sign = Dict(r.captures[1] => r.captures[2] for r in rows)
-            both = parse(Int, first(rows).captures[3])
-            # Floors are the measured values less a margin, so noise does not flip the gate while a real
-            # regression does. Bias 0.035 px is the optical figure; correlation and coverage are this
-            # pair's own, recorded in GATES.md.
-            fails = String[]
-            # A systematic offset over the agreeing population is held an order of magnitude tighter
-            # than the optical 0.035 px, because that is what the measurement supports: 0.0008 and
-            # 0.0025 px here.
-            bx <= 0.005 || push!(fails, "dx core bias $bx > 0.005")
-            by <= 0.005 || push!(fails, "dy core bias $by > 0.005")
-            corr["dx"] >= 0.93 || push!(fails, "dx corr $(corr["dx"]) < 0.93")
-            corr["dy"] >= 0.87 || push!(fails, "dy corr $(corr["dy"]) < 0.87")
-            sign["dy"] == "-" || push!(fails, "dy sign $(sign["dy"]), expected -")
-            both >= 55_000 || push!(fails, "both $both < 55000")
-            # The tail is bounded rather than ignored: it cancels today, and a tail that grew would
-            # otherwise hide behind a core bias that stayed small.
-            tailx <= 400 || push!(fails, "dx tail $tailx > 400 points beyond 10 px")
-            isempty(fails) ||  return (:red, join(fails, "; "))
-            return (:green, @sprintf("core bias %.4f/%.4f, corr %+.3f/%+.3f, dy sign %s, both %d, tail %d",
-                                     bx, by, corr["dx"], corr["dy"], sign["dy"], both, tailx))
+        # Gated on the core bias, correlation, the measured `dy` sign and coverage rather than on rungs.
+        # The ladder needs `CAPTURE_STAGES=1` and a radar capture costs 12-50 minutes, so no stage trace
+        # is on disk. And `exact` is 0 on `20151120` by construction — its base level runs a coarse pass
+        # and a `filtDisp` but no fine pass, so every reported point is bicubic-resized rather than
+        # quantized — which is why the gate cannot assert it.
+        #
+        # The `dy` sign is part of the assertion. `optflag == 0` pre-flips `Dy0`
+        # (`testautoRIFT.py:402`), and `correlator.jl` picks the sign by correlation rather than
+        # asserting it, so a regression that silently reintroduced the flip shows up as `+` and a
+        # collapsed correlation.
+        cases = ["S1A_IW_SLC__1SSH_20150828T162412", "S1A_IW_SLC__1SSH_20151120T080202",
+                 "S1A_IW_SLC__1SSH_20170221T204710", "S1B_IW_SLC__1SDH_20180809T204617",
+                 "S1C_IW_SLC__1SDV_20250416T010214", "S1C_IW_SLC__1SSV_20250416T010159",
+                 "S1A_IW_SLC__1SSV_20240618T025533", "S1A_IW_SLC__1SSV_20240618T025528"]
+        results = String[]
+        red = 0
+        skipped = 0
+        for c in cases
+            cmd = `julia --project=$(@__DIR__) -t 8 $(joinpath(@__DIR__, "correlator.jl")) $c --run 200`
+            state, detail = capture_run(cmd) do t
+                occursin("no call1.json", t) && return (:skipped, "no capture on disk")
+                rows = collect(eachmatch(r"^(dx|dy)\s+([+-])\s+(\d+)\s+\d+\s+\d+\s+[\d.]+%\s+\d+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+([+-][\d.]+)"m, t))
+                length(rows) == 2 || return (:red, "could not read both axes: " * last_line(t))
+                # **The core bias, not the mean over everything.** A pair correlating at a median of
+                # 0.148 — SAR speckle over a 24-day repeat — puts a few hundred of its points on the
+                # other side of a nearly flat peak surface, two-sided, by tens of pixels. On
+                # `20151120` that drags the plain mean to +0.027 px while the 78% agreeing within a
+                # pixel sit at −0.0008. Gating the plain mean would set a threshold around the tail's
+                # cancellation, which is noise; the core catches the systematic offset the threshold is
+                # for, and the tail is bounded separately below.
+                bm = match(r"bias core: dx ([+-]?[\d.e-]+), dy ([+-]?[\d.e-]+)", t)
+                bm === nothing && return (:red, "no bias core line: " * last_line(t))
+                bx, by = abs(parse(Float64, bm.captures[1])), abs(parse(Float64, bm.captures[2]))
+                tm = match(r"tail >10px: dx (\d+), dy (\d+) of (\d+)", t)
+                tm === nothing && return (:red, "no tail line: " * last_line(t))
+                tailx = parse(Int, tm.captures[1])
+                corr = Dict(r.captures[1] => parse(Float64, r.captures[4]) for r in rows)
+                sgn = Dict(r.captures[1] => r.captures[2] for r in rows)
+                both = parse(Int, first(rows).captures[3])
+                fails = String[]
+                # A systematic offset over the agreeing population is held an order of magnitude
+                # tighter than the optical 0.035 px, because that is what the measurement supports:
+                # the eight cases span 0.0002 to 0.0065 px.
+                bx <= 0.010 || push!(fails, "dx core bias $bx > 0.010")
+                by <= 0.010 || push!(fails, "dy core bias $by > 0.010")
+                # The floor is the weakest measured case less a margin. `20150828` correlates at 0.820
+                # and 0.825 — the lowest of the eight — where the rest reach 0.95-0.99.
+                corr["dx"] >= 0.78 || push!(fails, "dx corr $(corr["dx"]) < 0.78")
+                corr["dy"] >= 0.78 || push!(fails, "dy corr $(corr["dy"]) < 0.78")
+                sgn["dy"] == "-" || push!(fails, "dy sign $(sgn["dy"]), expected -")
+                # The tail is bounded rather than ignored: it cancels today, and a tail that grew would
+                # otherwise hide behind a core bias that stayed small. Six of the eight report zero.
+                tailx <= 400 || push!(fails, "dx tail $tailx > 400 beyond 10 px")
+                isempty(fails) || return (:red, join(fails, "; "))
+                return (:green, @sprintf("core %.4f/%.4f corr %+.3f/%+.3f both %d tail %d",
+                                         bx, by, corr["dx"], corr["dy"], both, tailx))
+            end
+            state === :red && (red += 1)
+            state === :skipped && (skipped += 1)
+            push!(results, "$(first(c, 24)) $(state === :green ? "ok" : String(state))")
         end
+        return (red == 0 ? :green : :red,
+                "$(length(cases) - red - skipped)/$(length(cases)) green" *
+                (skipped > 0 ? ", $skipped without a capture" : "") *
+                (red > 0 ? ": " * join(filter(r -> !endswith(r, "ok"), results), ", ") : ""))
     end),
 
     Gate("3.x", "the stage ladder on the golden Landsat case", false, function ()

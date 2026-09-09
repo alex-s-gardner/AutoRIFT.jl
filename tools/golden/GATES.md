@@ -1465,3 +1465,61 @@ The one plan item left undone is the **byte-vs-float floor** (`--dtype-pair`), w
 capture of this same pair at `CAPTURE_FLOAT32=1`. It matters more on radar than optical: SAR amplitude
 has a long right tail, so `uniform_data_type`'s `mean ± 3σ` window clips a different fraction than it
 does on optical reflectance, and the floor is what makes the 9,897 reference-only points attributable.
+
+---
+
+# All eight remaining radar pairs
+
+Run after the probe established the strategy: capture at `--run 200`, verify `call1.json`, prune the
+ISCE3 per-burst intermediates, then the endpoint. Sequential, because a capture peaks near 67 GB.
+
+## The eight, all green
+
+| # | case | driver | both | exact | only jl | only ref | core bias dx / dy | corr dx / dy | tail |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | `S1A_..._20150828T162412` | SLC | 1,327,618 | 29.03% | 77,340 | 69,830 | −0.0009 / +0.0020 | +0.820 / +0.825 | **0** |
+| 2 | `S1A_..._20151120T080202` | SLC | 60,611 | 0.00% † | 44,208 | 9,897 | −0.0008 / −0.0025 | +0.962 / +0.909 | 187 |
+| 3 | `S1A_..._20170221T204710` | SLC | 1,534,262 | 74.24% | 42,109 | 182,877 | +0.0040 / −0.0016 | +0.992 / +0.942 | 39 |
+| 4 | `S1B_..._20180809T204617` | SLC | 454,314 | — | — | — | −0.0042 / +0.0065 | — | **0** |
+| 5 | `S1C_..._20250416T010214` | SLC | 476,406 | — | — | — | +0.0032 / +0.0003 | — | **0** |
+| 6 | `S1C_..._20250416T010159` | BURST 7 | 33,213 | — | — | — | −0.0007 / −0.0011 | — | **0** |
+| 7 | `S1A_..._20240618T025533` | BURST 10 | 440,024 | — | — | — | +0.0011 / −0.0004 | — | 9 |
+| 8 | `S1A_..._20240618T025528` | BURST 24 | 1,231,710 | 65.81% | 67,461 | 358,526 | −0.0022 / −0.0013 | +0.988 / +0.951 | 7 |
+
+† Base level runs a coarse pass and a `filtDisp` but **no fine pass**, so every reported point is
+bicubic-resized rather than quantized and `exact` is 0 by construction.
+
+**Core bias spans 0.0002 to 0.0065 px across all sixteen axes.** Six of eight report a zero tail beyond
+10 px; the two largest tails are 187 (case 2) and 39 (case 3), against populations of 60,611 and
+1,534,262.
+
+## What the eight added over the probe
+
+**The probe was the weakest case in the set, not a typical one.** Its `exact` of 0% and its 187-point
+tail both come from the same fact — its base level runs no fine pass, so its answer comes from one
+level at a median correlation of 0.148. The others run all four levels and reach `exact` of 29%, 66% and
+74%, with correlations of 0.95–0.99 and tails of 0, 7 and 39. Reading the phase off the probe alone
+would have understated agreement substantially.
+
+**`process_burst` needs no harness change either.** Three burst pairs — 7, 10 and 24 bursts mosaicked
+before the correlator — reach the same `runAutorift` boundary through a different driver, and
+`kwargs_from_capture`/`pointset_from_capture` drive AutoRIFT.jl unchanged. The 24-burst pair is the
+second-largest case in the whole radar set at 1,231,710 both-measured points.
+
+**Cost, measured rather than estimated.** The probe's 2h15m was not representative:
+
+| driver | pairs | capture wall clock | peak on-disk | pruned to |
+|---|---|---|---|---|
+| `process_slc` | 5 | 12–50 min | 41–67 GB | 7–11 GB |
+| `process_burst` | 3 | 12–50 min | 14–56 GB | 4–16 GB |
+
+All seven new captures took **3h50m total**, against the ~18 hours estimated from the probe. Pruning
+`product/` and `product_sec/` immediately after each capture is what made a sequential run possible on a
+pool with ~60 GB free: those per-burst ISCE3 intermediates are 70–80% of a run and are read by no gate.
+
+## Step: the gate covers every radar case
+
+`3.rdr` now runs all eight rather than one, for the same reason `3.opt` runs all twelve: the two
+`_oversample` and `chip_size_max` bugs were invisible on twelve optical pairs and surfaced only on an
+anisotropic chip. Thresholds are the weakest measured case less a margin — core bias 0.010 px,
+correlation 0.78 (case 1 is the floor at 0.820/0.825), tail 400 points.
