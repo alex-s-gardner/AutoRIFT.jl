@@ -188,11 +188,61 @@ filenames parsed to midnight. This propagates into every modelled error estimate
 never exercised in production.
 
 **The dt-varying search-range scaling is disabled** — commented out in both
-Geogrid branches.
+Geogrid branches (`vend/testGeogrid.py:397-401`, `:481-485`).
 
 **A stale `autoRIFT_intermediate.nc` in the working directory silently skips
 correlation entirely** (`vend/testautoRIFT.py:693-706`). Worth knowing when
 comparing against production output.
+
+### Every ITS_LIVE search parameter is physical; the pixel counts are derived
+
+The parameter shapefile is in **physical units** — chip sizes in metres, velocities
+and search ranges in **m/yr** — and Geogrid converts each to pixels using the
+scene's pixel size and, for the rate quantities, the pair's time separation. So
+none of these is a constant of the sensor, and a reader who keys any of them to
+"optical against radar" will mis-predict all of them:
+
+| parameter file | units | pixels are |
+|---|---|---|
+| smallest allowable chip size | m | `ceil(chipsizex0 / pixsizex / 4) * 4` (`vend/testautoRIFT.py:374`) |
+| grid spacing | m | `ChipSize0X * gridspacingx / chipsizex0` (`:375`) |
+| `CSMINy0 / CSMINx0` | ratio of m | `ScaleChipSizeY`, hence `ChipSizeY` (`:377-378`) |
+| `vx0`, `vy0` | m/yr | the per-point prior `Dx0`, `Dy0` |
+| search range | m/yr | the per-point `SearchLimitX`, `SearchLimitY` |
+
+The rate conversion is `pixels = (m/yr) * (dt / 365.25) / pixel_size`, which
+`tools/ab/heatmaps.jl` and `speed_diff.jl` already invert as
+`PIXEL_SIZE * 365.25 / DATE_DT` to report a residual in m/yr. Two consequences:
+
+- **A pixel means a different velocity in every pair.** On the A/B Landsat pair —
+  15 m pixels, 8.0 days — one pixel is ~685 m/yr and one 1/16 upsampling step is a
+  ~43 m/yr claim. On a 48-day pair of the same scenes it is ~114 m/yr. A tolerance
+  quoted in pixels is therefore not a tolerance in velocity, and comparing two
+  cases' pixel residuals compares different physical quantities.
+- **The pixel search radius scales with `dt`.** A long-separation pair searches
+  further in pixels for the same physical speed, which is why the golden cases
+  carry base-level radii from 2 to 68 across a 5–89 day range of separations.
+
+Measured across the twenty golden captures, the derived quantities take these
+values — four base chip sizes and five y-scales, tracking resolution rather than
+platform:
+
+| `ChipSize0X` | pixel size | cases |
+|---:|---|---|
+| 8 | 30 m | 3 (L4/5, green band) |
+| 16 | 15 m | 4 (L7/8/9, panchromatic) |
+| 24 | 10 m | 2 (S2) |
+| 56, 64, 68 | range pixel, varies | 8 (S1) plus NISAR |
+
+`ScaleChipSizeY` is 1.0 wherever the pixel is square and 0.2353, 0.25 or 0.2857 on
+Sentinel-1, per acquisition, from azimuth:range ratios of 4.25, 4.0 and 3.5. In
+every radar case `ChipSizeY` lands on **16** — the chip is square on the *ground*,
+and only its pixel count differs between axes.
+
+This is the same pixel-is-area/pixel-is-point discipline as the section above,
+one level up: the reference's parameters live in the physical world and enter the
+correlator as pixel counts, so any comparison, tolerance, or port of the
+post-correlation chain has to state which of the two it is working in.
 
 ---
 

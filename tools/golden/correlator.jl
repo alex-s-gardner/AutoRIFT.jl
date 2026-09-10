@@ -240,8 +240,14 @@ function kwargs_from_capture(k::Capture)
     # axis alone — the array's name says so — and the pyramid doubles both axes together, so Y's
     # maximum is Y's minimum times the same number of doublings. Scaling only `chip_size` leaves the
     # two axes reaching their maxima after different doublings, which `_check_levels` rejects: on a
-    # Sentinel-1 pair at `ScaleChipSizeY = 0.25` that is `8` in X against `32` in Y. Invisible on
-    # every optical case, where the scale is 1.0 and the two forms coincide.
+    # Sentinel-1 pair at `ScaleChipSizeY = 0.25` that is `8` in X against `32` in Y.
+    #
+    # Invisible wherever the pixel is square, which is where the scale is 1.0 and the two forms
+    # coincide. That is a property of the pixel, not of the platform: `ScaleChipSizeY` is the ratio of
+    # the ITS_LIVE parameter chip sizes *in metres* (`vend/testautoRIFT.py:377-378`), so it departs
+    # from 1.0 exactly when the y and x pixel sizes differ, and it varies per acquisition — 0.2353,
+    # 0.25 and 0.2857 across the eight golden radar cases. Testing only on cases with a square pixel
+    # exercises neither form.
     return (; chip_size = (X = chip0, Y = round(Int, chip0 * scale_y)),
             chip_size_max = (X = maxchip, Y = round(Int, maxchip * scale_y)),
             grid_spacing = (X = spacing, Y = spacing),
