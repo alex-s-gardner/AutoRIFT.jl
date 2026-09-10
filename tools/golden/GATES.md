@@ -12,6 +12,14 @@ Machine: Apple M2 Max, 12 cores, macOS 26.5.2, Julia 1.12.5. Reference: autoRIFT
 `micromamba -n arift-ref`, whose `autoRIFT.py` is byte-identical to the pinned v2.1.2; container
 `ghcr.io/asfhyp3/hyp3-autorift:0.28.4` for the golden cases.
 
+> **Every case-level figure below is superseded and awaiting re-measurement.**
+> `pointset_from_capture` handed AutoRIFT.jl a wrong-sign `Dy0` — the capture records the prior
+> *before* `arImgDisp_*` flips it — so every `exact`, `bias` and coverage number measured through it
+> is wrong, on all twelve optical and all eight radar cases. On the worst block of LC08 Jakobshavn the
+> fix moves `dx` from 6.10% to **99.61%** exact. See "The fast-flow residual was a harness sign error".
+> Gate 0 (`tools/ab`) is unaffected: it passes a zero prior, so no sign convention crosses it.
+> Re-measure these rows; do not edit them.
+
 ## Gate 0 — the verified floor
 
 The agreement that predates the golden work. Everything else is built on it, so it is re-run first and
@@ -741,19 +749,184 @@ coverage admits. LC09 is the one case where both moved the same way: +16,459 mor
 
 ### What this settles about the residual
 
-The `exact` spread across cases — 54% to 93% — tracks the **scene**, not the code:
+**Nothing — every `exact` figure in this section was measured against a wrong-sign y prior and is
+superseded.** See "The fast-flow residual was a harness sign error" below. The readings this section
+reached, in the order they were reached and refuted:
 
-- Every stage is exact or reported-as-designed on all five, so the pipeline is not case-sensitive.
-- Both S2 cases and LC09 sit at 67–93%; both LC08 cases at 54–63%. The 15 m panchromatic band quantizes
-  harder onto 256 levels than S2's, and `tools/ab` stage 1 measures that path at 84.8% exact with a
-  35.8 px maximum against 100% on the float path.
-- So the case-to-case variation is the `UInt8` quantization interacting with scene contrast, which is
-  the reference's own preprocessing and not something a change here can recover.
+| reading | refuted by |
+|---|---|
+| the spread is `UInt8` quantization interacting with scene contrast | `Float32` moves `exact` by 0.15 points |
+| the residual is a search-radius effect | radius sweep in `tools/ab` is flat; radius was a proxy |
+| the residual is competing-maxima tie-breaking | the residual is spatially autocorrelated at +0.80 |
 
-**The correlator work is converged.** Five of five cases pass the ladder, coverage improved on all five,
-and the remaining `exact` shortfall is attributable to a quantization step the reference applies before
-the correlator sees anything. The gate should move to the post-correlation chain, which is where a
-product comparison becomes possible.
+The `exact` spread across cases — 54% to 93% — was read as tracking the **scene** rather than the
+code. It tracked the **prior**, which is largest on fast ice, which is why the spread looked
+scene-dependent.
+
+## The fast-flow residual was a harness sign error
+
+The whole-case figures show disagreement concentrated on the fast-flow tongues rather than scattered
+by contrast, and that shape is the finding. Three explanations were offered for it here and all three
+were wrong; what settled it was refusing to accept a *spatially coherent* residual as tie-breaking.
+
+### The discriminating test, which should have been run first
+
+Tie-breaking is independent per point, so its residual must be spatially white. Measured on the base
+level of LC08 Jakobshavn, `dx`:
+
+| | lag 1 | lag 2 | lag 4 | lag 8 | lag 16 |
+|---|---:|---:|---:|---:|---:|
+| whole base level | +0.64 | +0.56 | +0.51 | +0.33 | +0.09 |
+| fastest 10% | **+0.80** | +0.72 | +0.63 | +0.41 | +0.07 |
+| fastest 10%, correlation ≥ 0.5 | **+0.71** | +0.57 | +0.48 | +0.31 | −0.04 |
+
+Block means over 16×16 cells have sd **0.418** where white noise would give 0.032 — **13.1×** — and
+72.7% are positive. It also survives a strong-peak gate, so no ambiguity argument reaches it. **A
+residual that autocorrelates is a convention error, whatever its magnitude.**
+
+### Root cause: `Dy0` is flipped before the correlator sees it
+
+`arImgDisp_u`/`arImgDisp_s` set `Dy0 = -Dy0` as their first act (`autoRIFT.py:1058`, `:1231`),
+converting the prior from cartesian-Y to matrix-Y before any chip is cut. `capture.py` records
+`self.Dy0`, which is **pre-flip**, and `pointset_from_capture` passed it through unchanged — so
+AutoRIFT.jl cut its chip `2 * Dy0` rows from where the reference cut its own.
+
+The correlator flips the prior going *in* and the answer coming *out*. Undoing only the output is the
+natural mistake, because `Dy` is what gets compared.
+
+### The ladder that found it, on a 64×64 crop
+
+The crop reproduces the bias in **14 s** against 31 min for the scene, which is what made stepping
+through the chain affordable. Each rung is measured against an array the reference itself produced:
+
+| step | measurement | verdict |
+|---|---|---|
+| raw `Dx_rev0_L0` vs final `out_Dx` | **100.00% equal** on 1,211,482 points | nothing downstream alters values |
+| chip/window bounds, C `int()` vs `floor` | identical at all 2,188,984 points | not integer truncation |
+| window width, surface size, zero-sample column | identical at every radius, 15 → 181 | not geometry |
+| **ZNCC surface vs OpenCV `TM_CCOEFF_NORMED`**, byte-identical chip and window | **max diff 1.2e-6, same argmax**, 4 points | not the measure, not peak selection |
+| the reference's own formula on that surface | fails to reproduce its own answer by **+3.2…+4.6 px** | the window it used differs |
+| emulating its C++ index arithmetic | reproduces its answer to < 1 px | the chip rectangle differs |
+| chip rectangle, reference vs AutoRIFT.jl | x **+0**, y **+28 = 2 × Dy0** | the prior's sign |
+
+The surface comparison is the rung that made it unambiguous: **identical surfaces with a 3.9 px
+disagreement** puts the defect downstream of correlation and kills the quantization, measure and
+tie-breaking explanations at once.
+
+### The fix, and what it recovers
+
+`pointset_from_capture` negates `Dy0`. Worst 64×64 block, base level, against the reference's own raw
+level-0 output:
+
+| | exact | mean residual | p95 \|d\| |
+|---|---:|---:|---:|
+| `dx` before | 6.10% | +0.9043 | 3.875 |
+| `dx` after | **99.61%** | **−0.0004** | **0.000** |
+| `dy` before | 8.15% | −0.0158 | 1.875 |
+| `dy` after | **99.55%** | **+0.0007** | **0.000** |
+
+### Why it hid, and what that costs the ledger
+
+Two properties, both of which this ledger should now treat as warning signs:
+
+- **The error scales with the prior**, so it is absent on slow ice and largest on fast ice. That makes
+  it look like a velocity-dependent physical effect, and it made the case-to-case `exact` spread look
+  scene-dependent.
+- **A y-axis error surfaces in `dx`.** A chip misplaced in y still correlates best at a similar
+  vertical offset, so `dy`'s mean residual is −0.016 px while `dx` carries +0.90. Inspecting the axis
+  whose sign is in question finds nothing.
+
+**Every `exact`, `bias` and coverage figure measured through `pointset_from_capture` is superseded** —
+that is all twelve optical and all eight radar cases, since every one of them reaches AutoRIFT.jl
+through this function. Those rows have to be re-measured rather than edited. Coverage and `bias` are
+affected too, not only `exact`: a misplaced chip changes which points are degenerate.
+
+`AutoRIFT.jl was not at fault.` It was handed a wrong-sign prior and propagated it correctly, which is
+also why no synthetic test caught this: the package's own tests never construct a prior with the
+reference's sign convention. `REFERENCE.md` records the convention itself, all four flip sites, and
+the three tests that settle one.
+
+## Superseded: the residual is a search-radius effect, not quantization
+
+**Both claims in this section are wrong.** The `Float32` measurement is sound and is the reason the
+quantization explanation was dropped; the search-radius conclusion that replaced it is not — radius is
+a proxy for prior magnitude, and a radius sweep in `tools/ab` at fixed prior is flat (84.8% at radius
+20 against 87.5% at 120, bias 0.0000). Kept for the `Float32` rows and as a record of the wrong turn.
+
+```bash
+julia --project=tools/ab -t 8 tools/golden/compare_figures.jl LC08_L1TP_009011_20200703 --run 200
+julia --project=tools/ab -t 8 tools/golden/compare_figures.jl LC08_L1TP_009011_20200703 --run 301
+```
+
+The whole-case figures show the disagreement concentrated on the fast-flow tongues, not scattered by
+contrast. That is the wrong shape for a quantization tie-break, and running the dtype pair over the whole
+case settles it. LC08 Jakobshavn, `dx`, run 200 against run 301:
+
+| comparison | shared | exact | p99 |
+|---|---:|---:|---:|
+| AutoRIFT.jl vs reference, `UInt8` (production) | 1,660,132 | 55.12% | 0.9375 |
+| AutoRIFT.jl vs reference, `Float32` | 1,659,941 | **55.27%** | 0.9375 |
+| reference `UInt8` vs its own `Float32` (floor) | 1,715,662 | 95.00% | 0.0072 |
+| AutoRIFT.jl `UInt8` vs AutoRIFT.jl `Float32` | 1,595,699 | **100.00%** | 0.0000 |
+
+**Widening to `Float32` moves `exact` by 0.15 points**, and the profile across speed deciles is unchanged
+to a tenth of a point. So the quantization is not what the residual is made of. The last row is why the
+lever is worth having: AutoRIFT.jl is bit-identical across element types, so the two rows above it differ
+only in the reference, and the 95.00% floor is the reference disagreeing with itself.
+
+### It is the search radius, at fixed speed and fixed chip size
+
+Two confounds have to come out first. Fast points preferentially get a coarser chip (chip 16 covers 94.8%
+of the slowest speed decile but 52.2% of the ninth), and a coarse level is unquantized, where `exact` is
+0% by construction. Holding **both sides at chip 16** removes both, leaving 1,194,613 points at 76.60%:
+
+| speed decile (median px) | 0.06 | 0.14 | 0.44 | 0.79 | 0.96 | 1.13 | 1.38 | 1.96 | 3.10 | 6.60 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| exact | 99.7 | 99.3 | 97.4 | 93.0 | 88.8 | 81.1 | 66.4 | 61.5 | 51.5 | **27.8** |
+| mean residual | −0.000 | −0.000 | −0.003 | −0.004 | −0.003 | −0.005 | −0.002 | +0.005 | +0.011 | **+0.118** |
+
+The speed dependence survives at one chip size, and the fastest decile carries a **one-sided** residual
+where every other decile is centred on zero. Within that decile, binning by search radius separates the
+two: agreement falls from 90.7% at radius 15 to 13.4% at radius 72, and the mean residual rises with it.
+Speed is the proxy; **radius is the variable**.
+
+| base-level radius | 0–8 | 8–12 | 16–20 | 24–32 | 40–56 | 56–80 | 80–300 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| same integer sample | 97.8% | 93.0% | 97.9% | 93.8% | 90.8% | 80.7% | **71.1%** |
+| \|Δ\| ≥ 1 px | 0.06% | 0.63% | 0.08% | 0.17% | 0.45% | 3.75% | **13.6%** |
+| mean residual | −0.0004 | −0.0029 | +0.0094 | +0.0233 | +0.0827 | +0.1316 | **+0.4171** |
+
+Everything grows monotonically with radius, and at the widest windows one point in seven picks a
+**different integer sample** — a different match, not a rounded one.
+
+### What it is not
+
+Each of these is measured, and each rules out a candidate that the fast-flow shape would otherwise fit:
+
+- **Not reachability.** The reference's answer lies inside the window AutoRIFT.jl searched at
+  **0.000% outside on all ten speed deciles**, and neither side rails against its search limit at any
+  decile (0.000% both). The p95 of `|ref − prior| / radius` never exceeds 0.18, so both sides find their
+  peak well inside a window neither one exhausts. A radius too small, a prior too far off, or a coarse
+  mask restricting the wrong region would all show here, and none does.
+- **Not the sub-pixel refinement kernel.** Where the peak falls inside a pixel is independent of how fast
+  the ice moves, so a kernel defect cannot produce a monotonic speed or radius profile — and it would not
+  spare the 0–8 radius bin at 97.8%. The residual is also 98.3% on the 1/16 lattice with a median of
+  exactly zero, which is a refinement agreeing with the reference's own quantization step.
+- **Not the coarse pass's decision.** Already measured separately: at chip 32 the fine pass searches the
+  **identical** 348,397 points on both sides, symmetric difference 0.
+
+### The harness bug this was hiding behind, and why the earlier reading was wrong
+
+`cached_run`'s key was `(name, kw, size(grid.x))` — which is identical for run 200 and run 301, because a
+`CAPTURE_FLOAT32` capture differs from an ordinary one **only** in `in_I1`'s element type. So a `Float32`
+comparison silently reused the `UInt8` field and reported the quantization's effect as zero by
+construction. `eltype(k.arrays["in_I1"])` is now in the key.
+
+The earlier conclusion was not built on that bug, but on a narrower measurement: the dtype pair had been
+run on one traced level at a time, where the floor at chip 96 (98.54%) does equal AutoRIFT.jl's agreement
+and the reading "nothing attributable" is correct *for that level*. Generalizing it to the whole case was
+the error. The lesson is the one this ledger already applies elsewhere: **a per-level floor does not
+compose into a whole-case one**, because the levels are weighted by how many points each resolves.
 
 # Phase 2 — the remaining seven optical pairs
 
@@ -1151,8 +1324,8 @@ construction. Bias and correlation are the gate there.
 **Every stage of every pair is exact or reported-as-designed.** `|bias|` is under 0.035 px on eleven of
 twelve and correlation is 0.89–0.997 across the set. `exact` spans 27–93% and tracks the *scene* rather than
 the code: it is highest on the two Sentinel-2 pairs and lowest where the base chip size resolves fewest
-points, which is the `UInt8` quantization interacting with scene contrast — `tools/ab` stage 1 measures that
-path at 84.8% exact with a 35.8 px maximum against 100% on the float path.
+points. The cause is the search radius, not the `UInt8` quantization — see "The residual is a
+search-radius effect, not quantization".
 
 ### What this phase added
 

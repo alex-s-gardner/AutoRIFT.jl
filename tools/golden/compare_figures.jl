@@ -92,11 +92,27 @@ plotting the slow step, and the whole reason for plotting is to look at a result
 The cache key includes the settings, so changing a parameter re-runs rather than silently plotting the
 previous configuration. That is the failure mode worth designing against: a stale figure that looks
 current is worse than no figure.
+
+**The imagery's element type is part of the key.** A `CAPTURE_FLOAT32` capture and an ordinary one of
+the same case have identical settings and grid, and differ only in `in_I1`'s element type; a key
+without it serves the `UInt8` field for a `Float32` comparison and reports the quantization's effect
+as zero. The hash of the arrays themselves is not used — it costs a pass over 17,000² of imagery per
+figure, and `eltype` separates the two captures that exist.
+
+**The `PointSet`'s own contents are part of the key too**, not just its size. The priors, the radii and
+the coordinates all decide the answer and none of them is in `kw`, so a key over `kw` and `size` alone
+is unchanged by a fix to any of them — and then serves the field computed *before* the fix, under a
+log line saying it is reusing a run. That is the failure this cache has produced twice; both times the
+figure looked current. Hashing the grid arrays is cheap because the grid is 1/1000 the size of the
+imagery.
 """
 function cached_run(name::AbstractString, k::Capture, grid, kw)
     dir = get(ENV, "AUTORIFT_GOLDEN_CACHE",
               joinpath(homedir(), "data", "autorift", "tests", "golden_tests"))
-    key = string(hash((name, kw, size(grid.x))), base = 16)
+    key = string(hash((name, kw, size(grid.x), eltype(k.arrays["in_I1"]),
+                       grid.x, grid.y, grid.radius_x, grid.radius_y,
+                       grid.dx_prior, grid.dy_prior,
+                       grid.chip_size_x, grid.chip_size_y)), base = 16)
     path = joinpath(dir, "runs", "field_$(first(name, 24))_$key.jls")
 
     if isfile(path)
