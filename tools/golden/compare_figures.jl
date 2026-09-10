@@ -146,8 +146,12 @@ function compare_figure(name::AbstractString;
                         path = joinpath(tempdir(), "golden_$(first(name, 24)).png"),
                         zoom::Union{Nothing,Integer} = nothing,
                         center::Union{Nothing,Tuple{Integer,Integer}} = nothing,
-                        dlim::Real = 1.0)
-    k = read_capture(only(cases(name)); n = 100)
+                        dlim::Real = 1.0,
+                        run::Integer = 100)
+    # `run` because a capture is not always at the default: the radar cases live at 200, and the
+    # optical ones at 100 or 200 depending on when they were taken. Reading the wrong number fails on
+    # a missing directory rather than silently mapping a different comparison.
+    k = read_capture(only(cases(name)); n = run)
     grid = pointset_from_capture(k)
     kw = kwargs_from_capture(k)
     out = cached_run(name, k, grid, kw)
@@ -256,10 +260,13 @@ function main(args)
     dlim = 1.0
     d = findfirst(==("--dlim"), args)
     d === nothing || (dlim = parse(Float64, args[d + 1]))
+    run = 100
+    rr = findfirst(==("--run"), args)
+    rr === nothing || (run = parse(Int, args[rr + 1]))
 
     tag = zoom === nothing ? "" : "_zoom$zoom"
     p = compare_figure(name; path = joinpath(dir, "golden_$(first(name, 24))$tag.png"),
-                       zoom, center, dlim)
+                       zoom, center, dlim, run)
     println("wrote ", p)
     return nothing
 end
