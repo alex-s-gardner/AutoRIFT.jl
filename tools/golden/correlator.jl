@@ -106,10 +106,30 @@ function pointset_from_capture(k::Capture)
 
     rx, ry = _level_search_limits(srx, sry, k)
 
+    # **`Dy0` is negated, because the captured value is not the one the correlator uses.**
+    # `arImgDisp_u`/`arImgDisp_s` do `Dy0 = -Dy0` as their first act (`autoRIFT.py:1058`,
+    # and `:1231` for the signed entry point), converting the prior from cartesian-Y to
+    # matrix-Y before any chip is cut; the capture records `self.Dy0`, which is pre-flip. So
+    # the reference offsets its chip by `+Dy0` where AutoRIFT.jl's `chip_bounds` offsets by
+    # `-dy_prior`, and handing the captured value through unchanged places the chip `2 * Dy0`
+    # rows from where the reference put it.
+    #
+    # This is the same convention as the `Dy` on the way out, counted once on each side: the
+    # correlator flips the prior going in and flips the answer coming out, so a comparison
+    # must undo both. Undoing only the output — which is what a reader checking `Dy` against
+    # `dy` naturally does — leaves the input flip in place.
+    #
+    # Measured on the worst 64x64 block of the golden Landsat case, where `Dy0` reaches 14:
+    # `dx` exact goes 6.10% -> **99.61%** and `dy` 8.15% -> **99.55%**, with the mean residual
+    # falling from +0.90 px to -0.0004. The failure is invisible where the prior is small and
+    # grows with it, so it concentrates on the fast-flow tongues and reads as a velocity-
+    # dependent bias rather than as a sign error. It is also invisible in `dy` alone: the
+    # misplaced chip biases `dx` while `dy` stays near zero, because the wrong rows still
+    # correlate best at a similar vertical offset.
     return PointSet(
         Float64.(xg) .+ 1, Float64.(yg) .+ 1,
         rx, ry,
-        Float64.(dx0), Float64.(dy0),
+        Float64.(dx0), .-Float64.(dy0),
         fill(chip0, size(xg)), fill(round(Int, chip0 * scale_y), size(xg)),
         Int.(csmin), Int.(csmax),
     )
