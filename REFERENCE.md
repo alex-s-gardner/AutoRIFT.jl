@@ -196,6 +196,90 @@ comparing against production output.
 
 ---
 
+## The y sign and the half pixel: where every axis convention lives
+
+Two conventions account for more defects in this project than any algorithmic
+question, and both fail the same way — no error, a plausible-looking field, and a
+residual that is *zero under uniform motion and grows with the velocity gradient*.
+That signature is why they survive review: the median stays near zero, the scene
+correlates above 0.99, and only a difference **map** shows the structure, always
+along fast-flow margins where it reads as a physical effect rather than a bug.
+
+Anything that crosses this boundary — a new comparison, a new driver, a port of the
+post-correlation chain — has to settle both explicitly.
+
+### The y sign is flipped four times, not once
+
+`dy` is row-positive (down) inside the correlator and up-positive (cartesian)
+outside it, and the reference converts between them in four separate places:
+
+| where | what | direction |
+|---|---|---|
+| `autoRIFT.py:1058`, `:1231` | `Dy0 = -Dy0` on the **prior**, before any chip is cut | cartesian → matrix |
+| `autoRIFT.py:1142`, `:1308` | `Dy = -Dy` on the **answer**, before returning | matrix → cartesian |
+| `vend/testautoRIFT.py` | a *second* `Dy = -Dy` for radar only, `if optical_flag == 0` | applied to an already-cartesian value |
+| `netcdf_output.py` | `vy` sign against the grid's own y direction | product convention |
+
+**The prior and the answer are flipped independently, so a comparison must undo
+both.** Undoing only the output is the natural mistake — it is the flip a reader
+notices, because `Dy` is what gets compared — and it leaves the input flip in place.
+The cost, measured on the golden Landsat case: the chip is cut `2 * Dy0` rows from
+where the reference cut it, and base-level exact agreement on the worst block sits at
+**6.1%** instead of **99.6%**, with a coherent **+0.9 px** bias in `dx`.
+
+Note *`dx`*. A misplaced chip in y biases the **x** axis, because the wrong rows
+still correlate best at a similar vertical offset — so `dy` looks unbiased (mean
+−0.016 px) while `dx` carries the whole error. Checking the axis whose sign is in
+question finds nothing.
+
+### The half pixel is counted once on each side
+
+An even chip has no centre sample, and the reference resolves that with two
+`+0.5`s that do **not** cancel:
+
+- `runAutorift` snaps the grid to `round(xGrid) + 0.5` (`autoRIFT.py:890-891`).
+- `arImgDisp_*` then adds its own `Px + 0.5` before calling the C++
+  (`autoRIFT.py:1239-1240`).
+
+AutoRIFT.jl adds one equivalent `0.5` in `_shift_points`, so a harness comparing
+against captured arrays adds **`+1`, not `+0.5`**, for the index base — measured at
+85.0% exact against 49.2%. The two half pixels are the same convention counted once
+on each side, not a double shift to be removed. `tools/golden/correlator.jl`
+documents the scan.
+
+This is the pixel-is-area against pixel-is-point question in its correlator form,
+and it recurs wherever a grid is resampled rather than indexed: `cv2.resize` with
+`INTER_AREA` lands on cell **centres**, and reading a coarse node back with the
+half-sample convention places node `k` at `(k - 0.5) * stride + 0.5`. Correlating at
+a cell's *first* point instead of its centre measures the field half a cell from
+where every consumer assumes it was measured — 0.13–0.14 px on a Jakobshavn pair,
+growing with `stride`, so it appears as a level-dependent error no single shift
+corrects (`src/multichip.jl`, `_cell_centres`).
+
+### How to settle either one
+
+Do not reason about it; the reasoning is what fails. Three cheap tests, in order:
+
+1. **Map the difference before believing any summary statistic.** A sign error, a
+   whole-pixel roll, a transposed axis and a half-pixel offset produce four distinct
+   pictures and near-identical medians. `tools/golden/residual_maps.jl` exists for
+   this and records the case where a median of 1/16 px — one quantization step,
+   entirely plausible as tie-breaking — was a half-pixel grid error.
+2. **Scan the offset rather than deriving it.** Score `+0.0`, `+0.5` and `+1.0` and
+   report which wins; a hardcoded convention is correct only until the writer's
+   changes, and then fails silently.
+3. **Distinguish a bias from tie-breaking by spatial autocorrelation.** Tie-breaking
+   is independent per point, so its residual must have lag-1 autocorrelation near
+   zero and block means that shrink as `1/n`. The y-sign bug measured **+0.80** at
+   lag 1 and block means **13×** larger than white noise allows. A residual that
+   autocorrelates is a convention error, whatever its magnitude.
+
+`tools/ab/README.md` records the same discipline for argument order and array
+layout, which fail identically: a transposed displacement field still reads as a
+displacement field.
+
+---
+
 ## Validation
 
 Neither repository has a test that exercises the correlator, and hyp3-autorift's one
