@@ -751,8 +751,9 @@ end
 # **The X axis alone, which is what the reference uses.** Its ratio is
 # `int(self.ChipSize0X / self.GridSpacingX)` (`autoRIFT.py:481`) — one number, from the X chip and the
 # X spacing, with no Y term anywhere. Taking the smaller of the two axes agrees whenever the chip is
-# square, which every optical case in the golden set is, and diverges as soon as it is not: a
-# Sentinel-1 pair runs `ScaleChipSizeY = 0.25`, so a 64x16 chip on a grid spaced 32 gives 2 in X and
+# square in pixels — that is, wherever the pixel itself is square, since the chip is a fixed size in
+# metres — and diverges as soon as it is not: a Sentinel-1 pair runs `ScaleChipSizeY = 0.25`, an
+# azimuth pixel four times the range pixel, so a 64x16 chip on a grid spaced 32 gives 2 in X and
 # **0** in Y, and the minimum collapses the ratio to 1. The filter then judges over a 5-wide window at
 # `FracValid = 0.32` where the reference uses 9 at a threshold raised by its overlap term, which
 # rejects far less — measured as 176,211 points answered against the reference's 70,508 on

@@ -40,10 +40,22 @@ spelling of AutoRIFT.jl's. Three details are load-bearing and each changes the r
 
   * **`Dy0` is negated**, because `arImgDisp_*` does `Dy0 = -Dy0` before the call
     (`autoRIFT.py:1058`) and the capture records the pre-flip value.
-  * **The two axes have different chip sizes.** `ChipSizeY = round(ChipSizeX * ScaleChipSizeY / 2) * 2`
-    (`autoRIFT.py:650`), which is 1.0 on every optical case and **0.25** on Sentinel-1 — so a
-    transcription using one `chip` for both axes is right on twelve cases and wrong on eight, in y
-    only. Hence `chip_y` is a separate argument.
+  * **The two axes have different chip sizes, and the ratio is a property of the pixel rather than of
+    the platform.** `ChipSizeY = round(ChipSizeX * ScaleChipSizeY / 2) * 2` (`autoRIFT.py:650`), and
+    `ScaleChipSizeY` is `median(CSMINy0 / CSMINx0)` (`vend/testautoRIFT.py:377-378`) — the ratio of
+    the ITS_LIVE parameter chip sizes, which are **in metres**. The chip is square on the ground, so
+    the ratio is the y:x *pixel size* ratio and the two axes differ in pixel count whenever the pixel
+    is not square. Measured across the twenty captures it takes five values: 1.0 wherever the pixel is
+    square, and 0.2353, 0.25 and 0.2857 on Sentinel-1, varying per acquisition with the
+    azimuth:range ratio (4.25, 4.0, 3.5) rather than by sensor. `ChipSizeY` is **16 in all eight**
+    radar cases — the same ground footprint — which is what a square-on-the-ground chip looks like.
+
+    The same arithmetic sets the x axis: `ChipSize0X = ceil(chipsizex0 / pixsizex / 4) * 4`
+    (`vend/testautoRIFT.py:374`), so the base chip is a fixed distance divided by the pixel size and
+    the captures carry 8, 16, 24, 56, 64 and 68 pixels for it — 30 m, 15 m, 10 m and three range
+    pixel sizes. A transcription using one `chip` for both axes is therefore wrong on every case with
+    a non-square pixel, and a reader who keys either quantity to "optical against radar" will
+    mis-predict both.
   * **The arithmetic is `Float32` and truncating.** C's `int(...)` rounds toward zero, not `-Inf`,
     and the C++ holds the grid as `CV_32FC1`. That matters only where a rectangle edge crosses zero,
     which happens at points whose window falls off the left or top of the image — a few dozen per
