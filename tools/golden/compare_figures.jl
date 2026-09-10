@@ -92,11 +92,17 @@ plotting the slow step, and the whole reason for plotting is to look at a result
 The cache key includes the settings, so changing a parameter re-runs rather than silently plotting the
 previous configuration. That is the failure mode worth designing against: a stale figure that looks
 current is worse than no figure.
+
+**The imagery's element type is part of the key.** A `CAPTURE_FLOAT32` capture and an ordinary one of
+the same case have identical settings and grid, and differ only in `in_I1`'s element type; a key
+without it serves the `UInt8` field for a `Float32` comparison and reports the quantization's effect
+as zero. The hash of the arrays themselves is not used — it costs a pass over 17,000² of imagery per
+figure, and `eltype` separates the two captures that exist.
 """
 function cached_run(name::AbstractString, k::Capture, grid, kw)
     dir = get(ENV, "AUTORIFT_GOLDEN_CACHE",
               joinpath(homedir(), "data", "autorift", "tests", "golden_tests"))
-    key = string(hash((name, kw, size(grid.x))), base = 16)
+    key = string(hash((name, kw, size(grid.x), eltype(k.arrays["in_I1"]))), base = 16)
     path = joinpath(dir, "runs", "field_$(first(name, 24))_$key.jls")
 
     if isfile(path)
