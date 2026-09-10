@@ -65,3 +65,7 @@ __pycache__/
 
 # Scratch figures for inspection; regenerate with tools/golden/*_maps.jl
 tmp_figs/
+
+# Generated comparison figures: 8 MB of PNGs regenerable from the captures by
+# `tools/golden/all_figures.jl`.
+figs/
