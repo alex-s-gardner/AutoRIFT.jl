@@ -1847,3 +1847,53 @@ differ in shape — chip 384 is right-skewed at median +0.055 against mean +0.25
 median +0.281 against mean +0.268, so the equal means were coincidence); a whole-coarse-pixel shift
 (2.1% of chip-768 points lie within 0.15 px of any `k * Scale`); `InterpMask` (the level scaling survives
 restricting to unflagged points); the interpolator and its NaN rule (above).
+
+## Where it is not: five steps and two selection mechanisms, each closed by measurement
+
+Continuing from the section above, on the NISAR L2 GSLC case at chip 384 and 768.
+
+**The raw fine pass agrees.** Re-running the level-2 fine pass on the reference's own traced inputs —
+its lattice, its post-`MC2` search radii, its rounded prior, `chip 384 x 192`, oversample 64 — gives
+**99.41% bit-exact** over 30,115 both-defined points, with `p50 = p90 = p99 = 0`. Both sides sit exactly
+on the 1/64 lattice. What remains is 177 points differing by up to 94.56 px, which is a different
+correlation peak rather than a subpixel disagreement, and 548 points the reference reports and
+AutoRIFT.jl declines.
+
+**Those points are not what the heatmap shows.** Mapped on the level's own 572² grid, the 548 declined
+points lie on a thin diagonal along the footprint edge and the 177 are scattered; `ddx` at the raw pass
+renders blank on the same ±2 px scale where the merged residual shows strong blocks, and the merged
+chip-384 points fall where level 2 *agreed*. `figs/nisar_l2_level2_classes.png`.
+
+The arithmetic also rules them out on their own: 177 points at up to 94.56 px supply at most 16,832 px
+of displacement sum, against the 90,902 px needed to move 87,913 merged points by +1.034.
+
+**Level ownership agrees, and disagreeing about it costs little.** `chip_size` records which level
+answered each point, so the two maps can be compared rather than a proxy for them. Over a 401² window,
+124,159 both-measured points:
+
+| | n | share | mean ddx | median | std |
+|---|---:|---:|---:|---:|---:|
+| same owning level | 118,887 | 95.75% | +0.0017 | +0.0000 | 0.2541 |
+| different level | 5,272 | 4.25% | −0.0421 | −0.0279 | 0.2542 |
+
+The two groups have the *same* spread, and the largest per-pair mean anywhere in the ownership confusion
+matrix is −0.0474 px (`jl 384 -> ref 192`, n = 4,594). Nothing approaches +1.03 or +2.15, so a level
+mismatch does not produce a large residual.
+
+Ownership is exclusive and cumulative, which the trace confirms: `ChipSizeX_rev0_L2` holds
+0/96/192/384 counts of 3,590,592 / 1,215,214 / 341,225 / 87,913, summing to 2288², and the 96/192/384
+counts are identical in the final `out_ChipSizeX` — chip 768's 118,799 comes out of the points still at
+0. That is the `ChipSizeX == 0` guard at `autoRIFT.py:863-864`.
+
+**The residual is local, and no single coordinate explains it.** Windows disagree with each other. At
+rows 113–513 the chip-384 mean is +1.034 and chip 768 is +2.145; at rows 891–1291 chip 384 is −0.026 and
+no chip-768 point appears, with a whole-window mean of −0.00018 px. A sweep of 121² windows across the
+grid shows chip 96 within 0.023 px of zero in **every** window while the coarse levels swing widely — and
+the swing is not a function of position: row 781 spans −0.073 to +0.108 at chip 384, and row 541 spans
++0.063 to +2.488 at chip 768. A row-dependent law fits the first few windows and is falsified by the
+within-row spread.
+
+**So the base level agrees everywhere and the coarse levels disagree locally**, while every step that
+builds a coarse level — correlate, median-fill, previous-level fill, `INTER_AREA`, `INTER_CUBIC`, merge
+— has been shown to reproduce the reference exactly on the reference's own inputs. The cause is not yet
+identified, and the candidates that have been tested are listed here so they are not retested.
