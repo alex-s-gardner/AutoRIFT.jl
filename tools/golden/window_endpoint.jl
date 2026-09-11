@@ -71,7 +71,10 @@ function window_endpoint(c::GoldenCase; n::Integer = 100, half::Integer = 200,
     t = @elapsed out = autorift(b, a, w; kwargs_from_capture(k)...)
     @info "correlated window" seconds=round(t; digits = 1)
 
-    return (; jdx = out.dx, jdy = out.dy,
+    # `jcs` beside `rcs`, because which level answered a point is a result and not a parameter: the two
+    # implementations choose independently, and a point they assign to different levels carries the whole
+    # difference between two levels' answers rather than a numerical disagreement.
+    return (; jdx = out.dx, jdy = out.dy, jcs = out.chip_size,
             rdx = rdx_all[rows, cols],
             # `dy` carries the cartesian-to-matrix flip, the same one `compare_correlator` measures.
             rdy = .-k.arrays["out_Dy"][rows, cols],
