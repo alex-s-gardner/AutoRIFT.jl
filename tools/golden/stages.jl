@@ -548,10 +548,14 @@ function _level_pointset(k::Capture, L::Int, chip::Int, p::Params)
         dy0 = round.(windowmean(dy0, stride)[rows, cols][1:size(xg, 1), 1:size(xg, 2)])
     end
     n = size(xg)
+    # `dy0` is negated for the reason `pointset_from_capture` negates it: the trace records the prior
+    # in cartesian-Y, and `arImgDisp_u`/`arImgDisp_s` flip it to matrix-Y before cutting a chip
+    # (`autoRIFT.py:1058`, `:1231`). A `PointSet` carries the matrix-Y form, so passing the traced
+    # value through unchanged places every chip `2 * Dy0` rows from where the reference placed it.
     return PointSet(
         Float64.(xg) .+ 1, Float64.(yg) .+ 1,
         Int.(sx), Int.(sy),
-        Float64.(dx0), Float64.(dy0),
+        Float64.(dx0), .-Float64.(dy0),
         fill(chip, n), fill(chip, n),
         zeros(Int, n), zeros(Int, n),
     )
@@ -663,8 +667,13 @@ function rungs_coarse_sampling(k::Capture, L::Int, chip::Int)
     end
     # The priors, sampled at the node rather than reduced: the reference slices `Dx00` with the same
     # `rIdxC` it slices the grid with (`autoRIFT.py:643-644`), so no window is involved here.
+    #
+    # **The y prior is compared in cartesian-Y, which is the convention the trace is in.** A `PointSet`
+    # holds the matrix-Y form, so the sign is put back rather than the two being compared across the
+    # flip — an axis whose only difference is the convention would otherwise report every nonzero point
+    # as a disagreement while the chips it places are identical.
     for (axis, refname, jl) in (("x", "Dx0C", setup.coarse.dx_prior),
-                                ("y", "Dy0C", setup.coarse.dy_prior))
+                                ("y", "Dy0C", .-setup.coarse.dy_prior))
         ref = _state_shaped(k, refname, L, size(jl))
         ref === nothing && continue
         push!(out, exact_stage("3.6c coarse prior $axis", refname, Float32.(jl), ref))
@@ -883,8 +892,9 @@ function rungs_coarse_correlation(k::Capture, L::Int, chip::Int)
 
     p = params(; kwargs_from_capture(k)...)
     n = size(xg)
+    # `Dy0C` is cartesian-Y, as traced; a `PointSet` carries matrix-Y. See `_level_pointset`.
     pts = PointSet(Float64.(xg) .+ 1, Float64.(yg) .+ 1, Int.(srx), Int.(sry),
-                   Float64.(dx0), Float64.(dy0), fill(chip, n), fill(chip, n),
+                   Float64.(dx0), .-Float64.(dy0), fill(chip, n), fill(chip, n),
                    zeros(Int, n), zeros(Int, n))
     a = k.arrays["in_I1"]
     b = k.arrays["in_I2"]
