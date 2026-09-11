@@ -24,7 +24,7 @@ function window_figure(r, title::AbstractString; path = nothing)
     step = max(1, cld(maximum(size(ddx)), 800))
     sub(A) = A[1:step:end, 1:step:end]
 
-    fig = Figure(size = (1800, 1300))
+    fig = Figure(size = (1800, 1750))
     Label(fig[0, 1:4], "$(first(title, 60)) — AutoRIFT.jl vs autoRIFT, " *
                        "$(size(r.jdx, 1))×$(size(r.jdx, 2)) grid window";
           fontsize = 20, font = :bold)
@@ -52,9 +52,26 @@ function window_figure(r, title::AbstractString; path = nothing)
     # a fixed ±1 px panel sits beside it where saturation means a whole pixel.
     v = ddx[.!isnan.(ddx)]
     q = isempty(v) ? 1.0 : quantile(abs.(v), 0.98)
-    panel((2, 1), ddx, @sprintf("ddx = julia − python, auto scale ±%.3f px", q))
-    panel((2, 3), ddx, "ddx = julia − python, fixed ±1 px"; colorrange = (-1.0, 1.0))
-    panel((3, 1), ddy, "ddy = julia − python, fixed ±1 px"; colorrange = (-1.0, 1.0))
+    panel((2, 1), ddx, @sprintf("ddx, all points — fixed ±1 px (auto would be ±%.3f)", q);
+          colorrange = (-1.0, 1.0))
+
+    # **The level-assignment panel, because it is the difference between a residual and an artifact.**
+    # A window's extent decides which pyramid level claims a point, so a point the two implementations
+    # answered at different levels carries the gap between two levels' answers rather than a
+    # disagreement. Showing which points those are is what stops the rest of the figure being misread.
+    lvl = fill(NaN, size(ddx))
+    lvl[both] .= 0.0
+    lvl[both .& (r.jcs .!= r.rcs)] .= 1.0
+    nd = count(both .& (r.jcs .!= r.rcs))
+    panel((2, 3), lvl, @sprintf("level assignment differs (yellow): %d of %d = %.2f%%",
+                                nd, count(both), 100nd / count(both));
+          colormap = cgrad(:viridis, 2, categorical = true), colorrange = (0, 1))
+
+    # The same residual with those points removed: the part attributable to the computation.
+    ddx_same = copy(ddx); ddx_same[both .& (r.jcs .!= r.rcs)] .= NaN
+    ddy_same = copy(ddy); ddy_same[both .& (r.jcs .!= r.rcs)] .= NaN
+    panel((3, 1), ddx_same, "ddx, same level only — fixed ±1 px"; colorrange = (-1.0, 1.0))
+    panel((3, 3), ddy_same, "ddy, same level only — fixed ±1 px"; colorrange = (-1.0, 1.0))
 
     out = path === nothing ?
         joinpath(dirname(@__DIR__), "..", "figs", "window_$(first(title, 40)).png") : path
