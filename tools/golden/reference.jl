@@ -133,14 +133,23 @@ end
 # them.
 const REGENERABLE = ("filtered", "reprojected")
 
+# The same, for a driver that writes its scene copies as loose files beside the outputs rather than
+# into a directory. `crop_gslcs` (`nisar_isce3.py:508`) writes one uncompressed CFloat32 raster of a
+# whole GSLC swath per scene: on the Jakobshavn pair they are **48.3 GiB each**, against 44 GiB for
+# everything else in the run put together.
+const REGENERABLE_FILES = ("reference_cropped.tif", "secondary_cropped.tif")
+
 """
     prune_run(dir; dry_run = false) -> Int
 
 Delete the regenerable scene copies under `dir` and return the bytes freed.
 
 Keeps everything a comparison or a diagnosis needs: the product, `autoRIFT_intermediate.nc`, the
-geogrid rasters, `offset.tif`/`velocity.tif`, the browse images and the log. Only the filtered and
-reprojected scene copies go, and only those — a run stays fully comparable after pruning.
+geogrid rasters, `offset.tif`/`velocity.tif`, the browse images and the log. Only the scene copies go,
+and only those — a run stays fully comparable after pruning.
+
+The byte images the correlator was actually handed are in the capture, not in these files, so pruning
+cannot cost a correlator comparison. What it costs is re-running the driver to inspect a scene copy.
 """
 function prune_run(dir::AbstractString; dry_run::Bool = false)
     freed = 0
@@ -151,6 +160,12 @@ function prune_run(dir::AbstractString; dry_run::Bool = false)
             freed += filesize(joinpath(root, f))
         end
         dry_run || rm(path; recursive = true)
+    end
+    for name in REGENERABLE_FILES
+        path = joinpath(dir, name)
+        isfile(path) || continue
+        freed += filesize(path)
+        dry_run || rm(path)
     end
     return freed
 end
