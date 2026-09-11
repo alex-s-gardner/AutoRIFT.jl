@@ -351,28 +351,33 @@ end
 
 # How much coarser this level's grid is than the caller's, as an integer stride.
 #
-# The reference resizes its grid by `ChipSize0X / ChipSizeUniX[i]` at every level
-# (`autoRIFT.py:507-524`) and resizes the results back afterwards (`820-878`), so a level's grid
-# spacing grows with its chip and the chip-to-spacing ratio is the same at every level. That is what
-# makes one filter width correct throughout, and what keeps a level from posting sixteen estimates
-# per chip footprint — sixteen views of mostly the same pixels, which no coherence filter can tell
-# apart.
+# **The chip ratio, applied to both axes.** The reference resizes its grid by
+# `ChipSize0X / ChipSizeUniX[i]` at every level (`autoRIFT.py:510-514`) and resizes the results back
+# by the reciprocal afterwards (`:820-878`) — one factor, from the x extents, used for rows and
+# columns alike. So a level's grid spacing grows in proportion to its chip, every level sees the same
+# chip-to-spacing ratio, and one filter width is correct throughout.
+#
+# The invariant this holds: a level posts one estimate per chip footprint. A stride half of this
+# posts four, which are four views of mostly the same pixels — the coherence filter cannot tell them
+# apart, so they survive as mutually corroborating outliers. A per-axis rule reaches that halved
+# stride on every anisotropic chip and agrees on every square one, so only the radar and NISAR pairs
+# exercise the difference: on NISAR's 96x52 it gives 1, 1, 2, 4 against the reference's 1, 2, 4, 8,
+# whose own traced level grids run 2288x2288 -> 1144x1144 -> 572x572 -> 286x286.
+#
+# `chip_size_min` and not `_oversample(p) * p.grid_spacing`: the two coincide in every golden
+# configuration, since `chip_size_min.X` is an exact multiple of the spacing there and the ratio is
+# below `_oversample`'s cap. They part on a grid finer than that cap allows, and the chip ratio is
+# the one that reproduces the reference. `_check_levels` makes the division exact at every level.
+#
+# **Both axes take the x factor, which is not obviously right for a rectangular chip** — the NISAR
+# 96x52 chip is 52 px tall against a 48 px spacing, so a stride of 8 in y coarsens the grid well past
+# what the chip supports. Matched rather than endorsed; see `tools/golden/README.md`.
 #
 # A stride rather than a resize: the levels are powers of two of the base chip, so the coarse grid is
 # exactly every `n`-th point of the fine one, and taking a subset keeps the coordinates the caller
 # supplied instead of interpolating new ones.
-#
-# Derived from the *grid spacing*, not from `chip_size_min`. The invariant to hold is that every
-# level sees the same chip-to-spacing ratio, so the stride is whatever makes this level's effective
-# spacing proportional to its chip: `chip / (ratio * spacing)`, where the ratio is the finest
-# level's. Defining it against `chip_size_min` instead gives a stride of 1 whenever a single coarse
-# level runs alone — `chip_size_min` is then that same coarse size — and the ratio jumps to 8, where
-# the filter demands 877 of 1089 neighbours agree and nothing survives.
 function _level_decimation(p::Params, chip_size::Extent)
-    ratio = _oversample(p)
-    sx = chip_size.X ÷ max(ratio * p.grid_spacing.X, 1)
-    sy = chip_size.Y ÷ max(ratio * p.grid_spacing.Y, 1)
-    return max(min(sx, sy), 1)
+    return max(chip_size.X ÷ p.chip_size_min.X, 1)
 end
 
 # One point per `stride`-by-`stride` cell of `grid`, placed at the cell's centre.
@@ -773,8 +778,12 @@ function _oversample(p::Params)
     # is 877 of 1089, which no real velocity field clears — measured as zero coverage for a 64 px
     # chip on a grid spaced 8. The reference never exceeds 2 because it decimates every level to
     # keep the ratio fixed, so the formula it uses (`autoRIFT.py:498-502`) was only ever exercised
-    # there. A caller who posts a grid four times finer than its chips gets the same neighbourhood
-    # in ground units that the reference would use, and `_level_decimation` does the rest.
+    # there.
+    #
+    # The cap therefore bites only on a grid finer than any the reference runs, and it bites on the
+    # filter neighbourhood alone: `_level_decimation` is the chip ratio and does not consult this, so
+    # a capped ratio leaves the level grids where the reference puts them and widens the window less
+    # than the true ratio would.
     return clamp(ox, 1, 2)
 end
 
