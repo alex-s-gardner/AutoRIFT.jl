@@ -119,11 +119,13 @@ function report_window(r)
     @printf("\nlevel assignment: agree on %d of %d (%.2f%%), differ on %d (%.2f%%)\n",
             count(samelvl), count(both), 100count(samelvl) / count(both),
             count(difflvl), 100count(difflvl) / count(both))
-    count(difflvl) > 0 && @printf("  %s %d points are answered at different pyramid levels by the two\n" *
-                                  "  implementations, so their residual is a level difference rather than a\n" *
-                                  "  disagreement. Per-level figures from this window are not comparable to\n" *
-                                  "  the reference's; use `correlator.jl` over the whole grid for those.\n",
-                                  "WARNING:", count(difflvl))
+    if count(difflvl) > 0
+        @printf("  WARNING: %d points are answered at different pyramid levels by the two\n",
+                count(difflvl))
+        println("  implementations, so their residual is a level difference rather than a")
+        println("  disagreement. Per-level figures from this window are not comparable to")
+        println("  the reference's; use `correlator.jl` over the whole grid for those.")
+    end
 
     for (nm, j, ref) in (("dx", r.jdx, r.rdx), ("dy", r.jdy, r.rdy))
         d = j[both] .- ref[both]
