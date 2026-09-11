@@ -1712,6 +1712,9 @@ The prior's sign convention was wrong in two places, not one. `dc55e09` fixed
 rung 3.6c's comparison. Every case-level figure recorded before those two commits was measured
 through one or the other, so this section re-measures them rather than editing them.
 
+All twelve optical cases are re-measured here. The eight radar rows are not, so the warning at the top
+of this file stands until they are.
+
 Measured at `6dd337b` (2026-09-10). Command per case:
 
 ```
@@ -1738,19 +1741,39 @@ All twelve optical cases were red on that one rung and no other. `3.opt` is **12
 
 ## The optical endpoint, re-measured
 
-| case | both | exact | was | only jl | only ref | bias core dx | corr dx | tail |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| S2A Malaspina | 586,129 | **94.24%** | 92.65% | 6,581 | 10,489 | +0.0018 | +0.998 | **0** |
-| LC09 Antarctic | 464,316 | **83.01%** | 68.42% | 1,295 | 6,449 | −0.0048 | +0.998 | **0** |
-| S2B Jakobshavn | 605,987 | **78.85%** | 67.34% | 6,620 | 11,893 | −0.0047 | +1.000 | 2 (dy) |
-| LC08 East Greenland | 691,714 | **72.74%** | 63.21% | 37,625 | 34,853 | −0.0226 | +0.991 | 3 |
-| LC08 Jakobshavn | 1,662,200 | **71.84%** | 54.45% | 43,428 | 53,860 | −0.0080 | +0.998 | **0** |
+All twelve, in the order the earlier table used.
 
-Every case improves, by +1.6 to **+17.4** points. The largest gains are the fast-flow scenes, which
-is the signature the defect predicted: the error scales with the prior, so it was smallest where the
-prior was small.
+| # | case | filter | both | exact | was | Δ | bias core dx | corr dx | tail |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | S2A Malaspina | `hps` | 586,129 | **94.24%** | 92.65% | +1.59 | +0.0018 | +0.998 | **0** |
+| 2 | LC09 Antarctic | `hps` | 464,316 | **83.01%** | 68.42% | +14.59 | −0.0048 | +0.998 | **0** |
+| 3 | S2B Jakobshavn | `hps` | 605,987 | **78.85%** | 67.34% | +11.51 | −0.0047 | +1.000 | 2 (dy) |
+| 4 | LC08 East Greenland | `hps` | 691,714 | **72.74%** | 63.21% | +9.53 | −0.0226 | +0.991 | 3 |
+| 5 | LC08 Jakobshavn | `hps` | 1,662,200 | **71.84%** | 54.45% | +17.39 | −0.0080 | +0.998 | **0** |
+| 6 | `LE07_..._20130314` | `wallis_fill` | 713,305 | 59.94% | 59.83% | +0.11 | −0.0326 | +0.920 | **0** |
+| 7 | `LC08_060018` × `LE07` | `wallis_fill` | 672,912 | 58.56% | 58.49% | +0.07 | +0.0115 | +0.955 | **0** |
+| 8 | `LE07_..._20040810` | `wallis_fill` | 918,180 | **52.91%** | 50.18% | +2.73 | −0.0084 | +0.975 | **0** |
+| 9 | `LE07_..._20120428` | `wallis_fill` | 106,228 | 0.00% † | 0.00% | — | +0.0083 | +0.891 | **0** |
+| 10 | `LT04_063018` | `fft` | 272,875 | 56.02% | 55.95% | +0.07 | **+0.0008** | +0.982 | **0** |
+| 11 | `LT05_060018` | `fft` | 124,397 | 27.09% | 27.09% | 0.00 | −0.0031 | +0.993 | **0** |
+| 12 | `LT05_001013` (`P000`) | `fft` | 18,540 | 0.00% † | 0.00% | — | −0.0847 | +0.997 | **0** |
 
-**The tail is what changed most.** `LC08_L1TP_009011` reported a maximum residual of 399 px before
-and **5.4 px** after, with **0 of 1,662,200** points beyond 10 px on either axis. Four of the five
-cases report a zero tail; the largest is 3 points.
+† base level skipped on both sides, so every point is coarse and unquantized and `exact` is 0 by
+construction. Bias and correlation are the gate there.
+
+**Eleven of twelve report a zero tail beyond 10 px**, and the two that do not report 2 and 3 points
+against populations of 605,987 and 691,714. Before the fix `LC08_L1TP_009011` alone reached a
+maximum residual of 399 px; it is now **5.4 px**, with 0 of 1,662,200 points beyond 10 on either
+axis. This is the clearest single effect of the fix.
+
+**The gain lands entirely on the five `hps` cases**, +1.6 to +17.4 points, while the four
+`wallis_fill` and three `fft` cases move by at most +2.73 and mostly by under 0.15. That split is not
+a filter effect: cases 6, 7, 8 and 10 quantize 53–60% of their points, so they had as much room to
+gain as case 5 at 72%. The prior is the discriminating quantity — the misplacement was `2 * Dy0`
+rows, so a scene whose prior is near zero was never displaced far enough to lose its peak. Case 11 at
+27.09% is unchanged to four figures.
+
+**Case 12's bias is the one figure to keep an eye on.** At −0.0847 px it is the largest in the set by
+6×, on the smallest population (18,540) and the only `P000` case. It did not move with the fix, so it
+is not a sign-convention artifact; it predates this work and is unexplained.
 
