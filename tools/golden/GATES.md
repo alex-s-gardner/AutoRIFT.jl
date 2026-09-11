@@ -1777,3 +1777,73 @@ rows, so a scene whose prior is near zero was never displaced far enough to lose
 6×, on the smallest population (18,540) and the only `P000` case. It did not move with the fix, so it
 is not a sign-convention artifact; it predates this work and is unexplained.
 
+
+---
+
+# The coarse-level residual is not the interpolation
+
+The NISAR L2 GSLC case disagrees by +1.03 px at chip 384 and +2.15 px at chip 768 while the base level
+agrees at 98.0%. Above the base level a reported value is a `cv2.resize(..., INTER_CUBIC)` of a filtered
+field rather than a measurement (`autoRIFT.py:856-866`), so "interpolation" is the available
+explanation. It is the wrong one, and the arithmetic says so before any measurement does.
+
+## Why interpolation cannot produce a pixel
+
+Bicubic resampling is a deterministic 16-tap weighted sum. Identical inputs, weights and sample
+positions give identical outputs up to float32 summation order, which is bounded by `16 * eps * |value|`:
+
+| displacement | summation-order bound |
+|---|---|
+| 1 px | 1.9e-06 px |
+| 10 px | 1.9e-05 px |
+| 30 px | 5.7e-05 px |
+
+The observed residual is 1.1e+05 times the bound at a 10 px displacement. Five orders of magnitude is
+not an arithmetic effect.
+
+Measured against OpenCV's own output in `test/fixtures/resize/` — 63 and 64 samples, six scale factors
+including a non-integer 0.4286 — the worst disagreement over all twelve `INTER_AREA` fixtures is
+**1.79e-07** and over all twelve `INTER_CUBIC` fixtures **4.17e-07**, both at the float32 rounding
+floor, several bit-identical. (Only one of the 48 fixtures is asserted by the suite; the rest are
+checked here and should be added to it.)
+
+## Every step of the merge chain reproduces the reference exactly
+
+Taken from a stage trace of level 2 at `CAPTURE_STAGES=1 CAPTURE_STAGE_LEVEL=2` (run 201), replaying
+each operation on the reference's **own** traced input and comparing against its own traced output:
+
+| line | operation | max abs difference |
+|---|---|---|
+| `:831` | `INTER_AREA` downsample of `DxF0` | 3.05e-05 — float32 floor |
+| `:847` | `DxFM` patched from `DxF0` | **0.000e+00 — bit-exact, 100.00%** |
+| `:852` | `DxF` patched from `DxFM` | **0.000e+00 — bit-exact, 100.00%** |
+| `:856` | `INTER_CUBIC` upsample of `DxF` | 3.05e-05 — float32 floor |
+
+At the 87,913 points the merge assigns to chip 384, the two agree on definedness for **all** of them.
+
+One difference exists and is inert: after the upsample our field defines 203,648 points the reference
+leaves `NaN`, because OpenCV propagates a `NaN` tap over the whole 4x4 kernel footprint while a rule that
+skips and renormalizes keeps the point. None of those points is one the merge reads, so it cannot
+contribute to the residual — but it is a real difference in the NaN-propagation rule and would matter to
+any step that read the field directly.
+
+## What that leaves
+
+Given the reference's own `DxF` the whole chain is reproduced bit-for-bit, so the residual enters
+*before* it — in `DxF_rev0`, the level's own raw measurement at chip 384. That is the correlator at a
+coarse chip size, not the merge.
+
+Two further constraints on the cause, both measured:
+
+- **The sign differs between the two NISAR cases.** L1 RSLC coarse means are −0.017 / −0.077 / −0.575
+  at chips 192 / 384 / 768; L2 GSLC are −0.040 / +1.034 / +2.145. Same code, same ladder, same `Scale`
+  values, opposite signs — so not a fixed arithmetic or registration error.
+- **Emptiness does not explain it.** L1's coarse levels are *more* sparse (93.2% and 94.6% NaN at chips
+  384 and 768) than L2's (90.6%, 92.6%) and its residuals are smaller.
+
+Hypotheses closed by measurement, so they are not re-opened: integer truncation at `:821` (2288 = 2^4 *
+143, so every `Scale` divides exactly); a fixed fraction of a coarse pixel (the per-point distributions
+differ in shape — chip 384 is right-skewed at median +0.055 against mean +0.259, chip 768 symmetric at
+median +0.281 against mean +0.268, so the equal means were coincidence); a whole-coarse-pixel shift
+(2.1% of chip-768 points lie within 0.15 px of any `k * Scale`); `InterpMask` (the level scaling survives
+restricting to unflagged points); the interpolator and its NaN rule (above).
