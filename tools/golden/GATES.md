@@ -1702,3 +1702,55 @@ pool with ~60 GB free: those per-burst ISCE3 intermediates are 70–80% of a run
 `_oversample` and `chip_size_max` bugs were invisible on twelve optical pairs and surfaced only on an
 anisotropic chip. Thresholds are the weakest measured case less a margin — core bias 0.010 px,
 correlation 0.78 (case 1 is the floor at 0.820/0.825), tail 400 points.
+
+---
+
+# Re-measurement after the Dy0 sign fix
+
+The prior's sign convention was wrong in two places, not one. `dc55e09` fixed
+`pointset_from_capture`; `b10c8ba` fixed the stage ladder's own two `PointSet` constructions and
+rung 3.6c's comparison. Every case-level figure recorded before those two commits was measured
+through one or the other, so this section re-measures them rather than editing them.
+
+Measured at `6dd337b` (2026-09-10). Command per case:
+
+```
+julia --project=tools/golden -t 8 tools/golden/correlator.jl <case> --run 200
+```
+
+## The stage ladder, and why `3.opt` was red
+
+The fix is visible as a rung before it is visible as a figure. On `LC08_L1TP_009011`, rung 3.7
+(coarse correlation against the reference's own level-0 output):
+
+| | before | after |
+|---|---|---|
+| exact | 86.54% | **99.95%** |
+| bias | −0.0916 | **−0.0008** |
+| p99 / max | 63 / 342 | **0 / 9** |
+
+Rung 3.6c compares the y prior against the trace, which holds it in cartesian-Y while a `PointSet`
+holds matrix-Y. Comparing across the flip reported all 11,562 nonzero points of 85,556 as
+disagreements while the chips placed were identical.
+
+All twelve optical cases were red on that one rung and no other. `3.opt` is **12/12** and `3.x` is
+**23 of 23 rungs**.
+
+## The optical endpoint, re-measured
+
+| case | both | exact | was | only jl | only ref | bias core dx | corr dx | tail |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| S2A Malaspina | 586,129 | **94.24%** | 92.65% | 6,581 | 10,489 | +0.0018 | +0.998 | **0** |
+| LC09 Antarctic | 464,316 | **83.01%** | 68.42% | 1,295 | 6,449 | −0.0048 | +0.998 | **0** |
+| S2B Jakobshavn | 605,987 | **78.85%** | 67.34% | 6,620 | 11,893 | −0.0047 | +1.000 | 2 (dy) |
+| LC08 East Greenland | 691,714 | **72.74%** | 63.21% | 37,625 | 34,853 | −0.0226 | +0.991 | 3 |
+| LC08 Jakobshavn | 1,662,200 | **71.84%** | 54.45% | 43,428 | 53,860 | −0.0080 | +0.998 | **0** |
+
+Every case improves, by +1.6 to **+17.4** points. The largest gains are the fast-flow scenes, which
+is the signature the defect predicted: the error scales with the prior, so it was smallest where the
+prior was small.
+
+**The tail is what changed most.** `LC08_L1TP_009011` reported a maximum residual of 399 px before
+and **5.4 px** after, with **0 of 1,662,200** points beyond 10 px on either axis. Four of the five
+cases report a zero tail; the largest is 3 points.
+
