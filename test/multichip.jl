@@ -720,7 +720,7 @@ end
     @test_throws ArgumentError params(; chip_size = 32, chip_size_max = 96)
 end
 
-@testset "grid spacing survives a zeroed nodata margin" begin
+@testset "grid spacing survives a constant nodata fill" begin
     # A production grid is zeroed wherever there is no data (`testautoRIFT.py:394-403`), so a scene
     # whose first rows and columns are ocean has `x[1, 2] == x[1, 1]`. Reading the spacing from the
     # first two points gives zero there, `_cell_centres` then shifts by nothing, and every coarse node
@@ -749,9 +749,23 @@ end
     xrot = Float64[(c <= 5 || r <= 5) ? 0.0 : 5000.0 - (c - 1) for r in 1:12, c in 1:12]
     @test AutoRIFT._grid_step(xrot, 2) == -1
 
-    # No spacing at all: a single column, or an all-zero grid.
+    # **The nodata fill is a constant, and it is not always zero.** Both NISAR grids arrive filled with
+    # `0.5`, which the half-sample convention carries to `1.5` — covering 55.7% of the L2 array and
+    # 56.8% of the L1 one. A rule that excludes only steps *touching a zero* therefore counts every step
+    # inside the fill: on the L2 grid that is 2,895,601 zero steps against 2,297,235 real ones, so the
+    # mode is `0`, `_cell_centres` shifts by nothing, and every coarse node sits at its cell's first
+    # point. The property to exclude is the zero *step*, which a constant region produces whatever its
+    # value.
+    #
+    # Majority fill, since that is the case where the old rule flipped sign rather than merely wobbled.
+    xfill = Float64[(r <= 9) ? 1.5 : 1.5 + 8 * (c - 1) for r in 1:12, c in 1:12]
+    @test count(==(1.5), xfill) > length(xfill) ÷ 2     # the trap: the fill is the majority
+    @test AutoRIFT._grid_step(xfill, 2) == 8
+
+    # No spacing at all: a single column, an all-zero grid, or a grid that is nothing but fill.
     @test AutoRIFT._grid_step(zeros(4, 4), 2) == 0.0
     @test AutoRIFT._grid_step(reshape(Float64[1.5], 1, 1), 2) == 0.0
+    @test AutoRIFT._grid_step(fill(1.5, 4, 4), 2) == 0.0
 
     # And the consequence the helper exists for: a decimated node lands at the cell centre, half a
     # cell from its first point, even when the grid's first row and column are margin.
