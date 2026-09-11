@@ -385,6 +385,35 @@ end
     end
 end
 
+@testset "a level's stride is its chip ratio, in both axes" begin
+    # The reference resizes a level's grid by `ChipSize0X / ChipSizeUniX[i]` (`autoRIFT.py:510-514`) —
+    # one factor, from the x extents, applied to rows and columns alike. So the stride is the chip
+    # ratio and nothing else, and in particular it does not consult the y extent.
+    #
+    # Asserted directly rather than through a correlation, because a rule that decimates y less than
+    # the reference does still produces a plausible field: the level posts several estimates per chip
+    # footprint instead of one, which reads as blunders against the reference's smooth one rather than
+    # as a coverage or accuracy failure any end-to-end statistic isolates.
+    #
+    # The rectangular cases are the ones that discriminate. Every optical golden pair has a square
+    # chip, where a per-axis rule and this one agree at every level.
+    for (chip, cmax, spacing) in (((X = 96, Y = 52), (X = 768, Y = 416), 48),   # NISAR L1 RSLC
+                                  ((X = 96, Y = 48), (X = 768, Y = 384), 48),   # NISAR L2 GSLC
+                                  ((X = 32, Y = 8),  (X = 256, Y = 64),  32),   # Sentinel-1, 4:1
+                                  ((X = 32, Y = 32), (X = 256, Y = 256), 16))   # square control
+        p = params(; chip_size = chip, chip_size_max = cmax,
+                   grid_spacing = (X = spacing, Y = spacing))
+        sizes = AutoRIFT.chip_sizes(p)
+        @test [AutoRIFT._level_decimation(p, cs) for cs in sizes] == [1, 2, 4, 8]
+        # The stride is the x ratio at every level, whatever the aspect.
+        @test all(AutoRIFT._level_decimation(p, cs) == cs.X ÷ chip.X for cs in sizes)
+    end
+
+    # A grid coarser than the chip does not lift the finest level off its own points.
+    p = params(; chip_size = 32, chip_size_max = 64, grid_spacing = 64)
+    @test AutoRIFT._level_decimation(p, (X = 32, Y = 32)) == 1
+end
+
 @testset "a coarse level is correlated where it is read back from" begin
     # The round trip a decimated level makes: `_decimate_level` picks where to correlate, and
     # `_undecimate_level` interpolates the answers back with the half-sample convention, which places

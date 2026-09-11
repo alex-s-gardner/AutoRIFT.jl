@@ -311,6 +311,14 @@ function _consumed_grid(k::Capture, name::AbstractString, L::Int)
                              end))))
 end
 
+# A level's chip as an `Extent`, so a rung can ask the pyramid's own functions about it.
+#
+# The height follows the reference: `ChipSizeY = round(ChipSizeX * ScaleChipSizeY / 2) * 2`, recomputed
+# from the x extent at every level (`autoRIFT.py:650`, `:730`, `:869`) and forced even. `chip_sizes`
+# doubles both axes together from the base, which reaches the same heights on every golden case.
+_level_extent(k::Capture, chip::Int) =
+    (X = chip, Y = round(Int, chip * Float64(k.scalars["ScaleChipSizeY"]) / 2) * 2)
+
 # ---------------------------------------------------------------------------
 # 3.1 — the level's grid
 # ---------------------------------------------------------------------------
@@ -342,14 +350,24 @@ function rung_grid(k::Capture, L::Int, chip::Int, chip0::Int)
     # difference there changes which pixels a chip covers, and `src/multichip.jl` records that
     # self-consistency between correlation position and read-back is what the accuracy depends on —
     # not agreement with either half of the reference separately.
+    #
+    # **The stride comes from `_level_decimation`, the function the pyramid itself calls.** Deriving it
+    # here as `chip ÷ chip0` — the reference's own rule — would make this rung a comparison of the
+    # reference against a reimplementation of the reference, which agrees by construction whatever
+    # production does. The two rules coincide on a square chip and part on a rectangular one, so a
+    # ladder written that way is green on every optical case and stays green on the ones that disagree.
     full = pointset_from_capture(k)
-    sub = AutoRIFT._decimate_level(full, trues(size(full)), chip ÷ chip0)
+    stride = AutoRIFT._level_decimation(params(; kwargs_from_capture(k)...), _level_extent(k, chip))
+    sub = AutoRIFT._decimate_level(full, trues(size(full)), stride)
     sub === nothing && return StageResult("3.1 grid, level $L", "xGrid0", "exact", false, 0,
                                           "AutoRIFT.jl decimated to nothing at stride $stride")
     jl = Float32.(sub.grid.x .- 1)
+    # **Gated, not reported.** A level whose grid is a different size from the reference's is not a
+    # position difference to characterise — it means the two are correlating a different number of
+    # points, and every downstream rung on this level is then comparing arrays that do not correspond.
     size(jl) == size(xg0) || return StageResult("3.1 grid, level $L", "xGrid0", "exact", false, 0,
-        "shape $(size(jl)) against reference $(size(xg0)) — AutoRIFT.jl's decimation and the " *
-        "reference's resize disagree about the level's grid size")
+        "shape $(size(jl)) against reference $(size(xg0)) at stride $stride — AutoRIFT.jl's " *
+        "decimation and the reference's resize disagree about the level's grid size")
     # **Above the base chip size the two constructions differ by design, and this rung reports the
     # difference rather than gating on it.** The reference resizes with `INTER_AREA` and snaps to
     # `round(x + 0.5) - 0.5`; `_decimate_level` takes every `stride`-th point and `_cell_centres` shifts
@@ -378,7 +396,7 @@ function rung_grid(k::Capture, L::Int, chip::Int, chip0::Int)
         iszero(xg0[i]) && continue
         push!(offs, abs(Float64(xg0[i]) - Float64(jl[i])))
     end
-    cell = (chip ÷ chip0) * _grid_step_of(full)
+    cell = stride * _grid_step_of(full)
     med = isempty(offs) ? 0.0 : median(offs)
     exact = count(iszero, offs)
     # Reported, not gated: the difference is a documented decision, so a pass/fail here would either
@@ -475,7 +493,9 @@ function rung_priors(k::Capture, L::Int, chip::Int, chip0::Int, spacing::Int)
     # with OpenCV's mapping at 18,422 of 1,368,896 destinations against this slice's 1, so the slice is
     # the better model of `cv2.resize`'s nearest rule and the residual point is reported rather than
     # absorbed.
-    stride = chip ÷ chip0
+    # `_level_decimation`, so this reduces over the cell the pyramid actually decimates to. Recomputing
+    # the reference's own `1 / Scale` here instead would agree with the reference by construction.
+    stride = AutoRIFT._level_decimation(params(; kwargs_from_capture(k)...), _level_extent(k, chip))
     mx = windowmean(k.arrays["in_Dx0"], stride)
     rows = 1:stride:size(mx, 1)
     cols = 1:stride:size(mx, 2)
@@ -1112,7 +1132,11 @@ end
 function rungs_readback(k::Capture, L::Int, chip::Int, chip0::Int)
     out = StageResult[]
     L == 0 && return out                      # the base level is assigned, not resized
-    scale = chip ÷ chip0
+    # This level's stride, from the pyramid's own rule rather than from the reference's, for the reason
+    # rung 3.1 records. It is the factor `_undecimate_level`'s `reduce_prior` uses — `step(rows) + 1`
+    # for the mean and `step(rows)` for the area resize — so rung 3.12b models that step only if the two
+    # are the same number.
+    scale = AutoRIFT._level_decimation(params(; kwargs_from_capture(k)...), _level_extent(k, chip))
 
     # `DxFM` at a coarse level has three states: the `fillFiltWidth` median the fill loop reads, the
     # width-5 median built here, and that same array with `DxF0` written into it. The second is the one
