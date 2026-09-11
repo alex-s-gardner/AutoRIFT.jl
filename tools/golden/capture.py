@@ -394,11 +394,18 @@ def main():
     process_main()
 
 
+#
+# `DxF0`/`DyF0` are the previous level's merged field brought onto this level's grid — `colfilt` over a
+# `(Scale+1)²` window, then `INTER_AREA` (`autoRIFT.py:823-834`) — and they are what fills this level's
+# holes at `:847`. On a coarse level that is most of the array: the raw fine field is 90.6% NaN at chip
+# 384 and 92.6% at chip 768, so the array reaching the `INTER_CUBIC` upsample is mostly `DxF0` rather
+# than anything this level measured. Without them the fill path is the one part of the merge that cannot
+# be attributed to a step.
 STAGE_LOCALS = (
     'xGrid0', 'yGrid0', 'M0', 'SearchLimitX0', 'SearchLimitY0', 'Dx00', 'Dy00',
     'xGrid0C', 'yGrid0C', 'SearchLimitX0C', 'SearchLimitY0C', 'Dx0C', 'Dy0C',
     'DxC', 'DyC', 'M0C', 'MC', 'MC2',
-    'DxF', 'DyF', 'DxFM', 'DyFM', 'MF', 'MM',
+    'DxF', 'DyF', 'DxF0', 'DyF0', 'DxFM', 'DyFM', 'MF', 'MM',
     'Dx', 'Dy', 'ChipSizeX', 'InterpMask',
 )
 
