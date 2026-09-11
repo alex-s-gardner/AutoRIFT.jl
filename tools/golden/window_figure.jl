@@ -46,8 +46,15 @@ function window_figure(r, title::AbstractString; path = nothing)
           max(quantile(r.jdx[both], 0.98), quantile(r.rdx[both], 0.98)))
     panel((1, 1), r.jdx, "AutoRIFT.jl dx (px)"; colormap = :viridis, colorrange = vr)
     panel((1, 3), r.rdx, "autoRIFT (Python) dx (px)"; colormap = :viridis, colorrange = vr)
-    panel((2, 1), ddx, "ddx = julia − python (px)")
-    panel((2, 3), ddy, "ddy = julia − python (px)")
+    # **The difference panels state their own range.** A colour range auto-scaled to the 98th percentile
+    # of a sub-pixel residual renders it as saturated blocks, which reads as a large disagreement and is
+    # not one: on these cases the full scale can be a third of a pixel. So the range is in the title, and
+    # a fixed ±1 px panel sits beside it where saturation means a whole pixel.
+    v = ddx[.!isnan.(ddx)]
+    q = isempty(v) ? 1.0 : quantile(abs.(v), 0.98)
+    panel((2, 1), ddx, @sprintf("ddx = julia − python, auto scale ±%.3f px", q))
+    panel((2, 3), ddx, "ddx = julia − python, fixed ±1 px"; colorrange = (-1.0, 1.0))
+    panel((3, 1), ddy, "ddy = julia − python, fixed ±1 px"; colorrange = (-1.0, 1.0))
 
     out = path === nothing ?
         joinpath(dirname(@__DIR__), "..", "figs", "window_$(first(title, 40)).png") : path

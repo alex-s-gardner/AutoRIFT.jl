@@ -8,22 +8,32 @@
 # diagnostic: the same question over a 401x401 window is answered in about two minutes, which is the
 # difference between testing one hypothesis a day and testing several an hour.
 #
-# **A windowed point is answered identically to how the full pass answers it.** Every per-point field —
-# the node, the search radius, the chip bounds, the prior — travels in the `PointSet`, and the chips are
-# cut from the same full images. So restricting the point set changes *which* points are compared and
-# nothing about what any one of them measures. What a window cannot do is change which pyramid level
-# owns a point: that is decided by the reference's own merge over the whole grid, and is read from the
-# capture rather than recomputed.
+# **A windowed pass does not answer a point the way the full pass answers it, and the difference is not
+# small.** Every per-point field travels in the `PointSet` and the chips are cut from the same full
+# images, so a *single* correlation at a *given* chip size is unaffected. What the window changes is
+# **which pyramid level claims the point**. The coarse lattice is laid out from the grid's extent
+# (`stages.jl` records the same hazard for the coarse-sampling rung: "not crop-safe … a sub-window
+# samples a different set"), so a shifted or cropped extent decimates to different coarse nodes, the
+# level-selection mask differs, and a point can be answered by a different level entirely.
 #
-# Per-level statistics are the point of this tool. A whole-scene mean mixes populations that behave
-# differently — on the NISAR L2 case the base level agrees at 98% while chip 768 carries a 2 px offset —
-# and a single number for the scene reports neither.
+# Measured on the NISAR L1 case at grid node (246,1722), against the reference's −3.250000:
 #
-# **A window is a diagnostic, not a measurement of the case.** The coarse levels are sparse and unevenly
-# distributed, so which of them a window even contains depends on where it sits: two windows of the same
-# NISAR L1 case gave chip-384 means of −0.077 and −0.043, and one contained no chip-768 point at all.
-# Quote a window's per-level figure as a property of that window; a case-level number is `correlator.jl`
-# over the whole grid.
+# | window | our `dx` | level |
+# |---|---:|---:|
+# | half 8, 32, 100, 200 centred on the node | **−3.250000** — exact | 96 |
+# | the 401×401 window at rows 124–524 | −4.561503 | **768** |
+#
+# The point is bit-exact at four extents and off by 1.31 px at a fifth, because the fifth assigned it to
+# chip 768 rather than chip 96. Nothing about the correlator differs; the level does.
+#
+# **So per-level statistics from a window are not comparable to the reference's.** Reading a window's
+# residual against the reference's `out_ChipSizeX` compares two levels' answers and reports the
+# difference as a per-level disagreement. That artifact produced an apparent 130-point base-level
+# disagreement, and coarse-level means that swung between −0.077 and +2.15 across windows of one case.
+#
+# What a window *is* good for: reproducing a named point at a fixed extent, and bisecting an extent
+# dependence by holding the node and varying the window — which is what identified the artifact above.
+# **A case-level or per-level number comes from `correlator.jl` over the whole grid, and nowhere else.**
 include(joinpath(@__DIR__, "correlator.jl"))
 using Statistics, Printf, Serialization
 
@@ -74,7 +84,14 @@ function window_endpoint(c::GoldenCase; n::Integer = 100, half::Integer = 200,
     # `jcs` beside `rcs`, because which level answered a point is a result and not a parameter: the two
     # implementations choose independently, and a point they assign to different levels carries the whole
     # difference between two levels' answers rather than a numerical disagreement.
+    # `correlation` and `peak_ratio` travel too: the reference exports neither (`minMaxLoc`'s value is
+    # discarded at all four call sites), so they are the only way to ask whether a disagreement was
+    # predictable from the surface it came from. Note what each describes — `correlation` is `NaN` at an
+    # interpolated point, and `peak_ratio` there is the neighbourhood median rather than a measurement of
+    # that point — so a level's coverage of them has to be reported beside any figure derived from them.
     return (; jdx = out.dx, jdy = out.dy, jcs = out.chip_size,
+            correlation = out.correlation, peak_ratio = out.peak_ratio,
+            interpolated = out.interpolated,
             rdx = rdx_all[rows, cols],
             # `dy` carries the cartesian-to-matrix flip, the same one `compare_correlator` measures.
             rdy = .-k.arrays["out_Dy"][rows, cols],
@@ -85,27 +102,41 @@ end
 """
     report_window(r)
 
-Print the window's agreement overall and per owning pyramid level.
+Print the window's agreement, and how much of it the extent invalidates.
 
-The per-level breakdown is what the whole-scene mean cannot show: only the base level's values are a
-measured argmax, so only there does `exact` mean agreement rather than two interpolations landing on the
-same number.
+**The per-level breakdown is deliberately withheld.** Level assignment is extent-dependent, so grouping a
+window's residual by the reference's `out_ChipSizeX` compares points the two implementations answered at
+*different* levels and reports that as a per-level disagreement. What is printed instead is the level
+*disagreement rate*, which is the measure of how far this window's extent has moved the answer away from
+the full pass. A window whose levels agree everywhere is one whose residual can be read; one whose levels
+disagree is measuring its own extent.
 """
 function report_window(r)
     both = .!isnan.(r.jdx) .& .!isnan.(r.rdx)
+    # Level agreement first, because it decides whether anything below it means what it appears to.
+    samelvl = both .& (r.jcs .== r.rcs)
+    difflvl = both .& (r.jcs .!= r.rcs)
+    @printf("\nlevel assignment: agree on %d of %d (%.2f%%), differ on %d (%.2f%%)\n",
+            count(samelvl), count(both), 100count(samelvl) / count(both),
+            count(difflvl), 100count(difflvl) / count(both))
+    count(difflvl) > 0 && @printf("  %s %d points are answered at different pyramid levels by the two\n" *
+                                  "  implementations, so their residual is a level difference rather than a\n" *
+                                  "  disagreement. Per-level figures from this window are not comparable to\n" *
+                                  "  the reference's; use `correlator.jl` over the whole grid for those.\n",
+                                  "WARNING:", count(difflvl))
+
     for (nm, j, ref) in (("dx", r.jdx, r.rdx), ("dy", r.jdy, r.rdy))
         d = j[both] .- ref[both]
-        @printf("\n%s: both %d of %d   mean %+.5f  median %+.5f  std %.4f  max|d| %.3f  exact %.2f%%\n",
-                nm, count(both), length(both), mean(d), median(d), std(d),
-                maximum(abs.(d)), 100count(==(0), d) / length(d))
-        @printf("  %-6s %8s %8s %10s %10s %9s %9s\n",
-                "chip", "Scale", "n", "exact%", "mean", "median", "std")
-        for cs0 in sort(unique(r.rcs[both]))
-            m = both .& (r.rcs .== cs0)
-            dd = j[m] .- ref[m]
-            @printf("  %-6d %8.0f %8d %9.2f%% %+10.4f %+10.4f %9.4f\n",
-                    Int(cs0), cs0 / r.chip0, count(m), 100count(==(0), dd) / count(m),
-                    mean(dd), median(dd), std(dd))
+        @printf("\n%s  all points:        n=%7d  mean %+.5f  median %+.5f  max|d| %.3f  exact %.2f%%\n",
+                nm, count(both), mean(d), median(d), maximum(abs.(d)),
+                100count(==(0), d) / length(d))
+        # The same figures over the points whose level both sides agree on. This is the only subset of a
+        # window whose residual is attributable to the computation rather than to the extent.
+        if count(samelvl) > 0
+            ds = j[samelvl] .- ref[samelvl]
+            @printf("%s  same level only:   n=%7d  mean %+.5f  median %+.5f  max|d| %.3f  exact %.2f%%\n",
+                    nm, count(samelvl), mean(ds), median(ds), maximum(abs.(ds)),
+                    100count(==(0), ds) / length(ds))
         end
     end
     return nothing
