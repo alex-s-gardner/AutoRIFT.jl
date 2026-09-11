@@ -223,7 +223,7 @@ The rate conversion is `pixels = (m/yr) * (dt / 365.25) / pixel_size`, which
   further in pixels for the same physical speed, which is why the golden cases
   carry base-level radii from 2 to 68 across a 5–89 day range of separations.
 
-Measured across the twenty golden captures, the derived quantities take these
+Measured across all twenty-two golden captures, the derived quantities take these
 values — four base chip sizes and five y-scales, tracking resolution rather than
 platform:
 
@@ -232,12 +232,19 @@ platform:
 | 8 | 30 m | 3 (L4/5, green band) |
 | 16 | 15 m | 4 (L7/8/9, panchromatic) |
 | 24 | 10 m | 2 (S2) |
-| 56, 64, 68 | range pixel, varies | 8 (S1) plus NISAR |
+| 56, 64, 68 | range pixel, varies | 8 (S1) |
+| 96 | range pixel | 2 (NISAR L1 RSLC and L2 GSLC) |
 
 `ScaleChipSizeY` is 1.0 wherever the pixel is square and 0.2353, 0.25 or 0.2857 on
-Sentinel-1, per acquisition, from azimuth:range ratios of 4.25, 4.0 and 3.5. In
-every radar case `ChipSizeY` lands on **16** — the chip is square on the *ground*,
-and only its pixel count differs between axes.
+Sentinel-1, per acquisition, from azimuth:range ratios of 4.25, 4.0 and 3.5. On
+those eight `ChipSizeY` lands on **16** — the chip is square on the *ground*, and
+only its pixel count differs between axes.
+
+**The 16 is a property of the Sentinel-1 geometry, not of radar.** The two NISAR
+cases take `ChipSize0X = 96` with `ScaleChipSizeY` of 0.5 (L2 GSLC) and 0.5417
+(L1 RSLC), giving `ChipSizeY` of **48 and 52**. The invariant that survives is the
+one stated below: the parameters are physical, and the pixel counts follow the
+acquisition's own azimuth:range ratio.
 
 This is the same pixel-is-area/pixel-is-point discipline as the section above,
 one level up: the reference's parameters live in the physical world and enter the
