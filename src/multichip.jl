@@ -490,11 +490,15 @@ end
 #
 # Three properties of a production grid make the obvious readings wrong, and each has been measured:
 #
-#   * **It is zeroed at nodata.** The driver clears `xGrid` wherever there is no data
-#     (`testautoRIFT.py:394-403`), so `x[1, 2] - x[1, 1]` is `0` on a scene whose first row and column
-#     are ocean. Reading the spacing there gives zero, `_cell_centres` shifts by nothing, and every
-#     coarse node sits at its cell's first point — half a cell from where `_undecimate_level` reads it
-#     back.
+#   * **It is constant at nodata, and not always zero.** The driver clears `xGrid` wherever there is no
+#     data (`testautoRIFT.py:394-403`), so `x[1, 2] - x[1, 1]` is `0` on a scene whose first row and
+#     column are ocean. Reading the spacing there gives zero, `_cell_centres` shifts by nothing, and
+#     every coarse node sits at its cell's first point — half a cell from where `_undecimate_level`
+#     reads it back. The fill survives the half-sample snap as a *constant*, which need not be zero: on
+#     both NISAR grids it is `0.5`, covering 55.7% of the L2 array and 56.8% of the L1 one. So the
+#     property to exclude is a **zero step**, which is what a constant region produces whatever its
+#     value; testing the endpoints against zero alone let 2,895,601 steps inside the L2 fill outvote the
+#     2,297,235 real ones and returned a spacing of `0`.
 #   * **It is rotated, by an arbitrary amount.** A step along a row moves `x` by the spacing times the
 #     cosine of the rotation, which is `8` on a near-axis-aligned Landsat grid and `-1` on a Sentinel-2
 #     grid rotated near 90°. So the step is not the grid spacing, it is *signed*, and a rule that keeps
@@ -504,8 +508,8 @@ end
 #     they are always a minority of the array, so the mode excludes them without needing to identify
 #     them.
 #
-# Zero only when no two adjacent points both carry a coordinate, which means the caller has no grid.
-# `_cell_centres` then shifts by nothing, which is right for a grid with no spacing to speak of.
+# Zero only when no two adjacent points are a step apart, which means the caller has no grid along this
+# axis. `_cell_centres` then shifts by nothing, which is right for a grid with no spacing to speak of.
 function _grid_step(x::AbstractMatrix, dim::Int)
     n = size(x, dim)
     n > 1 || return 0.0
@@ -516,6 +520,9 @@ function _grid_step(x::AbstractMatrix, dim::Int)
         # touching one describes the margin rather than the spacing.
         (iszero(a) || iszero(b)) && continue
         d = Float64(b) - Float64(a)
+        # A zero step is a constant region, not a spacing. That is the nodata fill wherever it survived
+        # the snap as a nonzero constant, and it can be the majority of the array — see above.
+        iszero(d) && continue
         counts[d] = get(counts, d, 0) + 1
     end
     isempty(counts) && return 0.0
