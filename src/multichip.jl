@@ -357,21 +357,14 @@ end
 # columns alike. So a level's grid spacing grows in proportion to its chip, every level sees the same
 # chip-to-spacing ratio, and one filter width is correct throughout.
 #
-# The invariant this holds: a level posts one estimate per chip footprint. A stride half of this
-# posts four, which are four views of mostly the same pixels — the coherence filter cannot tell them
-# apart, so they survive as mutually corroborating outliers. A per-axis rule reaches that halved
-# stride on every anisotropic chip and agrees on every square one, so only the radar and NISAR pairs
-# exercise the difference: on NISAR's 96x52 it gives 1, 1, 2, 4 against the reference's 1, 2, 4, 8,
-# whose own traced level grids run 2288x2288 -> 1144x1144 -> 572x572 -> 286x286.
+# The invariant this holds: a level posts one estimate per chip footprint. Half this stride posts
+# four, which are four views of mostly the same pixels — the coherence filter cannot tell them apart,
+# so they survive as mutually corroborating outliers. `_check_levels` makes the division exact at
+# every level, so the stride is a power of two and the guard only covers the finest level.
 #
-# `chip_size_min` and not `_oversample(p) * p.grid_spacing`: the two coincide in every golden
-# configuration, since `chip_size_min.X` is an exact multiple of the spacing there and the ratio is
-# below `_oversample`'s cap. They part on a grid finer than that cap allows, and the chip ratio is
-# the one that reproduces the reference. `_check_levels` makes the division exact at every level.
-#
-# **Both axes take the x factor, which is not obviously right for a rectangular chip** — the NISAR
-# 96x52 chip is 52 px tall against a 48 px spacing, so a stride of 8 in y coarsens the grid well past
-# what the chip supports. Matched rather than endorsed; see `tools/golden/README.md`.
+# **Both axes take the x factor, which is not obviously right for a rectangular chip** — a 96x52 chip
+# on a 48 px grid reaches a stride of 8 in y, coarsening the grid past what a 52 px chip supports.
+# Matched rather than endorsed; see `tools/golden/README.md`.
 #
 # A stride rather than a resize: the levels are powers of two of the base chip, so the coarse grid is
 # exactly every `n`-th point of the fine one, and taking a subset keeps the coordinates the caller

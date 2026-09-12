@@ -256,16 +256,22 @@ function ladder(c::GoldenCase; n::Integer = 100, stop_on_red::Bool = true)
     minsearch = Int(k.scalars["minSearch"])
     @info "stage ladder" case=c.product level=L chip spacing minsearch
 
+    # One `Params` for the whole ladder. Every rung configures AutoRIFT.jl from the same capture, and
+    # `kwargs_from_capture` reduces `in_ChipSizeMaxX` twice per call — a multi-megapixel array on a
+    # production grid — so building it per rung reduces the same array once per rung to reach the same
+    # answer.
+    p = params(; kwargs_from_capture(k)...)
+
     out = StageResult[]
-    push!(out, rung_grid(k, L, chip, chip0))
+    push!(out, rung_grid(k, p, L, chip, chip0))
     push!(out, rung_search_rewrite(k, L, minsearch))
-    push!(out, rung_priors(k, L, chip, chip0, spacing))
-    append!(out, rungs_coarse_sampling(k, L, chip))
-    append!(out, rungs_coarse_correlation(k, L, chip))
-    append!(out, rungs_filter_params(k, L))
-    append!(out, rungs_coarse_mask(k, L, chip))
-    append!(out, rungs_fill(k, L))
-    append!(out, rungs_readback(k, L, chip, chip0))
+    push!(out, rung_priors(k, p, L, chip, chip0, spacing))
+    append!(out, rungs_coarse_sampling(k, p, L, chip))
+    append!(out, rungs_coarse_correlation(k, p, L, chip))
+    append!(out, rungs_filter_params(k, p, L))
+    append!(out, rungs_coarse_mask(k, p, L, chip))
+    append!(out, rungs_fill(k, p, L))
+    append!(out, rungs_readback(k, p, L, chip, chip0))
     append!(out, rungs_merge(k, L, chip, chip0))
 
     if stop_on_red
@@ -311,13 +317,11 @@ function _consumed_grid(k::Capture, name::AbstractString, L::Int)
                              end))))
 end
 
-# A level's chip as an `Extent`, so a rung can ask the pyramid's own functions about it.
-#
-# The height follows the reference: `ChipSizeY = round(ChipSizeX * ScaleChipSizeY / 2) * 2`, recomputed
-# from the x extent at every level (`autoRIFT.py:650`, `:730`, `:869`) and forced even. `chip_sizes`
-# doubles both axes together from the base, which reaches the same heights on every golden case.
-_level_extent(k::Capture, chip::Int) =
-    (X = chip, Y = round(Int, chip * Float64(k.scalars["ScaleChipSizeY"]) / 2) * 2)
+# The stride level `L` runs on, from the pyramid's own two functions rather than from a rule restated
+# here. A rung that recomputes the reference's `chip ÷ chip0` compares the reference against a
+# reimplementation of the reference, which agrees however production behaves; the oracle is the
+# reference's traced array, so the stride should come from the code under test.
+_level_stride(p::Params, L::Int) = AutoRIFT._level_decimation(p, AutoRIFT.chip_sizes(p)[L + 1])
 
 # ---------------------------------------------------------------------------
 # 3.1 — the level's grid
@@ -334,7 +338,7 @@ _level_extent(k::Capture, chip::Int) =
 # `round(x + 0.5) - 0.5` (`autoRIFT.py:509-530`), where AutoRIFT.jl decimates by taking every
 # `stride`-th point and shifting to the cell centre (`_decimate_level`, `_cell_centres`). Those two
 # reach the same place by different routes, so the rung compares the positions rather than the method.
-function rung_grid(k::Capture, L::Int, chip::Int, chip0::Int)
+function rung_grid(k::Capture, p::Params, L::Int, chip::Int, chip0::Int)
     xg0 = _consumed_grid(k, "xGrid0", L)
     if L == 0
         return exact_stage("3.1 grid, base level", "xGrid0", k.arrays["in_xGrid"], xg0)
@@ -350,14 +354,8 @@ function rung_grid(k::Capture, L::Int, chip::Int, chip0::Int)
     # difference there changes which pixels a chip covers, and `src/multichip.jl` records that
     # self-consistency between correlation position and read-back is what the accuracy depends on —
     # not agreement with either half of the reference separately.
-    #
-    # **The stride comes from `_level_decimation`, the function the pyramid itself calls.** Deriving it
-    # here as `chip ÷ chip0` — the reference's own rule — would make this rung a comparison of the
-    # reference against a reimplementation of the reference, which agrees by construction whatever
-    # production does. The two rules coincide on a square chip and part on a rectangular one, so a
-    # ladder written that way is green on every optical case and stays green on the ones that disagree.
     full = pointset_from_capture(k)
-    stride = AutoRIFT._level_decimation(params(; kwargs_from_capture(k)...), _level_extent(k, chip))
+    stride = _level_stride(p, L)
     sub = AutoRIFT._decimate_level(full, trues(size(full)), stride)
     sub === nothing && return StageResult("3.1 grid, level $L", "xGrid0", "exact", false, 0,
                                           "AutoRIFT.jl decimated to nothing at stride $stride")
@@ -479,7 +477,7 @@ end
 #
 # At the base chip size there is no decimation and the three are copies, so this rung asserts that —
 # a level that widened its own base radius would be searching a window the reference does not.
-function rung_priors(k::Capture, L::Int, chip::Int, chip0::Int, spacing::Int)
+function rung_priors(k::Capture, p::Params, L::Int, chip::Int, chip0::Int, spacing::Int)
     dx00 = _integral_state(k, "Dx00", L)
     if L == 0
         return exact_stage("3.4 prior, base level", "Dx00", k.arrays["in_Dx0"], dx00)
@@ -493,9 +491,8 @@ function rung_priors(k::Capture, L::Int, chip::Int, chip0::Int, spacing::Int)
     # with OpenCV's mapping at 18,422 of 1,368,896 destinations against this slice's 1, so the slice is
     # the better model of `cv2.resize`'s nearest rule and the residual point is reported rather than
     # absorbed.
-    # `_level_decimation`, so this reduces over the cell the pyramid actually decimates to. Recomputing
-    # the reference's own `1 / Scale` here instead would agree with the reference by construction.
-    stride = AutoRIFT._level_decimation(params(; kwargs_from_capture(k)...), _level_extent(k, chip))
+    # The pyramid's own stride, so this reduces over the cell it actually decimates to.
+    stride = _level_stride(p, L)
     mx = windowmean(k.arrays["in_Dx0"], stride)
     rows = 1:stride:size(mx, 1)
     cols = 1:stride:size(mx, 2)
@@ -648,8 +645,7 @@ end
 #
 # This rung is *not* crop-safe: which fine points the lattice lands on depends on the grid's extent, so
 # a sub-window samples a different set and the comparison would be against the wrong nodes.
-function rungs_coarse_sampling(k::Capture, L::Int, chip::Int)
-    p = params(; kwargs_from_capture(k)...)
+function rungs_coarse_sampling(k::Capture, p::Params, L::Int, chip::Int)
     # **This level's grid, not the full one.** Above the base chip size the reference resizes by
     # `ChipSize0X / chip` and everything after that runs on the resized grid — at chip 32 the grid is
     # 1172x1168 against the full 2344x2336. So the points handed to the coarse setup have to be this
@@ -713,8 +709,7 @@ end
 # Worth a rung because a parameter mismatch and a reducer mismatch are indistinguishable in the mask
 # they produce, and a comparison of masks alone would attribute one to the other. The reference reports
 # `FiltWidth`, `FracValid` and `Iter` per call, so this is a direct read.
-function rungs_filter_params(k::Capture, L::Int)
-    p = params(; kwargs_from_capture(k)...)
+function rungs_filter_params(k::Capture, p::Params, L::Int)
     out = StageResult[]
     # **A level's `filtDisp` calls are found by grid shape, not by counting two per level.** A level
     # whose coarse pass falls below `CoarseCorCutoff` `continue`s out (`autoRIFT.py:704-706`) and never
@@ -795,8 +790,7 @@ end
 # recomputes its median per pass over the progressively filled field, so a second-pass fill there sees
 # first-pass values. That is a real difference in the values filled — not in which points are filled —
 # and the rung measures it rather than asserting either behaviour.
-function rungs_fill(k::Capture, L::Int)
-    p = params(; kwargs_from_capture(k)...)
+function rungs_fill(k::Capture, p::Params, L::Int)
     out = StageResult[]
 
     # `DxF`, `DyF` and `MF` are mutated in place by the fill, so the trace numbers their revisions and a
@@ -898,7 +892,7 @@ end
 # The grid is the reference's own captured coarse grid, not one rebuilt by `_coarse_points`: rebuilding
 # it measures the setup as well, which rung 3.6 already does separately, and on this case that
 # conflation read as 85% where the correlator alone reads 98.5%.
-function rungs_coarse_correlation(k::Capture, L::Int, chip::Int)
+function rungs_coarse_correlation(k::Capture, p::Params, L::Int, chip::Int)
     out = StageResult[]
     xg = _state_coarse(k, "xGrid0C", L)
     xg === nothing && return out
@@ -910,7 +904,6 @@ function rungs_coarse_correlation(k::Capture, L::Int, chip::Int)
     any(isnothing, (yg, srx, sry, dx0, refdx)) && return out
     dy0 = _state_coarse(k, "Dy0C", L, size(xg))
 
-    p = params(; kwargs_from_capture(k)...)
     n = size(xg)
     # `Dy0C` is cartesian-Y, as traced; a `PointSet` carries matrix-Y. See `_level_pointset`.
     pts = PointSet(Float64.(xg) .+ 1, Float64.(yg) .+ 1, Int.(srx), Int.(sry),
@@ -1006,10 +999,9 @@ end
 # searched, so **every measurement lost here is lost before the correlator runs**. `M0C` and `MC` are
 # already compared at rungs 3.7 and 3.8; what this adds is the dilation, the expansion, and the
 # resulting radius — the three places a matching mask can still restrict a different region.
-function rungs_coarse_mask(k::Capture, L::Int, chip::Int)
+function rungs_coarse_mask(k::Capture, p::Params, L::Int, chip::Int)
     out = StageResult[]
     haskey(k.stages, "MC_rev0_L$L") || return out
-    p = params(; kwargs_from_capture(k)...)
     mc = _last_revision(k, "MC", L)
     mc === nothing && return out
     keep = k.stages[mc] .!= 0
@@ -1129,14 +1121,13 @@ end
 # that measures plenty and posts little has to be looked at. The comparison is per step rather than
 # end-to-end: a bicubic resize of a slightly different field differs everywhere, so only the step that
 # first diverges says anything.
-function rungs_readback(k::Capture, L::Int, chip::Int, chip0::Int)
+function rungs_readback(k::Capture, p::Params, L::Int, chip::Int, chip0::Int)
     out = StageResult[]
     L == 0 && return out                      # the base level is assigned, not resized
-    # This level's stride, from the pyramid's own rule rather than from the reference's, for the reason
-    # rung 3.1 records. It is the factor `_undecimate_level`'s `reduce_prior` uses — `step(rows) + 1`
+    # This level's stride, which is the factor `_undecimate_level`'s `reduce_prior` uses — `step(rows) + 1`
     # for the mean and `step(rows)` for the area resize — so rung 3.12b models that step only if the two
     # are the same number.
-    scale = AutoRIFT._level_decimation(params(; kwargs_from_capture(k)...), _level_extent(k, chip))
+    scale = _level_stride(p, L)
 
     # `DxFM` at a coarse level has three states: the `fillFiltWidth` median the fill loop reads, the
     # width-5 median built here, and that same array with `DxF0` written into it. The second is the one
