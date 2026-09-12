@@ -35,20 +35,47 @@ rdy = .-r.capture.arrays["out_Dy"][1:ny, 1:nx]      # sign measured in compare_c
 jcs = r.result.chip_size[1:ny, 1:nx]
 rcs = r.capture.arrays["out_ChipSizeX"][1:ny, 1:nx]
 
+# Crop to the bounding box of the points either side answered. A swath crosses its grid diagonally, so
+# the measured region can be a small fraction of the array — on a burst pair it is a narrow band with
+# empty margin on every side, and mapping the whole array spends the panel on nodata and shrinks the
+# part being read. Taking the union rather than the intersection keeps a coverage difference visible:
+# cropping to where *both* answered would hide exactly the points one side rejected.
+valid = (.!isnan.(jdx)) .| (rcs .> 0)
+rows = findall(any(valid; dims = 2)[:])
+cols = findall(any(valid; dims = 1)[:])
+if isempty(rows) || isempty(cols)
+    error("no valid points in either field; nothing to map")
+end
+rr, cc = first(rows):last(rows), first(cols):last(cols)
+@printf("cropped to rows %d:%d of %d, cols %d:%d of %d (%.1f%% of the array)\n",
+        first(rr), last(rr), ny, first(cc), last(cc), nx,
+        100 * length(rr) * length(cc) / (ny * nx))
+jdx, jdy = jdx[rr, cc], jdy[rr, cc]
+rdx, rdy = rdx[rr, cc], rdy[rr, cc]
+jcs, rcs = jcs[rr, cc], rcs[rr, cc]
+
 # Subsample so a 2000² grid renders quickly; nearest, so no interpolation invents structure.
-step = max(1, cld(max(ny, nx), 700))
+step = max(1, cld(maximum(size(jdx)), 700))
 sub(a) = a[1:step:end, 1:step:end]
 
 fig = Figure(size = (1500, 1000))
 lim = (-8, 8)
+# The difference panels span a few times the quantization step, not a whole pixel. The core biases
+# across the golden set are hundredths of a pixel, so a ±1 range renders every one of them as
+# background and the panel says only "no gross error". `--dlim` widens it to see how far the worst
+# disagreements reach.
+i = findfirst(==("--dlim"), ARGS)
+dlim = i === nothing ? 0.3 : parse(Float64, ARGS[i + 1])
 for (col, (lbl, j, rr)) in enumerate((("dx", jdx, rdx), ("dy", jdy, rdy)))
     heatmap(fig[1, col], sub(replace(j, NaN => NaN)); colorrange = lim, colormap = :balance,
             axis = (title = "AutoRIFT.jl $lbl", aspect = DataAspect()))
     heatmap(fig[2, col], sub(replace(rr, NaN => NaN)); colorrange = lim, colormap = :balance,
             axis = (title = "reference $lbl", aspect = DataAspect()))
     d = j .- rr
-    heatmap(fig[3, col], sub(d); colorrange = (-1, 1), colormap = :balance,
-            axis = (title = "$lbl difference (±1 px)", aspect = DataAspect()))
+    hm = heatmap(fig[3, col], sub(d); colorrange = (-dlim, dlim), colormap = :balance,
+                 axis = (title = @sprintf("%s difference (±%.2g px)", lbl, dlim),
+                         aspect = DataAspect()))
+    Colorbar(fig[4, col], hm.plot; label = "AutoRIFT.jl − reference (px)", vertical = false)
 end
 # Chip level, where a disagreement means the two describe different footprints.
 heatmap(fig[1, 3], sub(Float32.(jcs)); colormap = :viridis,
