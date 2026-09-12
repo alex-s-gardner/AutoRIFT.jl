@@ -12,13 +12,19 @@ Machine: Apple M2 Max, 12 cores, macOS 26.5.2, Julia 1.12.5. Reference: autoRIFT
 `micromamba -n arift-ref`, whose `autoRIFT.py` is byte-identical to the pinned v2.1.2; container
 `ghcr.io/asfhyp3/hyp3-autorift:0.28.4` for the golden cases.
 
-> **Every case-level figure below is superseded and awaiting re-measurement.**
-> `pointset_from_capture` handed AutoRIFT.jl a wrong-sign `Dy0` — the capture records the prior
-> *before* `arImgDisp_*` flips it — so every `exact`, `bias` and coverage number measured through it
-> is wrong, on all twelve optical and all eight radar cases. On the worst block of LC08 Jakobshavn the
-> fix moves `dx` from 6.10% to **99.61%** exact. See "The fast-flow residual was a harness sign error".
-> Gate 0 (`tools/ab`) is unaffected: it passes a zero prior, so no sign convention crosses it.
-> Re-measure these rows; do not edit them.
+> **The eight radar rows below are superseded and awaiting re-measurement.** Three defects invalidated
+> case-level figures in sequence, and the later sections of this file carry the re-measured numbers:
+>
+> | defect | what it broke | re-measured |
+> |---|---|---|
+> | `pointset_from_capture` handed AutoRIFT.jl a wrong-sign `Dy0`, the prior *before* `arImgDisp_*` flips it | every `exact`, `bias` and coverage number on all twenty cases | twelve optical, both NISAR |
+> | `_level_decimation` consulted the y extent, so a level's stride was half the reference's | every case with an anisotropic chip: eight radar, both NISAR | both NISAR |
+> | `_grid_step` read a spacing of zero past a majority nonzero nodata fill | nine of the twelve optical cases, both NISAR | twelve optical, both NISAR |
+>
+> So the twelve optical rows and both NISAR rows are current as of the sections that re-measure them;
+> the **eight radar rows are not** and must be re-measured before they can be read. Gate 0 (`tools/ab`)
+> is unaffected by all three: it passes a zero prior on an unrotated synthetic grid, so neither the sign
+> convention nor the nodata fill crosses it. Re-measure superseded rows; do not edit them.
 
 ## Gate 0 — the verified floor
 
@@ -1735,6 +1741,10 @@ through one or the other, so this section re-measures them rather than editing t
 All twelve optical cases are re-measured here. The eight radar rows are not, so the warning at the top
 of this file stands until they are.
 
+The nine cases whose grid step carries a zero are re-measured again later in this file, under "the twelve
+optical cases, re-measured after the grid-step fix" — read that table for those. The three whose step is
+already nonzero reproduce this one exactly, which is what makes them the control there.
+
 Measured at `6dd337b` (2026-09-10). Command per case:
 
 ```
@@ -1795,7 +1805,8 @@ rows, so a scene whose prior is near zero was never displaced far enough to lose
 
 **Case 12's bias is the one figure to keep an eye on.** At −0.0847 px it is the largest in the set by
 6×, on the smallest population (18,540) and the only `P000` case. It did not move with the fix, so it
-is not a sign-convention artifact; it predates this work and is unexplained.
+is not a sign-convention artifact; it predates this work and is unexplained. (Part of it was the missing
+cell-centre shift: the grid-step fix takes it to −0.0691, measured later in this file.)
 
 
 ---
@@ -1996,10 +2007,25 @@ pair as well as both NISAR ones — not NISAR alone:
 | NISAR L1, chip 96x52, spacing 48 | 1, 1, 2, 4 | 1, 2, 4, 8 | **changed** |
 | NISAR L2, chip 96x48, spacing 48 | 1, 1, 2, 4 | 1, 2, 4, 8 | **changed** |
 
-So the twelve optical cases cannot regress — all three optical configurations give the same strides under
-both rules — and the eight radar pairs are invalidated along with the two NISAR ones. Gate `3.rdr` has to
-be re-measured. Read from the real `kwargs_from_capture` path on the NISAR captures and from the
+So no optical case's stride moves — all three optical configurations give the same strides under both
+rules — and the eight radar pairs are invalidated along with the two NISAR ones. Gate `3.rdr` has to be
+re-measured. Read from the real `kwargs_from_capture` path on the NISAR captures and from the
 configuration arithmetic for the radar ones, whose captures are no longer on disk.
+
+**The stride is only half the scope.** The grid-step fix travels on a different axis, and an unchanged
+stride does not imply an unchanged case: it moves **nine of the twelve optical cases**, measured through
+`kwargs_from_capture` on each capture's own `in_xGrid`/`in_yGrid`. The majority-constant fill is not a
+NISAR property.
+
+| case | step before | step after |
+|---|---|---|
+| `LC08_L1TP_009011` | **0, 0** | 8, 8 |
+| `LC08_L1TP_062018`, both `LE07_061018`, `LE07_063018`, `LC08_060018`×`LE07`, `LT05_060018`, `LT04_063018` | **0, 0** | −1, −1 |
+| `LT05_001013` | **0, 0** | 4, 4 |
+| `LC09_L1GT_215109`, `S2A`, `S2B` | 8/−1/12 | unchanged |
+
+The three whose grid arrives without a zero-valued step are the control: they must reproduce the previous
+table exactly, and they do — see below.
 
 The stride also changes on a *square* chip whenever `grid_spacing` does not divide `chip_size_min` — 296
 of the swept combinations — but no golden case is configured that way, since `_oversample * grid_spacing`
@@ -2070,3 +2096,64 @@ coverage came back — and they did not close the coarse-level residual. Open, n
 part of both cases is coarse-level points where neither side is quantized and exact agreement is
 unreachable by construction (recorded earlier in this file). Correlation and bias are the numbers that
 carry meaning here; `exact` is reported for continuity with the optical cases.
+
+## Step: the twelve optical cases, re-measured after the grid-step fix
+
+The stride does not move on any optical case, but the grid step moves on nine of the twelve, so the
+optical table above is superseded on those nine and confirmed on the other three.
+
+**Gate `3.opt` is 12/12 green** — 254 rungs, 0 red, ~28 s per case on 10 threads. Every capture and its
+stage trace is still on disk, so this needed no container run.
+
+The endpoint, from `correlator.jl` over the whole grid, in the previous table's order. `both` is points
+both sides measured; `mv` marks a case whose grid step moved:
+
+| # | case | mv | both | Δ both | exact | exact n | Δ | bias core dx | corr dx | tail |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | S2A Malaspina | | 586,129 | **0** | 94.24% | 552,351 | — | +0.00179 | +0.99782 | 0 |
+| 2 | LC09 Antarctic | | 464,316 | **0** | 83.01% | 385,409 | — | −0.00479 | +0.99755 | 0 |
+| 3 | S2B Jakobshavn | | 605,987 | **0** | 78.85% | 477,819 | — | −0.00471 | +0.99967 | 2 (dy) |
+| 4 | LC08 East Greenland | * | 692,088 | +374 | 72.70% | 503,146 | ~ | **+0.00424** | +0.99200 | 1 (dx) |
+| 5 | LC08 Jakobshavn | * | 1,685,673 | **+23,473** | 70.87% | 1,194,637 | **+596** | −0.00888 | +0.99931 | 0 |
+| 6 | `LE07_..._20130314` | * | 713,575 | +270 | 59.92% | 427,581 | ~ | **−0.02658** | +0.92601 | 0 |
+| 7 | `LC08_060018` × `LE07` | * | 672,440 | −472 | 58.60% | 394,041 | ~ | +0.01127 | +0.95656 | 0 |
+| 8 | `LE07_..._20040810` | * | 919,043 | +863 | 52.86% | 485,817 | ~ | **+0.00478** | +0.97552 | 0 |
+| 9 | `LE07_..._20120428` | * | 112,064 | **+5,836** | 0.00% † | 0 | — | +0.00666 | +0.88999 | 0 |
+| 10 | `LT04_063018` | * | 272,851 | −24 | 56.02% | 152,861 | ~ | +0.00102 | +0.98253 | 0 |
+| 11 | `LT05_060018` | * | 137,259 | **+12,862** | 24.61% | 33,774 | **+68** | −0.00341 | +0.99210 | 0 |
+| 12 | `LT05_001013` (`P000`) | * | 19,408 | +868 | 0.15% † | 29 | **+29** | **−0.06907** | +0.99819 | 0 |
+
+† base level skipped on both sides, so every point is coarse and unquantized.
+
+**The three unmoved cases are the control, and they reproduce the previous table exactly** — identical
+`both` counts, exact counts within rounding of the recorded percentage, and core bias agreeing to five
+figures. All nine moved cases changed. Prediction and measurement agree in both directions, which is what
+separates a scoped change from an untested one.
+
+**`exact` as a *fraction* falls on cases 5, 11 and 12 while its *count* rises.** Case 5 gains 23,473
+both-measured points and 596 more exact ones; case 11 gains 12,862 and 68. The added points are the ones
+the zero shift had been placing half a cell from where `_undecimate_level` read them back, and they land
+at coarse levels where neither side is quantized — so a fraction over a grown population is not
+comparable to itself. The counts are, and they rise on every case that moved except where `both` fell.
+
+**Two cases lose coverage** — case 7 by 472 and case 10 by 24, against gains of 23,473 and 12,862
+elsewhere. A shifted coarse node can fall outside the image where the unshifted one did not, so a small
+two-sided movement is the expected signature rather than a regression.
+
+**Case 12's bias moved, and it was the one recorded as not moving.** `LT05_001013` was flagged above as
+the largest bias in the optical set at −0.0847 px, unchanged by the `Dy0` fix and therefore not a
+sign-convention artifact. The grid-step fix takes it to **−0.0691** and its coverage from 18,540 to
+19,408. So part of it was the missing cell-centre shift. At 4.5× the next largest core bias it is still
+the outlier in the set, and the residual is still unexplained.
+
+**Case 4's core bias improves by 5×**, −0.0226 → +0.0042, and case 6's by a fifth. Both are cases whose
+`x` step is −1 — a grid rotated near 90°, where a wrong shift moves a node along the wrong axis entirely.
+
+**Coverage across all twelve**: 6,880,833 both-measured, 232,610 julia-only, 333,402 reference-only —
+4.85% of `both`. The reference-only fraction is not uniform: 1.4–2.0% on the three `hps` cases with the
+highest agreement, against 23.8% on case 9 and 15.0% on case 11, both `wallis_fill`/`fft` cases whose
+base level is skipped or nearly so.
+
+**Eleven of twelve report a zero tail beyond 10 px.** The exceptions are 2 points of 605,987 on case 3
+(`dy`) and 1 of 692,088 on case 4 (`dx`); case 4's `dx` maximum of 11.03 px is the largest single residual
+in the set.
