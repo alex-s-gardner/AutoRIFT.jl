@@ -2004,3 +2004,47 @@ configuration arithmetic for the radar ones, whose captures are no longer on dis
 The stride also changes on a *square* chip whenever `grid_spacing` does not divide `chip_size_min` — 296
 of the swept combinations — but no golden case is configured that way, since `_oversample * grid_spacing`
 equals `chip_size_min.X` exactly in every one of them.
+
+## Step: the NISAR endpoint, on both cases, after the stride and grid-step fixes
+
+The case-level numbers, from `correlator.jl` over the whole grid — the only source of one. Both cases
+run the reference's own captured inputs through AutoRIFT.jl and diff against the reference's own `Dx`/`Dy`.
+
+| | L1 RSLC | L2 GSLC |
+|---|---:|---:|
+| grid | 2328 x 2304 | 2288 x 2288 |
+| scene | 57760 x 50511 (2.9 Gpx) | 54885 x 110085 (6.0 Gpx) |
+| both-measured | 1,786,566 | 1,751,658 |
+| `dx` exact | **73.90%** (1,320,352) | **72.20%** (1,264,646) |
+| `dy` exact | 73.86% (1,319,603) | 75.34% (1,319,639) |
+| `dx` correlation | **+0.99972** | +0.99890 |
+| `dy` correlation | +0.99884 | +0.99330 |
+| `dx` median \|d\| | 0.078 px | 0.132 px |
+| `dy` median \|d\| | 0.093 px | 0.054 px |
+| `dx` p99 | 0.887 px | 3.608 px |
+| `dx` bias / bias core | +0.055 / +0.051 | −0.010 / −0.113 |
+| `dy` bias / bias core | +0.027 / −0.028 | **−0.378** / **−0.126** |
+| tail >10 px | 78 `dx`, 7 `dy` | 31 `dx`, 0 `dy` |
+| only julia / only reference | 11,633 / 14,897 | 30,117 / 11,493 |
+| wall clock | 6h30m on 8 threads | 11h41m on 1 thread |
+
+**Read `bias_core`, not `bias`, when asking whether there is a systematic offset** — the reason is at
+`correlator.jl:371`. L2's `dy` `bias` of −0.378 is largely a two-sided tail on a flat SAR correlation
+surface; its systematic component is −0.126 over the 364,798 points agreeing within a pixel. That is
+still the largest core bias of the four axes and is unexplained.
+
+**The grids agree exactly and the endpoint `exact` did not improve.** All sixteen level grids and coarse
+lattices now match the reference's traced arrays, where three of four per case were wrong before. Against
+the pre-fix L2 measurement, `dx` exact moved **72.90% → 72.20%** and correlation +0.9988 → +0.99890. So
+the coarse-grid fixes were necessary — the level grids were provably wrong — and they are not sufficient
+to close the coarse-level residual. Two open threads, neither yet attributed:
+
+- L2's coverage asymmetry **flipped** to Julia-heavy: 30,117 points we measure and the reference does not
+  against 11,493 the other way, where L1 is near-balanced at 11,633 / 14,897. Consistent with the
+  coarser strides changing which level claims which point, but not demonstrated.
+- L2's `dy` core bias of −0.126 px, an order of magnitude above L1's −0.028.
+
+**`exact` is the wrong statistic above the base level and these are whole-scene figures**, so a large
+part of both cases is coarse-level points where neither side is quantized and exact agreement is
+unreachable by construction (recorded earlier in this file). Correlation and bias are the numbers that
+carry meaning here; `exact` is reported for continuity with the optical cases.
