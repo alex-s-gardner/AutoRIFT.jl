@@ -1895,5 +1895,73 @@ within-row spread.
 
 **So the base level agrees everywhere and the coarse levels disagree locally**, while every step that
 builds a coarse level — correlate, median-fill, previous-level fill, `INTER_AREA`, `INTER_CUBIC`, merge
-— has been shown to reproduce the reference exactly on the reference's own inputs. The cause is not yet
-identified, and the candidates that have been tested are listed here so they are not retested.
+— reproduces the reference exactly on the reference's own inputs. The candidates that were tested and
+failed are listed above so they are not retested.
+
+### The cause: two coupled bugs in the coarse grid, not in any step on it
+
+Every step was right and every step ran on the wrong grid. Two independent defects, both in AutoRIFT.jl,
+both invisible on a square chip:
+
+1. **The level stride ignored the reference's rule and consulted the y extent.**
+   `_level_decimation` returned `min(sx, sy)` over per-axis ratios where the reference resizes a level's
+   grid by `ChipSize0X / ChipSizeUniX[i]` (`autoRIFT.py:510-514`) — one factor, from the x extents,
+   applied to rows and columns alike. On NISAR that gave 1, 1, 2, 4 against the reference's 1, 2, 4, 8.
+   At half the stride a level posts **four estimates per chip footprint** instead of one: four views of
+   mostly the same pixels, which the coherence filter cannot separate, so they survive as mutually
+   corroborating outliers. That is the blunder texture — a rough field where the reference's is smooth.
+
+2. **`_grid_step` read a spacing of zero, so the cell-centre shift never happened.** It excluded steps
+   whose endpoints were zero, on the grounds that zero marks nodata. Both NISAR grids are filled with
+   `0.5`, carried to `1.5` by the half-sample snap, and the fill is the *majority* of the array — 55.7%
+   on L2, 56.8% on L1. The guard never fired, 2,895,601 zero steps inside the L2 fill outvoted 2,297,235
+   real 48 px ones, and the mode came out `0`. `_cell_centres` then shifted by nothing and every coarse
+   node sat at its cell's first point, half a cell from where `_undecimate_level` reads it back.
+
+**The coupling is why this resisted single-variable testing.** An earlier attempt at (1) alone measured
+*worse* — neighbour disagreement 3.0x to 10.2x, `exact` down — because at the wrong stride and a zero
+shift the two errors partly cancel. Fixing either alone breaks that cancellation. Both candidate
+"second differences" that were hunted instead have been eliminated by direct measurement: scipy's
+even-window origin matches `_window_margins` at w = 2, 4, 8, and the coarse node placement rule is
+identical to the reference's `INTER_AREA` block centre once converted to 1-based indices — but it is a
+*function of the stride*, which is exactly how one bug masqueraded as two.
+
+**What the ladder was doing wrong.** Every rung in `stages.jl` derived its own stride as `chip ÷ chip0`
+— the reference's rule — rather than calling `_level_decimation`. So the ladder compared the reference
+against a reimplementation of the reference and stayed green whatever production computed. Rung 3.1's
+shape check also *reported* rather than failed. The rungs now call the production function, and a level
+whose grid size disagrees with the reference's is red.
+
+Measured at level 2 of the L2 GSLC case, whose reference grid is 572²:
+
+| | our level grid | reduced prior vs reference | rung 3.1 cell |
+|---|---|---|---|
+| before | 1144 x 1144 | not comparable — shapes differ | `NaN of a 0 px cell` |
+| after | **572 x 572** | 327,145 of 327,184 agree (99.988%) | 192 px, offset 0.375 of a cell |
+
+Of the 39 residual nodes, 27 are the documented 1 px `INTER_NEAREST` mapping difference, 8 sit on the
+nodata boundary, and 8 exceed 5 px.
+
+**Every level grid and every coarse lattice now matches the reference's traced arrays**, on both cases —
+sixteen shapes, no exceptions. The stage trace dumps the level grid at `lvl{3,7,11,15}_xgrid` and the
+coarse lattice at `lvl{1,5,9,13}_xgrid`:
+
+| | level grids | coarse lattices |
+|---|---|---|
+| L1 RSLC, ours and the reference | 2328x2304, 1164x1152, 582x576, 291x288 | 291x288, 145x144, 72x72, 36x36 |
+| L2 GSLC, ours and the reference | 2288x2288, 1144x1144, 572x572, 286x286 | 286x286, 143x143, 71x71, 35x35 |
+
+Before the fix three of the four level grids were wrong on each case.
+
+**A windowed pass cannot measure this fix, and the reason is worth recording.** `_coarse_points` returns
+`nothing` when a level's coarse lattice is narrower than the outlier filter's window, so a level whose
+lattice does not fit is skipped outright. Halving each stride to its correct value halves each lattice,
+so windows that previously ran a level now skip it: on a 201² window chip 384 and 768 both return
+`nothing`, and on a 61² window *every* level does. That is the extent dependence
+`window_endpoint.jl`'s header already documents, made sharper — so the level grids above were verified
+on the full grid, where every lattice survives, and a case-level residual still has to come from
+`correlator.jl`.
+
+Cost per level rises with chip size despite the point count falling: on a 61² window the four levels take
+4.4, 6.2, 8.3 and 18.8 s at strides 1, 2, 4, 8. Chip area grows 64x across the pyramid while the point
+count falls 64x, and area wins — the FFT is over the padded chip-plus-search extent, not over the grid.
