@@ -1696,6 +1696,26 @@ All seven new captures took **3h50m total**, against the ~18 hours estimated fro
 `product/` and `product_sec/` immediately after each capture is what made a sequential run possible on a
 pool with ~60 GB free: those per-burst ISCE3 intermediates are 70–80% of a run and are read by no gate.
 
+**A capture and a whole-scene endpoint comparison are different costs, and the second is the larger
+one.** A capture runs the reference and dumps its arrays; `correlator.jl` then runs AutoRIFT.jl over
+every point of the same grid — 5,363,712 points across a 57760x50511 pair on L1 RSLC (2.9 Gpx), and
+5,234,944 across 54885x110085 on L2 GSLC (6.0 Gpx). The capture cost is the table above; the endpoint
+comparison is hours. Do not quote one for the other — a whole-scene endpoint duration is not a statement
+about how long the reference takes.
+
+**`threaded` is what the endpoint's cost turns on, and it was `false` for every golden run before
+`kwargs_from_capture` set it.** `Params` defaults it to `false`, so `-t 8` allocated eight threads and
+used one. Measured on a 201x201 window of the L1 RSLC grid, all five output fields bit-identical either
+way: 148.9 s serial against 22.3 s on eight threads.
+
+**The speedup does not hold across a whole scene, because a scene has a serial phase.** The L1 endpoint
+on eight threads ran at ~7.8 cores for its first 2.5 hours and then dropped to **1.0 core**, sampled
+over 90 s of CPU time rather than read from an instantaneous `%CPU`. `threaded` parallelises over grid
+points within a correlation pass (`src/params.jl:392`), so a serial phase is work outside one: the hole
+fill, the merge across levels, or the comparison itself. A window benchmark sees only the parallel part
+and overstates what the flag buys on a scene — the 6.7x above did, and an estimate built on it was
+wrong by more than a factor of two. Where that serial time goes is unattributed.
+
 ## Step: the gate covers every radar case
 
 `3.rdr` now runs all eight rather than one, for the same reason `3.opt` runs all twelve: the two
