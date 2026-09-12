@@ -218,17 +218,24 @@ const GATES = Gate[
                 both = parse(Int, first(rows).captures[3])
                 fails = String[]
                 # A systematic offset over the agreeing population is held an order of magnitude
-                # tighter than the optical 0.035 px, because that is what the measurement supports:
-                # the eight cases span 0.0002 to 0.0065 px.
+                # tighter than the optical 0.035 px. Six of the eight sit within 0.0072 px on both
+                # axes, which is what the bound is drawn from.
+                #
+                # **Two cases exceed it and are expected red**: the burst pairs `20250416T010159` at
+                # -0.0431/-0.0166 and `20240618T025533` at +0.0118. `GATES.md` records the measurement
+                # and why the bound is not the thing to widen — the same two cases gained coverage and
+                # correlation while their bias grew, which is a behaviour change wanting an
+                # explanation rather than a threshold set too tight.
                 bx <= 0.010 || push!(fails, "dx core bias $bx > 0.010")
                 by <= 0.010 || push!(fails, "dy core bias $by > 0.010")
-                # The floor is the weakest measured case less a margin. `20150828` correlates at 0.820
-                # and 0.825 — the lowest of the eight — where the rest reach 0.95-0.99.
+                # The floor is the weakest measured case less a margin. `20150828` is the lowest of the
+                # eight at 0.903 and 0.906, where the rest reach 0.94-0.99.
                 corr["dx"] >= 0.78 || push!(fails, "dx corr $(corr["dx"]) < 0.78")
                 corr["dy"] >= 0.78 || push!(fails, "dy corr $(corr["dy"]) < 0.78")
                 sgn["dy"] == "-" || push!(fails, "dy sign $(sgn["dy"]), expected -")
                 # The tail is bounded rather than ignored: it cancels today, and a tail that grew would
-                # otherwise hide behind a core bias that stayed small. Six of the eight report zero.
+                # otherwise hide behind a core bias that stayed small. Four of the eight report zero and
+                # `20151120` is the largest at 167, on the pair whose base level runs no fine pass.
                 tailx <= 400 || push!(fails, "dx tail $tailx > 400 beyond 10 px")
                 isempty(fails) || return (:red, join(fails, "; "))
                 return (:green, @sprintf("core %.4f/%.4f corr %+.3f/%+.3f both %d tail %d",

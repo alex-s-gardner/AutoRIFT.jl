@@ -12,19 +12,20 @@ Machine: Apple M2 Max, 12 cores, macOS 26.5.2, Julia 1.12.5. Reference: autoRIFT
 `micromamba -n arift-ref`, whose `autoRIFT.py` is byte-identical to the pinned v2.1.2; container
 `ghcr.io/asfhyp3/hyp3-autorift:0.28.4` for the golden cases.
 
-> **The eight radar rows below are superseded and awaiting re-measurement.** Three defects invalidated
-> case-level figures in sequence, and the later sections of this file carry the re-measured numbers:
+> **Read case-level figures from the re-measurement sections at the end of this file, not from the
+> sections that first recorded them.** Three defects invalidated case-level numbers in sequence. All
+> twenty cases have since been re-measured, so no row is awaiting a measurement — but a row's *original*
+> section still carries the superseded figure, because these are re-measured rather than edited.
 >
-> | defect | what it broke | re-measured |
+> | defect | what it broke | re-measured in |
 > |---|---|---|
-> | `pointset_from_capture` handed AutoRIFT.jl a wrong-sign `Dy0`, the prior *before* `arImgDisp_*` flips it | every `exact`, `bias` and coverage number on all twenty cases | twelve optical, both NISAR |
-> | `_level_decimation` consulted the y extent, so a level's stride was half the reference's | every case with an anisotropic chip: eight radar, both NISAR | both NISAR |
-> | `_grid_step` read a spacing of zero past a majority nonzero nodata fill | nine of the twelve optical cases, both NISAR | twelve optical, both NISAR |
+> | `pointset_from_capture` handed AutoRIFT.jl a wrong-sign `Dy0`, the prior *before* `arImgDisp_*` flips it | every `exact`, `bias` and coverage number on all twenty cases | "Re-measurement after the Dy0 sign fix" |
+> | `_level_decimation` consulted the y extent, so a level's stride was half the reference's — on three radar pairs no level coarsened at all | every anisotropic chip: eight radar, both NISAR | the NISAR and radar steps below |
+> | `_grid_step` read a spacing of zero past a majority nonzero nodata fill | nine of twelve optical, all eight radar, both NISAR | the optical and radar steps below |
 >
-> So the twelve optical rows and both NISAR rows are current as of the sections that re-measure them;
-> the **eight radar rows are not** and must be re-measured before they can be read. Gate 0 (`tools/ab`)
-> is unaffected by all three: it passes a zero prior on an unrotated synthetic grid, so neither the sign
-> convention nor the nodata fill crosses it. Re-measure superseded rows; do not edit them.
+> Gate 0 (`tools/ab`) is unaffected by all three: it passes a zero prior on an unrotated synthetic grid,
+> so neither the sign convention nor the nodata fill crosses it. **`3.rdr` is 6 of 8** — cases 6 and 7
+> exceed its core-bias threshold, which is the one open red gate.
 
 ## Gate 0 — the verified floor
 
@@ -1654,6 +1655,8 @@ ISCE3 per-burst intermediates, then the endpoint. Sequential, because a capture 
 
 ## The eight, all green
 
+Superseded by three later fixes and re-measured at the end of this file, where `3.rdr` is 6 of 8.
+
 | # | case | driver | both | exact | only jl | only ref | core bias dx / dy | corr dx / dy | tail |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
 | 1 | `S1A_..._20150828T162412` | SLC | 1,327,618 | 29.03% | 77,340 | 69,830 | −0.0009 / +0.0020 | +0.820 / +0.825 | **0** |
@@ -1728,6 +1731,10 @@ wrong by more than a factor of two. Where that serial time goes is unattributed.
 `_oversample` and `chip_size_max` bugs were invisible on twelve optical pairs and surfaced only on an
 anisotropic chip. Thresholds are the weakest measured case less a margin — core bias 0.010 px,
 correlation 0.78 (case 1 is the floor at 0.820/0.825), tail 400 points.
+
+Those thresholds were calibrated against the table above, which three later fixes superseded. The eight
+pairs are re-measured at the end of this file: coverage and correlation improve on nearly every one, and
+two cases now exceed the core-bias threshold.
 
 ---
 
@@ -2008,9 +2015,11 @@ pair as well as both NISAR ones — not NISAR alone:
 | NISAR L2, chip 96x48, spacing 48 | 1, 1, 2, 4 | 1, 2, 4, 8 | **changed** |
 
 So no optical case's stride moves — all three optical configurations give the same strides under both
-rules — and the eight radar pairs are invalidated along with the two NISAR ones. Gate `3.rdr` has to be
-re-measured. Read from the real `kwargs_from_capture` path on the NISAR captures and from the
-configuration arithmetic for the radar ones, whose captures are no longer on disk.
+rules — and the eight radar pairs are invalidated along with the two NISAR ones. Every figure above is
+read from the real `kwargs_from_capture` path on a capture on disk, radar included: all eight radar
+captures are intact, so `3.rdr` was re-measurable without a container run. It is re-measured at the end of
+this file, where the radar strides are also given per pair rather than as one Sentinel-1 row — three pairs
+decimated by 1, 1, 1, 1 before the fix, not 1, 1, 1, 2.
 
 **The stride is only half the scope.** The grid-step fix travels on a different axis, and an unchanged
 stride does not imply an unchanged case: it moves **nine of the twelve optical cases**, measured through
@@ -2157,3 +2166,83 @@ base level is skipped or nearly so.
 **Eleven of twelve report a zero tail beyond 10 px.** The exceptions are 2 points of 605,987 on case 3
 (`dy`) and 1 of 692,088 on case 4 (`dx`); case 4's `dx` maximum of 11.03 px is the largest single residual
 in the set.
+
+## Step: the eight radar pairs, re-measured after the stride and grid-step fixes
+
+`3.rdr` was the last gate standing on superseded figures. **All eight captures are still on disk** —
+`call1.json` present in every `200/capture` — so this needed no container run. The eight endpoints take
+**14m37s** total on 10 threads.
+
+Both fixes move every pair, on both axes. The stride change is larger here than anywhere else in the set:
+three pairs decimated by **1, 1, 1, 1** before, so no level coarsened at all.
+
+| case | `ScaleChipSizeY` | chip0 | old stride | new stride | old step | new step |
+|---|---:|---|---|---|---|---|
+| `20150828`, `20151120`, `20250416T010214`, `20240618T025533` | 0.2500 | 64x16 | 1, 1, 1, 2 | 1, 2, 4, 8 | **0, 0** | varies |
+| `20170221`, `20180809`, `20240618T025528` | 0.2353 | 68x16 | **1, 1, 1, 1** | 1, 2, 4, 8 | **0, 0** | varies |
+| `20250416T010159` | 0.2857 | 56x16 | 1, 1, 1, 2 | 1, 2, 4, 8 | **0, 0** | −6, 2 |
+
+The endpoint, whole grid, against "The eight, all green" above. That baseline predates the `Dy0` fix as
+well, so this is the effect of all three defects together and not of the stride alone:
+
+| # | case | driver | both | Δ both | exact | only jl | only ref | Δ only ref | core bias dx / dy | corr dx / dy | tail | gate |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | `S1A_..._20150828T162412` | SLC | 1,310,564 | −17,054 | 29.41% | 35,053 | 86,884 | +17,054 | **−0.00000** / −0.00029 | +0.903 / +0.906 | 0 | green |
+| 2 | `S1A_..._20151120T080202` | SLC | 60,072 | −539 | 0.00% † | 8,668 | 10,436 | +539 | −0.00428 / +0.00408 | +0.968 / +0.930 | 167 | green |
+| 3 | `S1A_..._20170221T204710` | SLC | 1,666,631 | **+132,369** | 69.08% | 23,633 | 50,508 | **−132,369** | +0.00715 / +0.00239 | +0.996 / +0.985 | 35 | green |
+| 4 | `S1B_..._20180809T204617` | SLC | 489,946 | +35,632 | 69.26% | 12,453 | 35,528 | −35,632 | +0.00479 / +0.00475 | +0.987 / +0.971 | 0 | green |
+| 5 | `S1C_..._20250416T010214` | SLC | 484,471 | +8,065 | 46.54% | 26,585 | 46,362 | −8,065 | +0.00560 / −0.00155 | +0.983 / +0.896 | 0 | green |
+| 6 | `S1C_..._20250416T010159` | BURST 7 | 35,986 | +2,773 | 36.17% | 3,499 | 5,949 | −2,773 | **−0.04313** / **−0.01656** | +0.941 / +0.850 | 0 | **red** |
+| 7 | `S1A_..._20240618T025533` | BURST 10 | 546,899 | **+106,874** | 63.24% | 34,030 | 36,156 | **−106,874** | **+0.01181** / +0.00556 | +0.992 / +0.982 | 14 | **red** |
+| 8 | `S1A_..._20240618T025528` | BURST 24 | 1,505,773 | **+274,063** | 54.77% | 73,479 | 84,463 | **−274,063** | −0.00107 / +0.00010 | +0.988 / +0.961 | 12 | green |
+
+† base level runs a coarse pass and a `filtDisp` but no fine pass, so every point is bicubic-resized
+rather than quantized and `exact` is 0 by construction.
+
+**Gate `3.rdr` is 6 of 8**, red on cases 6 and 7 against its `0.010 px` core-bias threshold.
+
+**The coverage gap closes, as it did on NISAR.** `only ref` falls **898,469 → 356,286**, from 16.16% of
+`both` to **5.84%**, and `both` rises 5,558,159 → 6,100,342 (**+542,183**). Every reference-only point
+recovered becomes a both-measured one — the two Δ columns are equal and opposite on all eight rows, so
+nothing moved to `only jl`, which itself falls 465,303 → 217,400. The direction matches the NISAR L2
+result and has the same cause: the coarse levels finally run on the reference's own lattice.
+
+**Correlation improves on 7 of 8 on each axis.** Case 1 gains most, +0.820 → **+0.903** on `dx` and
++0.825 → +0.906 on `dy`, and its core `dx` bias is now **−0.0000005 px**. Case 7's `dx` slips by 0.001
+and case 8's `dy` rises 0.951 → 0.961.
+
+**`exact` falls as a fraction on six of eight while `both` rises**, the same construction as on the
+optical and NISAR cases: the recovered points are coarse-level ones where neither side is quantized, so
+they cannot be exact. **The exact *count* rises on six and is flat on the other two.** Case 8 is the
+extreme — 65.81% → 54.77% on a population that grew by 274,063 — and its count still rises, from a
+baseline percentage implying 810,526–810,650 to a measured **824,654**. Case 1's count is flat at 385,404,
+which is the one case whose population *fell*; case 2's is 0 either way by construction.
+
+### The two red cases are both `process_burst`, and the bias is systematic
+
+Case 6's core `dx` bias is **−0.0431 px**, 4.3× the gate threshold and **62× its former −0.0007**. Case 7
+is +0.0118, 10.7× its former +0.0011. The five `process_slc` pairs stay within 0.0072.
+
+It is not a tail-cancellation artifact, which is what the core statistic exists to exclude: case 6's mean
+is −0.0642 and its core −0.0431, so the core carries **67%** of the mean, and case 7's carries 88%. A
+two-sided tail would leave the core near zero, as it does on case 2, where the mean is dragged while the
+core sits at −0.0043.
+
+Two properties separate the red pair from the green ones, and neither is established as the cause:
+
+- **Both are burst-mosaicked**, but so is case 8, which is the *best* core bias in the set at −0.0011.
+  So `process_burst` alone does not predict it; 7 and 10 bursts do while 24 does not.
+- **Case 6 is the only `ScaleChipSizeY = 0.2857` pair** and has the smallest chip in the set at 56x16.
+  It is also the smallest population, 35,986 points, and had the second-lowest `dy` correlation before
+  the fix.
+
+Case 6's `dy` core bias of −0.0166 is also over threshold, so it is not a single-axis effect. Both cases
+report a `dx` maximum well above their `dy` one — 6.97 against 2.18 on case 6, 18.04 against 5.93 on
+case 7 — so whatever it is, it is stronger along x, which is the axis the stride is now derived from.
+
+**The gate's threshold is not obviously the thing to change.** It was calibrated as "the weakest measured
+case less a margin" against figures that are now known to have been measured through three defects, so it
+describes the old behaviour rather than a physical requirement. But the two fixes improved coverage and
+correlation on these same two cases while the bias grew, which is not the signature of a threshold set
+too tight — a case whose systematic offset over its agreeing population grew 62× has changed behaviour
+that wants an explanation, not a wider bound. `3.rdr` stays red on 6 and 7 until there is one.
