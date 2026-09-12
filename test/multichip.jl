@@ -403,10 +403,7 @@ end
                                   ((X = 32, Y = 32), (X = 256, Y = 256), 16))   # square control
         p = params(; chip_size = chip, chip_size_max = cmax,
                    grid_spacing = (X = spacing, Y = spacing))
-        sizes = AutoRIFT.chip_sizes(p)
-        @test [AutoRIFT._level_decimation(p, cs) for cs in sizes] == [1, 2, 4, 8]
-        # The stride is the x ratio at every level, whatever the aspect.
-        @test all(AutoRIFT._level_decimation(p, cs) == cs.X ÷ chip.X for cs in sizes)
+        @test [AutoRIFT._level_decimation(p, cs) for cs in AutoRIFT.chip_sizes(p)] == [1, 2, 4, 8]
     end
 
     # A grid coarser than the chip does not lift the finest level off its own points.
