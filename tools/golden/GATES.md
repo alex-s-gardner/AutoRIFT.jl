@@ -1965,3 +1965,22 @@ on the full grid, where every lattice survives, and a case-level residual still 
 Cost per level rises with chip size despite the point count falling: on a 61² window the four levels take
 4.4, 6.2, 8.3 and 18.8 s at strides 1, 2, 4, 8. Chip area grows 64x across the pyramid while the point
 count falls 64x, and area wins — the FFT is over the padded chip-plus-search extent, not over the grid.
+
+**Which cases the fix moves.** The stride changes wherever the chip is anisotropic, which is every radar
+pair as well as both NISAR ones — not NISAR alone:
+
+| configuration | old stride | new stride | |
+|---|---|---|---|
+| optical, `ScaleChipSizeY = 1.0`, spacing 16, max 64/128/256 | 1, 2, 4, 8 | 1, 2, 4, 8 | unchanged |
+| Sentinel-1, `ScaleChipSizeY = 0.25`, chip 32x8, spacing 32 | 1, 1, 1, 2 | 1, 2, 4, 8 | **changed** |
+| NISAR L1, chip 96x52, spacing 48 | 1, 1, 2, 4 | 1, 2, 4, 8 | **changed** |
+| NISAR L2, chip 96x48, spacing 48 | 1, 1, 2, 4 | 1, 2, 4, 8 | **changed** |
+
+So the twelve optical cases cannot regress — all three optical configurations give the same strides under
+both rules — and the eight radar pairs are invalidated along with the two NISAR ones. Gate `3.rdr` has to
+be re-measured. Read from the real `kwargs_from_capture` path on the NISAR captures and from the
+configuration arithmetic for the radar ones, whose captures are no longer on disk.
+
+The stride also changes on a *square* chip whenever `grid_spacing` does not divide `chip_size_min` — 296
+of the swept combinations — but no golden case is configured that way, since `_oversample * grid_spacing`
+equals `chip_size_min.X` exactly in every one of them.
