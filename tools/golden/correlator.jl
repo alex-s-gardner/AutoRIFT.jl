@@ -248,10 +248,20 @@ function kwargs_from_capture(k::Capture)
     # from 1.0 exactly when the y and x pixel sizes differ, and it varies per acquisition — 0.2353,
     # 0.25 and 0.2857 across the eight golden radar cases. Testing only on cases with a square pixel
     # exercises neither form.
+    # `threaded` follows the thread count the process was started with, since `Params` cannot know it:
+    # `threaded = true` on one thread pays the parallel machinery for no workers, and `false` on eight
+    # leaves seven idle. It parallelises over grid points within a pass (`src/params.jl:392`), so it
+    # changes how long a pass takes and not what it answers — measured bit-identical on a 201x201
+    # window of the L1 RSLC grid, 38,983 points either way, 148.9 s against 22.3 s.
+    #
+    # A golden run is one pair at a time, which is the case this is for. The documentation's advice to
+    # leave it `false` and run one pair per worker is about batch throughput across many pairs, where
+    # the outer parallelism is the better axis; a single whole-scene comparison has no outer axis.
     return (; chip_size = (X = chip0, Y = round(Int, chip0 * scale_y)),
             chip_size_max = (X = maxchip, Y = round(Int, maxchip * scale_y)),
             grid_spacing = (X = spacing, Y = spacing),
             subpixel = subpixel_from_capture(k),
+            threaded = Threads.nthreads() > 1,
             preprocess = :none)
 end
 
