@@ -2033,16 +2033,38 @@ run the reference's own captured inputs through AutoRIFT.jl and diff against the
 surface; its systematic component is −0.126 over the 364,798 points agreeing within a pixel. That is
 still the largest core bias of the four axes and is unexplained.
 
-**The grids agree exactly and the endpoint `exact` did not improve.** All sixteen level grids and coarse
-lattices now match the reference's traced arrays, where three of four per case were wrong before. Against
-the pre-fix L2 measurement, `dx` exact moved **72.90% → 72.20%** and correlation +0.9988 → +0.99890. So
-the coarse-grid fixes were necessary — the level grids were provably wrong — and they are not sufficient
-to close the coarse-level residual. Two open threads, neither yet attributed:
+**What the fixes bought, measured against the pre-fix L2 run** (`dx` / `dy`):
 
-- L2's coverage asymmetry **flipped** to Julia-heavy: 30,117 points we measure and the reference does not
-  against 11,493 the other way, where L1 is near-balanced at 11,633 / 14,897. Consistent with the
-  coarser strides changing which level claims which point, but not demonstrated.
-- L2's `dy` core bias of −0.126 px, an order of magnitude above L1's −0.028.
+| L2 GSLC | pre-fix | post-fix | |
+|---|---:|---:|---|
+| both-measured | 1,646,459 | **1,751,658** | +105,199 (+6.4%) |
+| only reference | **116,692** | **11,493** | −105,199 — the recovered points |
+| only julia | 30,805 | 30,117 | ~unchanged |
+| `dx` exact | 72.90% | 72.20% | −0.70 pt |
+| `dy` exact | 73.08% | **75.34%** | +2.26 pt |
+| `dx` correlation | +0.99877 | +0.99890 | + |
+| `dy` correlation | +0.99511 | +0.99330 | − |
+| `dx` bias core | −0.0131 | −0.1128 | worse |
+| `dy` bias core | −0.0366 | −0.1259 | worse |
+
+**The coverage gap is what closed.** Before the fix the reference measured 116,692 points we did not;
+now it measures 11,493 — a tenfold reduction, and the direct consequence of the coarse levels finally
+running on the reference's own lattice. Those 105,199 recovered points are coarse-level ones, which is
+also why `dx` exact fell slightly while `dy` exact rose: the population being scored grew by 6.4%, and
+the added points are the unquantized coarse-level kind where exact agreement is unreachable by
+construction. A fraction over a changed population is not comparable to itself — the counts are.
+`dx` exact **n** rose 1,200,214 → 1,264,646.
+
+**Both core biases got worse**, from −0.013/−0.037 to −0.113/−0.126 px, and that is unexplained. It is
+the one number that moved the wrong way on a population that grew, so it is not a denominator artifact.
+`bias_core` is the statistic to read here, per `correlator.jl:371`; L2's `dy` `bias` of −0.378 is largely
+a two-sided tail on a flat SAR surface.
+
+So the coarse-grid fixes were necessary — the level grids were provably wrong, and 105,199 points of
+coverage came back — and they did not close the coarse-level residual. Open, not attributed:
+
+- Both core biases roughly tripling, on both axes, while coverage improved.
+- L2's `dy` correlation slipping +0.99511 → +0.99330 where `dx` improved.
 
 **`exact` is the wrong statistic above the base level and these are whole-scene figures**, so a large
 part of both cases is coarse-level points where neither side is quantized and exact agreement is
