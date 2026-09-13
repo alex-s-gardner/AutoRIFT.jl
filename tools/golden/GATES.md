@@ -2360,3 +2360,41 @@ smallest permitted block is **2736x1500 px** — and since the grid spans ~24.8 
 every permitted block size covers the whole scene in one block. Blocking cannot subdivide a NISAR
 scene at all as configured. That is a real limit on using `process_block_size` as a memory control
 here, and it is independent of the halo being shared or per-block.
+
+## Step: what the 44 GiB peak is, and it is not the imagery
+
+The obvious reading of a whole-scene peak near 50 GiB is that the scene is resident and should be read
+lazily. Measured on the L1 window at `-t 10`, that is wrong on both counts.
+
+| component | GiB |
+|---|---:|
+| imagery, both scenes as captured `UInt8` | 5.43 |
+| everything reachable **before** the pass | 6.26 |
+| maximum reachable **during** the pass (`gc_live_bytes`) | **50.40** |
+| peak RSS | 44.17 |
+
+Three findings, each of which rules something out:
+
+- **No padded copy is made.** `_pass_geometry` reports `fits = true` on this window, so the pass reads
+  the captured arrays in place. Padding is a real cost on a grid whose points reach outside the scene,
+  but it is not what this peak is.
+- **The memory is reachable, not uncollected.** `gc_live_bytes` peaks slightly *above* RSS, so the
+  collector is not behind — the process genuinely holds it.
+- **Lazy imagery would recover 5.43 GiB of ~50.** In production it is worth having, since the blocked
+  path reads a window per block; it is not the dominant term and it is unavailable in the harness
+  anyway, where `read_capture` materialises `UInt8` matrices from disk.
+
+**The dominant term is workspaces, and their count is larger than it should be.** After one pass the
+pool holds **51 workspaces across 28 keys, 9.97 GiB**, with the per-key cap of 2 working as intended.
+28 keys is the problem: `_radius_bucket` clamps to *each level's* own maximum radius, and the levels'
+maxima differ — 1905x830, 1918x1015, 1689x907, 1828x972 — so the top bucket is a different geometry at
+every level rather than one shared entry. **7.74 of the 9.97 GiB is those eight near-duplicate top
+buckets.**
+
+Dropping the clamp so every bucket is a clean power of two collapses them to one key per chip size, but
+costs 11-45% more transform area for every point in the top bucket (measured: `1792x4096` becomes
+`2304x4608` at chip 96x52), which is the regression the clamp exists to prevent. Clamping every level to
+one grid-wide maximum instead would collapse them to four keys — but a level's radii can *exceed* the
+grid's, since `sanitize!` floors them and the coarse pass rewrites them per level (1918 against a
+grid-wide 1905), so a single clamp needs that relationship established first rather than assumed. Left
+open deliberately.
