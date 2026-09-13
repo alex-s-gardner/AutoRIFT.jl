@@ -467,6 +467,37 @@ function next_fft_size(n::Integer)
     return best
 end
 
+"""
+    AutoRIFT._radius_bucket(r, cap) -> Int
+
+The search radius a point of radius `r` is correlated at: `r` rounded up to a power of two, never
+above `cap`.
+
+**Why a point is not correlated at its own exact radius.** A workspace sizes its FFT buffers from its
+extents, so an exact radius would mean a distinct transform length — and therefore a distinct FFTW
+plan and a distinct pool entry — per point. `WORKSPACE_POOL` is keyed on geometry, so that defeats
+pooling entirely, and `PLAN_FLAGS = FFTW_PATIENT` costs 116-347 ms per size that has never been seen.
+Rounding to a bounded ladder keeps both amortised: a real scene reaches a few dozen buckets, each
+reused by thousands of points.
+
+**Why the cap, which is the pass maximum.** Without it the rounding can land *above* the extent the
+pass was sized for — radius 1905 rounds to 2048, needing a 2304x4608 transform where the point itself
+needs 1792x4096 — which would make a bucket cost more memory and more work than correlating that point
+at the pass geometry. With the cap the widest bucket is exactly the pass's own workspace, so bucketing
+can only reduce work and footprint, never raise either.
+
+Zero maps to zero: a non-positive radius marks an unsearchable point (see [`AutoRIFT.sanitize!`](@ref))
+and such a point is skipped before any workspace is taken.
+
+The bucket is a function of the point alone, which is what makes a subset of a point set correlate as
+the whole set does — see [`AutoRIFT.PassGeometry`](@ref).
+"""
+@inline function _radius_bucket(r::Integer, cap::Integer)
+    r <= 0 && return 0
+    r >= cap && return Int(cap)
+    return min(1 << (ceil(Int, log2(r))), Int(cap))
+end
+
 # ---------------------------------------------------------------------------
 # Chip preparation
 # ---------------------------------------------------------------------------

@@ -606,8 +606,10 @@ function _run_blocked(raw::ImagePair, pts::PointSet{2}, p::Params, layout::Block
                       subpixel::SubpixelMethod)
     out = displacement_field(pts)
     # Every block shares the geometry, so one warm-up serves all of them — and it must happen here,
-    # on this task, rather than inside a block.
-    _warm_pass_plans(geometry.chip, geometry.radius, measure)
+    # on this task, rather than inside a block. Warmed from the whole point set rather than block by
+    # block, because a block's own points reach a subset of these buckets: warming per block would
+    # plan the same sizes repeatedly and, worse, plan them concurrently.
+    _warm_pass_plans(geometry.chip, geometry.radius, pts, measure)
 
     serial = _serial_params(p)
     if istrue(p.threaded)
