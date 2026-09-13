@@ -1723,7 +1723,10 @@ over 90 s of CPU time rather than read from an instantaneous `%CPU`. `threaded` 
 points within a correlation pass (`src/params.jl:392`), so a serial phase is work outside one: the hole
 fill, the merge across levels, or the comparison itself. A window benchmark sees only the parallel part
 and overstates what the flag buys on a scene — the 6.7x above did, and an estimate built on it was
-wrong by more than a factor of two. Where that serial time goes is unattributed.
+wrong by more than a factor of two.
+
+That serial time is **FFTW plan construction**, not any of the three candidates guessed at above, and
+it is fixed. See "the serial phase was the FFTW planner" at the end of this file.
 
 ## Step: the gate covers every radar case
 
@@ -2246,3 +2249,80 @@ describes the old behaviour rather than a physical requirement. But the two fixe
 correlation on these same two cases while the bias grew, which is not the signature of a threshold set
 too tight — a case whose systematic offset over its agreeing population grew 62× has changed behaviour
 that wants an explanation, not a wider bound. `3.rdr` stays red on 6 and 7 until there is one.
+
+## Step: the serial phase was the FFTW planner
+
+The one-core phase this file records twice — L1 running ~7.8 cores for 2.5 hours then dropping to 1.0 —
+is **FFTW plan construction under `FFTW_PATIENT`**. Not the hole fill, the merge or the comparison, each
+of which was guessed at and none of which is where the time goes.
+
+**How it was localized.** `sample(1)` on the live process, on an otherwise idle machine so contention
+could not explain it: every worker thread parked in `uv_cond_wait`, and the one busy thread was the
+*main* thread inside `libfftw3f`, running many different radix codelets (`hb_12`, `r2cb_32`, `n1_64`,
+`fftwf_cpy2d_pair_ci`) beneath `apply` at top level. That is the planner timing candidate algorithms,
+not a correlation executing. Two candidates were eliminated by direct measurement first: `_fill_holes!`
+takes **0.6 s** on the full 2328x2304 L1 grid with its real 66.4% hole pattern, and chunk load imbalance
+gives a greedy makespan 1.16x ideal, not the 4.2x an earlier `(2r+1)^2` cost proxy suggested.
+
+**Why `PATIENT` was the wrong flag, measured rather than argued.** Cold plan against warm execution, both
+flags, real-to-complex forward:
+
+| size | PATIENT plan | MEASURE plan | execution gain | repaid after |
+|---|---:|---:|---:|---:|
+| 28x28 | 97 ms | 0.0 ms | **0.98x** — slower | never |
+| 84x84 | 517 ms | 0.0 ms | **0.93x** — slower | never |
+| 84x160 | 1479 ms | 0.0 ms | 1.13x | 905,696 executions |
+| 320x640 | 6346 ms | 0.0 ms | 1.01x | 4,427,357 executions |
+| 576x1152 | 16,122 ms | 0.1 ms | 1.00x | never |
+| 2304x4608 | **306,787 ms** | 3873 ms | 1.05x | 13,016 executions |
+
+Five minutes to plan one 2304x4608 transform, which is what a 1905-pixel search radius on the L1 grid
+reaches. And `src/plans.jl`'s recorded justification for `PATIENT` — 1.41x at 28², 1.28x at 84² — **does
+not reproduce**: at those sizes it is not faster at all. `PLAN_FLAGS` is now `FFTW_MEASURE`.
+
+**The endpoint, same window and machine, `-t 10`.** A 201x201 window of the L1 grid, 40,360 searchable
+points:
+
+| | before | after | |
+|---|---:|---:|---|
+| wall clock | 1576.3 s | **104.6 s** | **15.1x** |
+| per searchable point | 39.06 ms | **2.59 ms** | |
+| peak RSS | 57.97 GiB | 61.45 GiB | 1.06x |
+
+**Peak RSS rises 6%, which is unexplained.** The prediction from the workspace arithmetic was 1.00x, so
+this is 6% unaccounted for rather than a known cost. It is not the dominant term in production — imagery
+is lazy and a block reads its own window — but the discrepancy stands.
+
+### What it costs in agreement: 0.0013% of one case's exact count
+
+A point is now correlated at its own radius bucketed to a power of two and clamped to the pass maximum
+(`AutoRIFT._radius_bucket`), rather than at the pass's widest radius. Transform length reassociates the
+same floating-point sum differently, so this perturbs results by construction and every golden figure is
+in principle affected. Measured on `LC08_L1TP_009011`, 1,685,673 both-measured points:
+
+| quantity | before | after | delta |
+|---|---:|---:|---:|
+| both-measured | 1,685,673 | 1,685,673 | **identical** |
+| only reference | 30,387 | 30,387 | **identical** |
+| only julia | 19,505 | 19,571 | +66 (0.0039% of what julia measures) |
+| `dx` exact | 70.87% | 70.87% | identical to 2 dp |
+| `dx` exact count | 1,194,637 | 1,194,621 | **−16 of 1.19 M** |
+| `dy` exact count | 1,195,999 | 1,195,987 | −12 |
+| `dx` correlation | +0.99931 | +0.99931 | identical to 5 dp |
+| `dy` correlation | +0.99904 | +0.99904 | identical to 5 dp |
+| bias core `dx` | −0.008884 | −0.008883 | +7.6e-07 |
+| bias core `dy` | −0.005186 | −0.005185 | +1.8e-06 |
+| wall clock | 332.0 s | **75.9 s** | **4.4x** |
+
+So the drift is at the seventh decimal on bias and 16 points in 1.19 million on exact agreement — far
+below the level any gate reads, and below the run-to-run wisdom variability this file already records
+(`correlation` reproducible to ~1e-7 against a fixed wisdom file, not absolutely). The 4.4x on an
+*optical* case is worth noting: optical radii are barely skewed, so almost all of that is the flag.
+
+**Both changes are needed together and neither is sufficient.** Bucketing alone multiplies the plan
+count — 43 distinct sizes for the L1 window against 4 — which under `PATIENT` is a large regression, not
+a gain. The flag alone leaves every point executing the widest point's transform. The commits are
+separate so each is bisectable, but the first is not an improvement on its own.
+
+`Pkg.test()`: **704,173 tests pass**, and the suite itself drops from 16m48s to **11m35s** — the tests
+were paying the same planning cost.
