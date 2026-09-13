@@ -476,7 +476,8 @@ above `cap`.
 **Why a point is not correlated at its own exact radius.** A workspace sizes its FFT buffers from its
 extents, so an exact radius would mean a distinct transform length — and therefore a distinct FFTW
 plan and a distinct pool entry — per point. `WORKSPACE_POOL` is keyed on geometry, so that defeats
-pooling entirely, and `PLAN_FLAGS = FFTW_PATIENT` costs 116-347 ms per size that has never been seen.
+pooling entirely, and planning a size never seen before costs 116-347 ms at the sizes `plan_flags` gives
+`FFTW_PATIENT` and far more above its threshold.
 Rounding to a bounded ladder keeps both amortised: a real scene reaches a few dozen buckets, each
 reused by thousands of points.
 

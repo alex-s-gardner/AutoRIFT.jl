@@ -56,16 +56,31 @@ const FFTW_PATIENT = UInt32(1 << 5)
 
 # The flag every plan in this file is built with, so the four planners cannot drift apart.
 #
-# `PATIENT` rather than `MEASURE`, and the gap is largest exactly where it matters most. Measured
-# on the real-to-complex forward transform: 1.41x at 28², 1.28x at 84², 1.15x at 128², 1.05x at
-# 192². The smallest sizes are the ones a default run executes most often, since the finest
-# chip-size level searches the most points.
+# `MEASURE`, which times candidate algorithms, rather than `ESTIMATE`, which guesses from a cost model.
+# The planning it costs is paid once per size per process, reused by every grid point, and removed
+# entirely on later runs by the wisdom file below.
 #
-# The cost is planning time, which `PATIENT` roughly triples, and which the wisdom file above
-# already exists to amortise across processes. `EXHAUSTIVE` was measured alongside and is not
-# worth its planning time: it matched `PATIENT` at every size but 128², where it gained a further
-# 8%.
-const PLAN_FLAGS = FFTW_PATIENT
+# **Not `PATIENT`, which is measurably not worth its planning time at any size this package reaches.**
+# `PATIENT` searches compositions of algorithms rather than algorithms, so its planning cost grows
+# steeply with the transform while its execution advantage does not. Measured on the real-to-complex
+# forward transform, cold plan against warm execution, both flags:
+#
+#   | size | PATIENT plan | MEASURE plan | execution gain | repaid after |
+#   |---|---:|---:|---:|---:|
+#   | 28x28 | 97 ms | 0.0 ms | **0.98x** (slower) | never |
+#   | 84x84 | 517 ms | 0.0 ms | **0.93x** (slower) | never |
+#   | 84x160 | 1479 ms | 0.0 ms | 1.13x | 905,696 executions |
+#   | 320x640 | 6346 ms | 0.0 ms | 1.01x | 4,427,357 executions |
+#   | 576x1152 | 16,122 ms | 0.1 ms | 1.00x | never |
+#   | 2304x4608 | **306,787 ms** | 3873 ms | 1.05x | 13,016 executions |
+#
+# At the small end `PATIENT` is not faster at all, and at 2304x4608 — a wide search radius on a radar
+# grid — it takes **five minutes to plan one transform**. A level executes on the order of a million
+# points, so even the sizes where `PATIENT` wins need most of a level's entire point count to break
+# even, and the whole-scene cost is dominated by planning rather than correlating.
+#
+# `EXHAUSTIVE` is further along the same curve and is not worth measuring again.
+const PLAN_FLAGS = FFTW_MEASURE
 
 const PLAN_LOCK = ReentrantLock()
 # `Ptr{Cvoid}`, so a cache hit yields a concrete type and the `ccall` below is a static call.

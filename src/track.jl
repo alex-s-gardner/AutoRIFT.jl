@@ -344,9 +344,9 @@ end
 # `pts` reaches, since that is what `_track_chunk!` takes a workspace at.
 #
 # Every one of them, not just the widest. An unplanned size is planned by whichever worker reaches it
-# first, under a planner that is not thread-safe, and `PLAN_FLAGS = FFTW_PATIENT` makes that 116-347 ms
-# of serialised work per size. Planning them here costs the same total once and leaves the workers
-# contending on nothing.
+# first, under a planner that is not thread-safe, and `plan_flags` makes that 116-347 ms of serialised
+# work per small size and far more for a large one. Planning them here costs the same total once and
+# leaves the workers contending on nothing.
 #
 # The measure decides *which kind* of transform to warm — `Coherence` executes complex-to-complex
 # plans and the real measures real-to-complex ones, so warming without knowing the measure warms
