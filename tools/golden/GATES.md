@@ -2326,3 +2326,37 @@ separate so each is bisectable, but the first is not an improvement on its own.
 
 `Pkg.test()`: **704,173 tests pass**, and the suite itself drops from 16m48s to **11m35s** — the tests
 were paying the same planning cost.
+
+## Step: a per-block halo is not worth having, and the reason is arithmetic
+
+The halo is one `Extent` on the `BlockLayout` (`src/tile.jl:60`), taken from the whole grid's maxima
+and applied to every block. Since the correlation reach is per point and a Geogrid radius field is
+spatially clustered, deriving each block's halo from its own points looks like a large saving. It is
+not, and this records the measurement so it is not re-attempted.
+
+**Implemented and measured, then reverted.** A `_block_halo` reducing over each block's own sanitized
+radii and priors, capped at the grid-wide halo, with `read_rows`/`read_cols` per block — which are
+already per-`Block` fields, so the plumbing needed nothing. All 36,492 tiling tests passed, so a
+blocked run still equalled an untiled one. The saving in imagery read, on the real L1 grid:
+
+| block (grid points) | blocks | adaptive | shared | saving |
+|---:|---:|---:|---:|---:|
+| 64 | 1332 | 454.4 GiB | 505.5 GiB | **1.11x** |
+| 128 | 342 | 209.2 GiB | 226.8 GiB | 1.08x |
+| 256 | 90 | 97.0 GiB | 102.0 GiB | 1.05x |
+| 512 | 25 | 45.3 GiB | 46.6 GiB | 1.03x |
+
+**Why the gain is 5% and not the 18x an earlier estimate gave.** That estimate assumed a block with no
+wide-radius point gets a small halo. It does not: the halo is
+`chip_size_max/2 + radius + |prior| + 2 + filter_reach + level_centre_offset`, and only the `radius`
+term is per point. `chip_size_max/2` alone is 384 px on this configuration, so the *floor* on a
+per-block halo is **561 px** against a grid-wide 2736 — and the median block reaches the full 2736
+anyway, because 53-60% of blocks contain at least one wide-radius point at every block size tried. A
+clustered radius field is not clustered finely enough to matter at block scale.
+
+**A second finding, which is the one worth acting on.** The guard at `src/tile.jl:236` compares the
+requested block size against the grid-wide halo and rejects anything smaller, so on this case the
+smallest permitted block is **2736x1500 px** — and since the grid spans ~24.8 image px per grid point,
+every permitted block size covers the whole scene in one block. Blocking cannot subdivide a NISAR
+scene at all as configured. That is a real limit on using `process_block_size` as a memory control
+here, and it is independent of the halo being shared or per-block.
