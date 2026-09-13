@@ -650,24 +650,56 @@ end
     return false
 end
 
-# Threaded driver: one task and one workspace per chunk, indexed by chunk rather than by
-# thread. Indexing per-thread state by `threadid()` is unsafe under task migration, and
-# per-chunk is correct by construction.
+# Threaded driver: as many tasks as threads, each claiming the next unclaimed chunk until they run
+# out. Per-chunk workspaces rather than per-thread ones, since indexing per-thread state by
+# `threadid()` is unsafe under task migration.
 #
-# Chunks are deliberately finer than the thread count. The sparse search zeroes
-# most of the grid in spatially clustered patterns, and a skipped point costs a comparison
-# where a searched one costs microseconds — so an even split of the index range leaves some
-# tasks with almost nothing to do. Oversubscribing lets the scheduler even that out.
+# **Dynamic claiming, not a static split, because per-point cost varies by orders of magnitude.** A
+# point is correlated at its own radius bucket (`_radius_bucket`), so a chunk's cost is set by the
+# radii it happens to contain: on a Geogrid-derived field the widest bucket's transform is hundreds of
+# times the narrowest's, and the wide points are spatially clustered rather than spread. A static split
+# of the index range therefore ends with one task still working while the rest have finished — and the
+# tail is the whole problem, since a run is only as fast as its last chunk. Claiming from a shared
+# counter lets the tasks that drew cheap chunks absorb the remaining work instead of idling.
+#
+# Claiming dynamically cannot change the result. Each chunk writes a disjoint set of points, and a
+# point's bucket depends on the point alone, so neither which task runs a chunk nor the order they run
+# in is an input. `test/track.jl` asserts serial and threaded agree bitwise.
+#
+# `CHUNKS_PER_THREAD` chunks per thread rather than one, so a task that draws an expensive chunk late
+# still has small ones behind it to trade against. Finer costs one workspace take-and-give per chunk,
+# measured at 0.7 us against a chunk's own hundreds of milliseconds.
+const CHUNKS_PER_THREAD = 16
+
 function _track_threaded!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
                           chip::Extent, radius::Extent, up::Int, p::Params,
                           measure::SimilarityMeasure)
     n = length(pts)
-    nchunks = min(n, max(1, 2 * Threads.nthreads()))
+    nchunks = min(n, max(1, CHUNKS_PER_THREAD * Threads.nthreads()))
     chunk = cld(n, nchunks)
-    tasks = map(Iterators.partition(eachindex(pts), chunk)) do range
-        StableTasks.@spawn _track_chunk!(out, ref, sec, okmask, pts, chip, radius,
-                                         up, p, measure, range)
+    ranges = collect(Iterators.partition(eachindex(pts), chunk))
+    next = Threads.Atomic{Int}(1)
+    ntasks = min(length(ranges), Threads.nthreads())
+    tasks = map(1:ntasks) do _
+        StableTasks.@spawn _track_claimed!(out, ref, sec, okmask, pts, chip, radius,
+                                           up, p, measure, ranges, next)
     end
     foreach(wait, tasks)
     return out
+end
+
+# One task's share: claim the next chunk until they run out.
+#
+# A function rather than a `begin` block inside the spawn, for the reason `src/tile.jl` records at
+# `_run_task_blocks!`: a variable assigned inside a closure *and* in the enclosing scope is hoisted
+# into one `Core.Box` shared by every closure built from that frame, so per-task state declared inline
+# would be shared by all the tasks.
+function _track_claimed!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
+                         chip::Extent, radius::Extent, up::Int, p::Params,
+                         measure::SimilarityMeasure, ranges, next::Threads.Atomic{Int})
+    while true
+        i = Threads.atomic_add!(next, 1)
+        i <= length(ranges) || return out
+        _track_chunk!(out, ref, sec, okmask, pts, chip, radius, up, p, measure, ranges[i])
+    end
 end
