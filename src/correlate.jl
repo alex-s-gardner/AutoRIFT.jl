@@ -350,10 +350,21 @@ end
 #     per-chunk allocation gave, obtained by a lock around a small vector instead of by the
 #     allocator.
 #
-# A run visits three geometries, so the pool holds at most three entries per shape plus however
-# many a burst of concurrent chunks needs. It is not bounded, and deliberately: bounding it would
-# mean either blocking a task or falling back to allocation, and the natural bound — the number
-# of chunks in flight — is already small and set by the thread count.
+# A run visits one geometry per (chip size, radius bucket) pair, which on a skewed radius field is
+# dozens rather than the handful a uniform one reaches: 48 pairs on a 201² window of a NISAR L1 grid,
+# 9.23 GiB if the pool retains one of each. So the pool is **bounded per key**, and the bound is what
+# keeps bucketing's memory in proportion to its concurrency rather than to its variety.
+#
+# `POOL_SLOTS_PER_KEY` is the retention limit, not a limit on how many workspaces may exist: a burst
+# of concurrent chunks wider than the bound still gets a workspace each — `take_workspace!` builds one
+# when the pool is empty — and the surplus is dropped on return rather than kept. That is the right
+# asymmetry, since holding a 0.86 GiB buffer against a future burst that may never come is a
+# guaranteed cost against a speculative saving.
+#
+# The bound is per key rather than global because the keys are not interchangeable: a workspace built
+# for one bucket cannot serve another, so a global cap would evict entries that are about to be needed
+# while keeping ones that are not.
+const POOL_SLOTS_PER_KEY = 2
 
 const WORKSPACE_LOCK = ReentrantLock()
 # Keyed by (chip, radius) so a checked-out workspace is byte-for-byte what `workspace` would have
@@ -389,13 +400,19 @@ end
 """
     AutoRIFT.give_workspace!(ws)
 
-Return a workspace to the pool. Its buffers are not cleared: every one is fully written before
-being read on the next use, which is what `prepare_chip!` and the integral images guarantee.
+Return a workspace to the pool, or drop it if that geometry's slots are full. Its buffers are not
+cleared: every one is fully written before being read on the next use, which is what `prepare_chip!`
+and the integral images guarantee.
+
+Dropping rather than growing the pool without limit is what bounds a run's footprint when the radius
+field is skewed — see `POOL_SLOTS_PER_KEY`. A dropped workspace is ordinary garbage, and the next
+caller needing that geometry builds one.
 """
 function give_workspace!(ws::CorrelationWorkspace)
     lock(WORKSPACE_LOCK) do
-        push!(get!(() -> CorrelationWorkspace[], WORKSPACE_POOL,
-                   (ws.max_chip, ws.max_radius)), ws)
+        pool = get!(() -> CorrelationWorkspace[], WORKSPACE_POOL,
+                    (ws.max_chip, ws.max_radius))
+        length(pool) < POOL_SLOTS_PER_KEY && push!(pool, ws)
     end
     return nothing
 end
