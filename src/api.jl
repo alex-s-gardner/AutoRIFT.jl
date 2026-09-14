@@ -266,8 +266,8 @@ All of [`AutoRIFT.params`](@ref)'s, plus:
   never contributes to a correlation.
 - `process_block_size`: `(X, Y)` **pixels** per block, or `nothing` (the default) for one block over
   the whole scene. Reads and filters the images a block at a time, so no array the size of the scene
-  is ever formed. **512 by 512 is a good default**; measured peak memory at 4096² and 6000² is
-  lowest there and rises with larger blocks.
+  is ever formed. **1024 by 1024 is a good default at a narrow halo**, and needs to grow with the
+  halo — see below.
 
   Two things are promised under semantic versioning, and only these two: the result is
   **bit-identical** to the untiled run, and no array the size of the scene — imagery or mask — is
@@ -275,17 +275,34 @@ All of [`AutoRIFT.params`](@ref)'s, plus:
   are all free to change.
 
   Worth it whenever peak memory matters, not only when the scene cannot fit. Measured total process
-  peak, threaded, against a resident untiled run:
+  peak on a 17121×16961 Landsat overlap at 10 threads, from a memory-mapped input, against an untiled
+  run of the same scene:
 
-  | scene | untiled | 512-pixel blocks |
-  |---|---:|---:|
-  | 4096² | 995 MiB | 593 MiB |
-  | 6000² | 1519 MiB | 603 MiB |
+  | block | blocks | peak | runtime | read amplification |
+  |---|---:|---:|---:|---:|
+  | untiled | 1 | 4958 MiB | 20.5 s | 1.00× |
+  | 2048 px | 81 | 3116 MiB | 24.4 s | 1.13× |
+  | 1024 px | 289 | **2140 MiB** | 22.6 s | 1.26× |
+  | 512 px | 1089 | 2248 MiB | 22.3 s | 1.55× |
+  | 256 px | 4160 | 2042 MiB | 24.0 s | 2.21× |
 
-  The gain grows with the scene — 40% and 60% here — and peak rises with the block size rather than
-  falling, since a larger block holds more imagery at once while the halo it saves is a fixed width.
-  The halo costs 1–13% extra *reading* at these sizes. Combine this with an input that reads a window
-  cheaply — a lazy `Raster`, or any disk-backed array — and the scene is never resident at all.
+  **Peak is set by a block's area, not by the number of blocks** — 2140, 2248 and 2042 MiB across a
+  14× range of block counts. Nine arrays sized to the largest read window are held per task, and the
+  task count is capped at `min(nblocks, nthreads)`, so the footprint is area × threads however finely
+  the scene is cut. Combine this with an input that reads a window cheaply — a lazy `Raster`, or any
+  disk-backed array — and the scene is never resident at all.
+
+  **Runtime is set by the halo, which is why the block size cannot simply be minimized.** The halo is
+  a fixed width for every block, so the imagery a run reads grows as `((block + 2·halo) / block)²` —
+  the fourth column above, at a 69-pixel halo. Below 1024 px the memory curve has flattened while that
+  redundancy keeps climbing, and pushed far enough it stops being merely wasteful: each block read
+  allocates a block-sized temporary, so read amplification is also allocation rate, and a 128-pixel
+  block on this scene becomes GC-bound rather than compute-bound. **A wide halo therefore needs a
+  proportionally larger block**, and a block only a few halos across is mostly overlap.
+
+  Keep the block count above the thread count. Fewer blocks than threads puts every block in flight at
+  once, which on this scene at 8192 px held nine 8331² working sets for a peak of 14856 MiB — 3× the
+  untiled run.
 
   A block is a whole number of grid points, so the size is a target that snaps outward: at
   `grid_spacing = 32` a request of 500 becomes 512. A tuple and only a tuple, since a full-width band

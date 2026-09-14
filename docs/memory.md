@@ -156,10 +156,73 @@ unpredictable direction is worse than no knob: a caller would size an instance f
 OOM-killed. **Tiling large scenes** is the honest version of this, since scene size is the one thing
 that does scale, and it is deferred rather than dismissed.
 
+## Block size: peak scales with block area, not with block count
+
+`process_block_size` is the one knob a caller has over peak memory, and the figure that decides
+whether it is usable is peak against runtime at each size. Measured on the full Landsat 8/9 overlap —
+17121×16961 px, a 2127×2107 grid, 922,784 measured points — at 10 worker threads, from a
+memory-mapped input. Reproduce with `tools/ab/mem_blocks.jl`.
+
+| block | blocks | peak MiB | vs untiled | runtime | read amplification |
+|---|---:|---:|---:|---:|---:|
+| untiled | 1 | 4958 | 1.00× | **20.5 s** | 1.00× |
+| 8192 px | 9 | 14856 | 3.00× | 42.0 s | 1.03× |
+| 4096 px | 25 | 6995 | 1.41× | 30.3 s | 1.06× |
+| 2048 px | 81 | 3116 | 0.63× | 24.4 s | 1.13× |
+| **1024 px** | 289 | **2140** | **0.43×** | **22.6 s** | 1.26× |
+| 512 px | 1089 | 2248 | 0.45× | 22.3 s | 1.55× |
+| 256 px | 4160 | 2042 | 0.41× | 24.0 s | 2.21× |
+
+`dx`/`dy` are bit-identical at every size and all 922,784 points are measured at every size, so
+nothing below is a quality trade.
+
+**1024 px is the default.** It cuts peak 2.3× for a 10% runtime cost, and the curve is flat from
+there to 256 px — 2140, 2248, 2042 MiB across a 14× range of block *counts*. That flatness is the
+finding: peak is set by a block's **area**, not by how many blocks there are. Nine arrays sized to the
+largest read window are held per task (`AutoRIFT.BlockBuffers`), and the task count is capped at
+`min(nblocks, nthreads)`, so the footprint is area × threads however finely the scene is cut.
+
+**Runtime is set by the halo, and that is what bounds how small a block can usefully be.** The halo
+is computed from the parameters and the grid *before* any block size is applied, and is the same for
+every block — `chip_size_max/2 + radius + |prior| + 2 + filter_reach + level_centre_offset`, which is
+69 px here. So it is a fixed-width skirt on a shrinking block, and the imagery a run reads grows as
+`((block + 2·halo) / block)²`: 1.26× at 1024 px, 1.55× at 512, 2.21× at 256, 3.82× at 128. Below
+1024 px the memory curve has already flattened while that redundancy keeps climbing, so smaller
+blocks buy nothing and cost reading. **If a configuration has a wide halo, the block size has to
+increase in proportion** — a block only a few halos across is mostly overlap.
+
+Pushed far enough the redundancy stops being merely wasteful. At 128 px (15,624 blocks, 3.82× read
+amplification) the run becomes allocation-bound rather than compute-bound: sampled stacks put 6 of 10
+workers in `__psynch_mutexwait` beneath `jl_safepoint_start_gc`, all queued on one mutex, and the run
+had not finished in 20 minutes against 22.6 s at 1024 px. Every block read allocates a block-sized
+temporary (`_read_block!` indexes rather than `copyto!`-ing a view, deliberately — a lazy input needs
+one read per window, not one per pixel), so read amplification is also allocation rate.
+
+**8192 px is a misconfiguration, not a baseline.** With 9 blocks on 10 threads every block is in
+flight at once, so the run holds nine 8331² working sets — 3× the untiled peak — and it is also one
+core short, since `min(nblocks, nthreads)` caps the tasks at 9. A block size chosen so that blocks are
+fewer than threads inverts what blocking is for. Keep the block count comfortably above the thread
+count.
+
+**The untiled row is a different parallel decomposition, not just a different block size.** It has one
+block, so it uses its threads through the intra-pass path while every blocked run uses them per block
+(`threaded = false` inside each). That is why it is the fastest row here and still not the one to
+choose: 4958 MiB against 2140 is the difference between what fits on an instance and what does not.
+
+**These numbers are for this configuration's 69 px halo.** A wide-halo configuration behaves
+differently in kind, not only in degree: on the NISAR L1 window the halo is 2736×1500 px, and
+`block_layout` rejects every block size smaller than that as being almost entirely overlap — which
+covers the whole scene in one block, so `process_block_size` is not available as a memory control
+there at all. `tools/golden/GATES.md` records that, along with a per-block halo that was implemented
+and reverted at a measured 1.03–1.11× gain, because `chip_size_max/2` alone floors the halo at 561 px
+whatever the block.
+
 ## Practical guidance
 
 - **Batch work: one pair per process or per worker, `threaded = false`.** Also 2.7× faster than
   intra-pair threading (`benchmark/suite/throughput.jl`), so this is not a tradeoff.
+- **`process_block_size = (1024, 1024)` when peak memory matters**, and scale it up with the halo
+  rather than down — see the table above. Check the block count stays above the thread count.
 - **Reuse a `Cache` across pairs** via `init`/`reinit!`/`autorift!`. The live heap is flat, so this
   is bounded regardless of batch length.
 - **No process recycling needed** — the measurement above is what establishes that.
