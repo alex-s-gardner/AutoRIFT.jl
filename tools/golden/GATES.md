@@ -2477,51 +2477,60 @@ grid's, since `sanitize!` floors them and the coarse pass rewrites them per leve
 grid-wide 1905), so a single clamp needs that relationship established first rather than assumed. Left
 open deliberately.
 
-## Step: a real geogrid is not bit-identical under blocking, and the tiling tests cannot see it
+## Step: blocking on a real geogrid, and what the outlier filter does to a last-bit difference
 
-**Open.** Fixing the rotated-grid layout above made blocking actually divide a golden grid, and the first
-thing a real multi-block run shows is that it does not reproduce the untiled answer. The synthetic suite
-passes 36,620 tiling assertions and misses this, because every grid it builds is one `gridpoints` makes.
+Fixing the rotated-grid layout above made blocking actually divide a golden grid, and the first real
+multi-block run did not reproduce the untiled answer. **The blocked correlation is right; the
+disagreement is the outlier filter amplifying a floating-point difference the package already
+documents.** Recorded because the intermediate readings each pointed somewhere else.
 
-Measured on `S2B_MSIL1C_20200612` at a 2048 px block — 144 blocks over a 10980x10980 scene, 1008x1008
-grid, 787,186 searchable points:
+Measured on `S2B_MSIL1C_20200612`, a 10980x10980 scene on a 1008x1008 grid with 787,186 searchable
+points, at a 2048 px block giving 144 blocks:
 
-| quantity | untiled | blocked |
-|---|---:|---:|
-| measured points | 612,607 | 611,467 |
-| only this side | 1163 | 23 |
-| differing where both measured | — | 2527 |
+| configuration | untiled | blocked | differing |
+|---|---:|---:|---:|
+| full ladder, `outliers` default | 612,607 | 611,467 | 3713 |
+| single chip size, `outliers` default | 481,037 | 481,036 | 1 |
+| single chip size, `outliers = :none` | 787,190 | 787,190 | **0, bit-identical** |
 
-Before the layout fix the same command produced **one** block, so the harness reported `identical = true`
-by comparing an untiled run against itself. That agreement was vacuous, and it is why this went unseen.
+The last row is the finding. With rejection off the two paths agree to the last bit, so nothing about
+reading, filtering, padding or the layout differs.
 
-**What it is not.** Each of these was measured and ruled out:
+**What the one point is.** Grid (918,827), `x = 9812.5`, `y = 10010.5`, radius 6, chip 24, zero prior.
+Correlated in isolation through its own block it answers `dx = 0.1875`, `correlation = 0.1534135` —
+exactly the untiled values — and its `peak_ratio` comes out **1.6192024 through the whole grid's pass
+geometry against 1.6192014 through the block's own**. That is a 6e-7 relative difference in a *quality
+metric*, from executing a different-sized transform: `src/plans.jl` already records that `correlation` is
+reproducible only to ~1e-7 while `dx`/`dy` are bit-identical, because a peak's location is insensitive to
+a perturbation that size. Here the metric feeds `reject_outliers`, which compares each point against its
+neighbours and takes a keep-or-drop decision — so a 6e-7 difference lands on either side of a threshold
+and the point is kept untiled and dropped blocked.
 
-- **Not the halo at a seam.** Only 9% of the discrepant points lie within 2 grid points of a block
-  boundary, against ~13% expected by chance at this block size.
-- **Not padding over real imagery**, which was the leading hypothesis. 37 of the 144 blocks do report
-  `fits = false` and get `_zeropad`ed, and all 37 sit at the scene edge where the untiled pass pads too.
-  But a synthetic grid whose points deliberately reach outside the scene stays bit-identical, so padding
-  alone does not produce this.
-- **Not per-point radius variety, `preprocess = :none`, a clustered unsearchable region, or a
-  `grid_spacing` that disagrees with the grid's true spacing** — that last one is real here (48 declared
-  against 12 measured) and all four reproduce bit-identically in isolation.
-- **Not the chip-size ladder or the outlier filter.** With a single chip size — no ladder, no coarse
-  pass, no fine rejection — **one** point of 481,037 still differs.
+The ladder then multiplies one point into 3713. A point the base level drops changes what the coarse
+gate, the hole fill and every level above it see, so the discrepancy compounds rather than accumulating
+linearly.
 
-**Where it stands.** That single point is grid (918,827), `x = 9812.5`, `y = 10010.5`, radius 6, chip 24,
-zero prior. Its block reads rows 9046:10427 and cols 8852:10260, so the imagery its 20-pixel reach needs
-is fully inside the window; the block reports `fits = true`, sits at no scene edge, and the 51x51
-neighbourhood of both images holds no non-finite pixel and only 5 zeros in 2601. The untiled run answers
-`dx = 0.1875`, the blocked run `NaN`. So a searchable point with its imagery present and no padding
-involved is being dropped by the blocked path, which points at the correlation or the mask bookkeeping
-inside `_prepared_block_pair` rather than at the layout.
+**Why the synthetic suite cannot see this.** 36,620 tiling assertions pass, and every grid they build
+comes from `gridpoints`: uniform radii, no fill, and — before the layout fix — a golden grid collapsed to
+one block, so the harness compared an untiled run against itself and reported agreement. That agreement
+was vacuous. Reproducing the failure needs a grid whose radius field is skewed enough that a block's own
+pass geometry differs materially from the whole grid's, which is a geogrid property.
 
-The ladder amplifies it — one point at a single chip size becomes 3713 discrepancies across four levels,
-since a point the base level drops changes what the coarse gate and the hole fill see at every level
-above it. So the single-chip case is the one to debug.
+**Four things this is not**, each measured and ruled out before the above was found: a halo effect at a
+seam (only 9% of discrepant points lie within 2 grid points of a boundary, against ~13% by chance);
+padding over real imagery (37 of 144 blocks do get `_zeropad`ed, all at the scene edge where the untiled
+pass pads too, and a synthetic grid whose points deliberately reach outside the scene stays
+bit-identical); per-point radius variety, `preprocess = :none`, a clustered unsearchable region, or a
+`grid_spacing` disagreeing with the grid's true spacing (48 declared against 12 measured here — all four
+reproduce bit-identically in isolation); and the chip ladder or the fine rejection themselves, since one
+point still differs with a single chip size.
 
-**This blocks using `process_block_size` on golden cases**, and it is a correctness question rather than
-a performance one: `docs/memory.md` states bit-identity as one of the two things blocking promises under
-semantic versioning. The Landsat sweep in that file is unaffected — those runs are bit-identical at every
-block size, and its grid comes from `gridpoints`.
+**What it means for the bit-identity promise.** `docs/memory.md` states bit-identity as one of two things
+`process_block_size` guarantees. That holds for the correlation and fails for the *rejection decision* on
+a grid with a skewed radius field, because the decision is a threshold on a quantity only reproducible to
+~1e-7. Two honest resolutions, neither applied: hand every block the whole grid's pass geometry for the
+quality metrics as well as the transform — which `_run_blocked` already does for `geometry`, so the
+remaining difference is that a bucket's workspace is sized to the bucket — or state the promise as
+bit-identical `dx`/`dy` *given the same keep mask*, and treat the mask as reproducible only where no point
+sits within ~1e-6 of a threshold. The Landsat sweep in `docs/memory.md` is unaffected either way: uniform
+radii mean a block's geometry equals the grid's, and those runs are bit-identical at every block size.
