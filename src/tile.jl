@@ -295,10 +295,10 @@ end
 # includes a full-width band, where `px` is the scene width and only the row count binds.
 function _block_shape(grid::PointSet{2}, px::Int, py::Int)
     nr, nc = size(grid)
-    rxi = _index_rate(grid.x, 1)
-    rxj = _index_rate(grid.x, 2)
-    ryi = _index_rate(grid.y, 1)
-    ryj = _index_rate(grid.y, 2)
+    rxi = _index_rate(grid, grid.x, 1)
+    rxj = _index_rate(grid, grid.x, 2)
+    ryi = _index_rate(grid, grid.y, 1)
+    ryj = _index_rate(grid, grid.y, 2)
     # The separable answer, from each axis's own dominant direction. Also the starting point for the
     # coupled case, since shrinking from here can only tighten a constraint that already holds.
     rowpts = clamp(floor(Int, py / max(ryi, rxi, EPS_RATE)), 1, nr)
@@ -323,37 +323,48 @@ const MAX_SHRINK = 20
 # cannot produce an infinite block.
 const EPS_RATE = 1e-9
 
-# Pixels of `A` per unit step of index dimension `dim`: the median of the nonzero absolute first
-# differences along that dimension.
+# Pixels of `A` per unit step of index dimension `dim`, measured over the points a block must cover.
 #
-# **The median of the *nonzero* differences, not of all of them.** A grid whose footprint is rotated
-# within its bounding box is mostly fill, and this cannot know the fill convention — the NISAR grids pad
-# with zeros rather than `NaN`, so a finiteness test does not find them. Two properties make the nonzero
-# median right anyway: a run of fill contributes *zero* differences, which the filter drops, while the
-# single difference crossing from fill into data is the scene's whole width, which a median ignores where
-# a mean would be dominated by it. Measured on the NISAR L1 grid, this recovers 33 px in `x` and 19 in
-# `y` against a maximum difference of 50505 and an all-differences median of 0.
+# **Reduced over pairs where both points are searchable**, which is what makes this robust on a grid whose
+# footprint is rotated within its bounding box. Such a grid is mostly fill — 65% of both NISAR grids — and
+# this cannot know the fill convention, since they pad with zeros rather than `NaN` and a finiteness test
+# finds nothing. Restricting to searchable pairs excludes fill by construction instead of by guessing a
+# sentinel, and it is the right restriction on its own terms: an unsearchable point is never correlated, so
+# its coordinate does not constrain a block.
 #
-# Subsampled, because this is an estimate of a spacing and reducing over five million points to produce
-# it costs more than the layout it informs.
+# Both alternatives were measured and both fail, in opposite directions:
+#
+#   * **The median of the nonzero steps** cannot see a genuinely separable axis. On the L2 GSLC grid `x`
+#     really is constant down a column, so every in-footprint step is zero and the only nonzero ones are
+#     the two that cross the fill boundary — giving `dx/di = 87666` from a sample of one, and a layout of
+#     5.2 million blocks, one per grid point.
+#   * **The median of every step** is zero on any grid that is majority fill, which is both NISAR grids.
+#     All four rates come out zero, and a zero rate is an infinite block.
+#
+# Over searchable pairs the same estimator gives 33/34/19/19 px on the rotated L1 grid and 0/48/24/0 on the
+# separable L2 grid — the true rates in both cases, with the cross terms vanishing exactly where they
+# should.
+#
+# Subsampled, because this is an estimate of a spacing and reducing over five million points to produce it
+# costs more than the layout it informs.
 #
 # Returns zero when nothing can be measured, which `_block_shape` reads as "this axis does not vary".
-function _index_rate(A::AbstractMatrix, dim::Int)
+function _index_rate(grid::PointSet{2}, A::AbstractMatrix, dim::Int)
     nr, nc = size(A)
     (dim == 1 ? nr : nc) > 1 || return 0.0
     steps = Float64[]
     stride = max(1, (nr * nc) ÷ RATE_SAMPLES)
-    lo1, hi1 = firstindex(A, 1), lastindex(A, 1)
-    lo2, hi2 = firstindex(A, 2), lastindex(A, 2)
-    ilast = dim == 1 ? hi1 - 1 : hi1
-    jlast = dim == 2 ? hi2 - 1 : hi2
+    ilast = dim == 1 ? nr - 1 : nr
+    jlast = dim == 2 ? nc - 1 : nc
     k = 0
-    for j in lo2:jlast, i in lo1:ilast
+    @inbounds for j in 1:jlast, i in 1:ilast
         k += 1
         k % stride == 0 || continue
-        d = dim == 1 ? Float64(A[i + 1, j]) - Float64(A[i, j]) :
-                       Float64(A[i, j + 1]) - Float64(A[i, j])
-        (isfinite(d) && d != 0) && push!(steps, abs(d))
+        i2, j2 = dim == 1 ? (i + 1, j) : (i, j + 1)
+        (issearchable(grid, CartesianIndex(i, j)) &&
+         issearchable(grid, CartesianIndex(i2, j2))) || continue
+        d = Float64(A[i2, j2]) - Float64(A[i, j])
+        isfinite(d) && push!(steps, abs(d))
     end
     isempty(steps) && return 0.0
     sort!(steps)
