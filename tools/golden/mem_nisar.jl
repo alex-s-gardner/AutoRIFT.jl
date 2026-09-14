@@ -20,6 +20,7 @@ include(joinpath(@__DIR__, "correlator.jl"))
 include(joinpath(dirname(@__DIR__), "ab", "memtrace.jl"))
 
 using Printf, Serialization
+using AutoRIFT: halo, block_layout, nsearchable
 
 const TRACE_DIR = joinpath(get(ENV, "AUTORIFT_GOLDEN_CACHE",
                                joinpath(expanduser("~/data/autorift/tests"), "golden_tests")),
@@ -49,7 +50,7 @@ function measure_case(c::GoldenCase; blocks::Vector{Int}, n::Integer = 100)
     h = halo(grid, p, scene)
     @printf("%s\n", c.product)
     @printf("  scene %d x %d px, grid %d x %d, halo %d x %d px, %d searchable points\n",
-            scene..., size(grid)..., h.X, h.Y, AutoRIFT.nsearchable(grid))
+            scene..., size(grid)..., h.X, h.Y, nsearchable(grid))
     flush(stdout)
 
     results = NamedTuple[]

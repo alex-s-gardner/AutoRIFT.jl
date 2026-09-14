@@ -2476,3 +2476,52 @@ one grid-wide maximum instead would collapse them to four keys — but a level's
 grid's, since `sanitize!` floors them and the coarse pass rewrites them per level (1918 against a
 grid-wide 1905), so a single clamp needs that relationship established first rather than assumed. Left
 open deliberately.
+
+## Step: a real geogrid is not bit-identical under blocking, and the tiling tests cannot see it
+
+**Open.** Fixing the rotated-grid layout above made blocking actually divide a golden grid, and the first
+thing a real multi-block run shows is that it does not reproduce the untiled answer. The synthetic suite
+passes 36,620 tiling assertions and misses this, because every grid it builds is one `gridpoints` makes.
+
+Measured on `S2B_MSIL1C_20200612` at a 2048 px block — 144 blocks over a 10980x10980 scene, 1008x1008
+grid, 787,186 searchable points:
+
+| quantity | untiled | blocked |
+|---|---:|---:|
+| measured points | 612,607 | 611,467 |
+| only this side | 1163 | 23 |
+| differing where both measured | — | 2527 |
+
+Before the layout fix the same command produced **one** block, so the harness reported `identical = true`
+by comparing an untiled run against itself. That agreement was vacuous, and it is why this went unseen.
+
+**What it is not.** Each of these was measured and ruled out:
+
+- **Not the halo at a seam.** Only 9% of the discrepant points lie within 2 grid points of a block
+  boundary, against ~13% expected by chance at this block size.
+- **Not padding over real imagery**, which was the leading hypothesis. 37 of the 144 blocks do report
+  `fits = false` and get `_zeropad`ed, and all 37 sit at the scene edge where the untiled pass pads too.
+  But a synthetic grid whose points deliberately reach outside the scene stays bit-identical, so padding
+  alone does not produce this.
+- **Not per-point radius variety, `preprocess = :none`, a clustered unsearchable region, or a
+  `grid_spacing` that disagrees with the grid's true spacing** — that last one is real here (48 declared
+  against 12 measured) and all four reproduce bit-identically in isolation.
+- **Not the chip-size ladder or the outlier filter.** With a single chip size — no ladder, no coarse
+  pass, no fine rejection — **one** point of 481,037 still differs.
+
+**Where it stands.** That single point is grid (918,827), `x = 9812.5`, `y = 10010.5`, radius 6, chip 24,
+zero prior. Its block reads rows 9046:10427 and cols 8852:10260, so the imagery its 20-pixel reach needs
+is fully inside the window; the block reports `fits = true`, sits at no scene edge, and the 51x51
+neighbourhood of both images holds no non-finite pixel and only 5 zeros in 2601. The untiled run answers
+`dx = 0.1875`, the blocked run `NaN`. So a searchable point with its imagery present and no padding
+involved is being dropped by the blocked path, which points at the correlation or the mask bookkeeping
+inside `_prepared_block_pair` rather than at the layout.
+
+The ladder amplifies it — one point at a single chip size becomes 3713 discrepancies across four levels,
+since a point the base level drops changes what the coarse gate and the hole fill see at every level
+above it. So the single-chip case is the one to debug.
+
+**This blocks using `process_block_size` on golden cases**, and it is a correctness question rather than
+a performance one: `docs/memory.md` states bit-identity as one of the two things blocking promises under
+semantic versioning. The Landsat sweep in that file is unaffected — those runs are bit-identical at every
+block size, and its grid comes from `gridpoints`.
