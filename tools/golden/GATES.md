@@ -2534,3 +2534,63 @@ remaining difference is that a bucket's workspace is sized to the bucket — or 
 bit-identical `dx`/`dy` *given the same keep mask*, and treat the mask as reproducible only where no point
 sits within ~1e-6 of a threshold. The Landsat sweep in `docs/memory.md` is unaffected either way: uniform
 radii mean a block's geometry equals the grid's, and those runs are bit-identical at every block size.
+
+## Step: what a whole NISAR scene costs, and a GC deadlock at 45 GiB
+
+Blocking works on these grids once the layout is fixed, and the figures are what a production instance
+would be sized from. Measured at `-t 10` on an M2 Max with 96 GiB, whole grid, one process per row.
+
+**NISAR L1 RSLC** — 57760x50511 px, grid 2328x2304, halo 2736x1500 px, 1.87 M searchable points:
+
+| block | blocks | runtime | peak | vs untiled | read amp | measured |
+|---|---:|---:|---:|---:|---:|---:|
+| untiled | 1 | 10.9 min | **55.2 GiB** | 1.00x | 1.00x | 1,798,199 |
+| 16384 px | 100 | — | 68.6 GiB | 1.24x | 2.89x | killed |
+| 8192 px | 380 | 18.4 min | 36.7 GiB | 0.67x | 4.51x | 1,797,084 |
+| 4096 px | 1482 | 16.9 min | **33.4 GiB** | 0.60x | 8.77x | 1,797,084 |
+
+**NISAR L2 GSLC** — 54885x110085 px (6.0 Gpx), grid 2288x2288, halo 2216x1103 px:
+
+| block | blocks | runtime | peak | read amp | measured |
+|---|---:|---:|---:|---:|---:|
+| untiled | 1 | 12.1 min | **80.9 GiB** | 1.00x | 1,781,775 |
+| 8192 px | 98 | deadlocked at 44 GiB | — | 0.87x | — |
+
+Three things worth stating.
+
+**The untiled peaks are the reason blocking matters here.** 55 GiB on L1 and **81 GiB on L2, on a 96 GiB
+machine** — a production instance sized from the L2 figure is a memory-optimized instance costing several
+times a general-purpose one, for a scene blocking runs at 37 GiB.
+
+**A block can be too large, and the crossover is arithmetic.** `BlockBuffers` holds nine block-sized
+arrays — two `UInt8` planes, three `Float32`, four `Bool`, 18 bytes per pixel — one set per task, so a run
+holds `min(nblocks, nthreads)` sets. At 16384 px on L1 the read window is 12232x22222, which is 4.56 GiB
+per set and **45.6 GiB across ten tasks** before any imagery or workspace: measured peak 68.6 GiB against
+an untiled 55.2. The prediction and the measurement agree to 1%, so the rule is usable rather than
+empirical — compute `9 x 18 bytes x (block + 2*halo)^2 x nthreads` and keep it well under the untiled
+peak.
+
+**L2 reads *less* than the scene when blocked** — 0.87x at 8192 px, against 4.51x for L1 at the same size.
+Two reasons compound: its halo is smaller relative to the block, and 64% of its grid is fill, so those
+blocks have no searchable point and `_searchable_span` gives them an empty read window. A read
+amplification below 1.0 is the signature of a grid whose footprint does not fill its bounding box.
+
+### The deadlock
+
+**Open, and it blocks the L2 measurement.** The 8192 px run reached 44.4 GiB and then stopped dead: 0%
+CPU across three samples six minutes apart, unresponsive to `SIGTERM`, killed with `SIGKILL`. A `sample`
+of all 31 threads puts every one in a wait — 16 in `__psynch_cvwait`, 4 in `__psynch_mutexwait` — and each
+of the four is
+
+    ijl_gc_small_alloc / ijl_gc_managed_malloc -> ijl_gc_collect -> jl_safepoint_start_gc -> uv_mutex_lock
+
+so every thread that tried to allocate is queued behind a collection that never starts. The trace is
+saved at `~/data/autorift/tests/golden_tests/mem/l2_deadlock_sample.txt`.
+
+The sampler thread `mem_nisar.jl` runs is **not** on any stack, so it is not the thread holding the lock,
+and this is not an artifact of the measurement harness. What is suggestive is the scale: ten tasks each
+allocating a 2.18 GiB buffer set on a process already holding 44 GiB, which is the same
+allocation-under-pressure shape as the 128-pixel Landsat case in `docs/memory.md` — that one merely
+crawled at 6 of 10 workers stuck on the same mutex, where this one stops. Whether that is a Julia GC bug
+at this scale or something this package does wrong is not established, and the L2 blocked figures cannot
+be quoted until it is.
