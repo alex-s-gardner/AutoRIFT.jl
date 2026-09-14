@@ -2546,8 +2546,14 @@ would be sized from. Measured at `-t 10` on an M2 Max with 96 GiB, whole grid, o
 |---|---:|---:|---:|---:|---:|---:|
 | untiled | 1 | 10.9 min | **55.2 GiB** | 1.00x | 1.00x | 1,798,199 |
 | 16384 px | 100 | — | 68.6 GiB | 1.24x | 2.89x | killed |
-| 8192 px | 380 | 18.4 min | 36.7 GiB | 0.67x | 4.51x | 1,797,084 |
-| 4096 px | 1482 | 16.9 min | **33.4 GiB** | 0.60x | 8.77x | 1,797,084 |
+| 8192 px | 380 | 41.1 min | 34.8 GiB | 0.63x | 4.51x | 1,797,076 |
+| 4096 px | 1482 | 45.0 min | **31.5 GiB** | 0.57x | 8.77x | 1,797,076 |
+
+**The peaks are the measurement; the blocked runtimes are upper bounds.** Those two rows were re-measured
+after `_index_rate` was corrected, on a machine that was also running the L2 job for part of their life. An
+earlier uncontended pass over the same block sizes — at the flawed rates, so a slightly different partition
+— gave 18.4 and 16.9 min. Peak RSS is insensitive to a competing process in a way wall clock is not, so the
+memory column stands and the time column wants a quiet machine before it is quoted.
 
 **NISAR L2 GSLC** — 54885x110085 px (6.0 Gpx), grid 2288x2288, halo 2216x1103 px:
 
