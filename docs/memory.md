@@ -210,12 +210,53 @@ block, so it uses its threads through the intra-pass path while every blocked ru
 choose: 4958 MiB against 2140 is the difference between what fits on an instance and what does not.
 
 **These numbers are for this configuration's 69 px halo.** A wide-halo configuration behaves
-differently in kind, not only in degree: on the NISAR L1 window the halo is 2736×1500 px, and
-`block_layout` rejects every block size smaller than that as being almost entirely overlap — which
-covers the whole scene in one block, so `process_block_size` is not available as a memory control
-there at all. `tools/golden/GATES.md` records that, along with a per-block halo that was implemented
-and reverted at a measured 1.03–1.11× gain, because `chip_size_max/2` alone floors the halo at 561 px
-whatever the block.
+differently in kind, not only in degree. On the NISAR L1 window `halo(grid, p, size)` is
+**2684×1448 px** — 6.8 by 6.4 km at that granule's 2.55 m ground-range and 4.44 m along-track
+spacing — because a Geogrid search-radius field is extremely skewed: median 26 px against a maximum
+of 1905, a 73× spread, and the halo takes the maximum. `tools/golden/GATES.md` records a per-block
+halo that was implemented and reverted at a measured 1.03–1.11× gain, since `chip_size_max/2` alone
+floors it at 561 px whatever the block.
+
+A 2684 px halo still permits blocks on a 57760×50511 scene, and it now produces them. Two properties
+of a rotated grid had to be handled first, and both used to fail silently rather than loudly.
+
+**A grid's coordinates need not be separable.** [`AutoRIFT.block_layout`](@ref) used to derive its
+block boundaries from `grid.y[:, 1]` and `grid.x[1, :]`, assuming a gridded `PointSet` repeats each
+coordinate down every row and across every column. A NISAR geogrid is a **rotated radar footprint**
+sampled onto a map grid, so `x` varies by 50502 px down a single column and `y` by 43164 px across a
+single row; only 43% of points carry real coordinates, and row 1 and column 1 hold *one* valid point
+each. Walking them spanned 216 px instead of the scene, so every requested block size up to 16384 px
+returned **one block** — an untiled run wearing a block size.
+
+The grid *is* the index-to-pixel mapping, so the block shape now comes from it: four rates, how far `x`
+and `y` each move per row and per column of the index space. A block of `a` rows by `b` columns spans
+about `a·∂x/∂i + b·∂x/∂j` pixels of `x`, and both axes must fit their budget. **Both index directions
+charge both axes**, which a separable calculation gets wrong — sizing rows from the `y` budget and
+columns from the `x` budget alone gives an `x` span of 11187 px at an 8192 px request on this grid, a
+37% overshoot of what the caller asked for. On an axis-aligned grid two of the four rates are zero, the
+constraints decouple, and this reduces to the separable answer, so a Landsat layout is unchanged — a
+full-width band included.
+
+**A block's read window must span only the points it will search.** The window came from
+[`AutoRIFT._pixel_span`](@ref) over every point in the block, and on a rotated grid the points outside
+the footprint carry a *fill* coordinate — zero here, not `NaN`, so a finiteness test does not find
+them. A block straddling the footprint edge therefore spanned from 0 to the real coordinates and read
+`1:57760`, the whole scene. Measured at an 8192 px block: 28 of 209 blocks each read half the scene or
+more, 99× the scene in total. [`AutoRIFT._searchable_span`](@ref) reduces over searchable points only,
+which is sound because `_run_one_block!` returns before any I/O for a block with nothing to search.
+
+With both fixed, the L1 grid divides as the request asks, and blocking is available on rotated grids:
+
+| block | blocks | max read window | read amplification |
+|---|---:|---:|---:|
+| 4096 px | 1444 | 5217×9747 | 8.31× |
+| 8192 px | 361 | 7572×14020 | 4.34× |
+| 16384 px | 100 | 12277×22519 | 2.85× |
+
+The amplification is high because the halo is, not because the layout is loose: at a 2684×1448 px halo
+even a 16384 px block pays 2.6×. That is the arithmetic in "Runtime is set by the halo" applied to a
+wide-halo configuration — the block size has to grow with the halo, and here the halo is large enough
+that only large blocks are efficient.
 
 ## Practical guidance
 

@@ -2350,16 +2350,94 @@ blocked run still equalled an untiled one. The saving in imagery read, on the re
 wide-radius point gets a small halo. It does not: the halo is
 `chip_size_max/2 + radius + |prior| + 2 + filter_reach + level_centre_offset`, and only the `radius`
 term is per point. `chip_size_max/2` alone is 384 px on this configuration, so the *floor* on a
-per-block halo is **561 px** against a grid-wide 2736 — and the median block reaches the full 2736
+per-block halo is **561 px** against a grid-wide 2684 — and the median block reaches the full 2684
 anyway, because 53-60% of blocks contain at least one wide-radius point at every block size tried. A
 clustered radius field is not clustered finely enough to matter at block scale.
 
+## Step: the wide halo is a skewed search radius, and the radius is the geogrid's own
+
+The halo above is dominated by the search radius, and a radius of 1905 px is worth interrogating before
+it is designed around. It survives interrogation: it is what the geogrid produced.
+
+`window_search_range.tif` — the geogrid's raw output, before `autoRIFT` reads anything — carries band 1
+min 0, **max 1905**, mean 72.5 and band 2 min 0, **max 830**, mean 41.6. Those are bit-identical to
+`in_SearchLimitX`/`in_SearchLimitY` in the capture, so nothing between the geogrid and the correlator
+rescales them.
+
+**The nodata value is not being read as data**, which is the first thing to suspect of a field whose
+maximum is 73x its median. The sentinel is `-32767` in `window_search_range.tif` and
+`window_offset.tif`, and the ITS_LIVE parameter rasters use `32767` for the search ranges and `-32767`
+for the velocities. None of the four values appears anywhere in the captured grid: no `32767`, no
+`-32767`, nothing with `|v| > 3000`, no `NaN`. The observed maxima in the source rasters — 11576 m/yr
+for `vxSearchRange`, 8147 for `vySearchRange` — are that data's own extrema, reported by `gdalinfo` as
+statistics separate from the declared nodata.
+
+**The field is genuinely skewed rather than corrupt.** Over the 2.3 M points with real coordinates and
+a nonzero chip size, `SearchLimitX` has median 26 and p99 959, then 1486 at p99.9, 1592 at p99.99 and
+1905 at the maximum — a continuous tail, not the spike of identical values a misread fill would give.
+The maximum is reached at exactly **4 points**, rows 1246-1247 and cols 1105-1106, a 2x2 cluster in the
+scene interior; the `-640` prior is 54 points at rows 1316-1333, cols 1113-1140, spatially adjacent to
+it. One fast feature, not a fill artifact.
+
+**Converting a pixel radius to a velocity needs `off2vel`, not the pixel spacing.** This is where a
+check of whether 1905 px is physically plausible goes wrong: `radius * spacing / days * 365.25` assumes
+an offset maps to ground displacement through the pixel size, which in radar geometry it does not. The
+geogrid stores the correct projection in `window_rdr_off2vel_x_vec.tif`, whose band 1 means 14.2 m/yr
+per pixel of range offset — against 19.4 implied by the naive form, so that step alone is 1.37x off.
+Through the stored conversion the median 26 px is 369 m/yr, p99 959 px is 13.6 km/yr and the maximum
+1905 px is 27 km/yr.
+
+27 km/yr is still fast for ice, and `off2vel` band 1 itself spans -377 to +393 across the scene, so a
+fixed pixel radius maps to wildly different velocities depending on where it sits. Whether those 4
+points are fast ice or poorly-conditioned geometry is a geogrid question and is left open. What is
+settled is that they are the geogrid's own numbers, correctly carried, with the nodata handled.
+
 **A second finding, which is the one worth acting on.** The guard at `src/tile.jl:236` compares the
 requested block size against the grid-wide halo and rejects anything smaller, so on this case the
-smallest permitted block is **2736x1500 px** — and since the grid spans ~24.8 image px per grid point,
-every permitted block size covers the whole scene in one block. Blocking cannot subdivide a NISAR
-scene at all as configured. That is a real limit on using `process_block_size` as a memory control
-here, and it is independent of the halo being shared or per-block.
+smallest permitted block is **2684x1448 px** — 6.8 by 6.4 km at this granule's 2.55 m ground-range and
+4.44 m along-track spacing.
+
+**That guard is not what stopped blocking here, and an earlier version of this section said it was.** A
+2684 px block divides a 57760x50511 scene about 19 by 20 ways. Yet every requested block size from 3072
+up to 16384 px returned **one block**, which no halo argument explains — the halo only sets a floor.
+
+Two independent defects, both silent, and both now fixed.
+
+**The grid is not separable.** `block_layout` derived its block boundaries from `grid.y[:, 1]` and
+`grid.x[1, :]`, on the assumption a gridded `PointSet` repeats each coordinate down every row and across
+every column. A NISAR geogrid is a rotated radar footprint sampled onto a map grid, so it is not
+axis-aligned in pixel space: `x` varies by 50502 px down column 1152, `y` by 43164 px across row 1164,
+only 43.2% of the 2328x2304 points carry real coordinates, and row 1 and column 1 contain **one** valid
+point each. Walking them spanned 216 px rather than the scene, so one block appeared to cover
+everything.
+
+The grid is itself the index-to-pixel mapping, so the block shape now comes from it: `x` moves 33 px per
+row of index *and* 33 px per column, `y` moves 19 px per each. A block of `a` by `b` index points spans
+`a*33 + b*33` px of `x`, and both axes have to fit. Sizing each axis from its own budget alone —
+`rowpts = py/dy_di`, `colpts = px/dx_dj` — gives 215 by 124 points at an 8192-px request, whose `x` span
+is 11187 px, a 37% overshoot. On an axis-aligned grid two of the four rates are zero and this reduces to
+the separable answer.
+
+**The read window spanned unsearchable points.** `_pixel_span` reduced over every point in the block,
+and outside the footprint the coordinates are *fill* — zero on this grid, not `NaN`, so finiteness does
+not detect them. A block straddling the footprint edge spanned 0 to the real coordinates and read
+`1:57760`: at an 8192 px block, 28 of 209 blocks each read half the scene or more, 99x the scene in
+total. `_searchable_span` now reduces over searchable points only, which is sound because
+`_run_one_block!` returns before any I/O for a block with nothing to search.
+
+Measured after both fixes, on the captured L1 grid:
+
+| block | blocks | max read window | read amplification |
+|---:|---:|---:|---:|
+| 4096 px | 1444 | 5217x9747 | 8.31x |
+| 8192 px | 361 | 7572x14020 | 4.34x |
+| 16384 px | 100 | 12277x22519 | 2.85x |
+
+So blocking *is* available on a NISAR grid, at a block size scaled to the halo. The amplification is set
+by the 2684x1448 px halo rather than by the layout: even a 16384 px block pays 2.9x, which is what a
+fixed-width halo costs when it is a large fraction of the block. Axis-aligned grids are unaffected — the
+Landsat sweep in `docs/memory.md` reproduces its previous block counts and amplification, a full-width
+band stays a band, and `dx`/`dy`/`correlation` stay bit-identical to an untiled run at every block size.
 
 ## Step: what the 44 GiB peak is, and it is not the imagery
 
