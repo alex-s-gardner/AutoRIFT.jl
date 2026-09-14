@@ -210,14 +210,14 @@ block, so it uses its threads through the intra-pass path while every blocked ru
 choose: 4958 MiB against 2140 is the difference between what fits on an instance and what does not.
 
 **These numbers are for this configuration's 69 px halo.** A wide-halo configuration behaves
-differently in kind, not only in degree. On the NISAR L1 window `halo(grid, p, size)` is
-**2684×1448 px** — 6.8 by 6.4 km at that granule's 2.55 m ground-range and 4.44 m along-track
+differently in kind, not only in degree. On the whole NISAR L1 grid `halo(grid, p, size)` is
+**2736×1500 px** — about 7 by 6.7 km at that granule's 2.55 m ground-range and 4.44 m along-track
 spacing — because a Geogrid search-radius field is extremely skewed: median 26 px against a maximum
 of 1905, a 73× spread, and the halo takes the maximum. `tools/golden/GATES.md` records a per-block
 halo that was implemented and reverted at a measured 1.03–1.11× gain, since `chip_size_max/2` alone
 floors it at 561 px whatever the block.
 
-A 2684 px halo still permits blocks on a 57760×50511 scene, and it now produces them. Two properties
+A 2736 px halo still permits blocks on a 57760×50511 scene, and it now produces them. Two properties
 of a rotated grid had to be handled first, and both used to fail silently rather than loudly.
 
 **A grid's coordinates need not be separable.** [`AutoRIFT.block_layout`](@ref) used to derive its
@@ -245,13 +245,45 @@ them. A block straddling the footprint edge therefore spanned from 0 to the real
 more, 99× the scene in total. [`AutoRIFT._searchable_span`](@ref) reduces over searchable points only,
 which is sound because `_run_one_block!` returns before any I/O for a block with nothing to search.
 
-With both fixed, the L1 grid divides as the request asks, and blocking is available on rotated grids:
+**And an index rate has to be measured over the points a block must cover.** The rates above came from
+the median of each axis's *nonzero* first differences, which cannot see a genuinely separable axis: on
+the NISAR L2 grid `x` really is constant down a column, so the only nonzero steps are the two crossing
+the fill boundary, giving `∂x/∂i = 87666 px` from a sample of one and a layout of 5.2 million blocks.
+The median of *every* step fails the other way — both NISAR grids are ~65% fill, so all four rates come
+out zero and a zero rate is an infinite block. Reducing over pairs where both points are searchable
+gives the true rates on both: 33/34/19/19 px on the rotated L1 grid, 0/48/24/0 on the separable L2 one.
 
-| block | blocks | max read window | read amplification |
-|---|---:|---:|---:|
-| 4096 px | 1444 | 5217×9747 | 8.31× |
-| 8192 px | 361 | 7572×14020 | 4.34× |
-| 16384 px | 100 | 12277×22519 | 2.85× |
+With all three fixed, both NISAR granules block. Measured whole-grid at `-t 10` on a 96 GiB machine:
+
+| case | block | blocks | runtime | peak | vs untiled | read amp |
+|---|---|---:|---:|---:|---:|---:|
+| L1 RSLC, 57760×50511 | untiled | 1 | 10.9 min | **55.2 GiB** | 1.00× | 1.00× |
+| | 16384 px | 100 | — | 68.6 GiB | 1.24× | 2.89× |
+| | 8192 px | 380 | 41.1 min† | 34.8 GiB | 0.63× | 4.51× |
+| | 4096 px | 1482 | 45.0 min† | **31.5 GiB** | 0.57× | 8.77× |
+| L2 GSLC, 54885×110085 | untiled | 1 | 12.1 min | **80.9 GiB** | 1.00× | 1.00× |
+| | 8192 px | 98 | **11.9 min** | **40.8 GiB** | **0.50×** | 0.86× |
+
+† shared the machine with another large job; peak RSS is insensitive to that where wall clock is not.
+
+**L2 is the case that makes blocking a production requirement.** Peak halves — 80.9 GiB to 40.8 — at a
+runtime difference inside run-to-run noise, keeping 99.98% of the untiled point count. On a 96 GiB
+machine that is the difference between needing a memory-optimized instance and not.
+
+**A block can also be too large, and the crossover is arithmetic rather than empirical.**
+`AutoRIFT.BlockBuffers` holds nine block-sized arrays — 18 bytes per pixel for a `UInt8` pair — one set
+per task, so a run holds `min(nblocks, nthreads)` sets. At 16384 px on L1 the read window is
+12232×22222, which is 4.56 GiB per set and **45.6 GiB across ten tasks** before any imagery or
+workspace; measured peak was 68.6 GiB against an untiled 55.2. Prediction and measurement agree to 1%,
+so `9 × 18 bytes × (block + 2·halo)² × nthreads` is worth computing before choosing a size.
+
+**Read amplification below 1.0 is possible**, and L2 shows it at 0.86×: its halo is small relative to
+the block and 64% of its grid is fill, so those blocks have no searchable point and read nothing at all.
+
+One failure is open. The L2 8192 px run deadlocked on the first attempt at 44.4 GiB — every allocating
+thread queued at `jl_safepoint_start_gc` behind a collection that never started — and completed cleanly
+on a second attempt with the machine idle. The difference was a concurrent job holding tens of GiB, so
+it needs memory pressure from outside the process. `tools/golden/GATES.md` holds the thread trace.
 
 The amplification is high because the halo is, not because the layout is loose: at a 2684×1448 px halo
 even a 16384 px block pays 2.6×. That is the arithmetic in "Runtime is set by the halo" applied to a
