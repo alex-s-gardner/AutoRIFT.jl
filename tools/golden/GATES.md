@@ -2535,7 +2535,7 @@ bit-identical `dx`/`dy` *given the same keep mask*, and treat the mask as reprod
 sits within ~1e-6 of a threshold. The Landsat sweep in `docs/memory.md` is unaffected either way: uniform
 radii mean a block's geometry equals the grid's, and those runs are bit-identical at every block size.
 
-## Step: what a whole NISAR scene costs, and a GC deadlock at 45 GiB
+## Step: what a whole NISAR scene costs, and a GC deadlock under contention
 
 Blocking works on these grids once the layout is fixed, and the figures are what a production instance
 would be sized from. Measured at `-t 10` on an M2 Max with 96 GiB, whole grid, one process per row.
@@ -2557,10 +2557,15 @@ memory column stands and the time column wants a quiet machine before it is quot
 
 **NISAR L2 GSLC** — 54885x110085 px (6.0 Gpx), grid 2288x2288, halo 2216x1103 px:
 
-| block | blocks | runtime | peak | read amp | measured |
-|---|---:|---:|---:|---:|---:|
-| untiled | 1 | 12.1 min | **80.9 GiB** | 1.00x | 1,781,775 |
-| 8192 px | 98 | deadlocked at 44 GiB | — | 0.87x | — |
+| block | blocks | runtime | peak | vs untiled | read amp | measured |
+|---|---:|---:|---:|---:|---:|---:|
+| untiled | 1 | 12.1 min | **80.9 GiB** | 1.00x | 1.00x | 1,781,775 |
+| 8192 px | 98 | **11.9 min** | **40.8 GiB** | **0.50x** | 0.86x | 1,781,377 |
+
+**This is the case that makes blocking a production requirement rather than a tuning knob: peak halves at
+identical runtime.** 80.9 GiB against 40.8 on a machine with 96, for 11.9 minutes against 12.1 — inside
+run-to-run noise — and 99.98% of the untiled point count. An instance sized from the untiled figure is
+memory-optimized; one sized from the blocked figure is not.
 
 Three things worth stating.
 
@@ -2581,22 +2586,27 @@ Two reasons compound: its halo is smaller relative to the block, and 64% of its 
 blocks have no searchable point and `_searchable_span` gives them an empty read window. A read
 amplification below 1.0 is the signature of a grid whose footprint does not fill its bounding box.
 
-### The deadlock
+### The deadlock, which is contention-dependent
 
-**Open, and it blocks the L2 measurement.** The 8192 px run reached 44.4 GiB and then stopped dead: 0%
-CPU across three samples six minutes apart, unresponsive to `SIGTERM`, killed with `SIGKILL`. A `sample`
-of all 31 threads puts every one in a wait — 16 in `__psynch_cvwait`, 4 in `__psynch_mutexwait` — and each
-of the four is
+**Reproduced once, then not.** The first attempt at the L2 8192 px row reached 44.4 GiB and stopped dead:
+0% CPU across three `sample` runs six minutes apart, unresponsive to `SIGTERM`, killed with `SIGKILL`. All
+31 threads sat in a wait — 16 in `__psynch_cvwait`, 4 in `__psynch_mutexwait` — and each of the four was
 
     ijl_gc_small_alloc / ijl_gc_managed_malloc -> ijl_gc_collect -> jl_safepoint_start_gc -> uv_mutex_lock
 
-so every thread that tried to allocate is queued behind a collection that never starts. The trace is
-saved at `~/data/autorift/tests/golden_tests/mem/l2_deadlock_sample.txt`.
+so every thread that tried to allocate was queued behind a collection that never started. The trace is at
+`~/data/autorift/tests/golden_tests/mem/l2_deadlock_sample.txt`.
 
-The sampler thread `mem_nisar.jl` runs is **not** on any stack, so it is not the thread holding the lock,
-and this is not an artifact of the measurement harness. What is suggestive is the scale: ten tasks each
-allocating a 2.18 GiB buffer set on a process already holding 44 GiB, which is the same
-allocation-under-pressure shape as the 128-pixel Landsat case in `docs/memory.md` — that one merely
-crawled at 6 of 10 workers stuck on the same mutex, where this one stops. Whether that is a Julia GC bug
-at this scale or something this package does wrong is not established, and the L2 blocked figures cannot
-be quoted until it is.
+**The same configuration then completed cleanly on an idle machine**, in 716 s at 41.8 GiB peak — the row
+in the table above. The difference between the two runs was a concurrent L1 job holding tens of GiB, so
+this is a deadlock that needs memory pressure from *outside* the process, not a property of the block size.
+That matters for how it is chased and for how much it threatens production: a worker that owns its instance
+did not hit it, and one packed alongside another large job did.
+
+Not an artifact of the harness. The sampler thread `mem_nisar.jl` runs appears on no stack in the trace,
+and it allocates only two small vectors per sample.
+
+Left open. The same allocation-under-pressure shape appears in the 128-pixel Landsat case in
+`docs/memory.md`, where 6 of 10 workers stall on the same mutex and the run merely crawls rather than
+stopping — so the mechanism is a spectrum this package can reach, whether or not the hard stop is a Julia
+GC bug. Anyone reproducing it should run two large jobs concurrently rather than one.
