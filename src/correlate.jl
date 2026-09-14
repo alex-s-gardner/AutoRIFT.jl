@@ -130,17 +130,23 @@ type: the chip is `Float32` because it is stored mean-removed, and the integral 
 identical machine code. The element type reaches the kernel through the image arguments, which
 is where it belongs.
 
-That decision survived the addition of complex support, and the deciding reason is the *pool*:
-`WORKSPACE_POOL` is keyed on geometry alone, and a type parameter would make the key
-`(T, chip, radius)` — so a `(:coherence, :zncc)` run would need two pool entries per geometry where
-one serves. The complex buffers are therefore parallel fields rather than a parameter.
+**The buffers a measure cannot reach are allocated empty**, which is why the type stays concrete
+while the footprint does not carry both paths. A real image dispatches to the `ZNCC`/`NCC` methods of
+`_correlate_surface!` and a complex one to the `Coherence` method, and `Coherence` on a real image is
+an error rather than a fallback — so within one workspace the reachable set is fixed, and the other
+fields are `0x0`. Measured at chip 96x52 radius 1905x830: a 657 MiB workspace holding both paths
+becomes 315 MiB for a real run and 534 MiB for a complex one. That is 52% of every workspace on the
+path production actually takes, and it matters more the more geometries a run visits, since each is a
+separate pool entry.
 
-The honest cost, since three separate comments below each justify one buffer and none of them add
-up: on a real-only run the complex fields are **roughly 55-60% of every workspace** and are never
-touched. They are pooled, so this is steady-state footprint rather than per-pair peak — measured
-per-pair peak RSS did not move — but a future measure needing its own scratch is the point at which
-lazily-allocated nested scratch (a `Union{Nothing,ComplexScratch}`, geometry still the only pool key)
-becomes the right shape rather than a seventh field.
+Which set is live follows from `T` at [`workspace`](@ref), so nothing branches per point: the empty
+buffers are never indexed because dispatch has already chosen the path that would have indexed them.
+`isqsum` is in both sets — a sum of squared *magnitudes* is real either way.
+
+`WORKSPACE_POOL`'s key carries that choice alongside the geometry, and it has to: a process running
+both measures over one geometry would otherwise hand a `Coherence` pass a real-shaped workspace, whose
+complex buffers are empty, and the failure would be an out-of-bounds write rather than a
+`DimensionMismatch`.
 
 Construct with [`workspace`](@ref).
 """
@@ -265,12 +271,19 @@ Allocate correlation buffers for chips up to `chip_size` and search radii up to
 One workspace per task, never shared: the buffers are written during correlation,
 so two tasks sharing one would corrupt each other.
 
-`T` is the element type of the images to be correlated. It is accepted for readability at the
-call site and asserted to be a `Real` or `Complex`, but the buffers do not depend on it — the
-chip is `Float32` because it is stored mean-removed, and the integral images are `Float64` to
-hold a sum of squares without loss. Any `T<:Real` correlates correctly, including `Int16` and
-other integer sensor types; `T<:Complex` is for SLC input under [`Coherence`](@ref) and uses the
-workspace's separate complex chip buffer.
+`T` is the element type of the images to be correlated, and it selects **which buffers are
+allocated**. A real `T` gets the `ZNCC`/`NCC` buffers and a complex one the [`Coherence`](@ref)
+buffers; the other set is allocated `0x0`, since the element type fixes which
+`_correlate_surface!` method a point can reach and the unreachable buffers would never be indexed.
+Roughly half of a both-paths workspace is dead weight on either path, and a run visits one pool
+entry per geometry, so this is the difference between holding one path's buffers and both.
+
+Their *element* types still do not depend on `T`: the chip is `Float32` because it is stored
+mean-removed, and the integral images are `Float64` to hold a sum of squares without loss. Any
+`T<:Real` correlates correctly, including `Int16` and other integer sensor types.
+
+A workspace is therefore only interchangeable with one built for the same `T`-kind, which
+[`AutoRIFT.take_workspace!`](@ref) carries in the pool key.
 """
 workspace(chip_size, search_radius) = workspace(Float32, chip_size, search_radius)
 
@@ -300,25 +313,42 @@ function workspace(::Type{T}, chip_size, search_radius) where {T<:ImageElement}
     fx = next_fft_size(winx)
     fy = next_fft_size(winy)
 
+    # Which set of buffers this workspace can reach. A real image reaches the `ZNCC`/`NCC` methods of
+    # `_correlate_surface!` and a complex one the `Coherence` method — and `Coherence` on a real image
+    # throws rather than degrading — so the two sets are mutually exclusive per workspace. The
+    # unreachable one is `0x0`: `undef` of zero extent allocates no data, and nothing indexes it
+    # because dispatch never selects the path that would.
+    #
+    # `real ? n : 0` rather than a branch around two constructor calls, so the field order stays
+    # readable against the struct and a new field cannot be added to one arm only.
+    real = T <: Real
+    rn(n) = real ? n : 0
+    cn(n) = real ? 0 : n
+
     return CorrelationWorkspace(
-        Matrix{Float32}(undef, csy, csx),
-        Matrix{ComplexF32}(undef, csy, csx),
+        Matrix{Float32}(undef, rn(csy), rn(csx)),
+        Matrix{ComplexF32}(undef, cn(csy), cn(csx)),
         Matrix{Float32}(undef, 2ry, 2rx),
         Matrix{Float32}(undef, csy, csx),
         Matrix{Float32}(undef, 2ry, 2rx),
+        # `isum` is the real path's plain sum table; `isqsum` is shared, since a sum of squared
+        # magnitudes is real whichever measure reads it.
+        Matrix{Float64}(undef, rn(winy + 1), rn(winx + 1)),
         Matrix{Float64}(undef, winy + 1, winx + 1),
-        Matrix{Float64}(undef, winy + 1, winx + 1),
-        Matrix{ComplexF64}(undef, winy + 1, winx + 1),
-        Matrix{Float64}(undef, 2ry, 2rx),
-        Matrix{ComplexF32}(undef, 2ry, 2rx),
-        Matrix{Float32}(undef, fy, fx),
-        Matrix{Float32}(undef, fy, fx),
-        Matrix{ComplexF32}(undef, fy ÷ 2 + 1, fx),
-        Matrix{ComplexF32}(undef, fy ÷ 2 + 1, fx),
-        Matrix{ComplexF32}(undef, fy ÷ 2 + 1, fx),
-        Matrix{ComplexF32}(undef, fy, fx),
-        Matrix{ComplexF32}(undef, fy, fx),
-        Matrix{ComplexF32}(undef, fy, fx),
+        Matrix{ComplexF64}(undef, cn(winy + 1), cn(winx + 1)),
+        Matrix{Float64}(undef, rn(2ry), rn(2rx)),
+        Matrix{ComplexF32}(undef, cn(2ry), cn(2rx)),
+        # The real-to-complex FFT scratch, including `wspec`: `Coherence` has no `prepare_window!`
+        # method and `_window_prepared` sends it down the unhoisted path (`src/track.jl:535`), so a
+        # complex run reaches none of these.
+        Matrix{Float32}(undef, rn(fy), rn(fx)),
+        Matrix{Float32}(undef, rn(fy), rn(fx)),
+        Matrix{ComplexF32}(undef, rn(fy ÷ 2 + 1), rn(fx)),
+        Matrix{ComplexF32}(undef, rn(fy ÷ 2 + 1), rn(fx)),
+        Matrix{ComplexF32}(undef, rn(fy ÷ 2 + 1), rn(fx)),
+        Matrix{ComplexF32}(undef, cn(fy), cn(fx)),
+        Matrix{ComplexF32}(undef, cn(fy), cn(fx)),
+        Matrix{ComplexF32}(undef, cn(fy), cn(fx)),
         chip,
         rad,
         Ref(false),
@@ -367,12 +397,18 @@ end
 const POOL_SLOTS_PER_KEY = 2
 
 const WORKSPACE_LOCK = ReentrantLock()
-# Keyed by (chip, radius) so a checked-out workspace is byte-for-byte what `workspace` would have
-# built. Note the element type is *not* part of the key, and does not need to be: no buffer here
-# has the image's type — the chip is `Float32` because it is stored mean-removed, the integral
-# images are `Float64` — which is the same reason `CorrelationWorkspace` carries no `T`.
+# Keyed by (chip, radius, iscomplex) so a checked-out workspace is byte-for-byte what `workspace`
+# would have built. The buffers still carry no image element type — the chip is `Float32` because it
+# is stored mean-removed, the integral images are `Float64` — but `workspace` allocates only the set
+# its `T` can reach, so a real-built and a complex-built workspace of the same geometry are *not*
+# interchangeable. Without the flag a process running both measures over one geometry would hand a
+# `Coherence` pass a workspace whose complex buffers are `0x0`, and the failure would be an
+# out-of-bounds write rather than a `DimensionMismatch`.
+#
+# A `Bool` rather than `T` itself: what the allocation depends on is real-versus-complex, so keying on
+# `T` would split `UInt8` from `Int16` and hold two identical workspaces per geometry.
 # `Vector` rather than a single slot because several chunks run concurrently.
-const WORKSPACE_POOL = Dict{Tuple{Extent,Extent},Vector{CorrelationWorkspace}}()
+const WORKSPACE_POOL = Dict{Tuple{Extent,Extent,Bool},Vector{CorrelationWorkspace}}()
 
 """
     AutoRIFT.take_workspace!(T, chip_size, search_radius) -> CorrelationWorkspace
@@ -385,9 +421,9 @@ the garbage.
 """
 function take_workspace!(::Type{T}, chip_size, search_radius) where {T<:ImageElement}
     # Normalized through `extent`, so a scalar, a plain tuple and a named tuple all reach the same
-    # pool entry rather than three. `give_workspace!` keys on the workspace's own fields, which are
-    # extents, so this has to produce the same thing.
-    key = (extent(chip_size), extent(search_radius))
+    # pool entry rather than three. `give_workspace!` keys on the workspace's own fields, so this has
+    # to produce the same thing — including the complex flag, which it recovers from the buffers.
+    key = (extent(chip_size), extent(search_radius), !(T <: Real))
     ws = lock(WORKSPACE_LOCK) do
         pool = get(WORKSPACE_POOL, key, nothing)
         isnothing(pool) || isempty(pool) ? nothing : pop!(pool)
@@ -411,11 +447,23 @@ caller needing that geometry builds one.
 function give_workspace!(ws::CorrelationWorkspace)
     lock(WORKSPACE_LOCK) do
         pool = get!(() -> CorrelationWorkspace[], WORKSPACE_POOL,
-                    (ws.max_chip, ws.max_radius))
+                    (ws.max_chip, ws.max_radius, iscomplexworkspace(ws)))
         length(pool) < POOL_SLOTS_PER_KEY && push!(pool, ws)
     end
     return nothing
 end
+
+"""
+    AutoRIFT.iscomplexworkspace(ws) -> Bool
+
+Whether `ws` was built for complex imagery, and so carries the [`Coherence`](@ref) buffers rather
+than the real ones.
+
+Read from the buffers themselves rather than stored, because it is derivable and a stored copy could
+disagree with them. `cchip` is the discriminating field: `workspace` gives it the chip's extent for a
+complex `T` and `0x0` for a real one, and a chip extent is never zero — `workspace` rejects that.
+"""
+iscomplexworkspace(ws::CorrelationWorkspace) = !isempty(ws.cchip)
 
 """
     AutoRIFT.clear_workspaces!()
@@ -536,6 +584,12 @@ information about displacement, so the honest answer is no measurement.
 """
 function prepare_chip!(ws::CorrelationWorkspace, chip::AbstractMatrix)
     ch, cw = size(chip)
+    # The mirror of the complex method's check: an empty `chip` means this workspace was built for
+    # complex imagery, which allocates the `Coherence` buffers instead of these.
+    isempty(ws.chip) && throw(ArgumentError(
+        "this workspace was built for complex imagery, so it has no real buffers, and the chip is " *
+        "real. Build it with `workspace(Float32, ...)` — or, through the pool, " *
+        "`take_workspace!(Float32, ...)`."))
     (ch <= size(ws.chip, 1) && cw <= size(ws.chip, 2)) || throw(DimensionMismatch(
         "chip is $(ch)x$(cw) but the workspace was built for at most " *
         "$(size(ws.chip, 1))x$(size(ws.chip, 2))"))
@@ -636,6 +690,13 @@ end
 # denominator therefore has the same shape as `ZNCC`'s.
 function prepare_chip!(ws::CorrelationWorkspace, chip::AbstractMatrix{<:Complex})
     ch, cw = size(chip)
+    # An empty `cchip` is a workspace built for real imagery, not one built too small: `workspace`
+    # allocates the complex buffers only for a complex `T`. Named separately because the geometry
+    # message below would send a reader looking at chip sizes for a mistake in the element type.
+    isempty(ws.cchip) && throw(ArgumentError(
+        "this workspace was built for real imagery, so it has no complex buffers, and the chip is " *
+        "complex. Build it with `workspace(ComplexF32, ...)` — or, through the pool, " *
+        "`take_workspace!(ComplexF32, ...)` — so the `Coherence` buffers are allocated."))
     (ch <= size(ws.cchip, 1) && cw <= size(ws.cchip, 2)) || throw(DimensionMismatch(
         "chip is $(ch)x$(cw) but the workspace was built for at most " *
         "$(size(ws.cchip, 1))x$(size(ws.cchip, 2))"))
