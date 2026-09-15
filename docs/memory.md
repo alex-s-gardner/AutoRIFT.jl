@@ -163,6 +163,11 @@ whether it is usable is peak against runtime at each size. Measured on the full 
 17121×16961 px, a 2127×2107 grid, 922,784 measured points — at 10 worker threads, from a
 memory-mapped input. Reproduce with `tools/ab/mem_blocks.jl`.
 
+Configuration first, since the block sizes below are only meaningful against it: `chip_size = 16`,
+`chip_size_max = 64` (3 levels), `grid_spacing = 8`, `search_radius = 20`, which give a **halo of 69×69
+px**. The halo is the floor on a legal block size and the width of the skirt every block reads around
+itself, so it is the number every row in this table is implicitly relative to.
+
 | block | blocks | peak MiB | vs untiled | runtime | read amplification |
 |---|---:|---:|---:|---:|---:|
 | untiled | 1 | 4958 | 1.00× | **20.5 s** | 1.00× |
@@ -204,6 +209,81 @@ core short, since `min(nblocks, nthreads)` caps the tasks at 9. A block size cho
 fewer than threads inverts what blocking is for. Keep the block count comfortably above the thread
 count.
 
+### The same sweep on a wide-halo granule, and what the two have in common
+
+The NISAR L2 sweep below is the same measurement on a scene 21× larger with a halo 32× wider. Reading
+them together separates what is general from what is a property of a 69 px halo.
+
+**Start from the chip size, because that is what sets the halo, and the halo is what sets the smallest
+legal block.** These are the inputs, not results — a block size is only interpretable against them:
+
+| | optical (Landsat 8/9) | NISAR L2 GSLC |
+|---|---:|---:|
+| scene | 17121×16961 px (290 Mpx) | 54885×110085 px (6042 Mpx) |
+| `chip_size` | 16 | 96×48 |
+| `chip_size_max` | 64 | 768×384 |
+| chip levels | 3 | 4 |
+| `grid_spacing` | 8 | 48 |
+| search radius | 20, uniform | median 34, **max 1052×526** |
+| `chip_size_max / 2` — the chip's share of the halo | 32 | 384×192 |
+| **halo** | **69×69 px** | **2216×1103 px** |
+| smallest legal block (halo is the floor) | 69 px | 2224×1110 px |
+| block size chosen | **1024 px** (14.8 halos) | **2304×1152 px** (1.04 halos) |
+
+The halo is `chip_size_max/2 + radius + |prior| + 2 + filter_reach + level_centre_offset`. On the optical
+case the chip dominates it: 32 of 69 px, with the radius adding 20. On NISAR the **radius** dominates:
+collapsing all four chip levels to one (`chip_size_max` 768→96) shrinks the halo only 2216→1711 px,
+because the maximum radius is 1052 and the halo takes the maximum, not the median of 34.
+
+That is why the two cases have floors three orders of magnitude apart in area, and why 512 or 1024 px
+blocks — fine on the optical scene — are rejected outright on NISAR at any chip setting.
+
+It is also why the optical run gets ~15 halos per block edge (1024/69) while NISAR's best row gets
+**1.04** in each axis (2304/2216, 1152/1103) — barely more than the skirt itself. The skirt is
+fixed-width, so `((b + 2h)/b)` per axis predicts the reading: 1.29× against a measured 1.26× on optical,
+which is close. On NISAR it predicts **8.52×** against a measured **3.30×**, and the gap is real rather
+than an error in either — 64% of that grid is nodata fill, and `_searchable_span` gives a block with no
+searchable point an empty read window, so a third of the predicted reads never happen. Use the formula as
+an upper bound on a partly-filled grid.
+
+Both sweeps at 10 worker threads, both bit-identical across sizes, peak normalized to each case's own
+untiled run:
+
+| blocks/thread | optical: peak | runtime | | NISAR L2: peak | runtime | occupancy |
+|---|---:|---:|---|---:|---:|---:|
+| 0.1 (untiled) | 1.00× | 1.00× | | 1.00× | 1.00× | 6.06 / 10 |
+| ~1 | 3.00× | 2.05× | | — | — | — |
+| ~10 | 0.63× | 1.19× | | 0.56× | 1.79× | **2.96 / 10** |
+| ~30 | **0.43×** | **1.10×** | | 0.47× | 1.14× | 5.17 / 10 |
+| ~65–110 | 0.45× | 1.09× | | 0.35× | 0.88× | 7.87 / 10 |
+| ~230–420 | 0.41× | 1.17× | | **0.34×** | **0.83×** | **9.03 / 10** |
+
+**Three things hold on both, and they are the transferable rules.**
+
+*Peak flattens once blocks are small.* The optical curve is flat from 1024 px to 256 px — 2140, 2248,
+2042 MiB over a 14× range of block counts — and NISAR does the same thing: cutting block *area* 3.6×
+from 3072² to 2304×1152 moves peak only 8%, 31.2 to 28.8 GiB. The reason is visible in the arithmetic:
+block buffers are just **13–21%** of NISAR's peak at these sizes (3.7 GiB of 28.8 at 2304×1152), so the
+rest — imagery, workspaces, the output field — does not shrink with the block. Below the knee, shrinking
+blocks buys almost no memory.
+
+*Too few blocks is the one configuration that is bad on every axis.* At ~1 block per thread the optical
+run holds every block in flight at once and peaks at **3.00×** its untiled figure; at ~10 the NISAR run
+drops to 2.96 of ten threads busy and takes **1.79×** as long. Both are the same fault — blocks are the
+unit of threaded work, so a pool the size of the thread count cannot balance.
+
+*Runtime is U-shaped in blocks per thread.* Optical bottoms out around 30–110 (1.09–1.10×) and rises
+again by 416 (1.17×), where read amplification has reached 2.21× and the run starts paying for redundant
+reading. NISAR is on the same curve but has not reached its minimum by 230 blocks/thread, because its
+halo is far wider relative to the scene and its blocks are still enormous in absolute terms.
+
+**What differs is only where the optimum sits, and the halo is what moves it.** Optical wants 1024 px
+and NISAR wants 2304×1152 — but "as small as the halo allows, then as many blocks as that gives" picks
+both. The wide-halo case reaches its floor before it reaches the flat part of the read-amplification
+penalty, which is why the earlier reading of the optical sweep — that a wide halo means the block size
+must *increase* — had the direction right for legality and wrong for choice: the halo raises the floor,
+it does not make large blocks desirable.
+
 **The untiled row is a different parallel decomposition, not just a different block size.** It has one
 block, so it uses its threads through the intra-pass path while every blocked run uses them per block
 (`threaded = false` inside each). That is why it is the fastest row here and still not the one to
@@ -212,10 +292,11 @@ choose: 4958 MiB against 2140 is the difference between what fits on an instance
 **These numbers are for this configuration's 69 px halo.** A wide-halo configuration behaves
 differently in kind, not only in degree. On the whole NISAR L1 grid `halo(grid, p, size)` is
 **2736×1500 px** — about 7 by 6.7 km at that granule's 2.55 m ground-range and 4.44 m along-track
-spacing — because a Geogrid search-radius field is extremely skewed: median 26 px against a maximum
-of 1905, a 73× spread, and the halo takes the maximum. `tools/golden/GATES.md` records a per-block
-halo that was implemented and reverted at a measured 1.03–1.11× gain, since `chip_size_max/2` alone
-floors it at 561 px whatever the block.
+spacing — because a Geogrid search-radius field is extremely skewed: over the searchable points the
+median x radius is **34** against a maximum of **1905**, a 56× spread, and the halo takes the maximum.
+Only 35% of the grid is searchable at all, so a median over every point is 0 and says nothing.
+`tools/golden/GATES.md` records a per-block halo that was implemented and reverted at a measured
+1.03–1.11× gain, since `chip_size_max/2` alone floors it at 561 px whatever the block.
 
 A 2736 px halo still permits blocks on a 57760×50511 scene, and it now produces them. Two properties
 of a rotated grid had to be handled first, and both used to fail silently rather than loudly.
@@ -253,7 +334,26 @@ The median of *every* step fails the other way — both NISAR grids are ~65% fil
 out zero and a zero rate is an infinite block. Reducing over pairs where both points are searchable
 gives the true rates on both: 33/34/19/19 px on the rotated L1 grid, 0/48/24/0 on the separable L2 one.
 
-With all three fixed, both NISAR granules block. Measured whole-grid at `-t 10` on a 96 GiB machine:
+With all three fixed, both NISAR granules block. Measured whole-grid at `-t 10` on a 96 GiB machine.
+Chip size and halo first, since they set the floor every block size below is measured against:
+
+| | L1 RSLC | L2 GSLC |
+|---|---:|---:|
+| scene | 57760×50511 px | 54885×110085 px |
+| `chip_size` → `chip_size_max` | 96×52 → 768×416 (4 levels) | 96×48 → 768×384 (4 levels) |
+| `grid_spacing` | 48 | 48 |
+| search radius x: median over searchable / max | 34 / **1905** | 34 / **1052** |
+| search radius y: median over searchable / max | 20 / 830 | 7 / 526 |
+| searchable points | 1,871,119 of 5.36 M (35%) | 1,873,823 of 5.23 M (36%) |
+| `chip_size_max / 2` | 384×208 | 384×192 |
+| **halo** | **2736×1500 px** | **2216×1103 px** |
+| smallest legal block | 2736×1500 | 2224×1110 |
+
+On both, the halo is set by the radius **maximum** — 56× the median over searchable points — rather than
+by the chip. That is why it is so much wider than the optical case's 69 px, and why no chip setting brings
+it below ~1700: dropping `chip_size_max` from 768 to 96 on L2, collapsing four pyramid levels to one,
+moves the halo only 2216 → 1711 px.
+
 
 | case | block | blocks | runtime | peak | vs untiled | read amp |
 |---|---|---:|---:|---:|---:|---:|
