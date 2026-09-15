@@ -2594,7 +2594,10 @@ Two reasons compound: its halo is smaller relative to the block, and 64% of its 
 blocks have no searchable point and `_searchable_span` gives them an empty read window. A read
 amplification below 1.0 is the signature of a grid whose footprint does not fill its bounding box.
 
-### The deadlock, which is contention-dependent
+### The deadlock, as first seen — superseded by "The root cause" below
+
+The heading this section carried, "which is contention-dependent", was wrong; keep reading to the root
+cause rather than stopping here.
 
 **Reproduced once, then not.** The first attempt at the L2 8192 px row reached 44.4 GiB and stopped dead:
 0% CPU across three `sample` runs six minutes apart, unresponsive to `SIGTERM`, killed with `SIGKILL`. All
@@ -2609,10 +2612,11 @@ so every thread that tried to allocate was queued behind a collection that never
 in the table above. The difference between the two runs was a concurrent L1 job holding tens of GiB, so at
 the time this read as a deadlock needing memory pressure from *outside* the process.
 
-**That qualification is wrong: it reproduces on an idle machine, and external pressure is not required.**
-See "The deadlock, requalified" below. What it does need is a *multi-configuration process* — several
-whole-granule runs in sequence, each leaving tens of GiB of live heap behind. Every single-configuration
-run has completed.
+**That qualification is wrong on both counts.** It reproduces on an idle machine, and it needs neither
+external pressure nor a multi-configuration process: it is a lock-order inversion between the macOS
+profiler and the collector inside the Julia runtime, reproducible in a script with no AutoRIFT in it. See
+"The root cause" below. Because it is a race, the clean retry that motivated the contention theory was
+simply a run that did not lose it.
 
 Not an artifact of the harness. The sampler thread `mem_nisar.jl` runs appears on no stack in the trace,
 and it allocates only two small vectors per sample.
@@ -2640,12 +2644,10 @@ collection that never starts rather than one taking a long time — every alloca
 safepoint waiting for a collector that does not exist. Trace at
 `~/data/autorift/tests/golden_tests/mem/l2_deadlock_2816_sample.txt`.
 
-**What both occurrences share is a multi-configuration process, not memory pressure.** Each row correlates
-the whole granule and leaves tens of GiB of live heap for the next (33.7 GiB at the end of the 3072 px row),
-and the hang lands on a row that is not the first. Against that, **every single-configuration run has
-completed** — 3072 px, 2304 px and the untiled row all finished when they were the only configuration in
-their process. So the reproducer is "several whole-granule runs in one process", which is a property of the
-measurement harness rather than of production, where a worker does one pair.
+**Root cause: a lock-order inversion between the macOS profiler and the collector, in the Julia runtime.**
+Not memory pressure, not the block size, and not this package — see "The root cause" below. The
+multi-configuration correlation is incidental; what matters is that a profiled run allocates hard on many
+threads for minutes.
 
 **A second stuck process was found at the same time**, left over from the five-configuration sweep: 0% CPU,
 16 threads in `__psynch_cvwait`, still resident at 11.8 GiB. It had been assumed dead — no output, no
@@ -2655,6 +2657,58 @@ message. Check `ps` for a 0%-CPU survivor before concluding a run died, and `sam
 
 The earlier note in this file attributing the 3072 px sweep row to an OOM kill is superseded: that process
 was hung, not killed.
+
+### The root cause: the profiler and the collector take two locks in opposite orders
+
+**A Julia runtime bug in `src/signals-mach.c`, present in every release through 1.13.0, and nothing to do
+with AutoRIFT.** Two code paths acquire libpthread's internal `os_unfair_lock` and a Julia lock in
+opposite orders:
+
+| | holds | then wants |
+|---|---|---|
+| profiler sampling thread — `jl_profile_thread_mach`, `signals-mach.c:797` | the profile lock, via `jl_lock_profile_mach` | libpthread's `os_unfair_lock`, via `pthread_mach_thread_np` inside `thread_suspend` |
+| thread ending a collection — `jl_mach_gc_end`, `signals-mach.c:97` | `safepoint_lock` | that same `os_unfair_lock`, via `thread_resume(pthread_mach_thread_np(...))` |
+
+Interleaved, the sampler waits on the unfair lock for a collector that is waiting for the sampler to
+release the profile lock. Every other thread then queues at `jl_safepoint_start_gc` behind a collection
+that has started and can never finish.
+
+The decisive evidence is that **no thread is collecting**: zero frames matching `gc_mark`, `sweep` or
+`gc_scan` in any trace. A slow collection has a marking thread; this has none. The `sample` output is the
+same in all three captured traces and in the minimal reproducer:
+
+```
+sampler:    jl_profile_thread_mach (signals-mach.c:797) -> pthread_mach_thread_np
+              -> _os_unfair_lock_lock_slow -> __ulock_wait2          [blocked]
+collector:  ijl_gc_collect -> jl_safepoint_end_gc (safepoint.c:232)
+              -> jl_mach_gc_end (signals-mach.c:97) -> pthread_mach_thread_np
+others:     10 threads at jl_safepoint_start_gc
+```
+
+**Reproduced without AutoRIFT.** `tools/golden/profiler_gc_deadlock.jl` is allocation churn on every
+thread while `Profile` samples at 0.5 ms — no imagery, no correlation:
+
+```bash
+julia -t 10,1 tools/golden/profiler_gc_deadlock.jl off       # always completes
+julia -t 10,1 tools/golden/profiler_gc_deadlock.jl profile   # hangs ~2 runs in 5
+```
+
+Measured 2 hangs in 5 attempts, at rounds 25 and 106 of 200, with the identical stack signature; the
+control arm runs the same workload without the profiler and has never hung. **It is a race, so one clean
+run proves nothing** — which is exactly the trap that made the first occurrence look contention-dependent
+after it completed on a retry.
+
+**Fixed upstream, but not in any release yet.** `ca49fc2e2` ("[macOS] Handle GC safepoint on-thread",
+2026-03-17) deletes `jl_mach_gc_end` and the `suspended_threads` list outright, handling the safepoint on
+the signalled thread instead of suspending from outside. Checked against the tags: `jl_mach_gc_end` is
+still present in v1.12.5, v1.12.6, v1.13.0-beta1, v1.13.0-rc1 and v1.13.0, and gone in 1.14-DEV. It has
+not been backported to `release-1.12` or `release-1.13`.
+
+**What this means for the measurements.** Nothing in the recorded figures is suspect: the peaks and
+runtimes come from unprofiled runs, and a hang costs an attribution rather than a measurement. It does
+mean the profiled arm of a long threaded run on macOS may need retrying, and that `profile_nisar.jl`'s
+split between a timed run and a separately profiled one is load-bearing rather than tidiness. Production
+is unaffected — a worker that does not profile cannot reach this path.
 
 ## Step: the L2 block-size sweep, and what a threaded whole-granule run actually costs
 
@@ -2777,9 +2831,11 @@ it was the first guess: measured over all five configurations, a profiled run co
 ### The sweep's own casualty was the deadlock, not a kill
 
 The 3072 px row stopped mid-profile in the five-configuration sweep with no exception, empty stderr and no
-crash report, which was read as a kernel memory kill. **It was the deadlock**: the process was still alive
-at 0% CPU and 11.8 GiB when found later, 16 threads in `__psynch_cvwait`. See "The deadlock, requalified"
-above — a hung Julia process and a killed one are indistinguishable from their output alone.
+crash report, which was read as a kernel memory kill. **It was the runtime deadlock**: the process was
+still alive at 0% CPU and 11.8 GiB when found later, and its trace carries the same
+`jl_mach_gc_end`/`jl_profile_thread_mach` pair as the other two. A hung Julia process and a killed one are
+indistinguishable from their output alone, so check `ps` for a 0%-CPU survivor before concluding a run died.
 
 The row was re-measured as the only configuration in a fresh process, at 347.6 s against 340.9 in the
-sweep, so the figures above are sound. The shared-process harness design is what is suspect at these sizes.
+sweep, so the figures are sound. Nothing about the shared-process design is implicated — the cause is the
+profiler, and the sweep merely profiled for long enough to hit a race.

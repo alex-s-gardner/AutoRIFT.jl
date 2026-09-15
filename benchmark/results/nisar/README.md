@@ -15,9 +15,15 @@ should be traceable to a line here.
 | `sweep_l2small.log` | 2304, 2816, 2304x1152, 3072x1536 px | **deadlocked** during the 2816 px profile; only the 2304 px row completed |
 | `sweep_aniso1.log` | 2304x1152 px | alone in its own process — the best configuration measured |
 
-Two of the four runs deadlocked, both while profiling a configuration that was not the first in its
-process. `tools/golden/GATES.md` records the thread traces and the reproducer. **A run that stops writing
-here has not necessarily died** — check for a 0%-CPU survivor with `ps` before assuming it did.
+Two of the four runs deadlocked, both while profiling. The cause is a **Julia runtime bug** — the macOS
+profiler suspends threads while holding the profile lock, and `jl_mach_gc_end` resumes them through the same
+libpthread `os_unfair_lock`, in the opposite order — present in every release through 1.13.0 and fixed on
+master by `ca49fc2e2`. `tools/golden/profiler_gc_deadlock.jl` reproduces it without AutoRIFT;
+`tools/golden/GATES.md` has the traces and the analysis.
+
+Two consequences for reading these logs. **A run that stops writing has not necessarily died** — check for a
+0%-CPU survivor with `ps` before assuming it did. And **the runtimes and peaks are unaffected**, because
+they come from the unprofiled arm of each configuration; a hang costs the attribution only.
 
 Recover a log's rows into the append-only history with:
 

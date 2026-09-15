@@ -461,10 +461,17 @@ predict 410 GiB for that L1 window and reject every block size this granule can 
 **Read amplification below 1.0 is possible**, and L2 shows it at 0.86×: its halo is small relative to
 the block and 64% of its grid is fill, so those blocks have no searchable point and read nothing at all.
 
-One failure is open. The L2 8192 px run deadlocked on the first attempt at 44.4 GiB — every allocating
-thread queued at `jl_safepoint_start_gc` behind a collection that never started — and completed cleanly
-on a second attempt with the machine idle. The difference was a concurrent job holding tens of GiB, so
-it needs memory pressure from outside the process. `tools/golden/GATES.md` holds the thread trace.
+One failure was chased to a root cause and is **not** this package's. Profiled runs on macOS can hang
+outright: the profiler's sampling thread suspends its target while holding the profile lock, and a thread
+ending a collection resumes threads from `jl_mach_gc_end` — both go through `pthread_mach_thread_np` and
+take libpthread's `os_unfair_lock`, in opposite orders. Every other thread then queues at
+`jl_safepoint_start_gc` behind a collection that has begun and can never end, with **no** thread marking
+or sweeping. It is a Julia runtime bug in `src/signals-mach.c`, present in every release through 1.13.0
+and fixed on master by `ca49fc2e2` (not backported). `tools/golden/profiler_gc_deadlock.jl` reproduces it
+in ~2 runs of 5 with no AutoRIFT code involved, and `tools/golden/GATES.md` holds the traces.
+
+None of the figures here are affected — they come from unprofiled runs — and an unprofiled production
+worker cannot reach the path at all.
 
 The amplification is high because the halo is, not because the layout is loose: at a 2684×1448 px halo
 even a 16384 px block pays 2.6×. That is the arithmetic in "Runtime is set by the halo" applied to a
