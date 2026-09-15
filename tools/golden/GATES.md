@@ -2562,10 +2562,13 @@ memory column stands and the time column wants a quiet machine before it is quot
 | untiled | 1 | 12.1 min | **80.9 GiB** | 1.00x | 1.00x | 1,781,775 |
 | 8192 px | 98 | **11.9 min** | **40.8 GiB** | **0.50x** | 0.86x | 1,781,377 |
 
+**Both runtimes in this table are superseded** — see "Step: the L2 block-size sweep" below, which spans
+five sizes with the JIT warmed and times each row with the profiler off. The untiled row here carries the
+process's compilation, and 8192 px is not the size to choose.
+
 **This is the case that makes blocking a production requirement rather than a tuning knob: peak halves at
-identical runtime.** 80.9 GiB against 40.8 on a machine with 96, for 11.9 minutes against 12.1 — inside
-run-to-run noise — and 99.98% of the untiled point count. An instance sized from the untiled figure is
-memory-optimized; one sized from the blocked figure is not.
+identical runtime.** 80.9 GiB against 40.8 on a machine with 96, and 99.98% of the untiled point count. An
+instance sized from the untiled figure is memory-optimized; one sized from the blocked figure is not.
 
 Three things worth stating.
 
@@ -2574,12 +2577,17 @@ machine** — a production instance sized from the L2 figure is a memory-optimiz
 times a general-purpose one, for a scene blocking runs at 37 GiB.
 
 **A block can be too large, and the crossover is arithmetic.** `BlockBuffers` holds nine block-sized
-arrays — two `UInt8` planes, three `Float32`, four `Bool`, 18 bytes per pixel — one set per task, so a run
-holds `min(nblocks, nthreads)` sets. At 16384 px on L1 the read window is 12232x22222, which is 4.56 GiB
-per set and **45.6 GiB across ten tasks** before any imagery or workspace: measured peak 68.6 GiB against
-an untiled 55.2. The prediction and the measurement agree to 1%, so the rule is usable rather than
-empirical — compute `9 x 18 bytes x (block + 2*halo)^2 x nthreads` and keep it well under the untiled
-peak.
+arrays — two `UInt8` planes, three `Float32`, four `Bool` — totalling **18 bytes per pixel**, one set per
+task, so a run holds `min(nblocks, nthreads)` sets. At 16384 px on L1 the read window is 12232x22222,
+which is 4.56 GiB per set and **45.6 GiB across ten tasks** before any imagery or workspace: measured peak
+68.6 GiB against an untiled 55.2. The prediction and the measurement agree to 1%, so the rule is usable
+rather than empirical — compute `18 bytes x (block + 2*halo)^2 x min(nblocks, nthreads)` and keep it well
+under the untiled peak.
+
+The 18 bytes are the total across the nine arrays, not each array's share. `tools/golden/profile_nisar.jl`
+holds the constant and measures it off the struct's own fields (exactly 18.0 B/px at a 2000x1500 window);
+reading it as 18 bytes *per array* predicts 410 GiB for that L1 window and rejects every block size the
+granule runs at.
 
 **L2 reads *less* than the scene when blocked** — 0.87x at 8192 px, against 4.51x for L1 at the same size.
 Two reasons compound: its halo is smaller relative to the block, and 64% of its grid is fill, so those
@@ -2610,3 +2618,109 @@ Left open. The same allocation-under-pressure shape appears in the 128-pixel Lan
 `docs/memory.md`, where 6 of 10 workers stall on the same mutex and the run merely crawls rather than
 stopping — so the mechanism is a spectrum this package can reach, whether or not the hard stop is a Julia
 GC bug. Anyone reproducing it should run two large jobs concurrently rather than one.
+
+## Step: the L2 block-size sweep, and what a threaded whole-granule run actually costs
+
+Five block sizes on NISAR L2 GSLC, whole grid, `-t 10,1` on the M2 Max with 96 GiB. Command:
+
+```bash
+julia --project=tools/golden -t 10,1 tools/golden/profile_nisar.jl NISAR_L2_PR_GSLC \
+    --blocks 0,8192,6144,4096,3072
+julia --project=tools/golden -t 10,1 tools/golden/profile_nisar.jl NISAR_L2_PR_GSLC --blocks 3072
+```
+
+`profile_nisar.jl` differs from `mem_nisar.jl` in three ways that each moved a number: it warms the JIT
+before recording anything, it times every row with the profiler **off** and profiles a second run, and it
+measures occupancy from CPU time rather than from profile samples. Runtime is the unprofiled figure.
+
+| block | blocks | runtime | peak | floor | vs untiled | occupancy | read amp | alloc | measured |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| untiled | 1 | 6.2 min | **85.0 GiB** | 39.6 | 1.00x | 6.06 / 10 | 1.00x | 225 GiB | 1,781,775 |
+| 8192 px | 98 | 11.2 min | 47.8 GiB | 29.9 | 0.56x | **2.96 / 10** | 0.86x | 784 GiB | 1,781,377 |
+| 6144 px | 162 | 6.2 min | 45.7 GiB | 29.1 | 0.54x | 5.50 / 10 | 1.00x | 799 GiB | 1,781,377 |
+| 4096 px | 378 | 7.1 min | 40.1 GiB | 28.9 | 0.47x | 5.17 / 10 | 1.33x | 897 GiB | 1,781,377 |
+| 3072 px | 648 | **5.8 min** | **31.2 GiB** | 22.5 | **0.37x** | **6.77 / 10** | 1.69x | 1063 GiB | 1,781,377 |
+
+The 3072 px row is from its own process; the rest share one. Every blocked row measures the same
+1,781,377 points, so the sizes differ in cost alone.
+
+**3072 px dominates: 0.37x the untiled peak and slightly faster than untiled.** That is the operating
+point on this granule, and it is the *smallest* size the halo permits — 2048 px is rejected against a
+2216x1103 px halo. The previously recorded choice of 8192 px is the worst blocked row on both axes.
+
+**Runtime is set by thread occupancy, and occupancy is set by block count.** 98 blocks over 10 threads
+runs at 2.96 threads of ten; 648 blocks run at 6.77. Per-block cost varies by orders of magnitude — a
+block whose points a finer level resolved returns before any I/O — so a pool with few blocks per thread
+spends the run waiting on a few expensive ones. Keep the block count near 10x the thread count. Note the
+untiled row reaches 6.06 through the intra-pass path, so it is a different decomposition rather than a
+one-block version of the others.
+
+**Read amplification does not drive the ranking.** It rises 0.86x → 1.69x across the rows while runtime
+*falls*. Allocation rises with it (225 → 1063 GiB, since `_read_block!` allocates a block-sized temporary
+per read) and GC still absorbs ≤1.0% of wall clock at 699 pauses. Redundant reading is cheap next to idle
+threads.
+
+**Where the time goes, over the whole run rather than at the peak.** Shares of *working* samples —
+running samples with a stack, excluding the parked ones, since folding those in would mix the occupancy
+result into every stage's share:
+
+| stage | 3072 px |
+|---|---:|
+| FFTW, all stacks (`(FFTW transform)` + `fft_execute!` / `ifft_execute!` under `_numerators_fft!`) | **53.1%** |
+| — of which unwound only to the codelet, `(FFTW transform)` | 27.1% |
+| `_read_block!` under `_prepared_block_pair` | 11.9% |
+| `preprocess` under `_prepare_block` | 3.5% |
+| `peak_index` under `subpixel_peak` | 1.5% |
+
+The FFTW share is **54–63% on every configuration** — 62.5% untiled, 56.9% at 8192 px, 56.4% at 6144,
+54.4% at 4096, 53.1% at 3072 — so it is a property of the correlator rather than of a block size, and it
+falls only slightly as the blocked path's own work grows. Those four figures come from the top-14 stacks
+each run printed, which is complete enough for FFTW (its stacks are all large) and not for the smaller
+rows: the same treatment gives `_read_block!` 4.6% at 4096 px where the full stack table gives 11.9% at
+3072. Only the 3072 px column above is measured against every stack.
+
+**The correlator's spectral core is the run**, at over half of all working time, and the blocked path's
+own overhead — reading plus preprocessing a block — is about 15%. That bounds what block-size tuning can
+win and says where to look for a real speedup: the FFT count per point, not the layout.
+
+The `(FFTW transform)` bucket is samples whose stack unwound no further than the codelet, so it is
+FFTW's own frames rather than a separate stage; it is listed apart only because those samples cannot be
+attributed to a call site.
+
+### Three instrument faults this found, two of them in the recorded figures
+
+**The profile buffer was undersized by 3x, and the failure is silent.** `mem_nisar.jl` requests
+`n = 60_000_000` words at `delay = 0.002`. A block costs `stack depth + 6` words per *running thread*, so
+ten threads over a 716 s run need ~165 M. Julia warns on `fetch` and stops recording at roughly a third of
+the run — which leaves a peak-window query correct, because the peak is early, and every whole-run query
+silently describing the first third. `plan_profile` sizes the buffer from a measured runtime and widens
+`delay` rather than truncating; the fill fraction is reported next to every attribution (9–13% here).
+
+**Profile-sample occupancy is not occupancy.** The obvious ratio — running samples over
+`ticks x nthreads` — reads **5.26** on a load that CPU time and construction both put at 1.0 threads, and
+8.55 on a genuinely saturating ten-thread load. The profiler samples parked threads and flags them only
+coarsely. `cpu_seconds / wall_seconds` from `proc_pid_rusage` measures 1.00 / 1.99 / 3.99 / 9.77 on 1, 2,
+4 and 10 spin loops, so that is the figure quoted above. Its fields are **mach ticks**: read as
+nanoseconds they give 0.02 threads for a one-thread load.
+
+**The buffer rule was written as a 9x overcount.** `docs/memory.md` and this file both said
+`9 x 18 bytes x (block + 2*halo)^2 x nthreads` while their prose said "18 bytes per pixel" — the nine
+arrays *total* 18 B/px for a `UInt8` pair (two `UInt8`, three `Float32`, four `Bool`), measured at exactly
+18.0 off the struct's fields. The derived figures in those sections (4.56 GiB per set, 45.6 across ten
+tasks) were computed correctly at 18 B/px, so only the formula was wrong — but applied as written it
+predicts 410 GiB for that L1 window and rejects every size this granule runs at.
+
+**The untiled 12.1 min in the table above was compilation.** The old harness had no warmup and measured
+untiled first, so that row carries the process's JIT; the blocked rows measured after it did not, which is
+what made blocking look free. Profiler overhead is not the explanation and this is worth recording because
+it was the first guess: measured over all five configurations, a profiled run costs **2–4%** (1.02x, 1.03x,
+1.03x, 1.04x).
+
+### An unexplained kill
+
+The 3072 px row died mid-profile in the five-configuration sweep: no exception, empty stderr, no crash
+report, zero swap in use — the signature of a kernel memory kill, in a process whose previous row had left
+33.7 GiB of live heap behind. It completed cleanly as the only configuration in a fresh process, at 347.6 s
+against 340.9 in the sweep, so the figures above are sound and the shared-process design is what is
+suspect at these sizes. Related to the contention-dependent deadlock above, and open for the same reason:
+both need memory pressure that a single-configuration run does not create.

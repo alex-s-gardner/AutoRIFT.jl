@@ -261,21 +261,61 @@ With all three fixed, both NISAR granules block. Measured whole-grid at `-t 10` 
 | | 16384 px | 100 | — | 68.6 GiB | 1.24× | 2.89× |
 | | 8192 px | 380 | 41.1 min† | 34.8 GiB | 0.63× | 4.51× |
 | | 4096 px | 1482 | 45.0 min† | **31.5 GiB** | 0.57× | 8.77× |
-| L2 GSLC, 54885×110085 | untiled | 1 | 12.1 min | **80.9 GiB** | 1.00× | 1.00× |
-| | 8192 px | 98 | **11.9 min** | **40.8 GiB** | **0.50×** | 0.86× |
+| L2 GSLC, 54885×110085 | untiled | 1 | 6.2 min | **85.0 GiB** | 1.00× | 1.00× |
+| | 8192 px | 98 | 11.2 min | 47.8 GiB | 0.56× | 0.86× |
+| | 6144 px | 162 | 6.2 min | 45.7 GiB | 0.54× | 1.00× |
+| | 4096 px | 378 | 7.1 min | 40.1 GiB | 0.47× | 1.33× |
+| | 3072 px | 648 | **5.8 min** | **31.2 GiB** | **0.37×** | 1.69× |
 
 † shared the machine with another large job; peak RSS is insensitive to that where wall clock is not.
 
-**L2 is the case that makes blocking a production requirement.** Peak halves — 80.9 GiB to 40.8 — at a
-runtime difference inside run-to-run noise, keeping 99.98% of the untiled point count. On a 96 GiB
-machine that is the difference between needing a memory-optimized instance and not.
+**L2 is the case that makes blocking a production requirement, and the right block size is the
+smallest the halo permits.** 3072 px runs the granule in **31.2 GiB and 5.8 minutes** against an
+untiled 85.0 GiB and 6.2 — less than four tenths the peak *and* slightly faster, at 99.98% of the
+untiled point count. Every blocked row measures the same 1,781,377 points, so the sizes differ in cost
+alone. On a 96 GiB machine this is the difference between a memory-optimized instance and a
+general-purpose one.
+
+**Runtime is not monotonic in block size, and the reason is thread occupancy.** Measured as
+`cpu_seconds / wall_seconds` (`tools/golden/profile_nisar.jl`), the five rows run at 6.06, 2.96, 5.50,
+5.17 and 6.77 of ten threads. 8192 px is the outlier at **2.96** — 98 blocks over 10 threads, with
+per-block cost spanning orders of magnitude because a block whose points a finer level resolved returns
+before any I/O, so the pool spends most of the run waiting on a few expensive blocks. 648 blocks at
+3072 px keep it fed. **Block count, not block size, is what has to stay well above the thread count**;
+a factor of ten is comfortable and a factor of ten *fewer* costs a doubling of wall clock.
+
+Read amplification rises from 0.86× to 1.69× across those rows and does not drive the ranking —
+the fastest row has the highest amplification. Allocation follows it (225 GiB untiled to 1063 GiB at
+3072 px, since every block read allocates a block-sized temporary), and GC absorbs 1% of wall clock at
+worst, so on this granule allocation rate is not the constraint that block size trades against.
+
+**The L2 rows above supersede an earlier pass that measured untiled at 80.9 GiB and 12.1 min, and the
+runtime half of that is an instrument artifact.** `src/` is unchanged across the interval and both
+passes count the same points, so nothing about the package moved. The earlier harness had no warmup and
+measured the untiled configuration first, so that row carries the process's JIT compilation; the
+blocked rows it measured afterwards did not, which is why the gap appears on untiled alone and why the
+recorded ordering made blocking look free. `profile_nisar.jl` correlates a small patch of the grid
+before any row is recorded.
+
+Profiler overhead is *not* the explanation, and this is worth stating because it was the first guess.
+Every row here is measured twice — once with the profiler off and once with it on at 2 ms — and the
+profiled run costs **2–4%** (1.02×, 1.03×, 1.03×, 1.04×), nowhere near the factor of two the
+discrepancy would need. Sampling at this rate is cheap enough to ignore; compiling is not.
+
+The 4 GiB peak difference is a genuine measurement spread. Peak is sampled from a shared process whose
+floor depends on what the previous configuration left behind, which is why the floor is reported beside
+every peak and why 3072 px was re-measured alone — it reproduced at 347.6 s against 340.9 in the sweep.
 
 **A block can also be too large, and the crossover is arithmetic rather than empirical.**
-`AutoRIFT.BlockBuffers` holds nine block-sized arrays — 18 bytes per pixel for a `UInt8` pair — one set
-per task, so a run holds `min(nblocks, nthreads)` sets. At 16384 px on L1 the read window is
-12232×22222, which is 4.56 GiB per set and **45.6 GiB across ten tasks** before any imagery or
-workspace; measured peak was 68.6 GiB against an untiled 55.2. Prediction and measurement agree to 1%,
-so `9 × 18 bytes × (block + 2·halo)² × nthreads` is worth computing before choosing a size.
+`AutoRIFT.BlockBuffers` holds nine block-sized arrays totalling **18 bytes per pixel** for a `UInt8`
+pair — two `UInt8` planes, three `Float32` and four `Bool` — and each of `min(nblocks, nthreads)` tasks
+gets its own set. At 16384 px on L1 the read window is 12232×22222, which is 4.56 GiB per set and
+**45.6 GiB across ten tasks** before any imagery or workspace; measured peak was 68.6 GiB against an
+untiled 55.2. Prediction and measurement agree to 1%, so
+`18 bytes × (block + 2·halo)² × min(nblocks, nthreads)` is worth computing before choosing a size.
+
+The 18 bytes are the total across all nine arrays, not the size of each: `18 bytes` per array would
+predict 410 GiB for that L1 window and reject every block size this granule can actually run.
 
 **Read amplification below 1.0 is possible**, and L2 shows it at 0.86×: its halo is small relative to
 the block and 64% of its grid is fill, so those blocks have no searchable point and read nothing at all.
@@ -287,15 +327,27 @@ it needs memory pressure from outside the process. `tools/golden/GATES.md` holds
 
 The amplification is high because the halo is, not because the layout is loose: at a 2684×1448 px halo
 even a 16384 px block pays 2.6×. That is the arithmetic in "Runtime is set by the halo" applied to a
-wide-halo configuration — the block size has to grow with the halo, and here the halo is large enough
-that only large blocks are efficient.
+wide-halo configuration, and it sets the *floor* on a usable block size — a block below the halo is
+rejected outright.
+
+It does not follow that large blocks are the efficient ones, which is what the amplification argument
+alone suggests. On L2 the highest-amplification row measured is also the fastest and the cheapest:
+1.69× at 3072 px runs in 5.8 min at 31.2 GiB, against 0.86× at 8192 px in 11.2 min at 47.8. Redundant
+reading is cheap next to leaving threads idle, so the halo tells you the smallest block you may use and
+the thread count tells you which of the permitted sizes to pick.
 
 ## Practical guidance
 
 - **Batch work: one pair per process or per worker, `threaded = false`.** Also 2.7× faster than
   intra-pair threading (`benchmark/suite/throughput.jl`), so this is not a tradeoff.
-- **`process_block_size = (1024, 1024)` when peak memory matters**, and scale it up with the halo
-  rather than down — see the table above. Check the block count stays above the thread count.
+- **`process_block_size = (1024, 1024)` when peak memory matters.** A wide halo raises the *floor* on
+  the size — a block smaller than its own halo is rejected — so on a NISAR granule the usable range
+  starts around 3072 px. Within the range the size a granule permits, take the **smallest** one: on
+  NISAR L2 that is both the lowest peak and the fastest row.
+- **Size by block count, not by block size: keep it around 10× the thread count.** This is the knob
+  that sets runtime, because blocks are the unit of threaded work and their cost varies by orders of
+  magnitude. 98 blocks on 10 threads runs at 3.0 threads of occupancy and takes 1.8× as long as 648
+  blocks, which runs at 6.8.
 - **Reuse a `Cache` across pairs** via `init`/`reinit!`/`autorift!`. The live heap is flat, so this
   is bounded regardless of batch length.
 - **No process recycling needed** — the measurement above is what establishes that.
