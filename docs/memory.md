@@ -265,29 +265,44 @@ With all three fixed, both NISAR granules block. Measured whole-grid at `-t 10` 
 | | 8192 px | 98 | 11.2 min | 47.8 GiB | 0.56× | 0.86× |
 | | 6144 px | 162 | 6.2 min | 45.7 GiB | 0.54× | 1.00× |
 | | 4096 px | 378 | 7.1 min | 40.1 GiB | 0.47× | 1.33× |
-| | 3072 px | 648 | **5.8 min** | **31.2 GiB** | **0.37×** | 1.69× |
+| | 3072 px | 648 | 5.8 min | 31.2 GiB | 0.37× | 1.69× |
+| | 2304 px | 1152 | 5.5 min | 30.0 GiB | 0.35× | 2.26× |
+| | 2304×1152 px | 2304 | **5.2 min** | **28.8 GiB** | **0.34×** | 3.30× |
 
 † shared the machine with another large job; peak RSS is insensitive to that where wall clock is not.
 
 **L2 is the case that makes blocking a production requirement, and the right block size is the
-smallest the halo permits.** 3072 px runs the granule in **31.2 GiB and 5.8 minutes** against an
-untiled 85.0 GiB and 6.2 — less than four tenths the peak *and* slightly faster, at 99.98% of the
-untiled point count. Every blocked row measures the same 1,781,377 points, so the sizes differ in cost
-alone. On a 96 GiB machine this is the difference between a memory-optimized instance and a
-general-purpose one.
+smallest shape the halo permits.** 2304×1152 px runs the granule in **28.8 GiB and 5.2 minutes** against
+an untiled 85.0 GiB and 6.2 — about a third of the peak *and* faster, at 99.98% of the untiled point
+count. Every blocked row measures the same 1,781,377 points, so the sizes differ in cost alone. On a 96
+GiB machine this is the difference between a memory-optimized instance and a general-purpose one.
 
-**Runtime is not monotonic in block size, and the reason is thread occupancy.** Measured as
-`cpu_seconds / wall_seconds` (`tools/golden/profile_nisar.jl`), the five rows run at 6.06, 2.96, 5.50,
-5.17 and 6.77 of ten threads. 8192 px is the outlier at **2.96** — 98 blocks over 10 threads, with
-per-block cost spanning orders of magnitude because a block whose points a finer level resolved returns
-before any I/O, so the pool spends most of the run waiting on a few expensive blocks. 648 blocks at
-3072 px keep it fed. **Block count, not block size, is what has to stay well above the thread count**;
-a factor of ten is comfortable and a factor of ten *fewer* costs a doubling of wall clock.
+**Both axes want sizing separately, because the halo is not square.** At 2216×1103 px it is almost
+exactly 2:1, so a *square* block clears the X halo and then over-provisions Y twofold. `2304×1152`
+follows the halo's own aspect ratio and is the best row measured; the square floor is 2304 (2048 is
+rejected against the 2216 px X halo) while the Y floor is half that.
 
-Read amplification rises from 0.86× to 1.69× across those rows and does not drive the ranking —
-the fastest row has the highest amplification. Allocation follows it (225 GiB untiled to 1063 GiB at
-3072 px, since every block read allocates a block-sized temporary), and GC absorbs 1% of wall clock at
-worst, so on this granule allocation rate is not the constraint that block size trades against.
+**Runtime is monotonic in block *count*, not in block size, and the mechanism is thread occupancy.**
+Measured as `cpu_seconds / wall_seconds` (`tools/golden/profile_nisar.jl`):
+
+| block | blocks | blocks/thread | occupancy of 10 |
+|---|---:|---:|---:|
+| 8192 px | 98 | 9.8 | **2.96** |
+| 6144 px | 162 | 16.2 | 5.50 |
+| 4096 px | 378 | 37.8 | 5.17 |
+| 3072 px | 648 | 64.8 | 6.77 |
+| 2304 px | 1152 | 115.2 | 7.87 |
+| 2304×1152 px | 2304 | 230.4 | **9.03** |
+
+Per-block cost spans orders of magnitude — a block whose points a finer level resolved returns before any
+I/O — so a pool with few blocks per thread waits on a handful of expensive ones while the rest idle. **Ten
+blocks per thread is not enough; occupancy is still climbing at 230.** Many small blocks is the
+configuration that keeps a wide machine fed, and there is no measured turning point on this granule.
+
+Read amplification rises 0.86× → 3.30× across those rows and does not drive the ranking — the fastest row
+has the *highest* amplification. Allocation follows it (225 GiB untiled to 1727 GiB, since every block
+read allocates a block-sized temporary) and GC still absorbs ≤1.7% of wall clock, so on this granule
+neither reading nor allocation is the constraint that block size trades against. Idle threads are.
 
 **The L2 rows above supersede an earlier pass that measured untiled at 80.9 GiB and 12.1 min, and the
 runtime half of that is an instrument artifact.** `src/` is unchanged across the interval and both
@@ -340,14 +355,16 @@ the thread count tells you which of the permitted sizes to pick.
 
 - **Batch work: one pair per process or per worker, `threaded = false`.** Also 2.7× faster than
   intra-pair threading (`benchmark/suite/throughput.jl`), so this is not a tradeoff.
-- **`process_block_size = (1024, 1024)` when peak memory matters.** A wide halo raises the *floor* on
-  the size — a block smaller than its own halo is rejected — so on a NISAR granule the usable range
-  starts around 3072 px. Within the range the size a granule permits, take the **smallest** one: on
-  NISAR L2 that is both the lowest peak and the fastest row.
-- **Size by block count, not by block size: keep it around 10× the thread count.** This is the knob
-  that sets runtime, because blocks are the unit of threaded work and their cost varies by orders of
-  magnitude. 98 blocks on 10 threads runs at 3.0 threads of occupancy and takes 1.8× as long as 648
-  blocks, which runs at 6.8.
+- **`process_block_size = (1024, 1024)` when peak memory matters**, and go as small as the halo allows.
+  A block smaller than its own halo is rejected, which is the only floor; within what a granule permits,
+  the smallest shape is both the lowest peak and the fastest run.
+- **Size the two axes separately against `halo(grid, p, size)`.** A 2:1 halo wants a 2:1 block; a square
+  one wastes half of the short axis. On NISAR L2 that is `(2304, 1152)`, which beats `(3072, 3072)` on
+  peak, runtime and occupancy at once.
+- **Aim for hundreds of blocks per thread, not tens.** Blocks are the unit of threaded work and their
+  cost varies by orders of magnitude, so a small pool waits on its slowest members: 9.8 blocks/thread
+  runs at 3.0 threads of ten, 64.8 at 6.8 and 230.4 at 9.0. Occupancy was still improving at the smallest
+  size measured.
 - **Reuse a `Cache` across pairs** via `init`/`reinit!`/`autorift!`. The live heap is flat, so this
   is bounded regardless of batch length.
 - **No process recycling needed** — the measurement above is what establishes that.

@@ -50,6 +50,27 @@ const TRACE_DIR = joinpath(get(ENV, "AUTORIFT_GOLDEN_CACHE",
 argvalue(flag, default) = (i = findfirst(==(flag), ARGS);
                            isnothing(i) ? default : ARGS[i + 1])
 
+# A block size is `(X, Y)` pixels, with `(0, 0)` for an untiled run.
+#
+# Both axes are swept independently because a halo need not be square, and on these granules it is very
+# much not: the NISAR L2 halo is 2216x1103 px, so the *square* floor is twice the Y floor and a square
+# block over-provisions Y by a factor of two. `--blocks 3072` still means 3072x3072, since a square
+# sweep is the common case; `--blocks 2304x1152` reaches the anisotropic ones.
+"""
+    parse_block(s) -> Tuple{Int,Int}
+
+Parse one `--blocks` entry: `"0"` for untiled, `"N"` for `N` square, or `"XxY"`.
+"""
+function parse_block(s::AbstractString)
+    parts = split(s, 'x')
+    length(parts) == 1 && return (n = parse(Int, parts[1]); (n, n))
+    length(parts) == 2 && return (parse(Int, parts[1]), parse(Int, parts[2]))
+    throw(ArgumentError("block size \"$s\" is not `N`, `XxY` or `0`"))
+end
+
+block_label(bs::Tuple{Int,Int}) =
+    bs == (0, 0) ? "untiled" : bs[1] == bs[2] ? "$(bs[1]) px" : "$(bs[1])x$(bs[2]) px"
+
 # ---------------------------------------------------------------------------
 # How much of the machine a run used
 # ---------------------------------------------------------------------------
@@ -233,13 +254,14 @@ end
 
 # The layout figures for a block size, or `nothing` if it cannot produce a layout. Computed before
 # running so a rejected size is a message rather than a surprise minutes in.
-function layout_figures(grid, p, scene, bs::Int)
-    bs == 0 && return (nblocks = 1, readamp = 1.0, window = scene)
+function layout_figures(grid, p, scene, bs::Tuple{Int,Int})
+    bs == (0, 0) && return (nblocks = 1, readamp = 1.0, window = scene)
     local L
     try
-        L = block_layout(grid, p, scene, (bs, bs))
+        L = block_layout(grid, p, scene, bs)
     catch e
-        @printf("  block %6d px: REJECTED — %s\n", bs, first(sprint(showerror, e), 160))
+        @printf("  block %-12s REJECTED — %s\n", block_label(bs),
+                first(sprint(showerror, e), 160))
         return nothing
     end
     readamp = sum(length(x.read_rows) * length(x.read_cols) for x in L.blocks) / prod(scene)
@@ -291,7 +313,7 @@ Correlate once at block size `bs`, tracing resident memory, and profile the run 
 `seconds_hint` sizes the profile buffer (see [`plan_profile`](@ref)) and comes from the unprofiled
 run of the same configuration, so the buffer is sized against a measurement rather than a guess.
 """
-function run_config(a, b, grid, kw; bs::Int, profile::Bool,
+function run_config(a, b, grid, kw; bs::Tuple{Int,Int}, profile::Bool,
                     seconds_hint::Real, nthreads::Integer, label::AbstractString)
     # The floor this configuration is measured against: what the process holds with the imagery
     # resident and nothing running. Collected after a full collection so the figure is a requirement
@@ -324,11 +346,11 @@ function run_config(a, b, grid, kw; bs::Int, profile::Bool,
     cpu0 = cpu_seconds!(buf)
     out, trace, seconds = with_trace(; interval = 0.01, progress) do
         if profile
-            Profile.@profile(bs == 0 ? autorift(b, a, grid; kw...) :
-                             autorift(b, a, grid; kw..., process_block_size = (bs, bs)))
+            Profile.@profile(bs == (0, 0) ? autorift(b, a, grid; kw...) :
+                             autorift(b, a, grid; kw..., process_block_size = bs))
         else
-            bs == 0 ? autorift(b, a, grid; kw...) :
-            autorift(b, a, grid; kw..., process_block_size = (bs, bs))
+            bs == (0, 0) ? autorift(b, a, grid; kw...) :
+            autorift(b, a, grid; kw..., process_block_size = bs)
         end
     end
     cpu = cpu_seconds!(buf) - cpu0
@@ -368,8 +390,8 @@ end
 # So the sample counts below are counts, not a rate, and occupancy is `cpu_seconds / wall_seconds`
 # from [`cpu_seconds!`](@ref) — validated to 1.00 / 1.99 / 3.99 / 9.77 on 1, 2, 4 and 10 spin loops.
 function report(r, figs, nthreads)
-    @printf("  %-22s %6d blocks  %7.1f s  peak %8.2f GiB (%.2f above floor)  readamp %5.2fx  measured %d\n",
-            r.block == 0 ? "untiled" : "$(r.block) px", figs.nblocks, r.seconds,
+    @printf("  %-14s %6d blocks  %7.1f s  peak %8.2f GiB (%.2f above floor)  readamp %5.2fx  measured %d\n",
+            block_label(r.block), figs.nblocks, r.seconds,
             r.peak / 2^30, r.peak_above_floor / 2^30, figs.readamp, r.measured)
     @printf("      resident peak %.2f GiB   live peak %.2f GiB   live at end %.2f GiB   floor %.2f GiB\n",
             r.peak_resident / 2^30, r.peak_live / 2^30, r.end_live / 2^30, r.floor_bytes / 2^30)
@@ -418,7 +440,8 @@ through `read_capture`, and paying that per configuration costs more than the me
 configuration's peak is reported against the trace's own settled floor before it started, which is
 what makes one process sufficient.
 """
-function measure_case(c::GoldenCase; blocks::Vector{Int}, n::Integer = 100, profile::Bool = true)
+function measure_case(c::GoldenCase; blocks::Vector{Tuple{Int,Int}}, n::Integer = 100,
+                      profile::Bool = true)
     k = read_capture(c; n)
     grid = pointset_from_capture(k)
     kw = kwargs_from_capture(k)
@@ -442,23 +465,22 @@ function measure_case(c::GoldenCase; blocks::Vector{Int}, n::Integer = 100, prof
     # is in the hundreds of pixels — a hardcoded 512 px is rejected outright on the NISAR L2 grid,
     # whose halo is 620x370 px over a warmup patch.
     warmup(a, b, grid, kw)
-    blocked = filter(!=(0), blocks)
+    blocked = filter(!=((0, 0)), blocks)
     if !isempty(blocked)
-        bs = minimum(blocked)
-        warmup(a, b, grid, merge(kw, (; process_block_size = (bs, bs))))
+        warmup(a, b, grid, merge(kw, (; process_block_size = argmin(prod, blocked))))
     end
 
     results = NamedTuple[]
     for bs in blocks
         figs = layout_figures(grid, p, scene, bs)
         isnothing(figs) && continue
-        label = bs == 0 ? "untiled" : "$(bs) px"
+        label = block_label(bs)
 
         # Clean wall clock first, with the profiler off: sampling ten threads every few milliseconds
         # perturbs the runtime this row is meant to report.
         clean = run_config(a, b, grid, kw; bs, profile = false,
                            seconds_hint = 1, nthreads, label = "$label (timing)")
-        @printf("  %-22s %7.1f s clean\n", label, clean.seconds)
+        @printf("  %-14s %7.1f s clean\n", label, clean.seconds)
         flush(stdout)
 
         r = if profile
@@ -482,24 +504,25 @@ end
 
 # Blocking promises a bit-identical result, so it is checked rather than assumed.
 function report_agreement(results)
-    base = findfirst(r -> r.block == 0, results)
+    base = findfirst(r -> r.block == (0, 0), results)
     isnothing(base) && return nothing
     ref = results[base]
     println("\nagreement against the untiled run:")
     for r in results
         r.block == ref.block && continue
-        @printf("  %-10s dx identical %s   dy identical %s   measured %d vs %d\n",
-                "$(r.block) px", isequal(ref.dx, r.dx), isequal(ref.dy, r.dy),
+        @printf("  %-14s dx identical %s   dy identical %s   measured %d vs %d\n",
+                block_label(r.block), isequal(ref.dx, r.dx), isequal(ref.dy, r.dy),
                 r.measured, ref.measured)
     end
     return nothing
 end
 
 function main()
-    isempty(ARGS) && error("usage: profile_nisar.jl <product-fragment> [--blocks a,b] [--run N] [--no-profile]")
+    isempty(ARGS) && error("usage: profile_nisar.jl <product-fragment> " *
+                          "[--blocks 0,3072,2304x1152] [--run N] [--no-profile]")
     c = only(cases(ARGS[1]))
     n = parse(Int, argvalue("--run", "100"))
-    blocks = parse.(Int, split(argvalue("--blocks", "8192"), ','))
+    blocks = parse_block.(split(argvalue("--blocks", "3072"), ','))
     results = measure_case(c; blocks, n, profile = !("--no-profile" in ARGS))
     report_agreement(results)
     mkpath(TRACE_DIR)
@@ -507,7 +530,9 @@ function main()
     # holding them cannot be deserialized without loading this script, which defines `main` and would
     # re-run the measurement. The trace is reduced to the figures already extracted from it and the
     # scan to plain fields, so a reader needs nothing but `Serialization`.
-    path = joinpath(TRACE_DIR, "prof_$(first(split(c.product, "_X_"))).jls")
+    tag = get(ENV, "AUTORIFT_PROFILE_TAG", "")
+    path = joinpath(TRACE_DIR,
+                    "prof_$(first(split(c.product, "_X_")))$(isempty(tag) ? "" : "_" * tag).jls")
     plain = map(results) do r
         base = Base.structdiff(r, (; dx = 0, dy = 0, trace = 0, scan = 0))
         scan = isnothing(r.scan) ? nothing :

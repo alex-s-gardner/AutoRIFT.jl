@@ -2606,27 +2606,65 @@ so every thread that tried to allocate was queued behind a collection that never
 `~/data/autorift/tests/golden_tests/mem/l2_deadlock_sample.txt`.
 
 **The same configuration then completed cleanly on an idle machine**, in 716 s at 41.8 GiB peak — the row
-in the table above. The difference between the two runs was a concurrent L1 job holding tens of GiB, so
-this is a deadlock that needs memory pressure from *outside* the process, not a property of the block size.
-That matters for how it is chased and for how much it threatens production: a worker that owns its instance
-did not hit it, and one packed alongside another large job did.
+in the table above. The difference between the two runs was a concurrent L1 job holding tens of GiB, so at
+the time this read as a deadlock needing memory pressure from *outside* the process.
+
+**That qualification is wrong: it reproduces on an idle machine, and external pressure is not required.**
+See "The deadlock, requalified" below. What it does need is a *multi-configuration process* — several
+whole-granule runs in sequence, each leaving tens of GiB of live heap behind. Every single-configuration
+run has completed.
 
 Not an artifact of the harness. The sampler thread `mem_nisar.jl` runs appears on no stack in the trace,
 and it allocates only two small vectors per sample.
 
-Left open. The same allocation-under-pressure shape appears in the 128-pixel Landsat case in
-`docs/memory.md`, where 6 of 10 workers stall on the same mutex and the run merely crawls rather than
-stopping — so the mechanism is a spectrum this package can reach, whether or not the hard stop is a Julia
-GC bug. Anyone reproducing it should run two large jobs concurrently rather than one.
+### The deadlock, requalified: an idle machine is enough
+
+**Reproduced on an idle machine with nothing else running**, so the "needs external memory pressure"
+qualification above does not hold. Hit while sweeping smaller block sizes: the 2816 px row stopped dead at
+**25.4 GiB** — a third of the untiled peak, and well under the 44.4 GiB of the first occurrence — after its
+2304 px predecessor had completed normally in the same process.
+
+Same signature as the original, at a different block size and a much lower footprint:
+
+| | first occurrence | this one |
+|---|---|---|
+| block | 8192 px | 2816 px |
+| footprint at stop | 44.4 GiB | **25.4 GiB** |
+| other load on machine | concurrent L1 job, tens of GiB | **none** |
+| `__psynch_cvwait` | 16 | 16 |
+| `__psynch_mutexwait` | 4 | 4 |
+| through `ijl_gc_collect -> jl_safepoint_start_gc -> uv_mutex_lock` | yes | yes |
+
+**No thread is collecting.** Zero frames in the sample match `gc_mark`, `sweep` or `gc_scan`, so this is a
+collection that never starts rather than one taking a long time — every allocating thread is parked at the
+safepoint waiting for a collector that does not exist. Trace at
+`~/data/autorift/tests/golden_tests/mem/l2_deadlock_2816_sample.txt`.
+
+**What both occurrences share is a multi-configuration process, not memory pressure.** Each row correlates
+the whole granule and leaves tens of GiB of live heap for the next (33.7 GiB at the end of the 3072 px row),
+and the hang lands on a row that is not the first. Against that, **every single-configuration run has
+completed** — 3072 px, 2304 px and the untiled row all finished when they were the only configuration in
+their process. So the reproducer is "several whole-granule runs in one process", which is a property of the
+measurement harness rather than of production, where a worker does one pair.
+
+**A second stuck process was found at the same time**, left over from the five-configuration sweep: 0% CPU,
+16 threads in `__psynch_cvwait`, still resident at 11.8 GiB. It had been assumed dead — no output, no
+exception, empty stderr — and the assumption was wrong in a way worth recording: **a Julia process
+deadlocked this way looks exactly like one that was killed**, since both stop writing and neither leaves a
+message. Check `ps` for a 0%-CPU survivor before concluding a run died, and `sample` it before killing it.
+
+The earlier note in this file attributing the 3072 px sweep row to an OOM kill is superseded: that process
+was hung, not killed.
 
 ## Step: the L2 block-size sweep, and what a threaded whole-granule run actually costs
 
-Five block sizes on NISAR L2 GSLC, whole grid, `-t 10,1` on the M2 Max with 96 GiB. Command:
+Seven configurations on NISAR L2 GSLC, whole grid, `-t 10,1` on the M2 Max with 96 GiB. Command:
 
 ```bash
 julia --project=tools/golden -t 10,1 tools/golden/profile_nisar.jl NISAR_L2_PR_GSLC \
     --blocks 0,8192,6144,4096,3072
 julia --project=tools/golden -t 10,1 tools/golden/profile_nisar.jl NISAR_L2_PR_GSLC --blocks 3072
+julia --project=tools/golden -t 10,1 tools/golden/profile_nisar.jl NISAR_L2_PR_GSLC --blocks 2304x1152
 ```
 
 `profile_nisar.jl` differs from `mem_nisar.jl` in three ways that each moved a number: it warms the JIT
@@ -2639,21 +2677,40 @@ measures occupancy from CPU time rather than from profile samples. Runtime is th
 | 8192 px | 98 | 11.2 min | 47.8 GiB | 29.9 | 0.56x | **2.96 / 10** | 0.86x | 784 GiB | 1,781,377 |
 | 6144 px | 162 | 6.2 min | 45.7 GiB | 29.1 | 0.54x | 5.50 / 10 | 1.00x | 799 GiB | 1,781,377 |
 | 4096 px | 378 | 7.1 min | 40.1 GiB | 28.9 | 0.47x | 5.17 / 10 | 1.33x | 897 GiB | 1,781,377 |
-| 3072 px | 648 | **5.8 min** | **31.2 GiB** | 22.5 | **0.37x** | **6.77 / 10** | 1.69x | 1063 GiB | 1,781,377 |
+| 3072 px | 648 | 5.8 min | 31.2 GiB | 22.5 | 0.37x | 6.77 / 10 | 1.69x | 1063 GiB | 1,781,377 |
+| 2304 px | 1152 | 5.5 min | 30.0 GiB | 22.1 | 0.35x | 7.87 / 10 | 2.26x | — | 1,781,377 |
+| 2304x1152 px | 2304 | **5.2 min** | **28.8 GiB** | 21.3 | **0.34x** | **9.03 / 10** | 3.30x | 1727 GiB | 1,781,377 |
 
-The 3072 px row is from its own process; the rest share one. Every blocked row measures the same
-1,781,377 points, so the sizes differ in cost alone.
+The 3072 px, 2304 px and 2304x1152 px rows are each from their own process; the first four share one.
+Every blocked row measures the same 1,781,377 points, so the sizes differ in cost alone.
 
-**3072 px dominates: 0.37x the untiled peak and slightly faster than untiled.** That is the operating
-point on this granule, and it is the *smallest* size the halo permits — 2048 px is rejected against a
-2216x1103 px halo. The previously recorded choice of 8192 px is the worst blocked row on both axes.
+**2304x1152 px dominates every axis: 0.34x the untiled peak, 0.83x its runtime, 90% occupancy.** The
+previously recorded choice of 8192 px is the worst blocked row measured. Note the ordering is monotonic in
+block *count* over all six blocked rows, on peak and runtime alike.
 
-**Runtime is set by thread occupancy, and occupancy is set by block count.** 98 blocks over 10 threads
-runs at 2.96 threads of ten; 648 blocks run at 6.77. Per-block cost varies by orders of magnitude — a
-block whose points a finer level resolved returns before any I/O — so a pool with few blocks per thread
-spends the run waiting on a few expensive ones. Keep the block count near 10x the thread count. Note the
-untiled row reaches 6.06 through the intra-pass path, so it is a different decomposition rather than a
-one-block version of the others.
+**Both axes need sizing separately, and sweeping squares alone misses the best shape.** The halo is
+2216x1103 px — almost exactly 2:1 — so a square block clears X and over-provisions Y twofold. The square
+floor is 2304 (2048 is rejected on the X halo) while Y's floor is half that, and following the halo's
+aspect ratio is what produced the best row. `--blocks 2304x1152` reaches these; `--blocks N` still means
+square.
+
+**Runtime is set by thread occupancy, and occupancy by blocks per thread — hundreds, not tens.**
+
+| block | blocks/thread | occupancy of 10 |
+|---|---:|---:|
+| 8192 px | 9.8 | 2.96 |
+| 6144 px | 16.2 | 5.50 |
+| 4096 px | 37.8 | 5.17 |
+| 3072 px | 64.8 | 6.77 |
+| 2304 px | 115.2 | 7.87 |
+| 2304x1152 px | 230.4 | **9.03** |
+
+Per-block cost varies by orders of magnitude — a block whose points a finer level resolved returns before
+any I/O — so a pool with few blocks per thread spends the run waiting on a few expensive ones. **There is no
+turning point in the measured range**: occupancy was still improving at 230 blocks/thread, so an earlier
+version of this section recommending "near 10x the thread count" understated it by an order of magnitude.
+Note the untiled row reaches 6.06 through the intra-pass path, so it is a different decomposition rather
+than a one-block version of the others.
 
 **Read amplification does not drive the ranking.** It rises 0.86x → 1.69x across the rows while runtime
 *falls*. Allocation rises with it (225 → 1063 GiB, since `_read_block!` allocates a block-sized temporary
@@ -2664,24 +2721,25 @@ threads.
 running samples with a stack, excluding the parked ones, since folding those in would mix the occupancy
 result into every stage's share:
 
-| stage | 3072 px |
-|---|---:|
-| FFTW, all stacks (`(FFTW transform)` + `fft_execute!` / `ifft_execute!` under `_numerators_fft!`) | **53.1%** |
-| — of which unwound only to the codelet, `(FFTW transform)` | 27.1% |
-| `_read_block!` under `_prepared_block_pair` | 11.9% |
-| `preprocess` under `_prepare_block` | 3.5% |
-| `peak_index` under `subpixel_peak` | 1.5% |
+| stage | 3072 px | 2304x1152 px |
+|---|---:|---:|
+| FFTW, all stacks (`(FFTW transform)` + `fft_execute!` / `ifft_execute!` under `_numerators_fft!`) | **53.1%** | **45.7%** |
+| `_read_block!` under `_prepared_block_pair` | 11.9% | 19.0% |
+| `preprocess` under `_prepare_block` | 7.4% | 11.9% |
+| `peak_index` under `subpixel_peak` | 3.2% | 2.6% |
 
-The FFTW share is **54–63% on every configuration** — 62.5% untiled, 56.9% at 8192 px, 56.4% at 6144,
-54.4% at 4096, 53.1% at 3072 — so it is a property of the correlator rather than of a block size, and it
-falls only slightly as the blocked path's own work grows. Those four figures come from the top-14 stacks
-each run printed, which is complete enough for FFTW (its stacks are all large) and not for the smaller
-rows: the same treatment gives `_read_block!` 4.6% at 4096 px where the full stack table gives 11.9% at
-3072. Only the 3072 px column above is measured against every stack.
+Both columns are measured against every stack. The four rows above them in the sweep were read from the
+top-14 stacks each run printed, which is complete enough for FFTW (its stacks are all large) and not for
+the smaller entries: that treatment gives `_read_block!` 4.6% at 4096 px where a full accounting gives
+11.9% at 3072. On the FFTW total the truncated reads are usable — 62.5% untiled, 56.9% at 8192 px, 56.4%
+at 6144, 54.4% at 4096.
 
-**The correlator's spectral core is the run**, at over half of all working time, and the blocked path's
-own overhead — reading plus preprocessing a block — is about 15%. That bounds what block-size tuning can
-win and says where to look for a real speedup: the FFT count per point, not the layout.
+**The correlator's spectral core is the run**, and the blocked path's own overhead is what grows as blocks
+shrink: reading plus preprocessing goes from 19.3% at 3072 px to **30.9%** at 2304x1152, while FFTW falls
+53.1% → 45.7%. That is the price paid for occupancy, and at these sizes it is still worth paying — the
+2304x1152 row is faster in wall clock despite spending a third of its working time on block handling.
+It also locates the ceiling: with ~31% of the run in reading and preprocessing, shrinking blocks further
+has less and less headroom, and a real speedup means fewer FFTs per point rather than a better layout.
 
 The `(FFTW transform)` bucket is samples whose stack unwound no further than the codelet, so it is
 FFTW's own frames rather than a separate stage; it is listed apart only because those samples cannot be
@@ -2716,11 +2774,12 @@ what made blocking look free. Profiler overhead is not the explanation and this 
 it was the first guess: measured over all five configurations, a profiled run costs **2–4%** (1.02x, 1.03x,
 1.03x, 1.04x).
 
-### An unexplained kill
+### The sweep's own casualty was the deadlock, not a kill
 
-The 3072 px row died mid-profile in the five-configuration sweep: no exception, empty stderr, no crash
-report, zero swap in use — the signature of a kernel memory kill, in a process whose previous row had left
-33.7 GiB of live heap behind. It completed cleanly as the only configuration in a fresh process, at 347.6 s
-against 340.9 in the sweep, so the figures above are sound and the shared-process design is what is
-suspect at these sizes. Related to the contention-dependent deadlock above, and open for the same reason:
-both need memory pressure that a single-configuration run does not create.
+The 3072 px row stopped mid-profile in the five-configuration sweep with no exception, empty stderr and no
+crash report, which was read as a kernel memory kill. **It was the deadlock**: the process was still alive
+at 0% CPU and 11.8 GiB when found later, 16 threads in `__psynch_cvwait`. See "The deadlock, requalified"
+above — a hung Julia process and a killed one are indistinguishable from their output alone.
+
+The row was re-measured as the only configuration in a fresh process, at 347.6 s against 340.9 in the
+sweep, so the figures above are sound. The shared-process harness design is what is suspect at these sizes.
