@@ -13,23 +13,31 @@
 # it is what made the first occurrence look contention-dependent.
 #
 # **This is a Julia runtime bug, not a package one** — `src/signals-mach.c` in every release through
-# 1.13.0. Two locks are taken in opposite orders:
+# 1.13.0. One lock is involved, not two: the profiler freezes the thread holding it.
 #
-#   * The profiler's sampling thread calls `jl_lock_profile_mach`, then suspends its target while
-#     still holding that lock (`jl_profile_thread_mach`, `signals-mach.c:797`). Suspending goes
-#     through `pthread_mach_thread_np`, which takes libpthread's internal `os_unfair_lock`.
-#   * A thread finishing a collection resumes the threads it stopped, from `jl_mach_gc_end`
-#     (`signals-mach.c:97`) — `thread_resume(pthread_mach_thread_np(...))`, which wants that same
-#     `os_unfair_lock`, while holding `safepoint_lock`.
+# `pthread_mach_thread_np(t)` looks `t` up in libpthread's global thread list under `_pthread_list_lock`,
+# an `os_unfair_lock`. Looking up *another* thread takes the lock; a self-lookup does not.
 #
-# Interleave them and the sampler waits on the unfair lock while the collector waits for the sampler
-# to release it. Every other thread then piles up at `jl_safepoint_start_gc` behind a collection that
-# has begun and can never end, so `sample` shows 0 threads marking or sweeping. The process is
-# unkillable by `SIGTERM` and holds its full footprint.
+#   1. A thread ending a collection enters `jl_mach_gc_end` (`signals-mach.c:97`) and calls
+#      `thread_resume(pthread_mach_thread_np(...))` to wake the threads it stopped, so it is inside
+#      libpthread holding `_pthread_list_lock`.
+#   2. The profiler picks that thread as its next target and `thread_suspend`s it
+#      (`jl_thread_suspend_and_get_state2`), freezing it mid-critical-section with the lock held.
+#      `jl_profile_thread_mach` unwinds the target and only resumes it at the very end.
+#   3. The sampler needs `pthread_mach_thread_np` again before that resume, blocks on the lock, and waits
+#      on a holder that only the sampler can resume.
+#
+# So the sampler deadlocks against a thread it stopped. Every other thread then piles up at
+# `jl_safepoint_start_gc` behind a collection that has begun and can never end, which is why `sample`
+# shows **no** thread marking or sweeping. The process holds its full footprint and ignores `SIGTERM`.
+#
+# In a trace, exactly two threads sit in `pthread_mach_thread_np`: the sampler at a fixed `+56` with
+# `_os_unfair_lock_lock_slow` beneath it (blocked), and the victim at a varying offset with nothing
+# beneath it (suspended at an arbitrary instruction, holding the lock).
 #
 # Fixed upstream by `ca49fc2e2` ("[macOS] Handle GC safepoint on-thread", 2026-03-17), which deletes
-# `jl_mach_gc_end` and the `suspended_threads` list outright and handles the safepoint on the
-# signalled thread. Present in 1.14-DEV; **not** backported to release-1.12 or release-1.13.
+# `jl_mach_gc_end` and the `suspended_threads` list and handles the safepoint on the signalled thread, so
+# step 1 cannot happen. Present in 1.14-DEV; **not** backported to release-1.12 or release-1.13.
 #
 # Until then, on macOS: do not profile a long multithreaded allocation-heavy run. `profile_nisar.jl`
 # times a run with the profiler off and profiles a separate one, so a hang costs the attribution and

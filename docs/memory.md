@@ -463,11 +463,12 @@ predict 410 GiB for that L1 window and reject every block size this granule can 
 the block and 64% of its grid is fill, so those blocks have no searchable point and read nothing at all.
 
 One failure was chased to a root cause and is **not** this package's. Profiled runs on macOS can hang
-outright: the profiler's sampling thread suspends its target while holding the profile lock, and a thread
-ending a collection resumes threads from `jl_mach_gc_end` — both go through `pthread_mach_thread_np` and
-take libpthread's `os_unfair_lock`, in opposite orders. Every other thread then queues at
-`jl_safepoint_start_gc` behind a collection that has begun and can never end, with **no** thread marking
-or sweeping. It is a Julia runtime bug in `src/signals-mach.c`, present in every release through 1.13.0
+outright, and the mechanism is one lock rather than two: `pthread_mach_thread_np` looks a thread up in
+libpthread's global list under an `os_unfair_lock`, so a thread ending a collection holds that lock while
+resuming others from `jl_mach_gc_end`. The profiler then `thread_suspend`s exactly that thread, freezing it
+with the lock held, and blocks on the same lock before it reaches its own resume — deadlocking against a
+thread only it can restart. Every other thread queues at `jl_safepoint_start_gc` behind a collection that
+has begun and can never end, with **no** thread marking or sweeping. It is a Julia runtime bug in `src/signals-mach.c`, present in every release through 1.13.0
 and fixed on master by `ca49fc2e2` (not backported). `tools/golden/profiler_gc_deadlock.jl` reproduces it
 in ~2 runs of 5 with no AutoRIFT code involved, and `tools/golden/GATES.md` holds the traces.
 

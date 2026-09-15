@@ -2616,10 +2616,10 @@ in the table above. The difference between the two runs was a concurrent L1 job 
 the time this read as a deadlock needing memory pressure from *outside* the process.
 
 **That qualification is wrong on both counts.** It reproduces on an idle machine, and it needs neither
-external pressure nor a multi-configuration process: it is a lock-order inversion between the macOS
-profiler and the collector inside the Julia runtime, reproducible in a script with no AutoRIFT in it. See
-"The root cause" below. Because it is a race, the clean retry that motivated the contention theory was
-simply a run that did not lose it.
+external pressure nor a multi-configuration process: the macOS profiler suspends a thread mid-way through
+libpthread's thread-list lock and then blocks on that lock itself, inside the Julia runtime and
+reproducible in a script with no AutoRIFT in it. See "The root cause" below. Because it is a race, the
+clean retry that motivated the contention theory was simply a run that did not lose it.
 
 Not an artifact of the harness. The sampler thread `mem_nisar.jl` runs appears on no stack in the trace,
 and it allocates only two small vectors per sample.
@@ -2647,10 +2647,10 @@ collection that never starts rather than one taking a long time — every alloca
 safepoint waiting for a collector that does not exist. Trace at
 `~/data/autorift/tests/golden_tests/mem/l2_deadlock_2816_sample.txt`.
 
-**Root cause: a lock-order inversion between the macOS profiler and the collector, in the Julia runtime.**
-Not memory pressure, not the block size, and not this package — see "The root cause" below. The
-multi-configuration correlation is incidental; what matters is that a profiled run allocates hard on many
-threads for minutes.
+**Root cause: the profiler suspends a thread that is holding libpthread's global thread-list lock, then
+blocks on that same lock.** A Julia runtime bug, not memory pressure, not the block size, and not this
+package — see "The root cause" below. The multi-configuration correlation is incidental; what matters is
+that a profiled run allocates hard on many threads for long enough to lose a race.
 
 **A second stuck process was found at the same time**, left over from the five-configuration sweep: 0% CPU,
 16 threads in `__psynch_cvwait`, still resident at 11.8 GiB. It had been assumed dead — no output, no
@@ -2661,32 +2661,44 @@ message. Check `ps` for a 0%-CPU survivor before concluding a run died, and `sam
 The earlier note in this file attributing the 3072 px sweep row to an OOM kill is superseded: that process
 was hung, not killed.
 
-### The root cause: the profiler and the collector take two locks in opposite orders
+### The root cause: the profiler suspends a thread holding libpthread's thread-list lock
 
 **A Julia runtime bug in `src/signals-mach.c`, present in every release through 1.13.0, and nothing to do
-with AutoRIFT.** Two code paths acquire libpthread's internal `os_unfair_lock` and a Julia lock in
-opposite orders:
+with AutoRIFT.** It is *not* a symmetric lock-order inversion between two lock types — an earlier reading
+of these traces recorded it that way and was wrong. There is **one** lock, and the profiler freezes its
+holder:
 
-| | holds | then wants |
-|---|---|---|
-| profiler sampling thread — `jl_profile_thread_mach`, `signals-mach.c:797` | the profile lock, via `jl_lock_profile_mach` | libpthread's `os_unfair_lock`, via `pthread_mach_thread_np` inside `thread_suspend` |
-| thread ending a collection — `jl_mach_gc_end`, `signals-mach.c:97` | `safepoint_lock` | that same `os_unfair_lock`, via `thread_resume(pthread_mach_thread_np(...))` |
+`pthread_mach_thread_np(t)` looks `t` up in libpthread's global thread list under
+**`_pthread_list_lock`**, an `os_unfair_lock`. A lookup of *another* thread must take it; a self-lookup
+takes a lock-free fast path. Both parties here look up other threads.
 
-Interleaved, the sampler waits on the unfair lock for a collector that is waiting for the sampler to
-release the profile lock. Every other thread then queues at `jl_safepoint_start_gc` behind a collection
-that has started and can never finish.
+1. A Julia thread finishes a collection, enters `jl_mach_gc_end` (`signals-mach.c:97`), and calls
+   `thread_resume(pthread_mach_thread_np(ptls2->system_id))` to wake the threads it stopped. It is now
+   **inside libpthread holding `_pthread_list_lock`**.
+2. The profiler's sampling thread picks that thread as its next target and, in
+   `jl_thread_suspend_and_get_state2`, calls `thread_suspend` on it — freezing it *mid-critical-section
+   with the lock held*. `jl_profile_thread_mach` then unwinds the target's stack and only calls
+   `jl_thread_resume` at the very end.
+3. Before reaching that resume, the sampler needs `pthread_mach_thread_np` again, blocks on
+   `_pthread_list_lock`, and waits on a lock whose holder is suspended and can only be resumed by the
+   sampler itself. **The sampler deadlocks against a thread it stopped.**
 
-The decisive evidence is that **no thread is collecting**: zero frames matching `gc_mark`, `sweep` or
-`gc_scan` in any trace. A slow collection has a marking thread; this has none. The `sample` output is the
-same in all three captured traces and in the minimal reproducer:
+The lock is process-global, so the two need not be interacting through Julia at all — which is why block
+size, memory pressure and the multi-configuration harness are all irrelevant to it.
 
-```
-sampler:    jl_profile_thread_mach (signals-mach.c:797) -> pthread_mach_thread_np
-              -> _os_unfair_lock_lock_slow -> __ulock_wait2          [blocked]
-collector:  ijl_gc_collect -> jl_safepoint_end_gc (safepoint.c:232)
-              -> jl_mach_gc_end (signals-mach.c:97) -> pthread_mach_thread_np
-others:     10 threads at jl_safepoint_start_gc
-```
+**The traces say exactly this, and the offsets are the evidence.** Only ever *two* threads are inside
+`pthread_mach_thread_np`, at different offsets and with different frames beneath:
+
+| thread | offset | frame beneath | reading |
+|---|---|---|---|
+| sampler (`jl_profile_thread_mach:797`) | `+56` in every trace | `_os_unfair_lock_lock_slow` → `__ulock_wait2` | **blocked acquiring** the lock |
+| victim (`jl_mach_gc_end:97`) | `+76`, `+164` — varies | **none** | **suspended holding** it, frozen at an arbitrary instruction |
+
+A blocked thread is always at the same instruction; a *suspended* one stops wherever it happened to be,
+which is why the victim's offset differs between traces and the sampler's never does. And **no thread is
+collecting** — zero frames matching `gc_mark`, `sweep` or `gc_scan` — so this is a collection that cannot
+finish rather than one taking a long time. Every remaining thread queues at `jl_safepoint_start_gc` behind
+it.
 
 **Reproduced without AutoRIFT.** `tools/golden/profiler_gc_deadlock.jl` is allocation churn on every
 thread while `Profile` samples at 0.5 ms — no imagery, no correlation:
@@ -2696,22 +2708,23 @@ julia -t 10,1 tools/golden/profiler_gc_deadlock.jl off       # always completes
 julia -t 10,1 tools/golden/profiler_gc_deadlock.jl profile   # hangs ~2 runs in 5
 ```
 
-Measured 2 hangs in 5 attempts, at rounds 25 and 106 of 200, with the identical stack signature; the
-control arm runs the same workload without the profiler and has never hung. **It is a race, so one clean
-run proves nothing** — which is exactly the trap that made the first occurrence look contention-dependent
-after it completed on a retry.
+Measured 2 hangs in 5 attempts, at rounds 25 and 106 of 200, with the same two-thread signature; the
+control arm runs the same workload unprofiled and has never hung. **It is a race, so one clean run proves
+nothing** — which is exactly the trap that made the first occurrence look contention-dependent after it
+completed on a retry.
 
 **Fixed upstream, but not in any release yet.** `ca49fc2e2` ("[macOS] Handle GC safepoint on-thread",
-2026-03-17) deletes `jl_mach_gc_end` and the `suspended_threads` list outright, handling the safepoint on
-the signalled thread instead of suspending from outside. Checked against the tags: `jl_mach_gc_end` is
-still present in v1.12.5, v1.12.6, v1.13.0-beta1, v1.13.0-rc1 and v1.13.0, and gone in 1.14-DEV. It has
-not been backported to `release-1.12` or `release-1.13`.
+2026-03-17) deletes `jl_mach_gc_end` and the `suspended_threads` list outright and handles the safepoint on
+the signalled thread — so no thread calls `pthread_mach_thread_np` to resume another, and step 1 above
+cannot happen. Checked against the tags: `jl_mach_gc_end` is still present in v1.12.5, v1.12.6,
+v1.13.0-beta1, v1.13.0-rc1 and v1.13.0, and gone in 1.14-DEV. Not backported to `release-1.12` or
+`release-1.13`.
 
-**What this means for the measurements.** Nothing in the recorded figures is suspect: the peaks and
-runtimes come from unprofiled runs, and a hang costs an attribution rather than a measurement. It does
-mean the profiled arm of a long threaded run on macOS may need retrying, and that `profile_nisar.jl`'s
-split between a timed run and a separately profiled one is load-bearing rather than tidiness. Production
-is unaffected — a worker that does not profile cannot reach this path.
+**What this means for the measurements.** Nothing in the recorded figures is suspect: peaks and runtimes
+come from unprofiled runs, and a hang costs an attribution rather than a measurement. It does mean the
+profiled arm of a long threaded run on macOS may need retrying, and that `profile_nisar.jl`'s split
+between a timed run and a separately profiled one is load-bearing rather than tidiness. Production is
+unaffected — a worker that does not profile never starts the sampler thread.
 
 ## Step: the L2 block-size sweep, and what a threaded whole-granule run actually costs
 
