@@ -517,6 +517,100 @@ function report_agreement(results)
     return nothing
 end
 
+# ---------------------------------------------------------------------------
+# The history, which is append-only
+# ---------------------------------------------------------------------------
+#
+# One file per case, holding **every** row ever measured for it rather than the last run's rows.
+#
+# Writing the run's own results and nothing else loses the sweep: a five-configuration run followed by a
+# one-configuration re-measurement of a single block size leaves a file describing only that size, and
+# the four other rows exist afterwards solely in whatever console log the caller happened to keep. That
+# is how the untiled, 8192, 6144 and 4096 rows of the first L2 sweep came to survive only in a scratch
+# log. Appending costs nothing and the rows are small once the trace is dropped.
+#
+# A row carries its own `stamp` and `commit`, so a re-measurement is a new row beside the old one rather
+# than a replacement, and two rows that disagree can be told apart by when and at what code they were
+# taken. `render_history` prints the newest row per block size, which is the reading a caller wants,
+# while the superseded ones stay on disk.
+
+history_path(c::GoldenCase) =
+    joinpath(TRACE_DIR, "prof_$(first(split(c.product, "_X_"))).jls")
+
+"""
+    save_results(c::GoldenCase, results) -> String
+
+Append `results` to `c`'s measurement history and print the table of everything measured so far.
+
+The `DisplacementField`s, the `MemTrace` and the `ProfileScan` struct are all dropped: a record holding
+them could not be deserialized without loading this script, which runs a measurement on include. What
+is kept is the figures already extracted from the trace plus the scan as plain fields, so a reader needs
+nothing but `Serialization`.
+"""
+function save_results(c::GoldenCase, results)
+    mkpath(TRACE_DIR)
+    path = history_path(c)
+    stamp = Libc.strftime("%Y-%m-%dT%H:%M:%S", time())
+    commit = try
+        readchomp(`git -C $(dirname(dirname(@__DIR__))) rev-parse --short HEAD`)
+    catch
+        "unknown"
+    end
+    plain = map(results) do r
+        base = Base.structdiff(r, (; dx = 0, dy = 0, trace = 0, scan = 0))
+        scan = isnothing(r.scan) ? nothing :
+               (; fill = r.scan.fill, delay = r.scan.delay,
+                samples = r.scan.result.samples, idle = r.scan.result.idle,
+                sleeping = r.scan.result.sleeping, gc = r.scan.result.gc,
+                span = r.scan.result.span, stacks = r.scan.result.stacks)
+        return (; base..., scan, stamp, commit)
+    end
+    # Read-then-write rather than opening in append mode: `Serialization` writes one value per stream,
+    # so appending bytes would produce a file whose second value a single `deserialize` never sees.
+    old = isfile(path) ? deserialize(path) : []
+    all = vcat(old, plain)
+    serialize(path, all)
+    @printf("\nwrote %s — %d new row%s, %d in history\n",
+            path, length(plain), length(plain) == 1 ? "" : "s", length(all))
+    render_history(all)
+    return path
+end
+
+"""
+    render_history(rows)
+
+Print every measured configuration, newest measurement per block size, with absolute figures.
+
+Ratios alone cannot be read as a cost — an instance is sized from minutes and GiB — so runtime and peak
+are printed in the units they are budgeted in, with the ratio beside them rather than instead of them.
+"""
+function render_history(rows)
+    isempty(rows) && return nothing
+    # Newest row per block size, by position: `vcat` appends, so the last occurrence is the newest.
+    latest = Dict{Any,Any}()
+    for r in rows
+        latest[r.block] = r
+    end
+    keep = sort!(collect(values(latest)); by = r -> (r.block == (0, 0) ? 0 : -prod(r.block)))
+    base = get(latest, (0, 0), nothing)
+    println("\nevery configuration measured for this case (newest per block size):")
+    @printf("  %-14s %7s %9s %9s %9s %7s %8s %9s  %s\n",
+            "block", "blocks", "runtime", "vs untiled", "peak GiB", "vs unt", "occ/thr", "read amp",
+            "measured")
+    for r in keep
+        rt = r.clean_seconds
+        pk = r.peak / 2^30
+        @printf("  %-14s %7d %7.1f s %9s %9.2f %7s %5.2f/%-2d %8.2fx  %d\n",
+                block_label(r.block), r.nblocks, rt,
+                isnothing(base) ? "—" : @sprintf("%.2fx", rt / base.clean_seconds),
+                pk, isnothing(base) ? "—" : @sprintf("%.2fx", pk / (base.peak / 2^30)),
+                r.clean_occupancy, r.nthreads, r.readamp, r.measured)
+    end
+    n = length(rows) - length(keep)
+    n > 0 && @printf("  (%d superseded row%s also on disk)\n", n, n == 1 ? "" : "s")
+    return nothing
+end
+
 function main()
     isempty(ARGS) && error("usage: profile_nisar.jl <product-fragment> " *
                           "[--blocks 0,3072,2304x1152] [--run N] [--no-profile]")
@@ -525,25 +619,7 @@ function main()
     blocks = parse_block.(split(argvalue("--blocks", "3072"), ','))
     results = measure_case(c; blocks, n, profile = !("--no-profile" in ARGS))
     report_agreement(results)
-    mkpath(TRACE_DIR)
-    # The fields go (they are the bulk), and so do the `MemTrace` and `ProfileScan` structs: a record
-    # holding them cannot be deserialized without loading this script, which defines `main` and would
-    # re-run the measurement. The trace is reduced to the figures already extracted from it and the
-    # scan to plain fields, so a reader needs nothing but `Serialization`.
-    tag = get(ENV, "AUTORIFT_PROFILE_TAG", "")
-    path = joinpath(TRACE_DIR,
-                    "prof_$(first(split(c.product, "_X_")))$(isempty(tag) ? "" : "_" * tag).jls")
-    plain = map(results) do r
-        base = Base.structdiff(r, (; dx = 0, dy = 0, trace = 0, scan = 0))
-        scan = isnothing(r.scan) ? nothing :
-               (; fill = r.scan.fill, delay = r.scan.delay,
-                samples = r.scan.result.samples, idle = r.scan.result.idle,
-                sleeping = r.scan.result.sleeping, gc = r.scan.result.gc,
-                span = r.scan.result.span, stacks = r.scan.result.stacks)
-        return (; base..., scan)
-    end
-    serialize(path, plain)
-    @printf("\nwrote %s\n", path)
+    save_results(c, results)
     return nothing
 end
 

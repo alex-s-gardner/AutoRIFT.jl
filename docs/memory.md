@@ -246,17 +246,43 @@ than an error in either — 64% of that grid is nodata fill, and `_searchable_sp
 searchable point an empty read window, so a third of the predicted reads never happen. Use the formula as
 an upper bound on a partly-filled grid.
 
-Both sweeps at 10 worker threads, both bit-identical across sizes, peak normalized to each case's own
-untiled run:
+Both sweeps at 10 worker threads, both bit-identical across sizes. Absolute figures, because a ratio is
+not a cost — an instance is sized from GiB and a schedule from minutes; ratios are against each case's own
+untiled row.
 
-| blocks/thread | optical: peak | runtime | | NISAR L2: peak | runtime | occupancy |
-|---|---:|---:|---|---:|---:|---:|
-| 0.1 (untiled) | 1.00× | 1.00× | | 1.00× | 1.00× | 6.06 / 10 |
-| ~1 | 3.00× | 2.05× | | — | — | — |
-| ~10 | 0.63× | 1.19× | | 0.56× | 1.79× | **2.96 / 10** |
-| ~30 | **0.43×** | **1.10×** | | 0.47× | 1.14× | 5.17 / 10 |
-| ~65–110 | 0.45× | 1.09× | | 0.35× | 0.88× | 7.87 / 10 |
-| ~230–420 | 0.41× | 1.17× | | **0.34×** | **0.83×** | **9.03 / 10** |
+| blocks/thread | optical block | peak MiB | runtime | | NISAR block | peak GiB | runtime | occupancy |
+|---|---|---:|---:|---|---|---:|---:|---:|
+| 0.1 (untiled) | untiled | 4958 (1.00×) | 20.5 s (1.00×) | | untiled | 85.0 (1.00×) | 6.2 min (1.00×) | 6.06 / 10 |
+| ~1 | 8192 px | 14856 (3.00×) | 42.0 s (2.05×) | | — | — | — | — |
+| ~10 | 2048 px | 3116 (0.63×) | 24.4 s (1.19×) | | 8192 px | 47.8 (0.56×) | 11.2 min (1.79×) | **2.96 / 10** |
+| ~30 | **1024 px** | **2140 (0.43×)** | **22.6 s (1.10×)** | | 4096 px | 40.1 (0.47×) | 7.1 min (1.14×) | 5.17 / 10 |
+| ~65–115 | 512 px | 2248 (0.45×) | 22.3 s (1.09×) | | 2304 px | 30.0 (0.35×) | 5.5 min (0.88×) | 7.87 / 10 |
+| ~230–420 | 256 px | 2042 (0.41×) | 24.0 s (1.17×) | | **2304×1152 px** | **28.8 (0.34×)** | **5.2 min (0.83×)** | **9.03 / 10** |
+
+The rows are paired by blocks per thread rather than by block size, since that is the axis the two cases
+share; the optical 4096/6144 and NISAR 3072/6144 rows are omitted from the pairing and appear in each
+case's own table. Every figure here is reproducible from the measurement history — see below.
+
+### Where these measurements are kept
+
+Every row above is on disk, not only in this document.
+
+- **`benchmark/results/nisar/sweep_*.log`** — the console logs of each NISAR sweep, in the repository.
+  These carry the per-stack profile attribution and the progress of each run, and they are the primary
+  record: a figure quoted here should be traceable to one of them.
+- **`$AUTORIFT_GOLDEN_CACHE/mem/prof_<case>.jls`** — an **append-only** history, one file per case,
+  holding every row ever measured for it. `profile_nisar.jl` appends to it and prints the whole table at
+  the end of a run, so a one-configuration re-measurement no longer hides the sweep it belongs to. Each
+  row carries the timestamp and short commit it was taken at, so two rows that disagree can be told
+  apart. Outside the repository because the traces are large and the imagery they describe is larger.
+- **`tools/golden/backfill_history.jl`** recovers rows from a console log into that history.
+
+**It used to overwrite rather than append, and that lost the first L2 sweep.** The file was keyed on the
+case alone and written with just the finishing run's rows, so re-measuring 3072 px on its own replaced a
+five-row sweep with one row; the untiled, 8192, 6144 and 4096 rows survived only because their console
+output happened to be kept, and were parsed back out of it. A measurement that costs an hour of machine
+time should not be destroyed by the next one-line command, which is why the history is append-only and
+why the logs are committed rather than left in a scratch directory.
 
 **Three things hold on both, and they are the transferable rules.**
 
