@@ -1,7 +1,8 @@
 # Memory
 
-Measured on an Apple M2 Max, Julia 1.12.5, against autoRIFT v2.1.2 under Python 3.11. Reproduce
-with `julia --project=benchmark benchmark/memory.jl` and
+Measured on an Apple M2 Max against autoRIFT v2.1.2 under Python 3.11, on Julia 1.12.5 — the toolchain
+has since moved to 1.13.0, which leaves the S2B untiled point count unchanged at 612,607 but has not been
+used to re-time any row here. Reproduce with `julia --project=benchmark benchmark/memory.jl` and
 `mamba run -n arift-ref python tools/python_ref/bench_reference.py`.
 
 Runtime was M8's subject. This is the other axis, and it matters for a specific reason: AutoRIFT is

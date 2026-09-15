@@ -8,7 +8,10 @@ a regression to fix rather than a number to update.
 implementations. This records what has been *verified at a commit*, which is a different claim and the
 one that decays. A gate whose command cannot be re-run is not a gate.
 
-Machine: Apple M2 Max, 12 cores, macOS 26.5.2, Julia 1.12.5. Reference: autoRIFT 2.1.1 in
+Machine: Apple M2 Max, 12 cores, macOS 26.5.2. Julia 1.12.5 for every row recorded below; the
+toolchain has since moved to **1.13.0**, on which the suite passes 704,363/704,363 and the untiled
+point count on the S2B case is unchanged at 612,607. Re-measure before quoting a *runtime* against the
+new toolchain. Reference: autoRIFT 2.1.1 in
 `micromamba -n arift-ref`, whose `autoRIFT.py` is byte-identical to the pinned v2.1.2; container
 `ghcr.io/asfhyp3/hyp3-autorift:0.28.4` for the golden cases.
 
