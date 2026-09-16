@@ -384,10 +384,12 @@ moves the halo only 2216 → 1711 px.
 
 | case | block | blocks | runtime | peak | vs untiled | read amp |
 |---|---|---:|---:|---:|---:|---:|
-| L1 RSLC, 57760×50511 | untiled | 1 | 10.9 min | **55.2 GiB** | 1.00× | 1.00× |
-| | 16384 px | 100 | — | 68.6 GiB | 1.24× | 2.89× |
-| | 8192 px | 380 | 41.1 min† | 34.8 GiB | 0.63× | 4.51× |
-| | 4096 px | 1482 | 45.0 min† | **31.5 GiB** | 0.57× | 8.77× |
+| L1 RSLC, 57760×50511 | untiled | 1 | **9.5 min** | 49.4 GiB | 1.00× | 1.00× |
+| | 16384 px | 100 | 30.9 min | 59.6 GiB | 1.21× | 2.89× |
+| | 8192 px | 380 | 18.0 min | 33.9 GiB | 0.69× | 4.51× |
+| | 8192×4096 px | 760 | 13.8 min | 30.4 GiB | 0.62× | 6.42× |
+| | 4096 px | 1482 | 11.0 min | 27.7 GiB | 0.56× | 8.77× |
+| | 2816×1536 px | 5814 | 12.7 min | **24.4 GiB** | **0.49×** | 21.60× |
 | L2 GSLC, 54885×110085 | untiled | 1 | 6.2 min | **85.0 GiB** | 1.00× | 1.00× |
 | | 8192 px | 98 | 11.2 min | 47.8 GiB | 0.56× | 0.86× |
 | | 6144 px | 162 | 6.2 min | 45.7 GiB | 0.54× | 1.00× |
@@ -396,7 +398,21 @@ moves the halo only 2216 → 1711 px.
 | | 2304 px | 1152 | 5.5 min | 30.0 GiB | 0.35× | 2.26× |
 | | 2304×1152 px | 2304 | **5.2 min** | **28.8 GiB** | **0.34×** | 3.30× |
 
-† shared the machine with another large job; peak RSS is insensitive to that where wall clock is not.
+The L1 rows are re-measured with the fixed harness on an otherwise idle machine; the L2 rows are the
+earlier sweep. **Every earlier L1 timing was invalid, and by my own hand rather than the machine's**: the
+figures they replace came from runs I was concurrently `sample`-ing or loading captures beside. `sample`
+suspends every thread to unwind it, which on a 34 GiB ten-thread process inflated one untiled row from
+~580 s to 2592 s — 4.5×. Two clean back-to-back runs give 587.1 s and 575.5 s, so untiled is ~570 s
+reproducible to 2%. **Do not observe a row while it runs**; poll with `ps` and nothing heavier.
+
+**L1 agrees with L2 after all: smaller blocks win, and blocking is not a loss here.** 4096 px runs at
+0.56× the untiled peak for 1.17× the runtime, and 2816×1536 reaches **0.49×** peak. An earlier reading of
+this case — that blocking is a pure loss on L1 — was an artifact of the invalid timings above.
+
+**16384 px is the one bad configuration, and occupancy says why.** 100 blocks over 10 threads run at
+**2.33 of 10 threads** against 9.21 untiled and 8.94 at 4096 px, because L1's radius field puts 47% of
+all the work in a single block (median radius 34 against a maximum of 1905). Blocking cannot balance a
+pool of 10 blocks per thread when one block is half the scene's cost.
 
 **L2 is the case that makes blocking a production requirement, and the right block size is the
 smallest shape the halo permits.** 2304×1152 px runs the granule in **28.8 GiB and 5.2 minutes** against
@@ -486,20 +502,54 @@ alone suggests. On L2 the highest-amplification row measured is also the fastest
 reading is cheap next to leaving threads idle, so the halo tells you the smallest block you may use and
 the thread count tells you which of the permitted sizes to pick.
 
+## Transform sizes are already quantized, and coarsening costs more than it saves
+
+The count of distinct FFT sizes a NISAR pass plans looks alarming until it is measured properly. Distinct
+*raw* `(radius_x, radius_y)` pairs on the L1 grid number **29,761** — but that is not what gets planned.
+[`AutoRIFT._radius_bucket`](@ref) rounds every radius up to a power of two and caps it at the pass radius,
+so the ladder actually reached is **37 sizes** on L1 and 44 on L2, each reused by tens of thousands of
+points. Nine rungs per axis: 8, 16, 32 … 1024, cap.
+
+Two alternative ladders measured against the shipping one, on a 400×400 window of the L1 grid
+(`tools/golden/fft_ladder_test.jl`):
+
+| ladder | plan sizes reached | runtime | vs shipping |
+|---|---:|---:|---:|
+| powers of two — ships | 25 | **363.3 s** | **1.00×** |
+| every second power of two | 10 | 452.1 s | 1.24× |
+| multiples of 4 | 25† | 462.0 s | 1.27× |
+
+**Both alternatives are slower, and for opposite reasons.** Coarsening to every second power of two more
+than halves the ladder and still loses 24%, because a coarser rung makes a point compute a *larger*
+transform than it needs — the saving in planning is smaller than the waste in execution. Going finer, to
+multiples of 4, loses 27% while admitting far more plans: 476 × 207 possible size pairs on L1 against the
+power-of-two ladder's 9 × 8.
+
+So the ladder is not the lever. Planning is already amortized — the wisdom file turns three cold plans
+from 822 ms into 0.1 ms — and what remains is execution cost, which a coarser ladder increases.
+
+† The harness rewrites radii and hands them to the unmodified correlator, whose own `_radius_bucket`
+re-rounds to powers of two, so this row measures the *cost* of finer radii rather than the plan count a
+real interval-4 implementation would carry. That cost is the half that matters; the plan count only gets
+worse.
+
 ## Practical guidance
 
 - **Batch work: one pair per process or per worker, `threaded = false`.** Also 2.7× faster than
   intra-pair threading (`benchmark/suite/throughput.jl`), so this is not a tradeoff.
-- **`process_block_size = (1024, 1024)` when peak memory matters**, and go as small as the halo allows.
-  A block smaller than its own halo is rejected, which is the only floor; within what a granule permits,
-  the smallest shape is both the lowest peak and the fastest run.
-- **Size the two axes separately against `halo(grid, p, size)`.** A 2:1 halo wants a 2:1 block; a square
-  one wastes half of the short axis. On NISAR L2 that is `(2304, 1152)`, which beats `(3072, 3072)` on
-  peak, runtime and occupancy at once.
-- **Aim for hundreds of blocks per thread, not tens.** Blocks are the unit of threaded work and their
-  cost varies by orders of magnitude, so a small pool waits on its slowest members: 9.8 blocks/thread
-  runs at 3.0 threads of ten, 64.8 at 6.8 and 230.4 at 9.0. Occupancy was still improving at the smallest
-  size measured.
+- **`process_block_size = (1024, 1024)` when peak memory matters**, and go small — but not to the floor.
+  Peak falls monotonically as blocks shrink; runtime does not. On NISAR L1 the lowest peak is
+  `(2816, 1536)` at 0.49× untiled while the fastest blocked row is `4096` square, 13% quicker for 3 GiB
+  more. Pick by which resource binds.
+- **Size the two axes separately against `halo(grid, p, size)`.** A block below its own halo is rejected,
+  and the halo need not be square: L2's is 2216×1103, so `(2304, 1152)` follows it and beats
+  `(3072, 3072)` on peak, runtime and occupancy at once. That is the floor, not the target.
+- **Aim for at least ~100 blocks per thread.** Blocks are the unit of threaded work and their cost varies
+  by orders of magnitude, so a small pool waits on its slowest member. Measured occupancy of ten threads:
+  10 blocks/thread → **2.3**, 38 → 4.6, 76 → 6.6, 148 → **8.9**. Past ~150 the gain flattens and read
+  amplification keeps rising, which is why L1's 581 blocks/thread row is slower than its 148.
+- **Do not tune the FFT transform-size ladder.** It is already power-of-two quantized to a few dozen
+  sizes; both coarser and finer ladders measure slower. See the section above.
 - **Reuse a `Cache` across pairs** via `init`/`reinit!`/`autorift!`. The live heap is flat, so this
   is bounded regardless of batch length.
 - **No process recycling needed** — the measurement above is what establishes that.

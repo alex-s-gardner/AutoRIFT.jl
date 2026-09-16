@@ -2552,6 +2552,10 @@ would be sized from. Measured at `-t 10` on an M2 Max with 96 GiB, whole grid, o
 | 8192 px | 380 | 41.1 min | 34.8 GiB | 0.63x | 4.51x | 1,797,076 |
 | 4096 px | 1482 | 45.0 min | **31.5 GiB** | 0.57x | 8.77x | 1,797,076 |
 
+**Superseded — see "Step: the L1 sweep, re-measured on an idle machine" below.** Every runtime in this
+table is inflated, and every peak is a few GiB high, because these rows shared the machine with other work.
+The re-measured figures are 9.5 min untiled and 24.4-30.9 min across the blocked rows.
+
 **The peaks are the measurement; the blocked runtimes are upper bounds.** Those two rows were re-measured
 after `_index_rate` was corrected, on a machine that was also running the L2 job for part of their life. An
 earlier uncontended pass over the same block sizes — at the flawed rates, so a slightly different partition
@@ -2855,3 +2859,98 @@ indistinguishable from their output alone, so check `ps` for a 0%-CPU survivor b
 The row was re-measured as the only configuration in a fresh process, at 347.6 s against 340.9 in the
 sweep, so the figures are sound. Nothing about the shared-process design is implicated — the cause is the
 profiler, and the sweep merely profiled for long enough to hit a race.
+
+## Step: the L1 sweep, re-measured on an idle machine
+
+Six configurations on NISAR L1 RSLC, whole grid, `-t 10,1`, one process each, `--no-profile`. Command:
+
+```bash
+for bs in 0 16384 8192 4096 8192x4096 2816x1536; do
+  julia --project=tools/golden -t 10,1 tools/golden/profile_nisar.jl \
+      NISAR_L1_PR_RSLC --blocks $bs --no-profile
+done
+```
+
+Scene 57760x50511 px, grid 2328x2304, halo **2736x1500 px**, 1,871,119 searchable points. The square block
+floor is 2736; per-axis it is 2736x1500, so `2816x1536` is essentially the smallest legal block.
+
+| block | blocks | blocks/thread | runtime | vs untiled | peak | vs untiled | occupancy | read amp | measured |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| untiled | 1 | — | **567.2 s** | 1.00x | 49.36 GiB | 1.00x | **9.21 / 10** | 1.00x | 1,798,199 |
+| 16384 px | 100 | 10 | 1852.3 s | 3.27x | 59.58 GiB | 1.21x | **2.33 / 10** | 2.89x | 1,797,136 |
+| 8192 px | 380 | 38 | 1078.4 s | 1.90x | 33.85 GiB | 0.69x | 4.61 / 10 | 4.51x | 1,797,076 |
+| 8192x4096 px | 760 | 76 | 828.0 s | 1.46x | 30.41 GiB | 0.62x | 6.60 / 10 | 6.42x | 1,797,076 |
+| **4096 px** | 1482 | 148 | **661.5 s** | **1.17x** | 27.72 GiB | 0.56x | **8.94 / 10** | 8.77x | 1,797,076 |
+| 2816x1536 px | 5814 | 581 | 762.5 s | 1.34x | **24.43 GiB** | **0.49x** | 9.03 / 10 | 21.60x | 1,797,026 |
+
+**L1 agrees with L2 after all.** An earlier reading of this case — that blocking is a pure loss here —
+came from invalid timings (below). Blocking halves the peak: 4096 px runs at 0.56x untiled for 1.17x the
+runtime, and 2816x1536 reaches 0.49x. What differs from L2 is only that L1's untiled row is *fast*, at
+9.21/10 occupancy, so no blocked row beats it on wall clock.
+
+**The two resources disagree, which they did not on L2.** Peak falls monotonically with block size all the
+way to the floor, but runtime bottoms out at 4096 px and rises again by 2816x1536 — read amplification
+reaches **21.6x** there, and paying 21x the I/O eventually outruns the occupancy gain. So on L1 the answer
+depends on which resource binds: 4096 px for speed, 2816x1536 for memory.
+
+**16384 px is the one configuration that is bad on both axes**, at 1.21x the peak and 3.27x the runtime.
+Occupancy explains it: **2.33 of 10 threads**. With 100 blocks over 10 threads and L1's radius field
+putting an estimated 47% of all correlation work in a single block — median radius 34 against a maximum of
+1905 — the pool cannot balance. The same arithmetic gives 25% in one block at 8192 px, and by 4096 px the
+imbalance is diluted enough that occupancy reaches 8.94.
+
+### Every earlier L1 timing was invalid, and the harness was not at fault
+
+Three attempts produced three different untiled figures before this one. None of the spread was the
+configuration, the machine, or FFTW wisdom; all of it was **me observing the run**:
+
+| untiled measurement | concurrent activity | result |
+|---|---|---|
+| first sweep | two scripts each `read_capture`-ing the same 12 GB NISAR capture | 649.8 s |
+| "quiet" sweep | my own `sample` calls, twice, on the live process | **2592.1 s** |
+| reproducibility test, run 1 | nothing | 587.1 s |
+| reproducibility test, run 2 | nothing | 575.5 s |
+| this sweep | nothing | 567.2 s |
+
+`sample` suspends every thread to unwind it. On a 34 GiB ten-thread process, calling it twice inflated the
+row **4.5x** — and the process looked healthy at every check, because it was: it was being stopped and
+restarted thousands of times by the observer. The three clean measurements agree to 3.5%.
+
+**Wisdom was ruled out explicitly**, since it was the leading hypothesis. Two whole-grid runs inside one
+process — where nothing but FFTW planning state can differ — measured 587.1 s and 575.5 s with the wisdom
+file byte-identical (324,653 bytes) before and after both. `benchmark/results/nisar/l1_reproducibility.log`.
+
+The rule this establishes: **poll a running measurement with `ps` or `pgrep` and nothing heavier.** A
+`sample` is a measurement of its own and cannot be taken during one.
+
+## Step: whether fewer FFT transform sizes would help — measured, and it does not
+
+The premise checked first, because it was wrong in a way that matters. Distinct *raw* `(radius_x, radius_y)`
+pairs on the NISAR L1 grid number **29,761**, and an earlier note in this session quoted that as the number
+of FFT plans a pass builds. It is not: `AutoRIFT._radius_bucket` rounds every radius up to a power of two
+and caps it at the pass radius, so the ladder actually reached is **37 sizes** on L1 and 44 on L2 — nine
+rungs per axis (8, 16, 32 … 1024, cap), each reused by tens of thousands of points.
+
+So the ladder is already quantized far more aggressively than "intervals of 4", which would admit 476 x 207
+size pairs on L1 against 9 x 8. Three ladders measured on a 400x400 window of the L1 grid
+(`tools/golden/fft_ladder_test.jl`):
+
+| ladder | sizes reached | runtime | vs shipping | measured points |
+|---|---:|---:|---:|---:|
+| powers of two — **ships** | 25 | **363.3 s** | **1.00x** | 128,675 |
+| every second power of two | 10 | 452.1 s | 1.24x | 127,008 |
+| multiples of 4 | 25† | 462.0 s | 1.27x | 130,564 |
+
+**Both alternatives lose, for opposite reasons.** Halving the ladder to every second power of two still
+costs **24%**: a coarser rung makes a point execute a *larger* transform than it needs, and that waste
+exceeds the planning it saves. Going finer, to multiples of 4, costs **27%** while admitting far more plans.
+The shipping ladder is at the minimum of a real tradeoff rather than an arbitrary choice.
+
+The reason there is nothing to win: planning is already amortized to nothing. The wisdom file turns three
+cold plans from 822 ms into 0.1 ms, and it is per-size-per-machine, so a production worker pays it once
+ever. What remains is execution, which a coarser ladder makes worse.
+
+† The harness rewrites the radii and hands them to the *unmodified* correlator, whose own `_radius_bucket`
+re-rounds to powers of two — so this row measures the cost of feeding the correlator finer radii, not the
+plan count a real interval-4 implementation would carry. The cost is the half that decides the question;
+the plan count only moves against it.

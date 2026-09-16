@@ -8,6 +8,32 @@ Each log carries what the serialized row does not: the per-stack profile attribu
 printed before each run, and the progress of the run itself. `docs/memory.md` quotes these; a figure there
 should be traceable to a line here.
 
+### L1 RSLC (re-measured on an idle machine)
+
+| log | configuration | runtime | peak | occupancy |
+|---|---|---:|---:|---:|
+| `l1_0.log` | untiled | 567.2 s | 49.36 GiB | 9.21/10 |
+| `l1_16384.log` | 16384 px | 1852.3 s | 59.58 GiB | 2.33/10 |
+| `l1_8192.log` | 8192 px | 1078.4 s | 33.85 GiB | 4.61/10 |
+| `l1_8192x4096.log` | 8192x4096 px | 828.0 s | 30.41 GiB | 6.60/10 |
+| `l1_4096.log` | 4096 px — fastest blocked | 661.5 s | 27.72 GiB | 8.94/10 |
+| `l1_2816x1536.log` | 2816x1536 px — lowest peak | 762.5 s | 24.43 GiB | 9.03/10 |
+
+Timed arm only (`--no-profile`): the profiled arm doubles the cost and can hit the runtime deadlock, and
+peak, runtime, occupancy and read amplification all come from the timed arm.
+
+`l1_reproducibility.log` — two whole-grid untiled runs in one process (587.1 s, 575.5 s), which is what
+ruled FFTW wisdom out as the cause of the earlier timing spread.
+
+`l1_fft_ladder.log` — three FFT transform-size ladders compared. The shipping power-of-two ladder wins;
+coarser costs 24%, multiples of 4 cost 27%.
+
+**Do not observe a row while it runs.** Three earlier L1 sweeps were invalidated by concurrent activity,
+the worst of it a `sample` on the live process, which inflated one untiled row 4.5x. Poll with `ps` or
+`pgrep` only.
+
+### L2 GSLC
+
 | log | configurations | note |
 |---|---|---|
 | `sweep_l2b.log` | untiled, 8192, 6144, 4096, 3072 px | one process; **deadlocked** during the 3072 px profile, so that row is absent |

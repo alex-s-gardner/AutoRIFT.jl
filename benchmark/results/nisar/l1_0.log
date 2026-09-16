@@ -1,0 +1,19 @@
+NISAR_L1_PR_RSLC_003_170_D_053_7700_SHNA_A_20251028T235201_20251028T235238_X05009_N_P_J_001_X_NISAR_L1_PR_RSLC_007_170_D_053_7700_SHNA_A_20251215T235203_20251215T235240_X05009_N_P_J_001_G0120V02_P094
+  scene 57760 x 50511 px, grid 2328 x 2304, halo 2736 x 1500 px, 1871119 searchable points, 10 threads
+  warmup: 128 x 128 grid patch at (551, 1361), 16384 searchable points, 3.3 s compiling
+  untiled          567.2 s clean
+  untiled             1 blocks    567.2 s  peak    49.36 GiB (22.84 above floor)  readamp  1.00x  measured 1798199
+      resident peak 49.44 GiB   live peak 50.02 GiB   live at end 48.61 GiB   floor 26.52 GiB
+      allocated 156.0 GiB   GC 1.1 s (0.2% of wall) in 60 pauses, 15 full
+      occupancy 9.21 of 10 threads (92%)   cpu 5225 s over 567 s wall
+      buffer prediction: 18 B/px x 57760 x 50511 px window x 1 tasks = 48.9 GiB
+
+agreement against the untiled run:
+
+wrote /Users/gardnera/data/autorift/tests/golden_tests/mem/prof_NISAR_L1_PR_RSLC_003_170_D_053_7700_SHNA_A_20251028T235201_20251028T235238_X05009_N_P_J_001.jls — 1 new row, 3 in history
+
+every configuration measured for this case (newest per block size):
+  block           blocks   runtime vs untiled  peak GiB  vs unt  occ/thr  read amp  measured
+  16384 px           100  2067.3 s     3.64x     69.05   1.40x  2.80/10     2.89x  1797136
+  untiled              1   567.2 s     1.00x     49.36   1.00x  9.21/10     1.00x  1798199
+  (1 superseded row also on disk)

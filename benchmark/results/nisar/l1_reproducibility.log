@@ -1,0 +1,6 @@
+mode warm
+wisdom /Users/gardnera/.julia/scratchspaces/52cb0ed0-aa80-430c-bd04-c52888a79add/fftw_wisdom/Apple_M2_Max-fftw1.10.0.wisdom: 324653 bytes
+scene (57760, 50511), 10 threads
+
+run 1: wall    587.1 s   cpu   5307.0 s   occ  9.04/10   measured 1798199   wisdom 324653 bytes
+run 2: wall    575.5 s   cpu   5251.8 s   occ  9.13/10   measured 1798199   wisdom 324653 bytes

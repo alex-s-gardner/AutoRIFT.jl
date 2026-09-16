@@ -1,0 +1,9 @@
+sample (400, 400) of grid (2328, 2304), searchable 159652
+
+pow2 (ships)            25 sizes    363.26 s   measured 128675
+pow4 (coarser)          10 sizes    452.14 s   measured 127008
+int4 (asked)            25 sizes    462.00 s   measured 130564
+
+pow2 (ships)             1.00x the shipping ladder
+pow4 (coarser)           1.24x the shipping ladder
+int4 (asked)             1.27x the shipping ladder
