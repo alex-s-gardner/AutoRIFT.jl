@@ -48,7 +48,7 @@ include("reference.jl")
 include("intermediate.jl")
 
 using AutoRIFT
-using AutoRIFT: PointSet, params
+using AutoRIFT: PointSet, params, rebuild
 using Printf, Statistics
 
 """
@@ -133,6 +133,55 @@ function pointset_from_capture(k::Capture)
         fill(chip0, size(xg)), fill(round(Int, chip0 * scale_y), size(xg)),
         Int.(csmin), Int.(csmax),
     )
+end
+
+"""
+    _thin(grid::PointSet{2}, stride::Integer; block = 128) -> PointSet{2}
+
+`grid` with all but a scattered `1/stride^2` of its points marked skipped — `block`-sized square tiles
+on a `stride * block` lattice — for a comparison that costs a fraction of the whole scene.
+
+**Tiles, not a point lattice, because the correlator is not pointwise.** `filtDisp` and the
+level merge consult each point's neighbors, so a point whose neighbors are all skipped loses its
+base-level measurement to an interpolated one. Thinning to every 16th *point* on the L1 RSLC grid
+drives `exact` to **0.00%** against 73.90% on the whole grid and moves `dx` `bias_core` from +0.051 to
++0.109. A tile keeps each kept point's neighborhood.
+
+**Tiles rather than one window** because a NISAR grid is a rotated radar footprint on a map grid: the
+chip sizes, search radii and levels a point resolves at vary across it, and one window carries
+whichever mix its corner holds. Scattered tiles keep the mix roughly in proportion.
+
+**A thinned run's answers are its own, whatever the tiling.** A level's coarse grid is this grid
+decimated by 1, 2, 4, 8, and a thinned one can fall below the width its filter needs, at which point
+the level silently produces nothing — so the two sides resolve different level sets and the effect is
+not confined to a tile's border. On L1 at `stride = 4`, `exact` runs 16.81% at a 128-px tile, 9.41% at
+256 and 0.00% at 512, non-monotonically, on unchanged code. Compare a thinned run only against another
+at the same `stride` *and* `block`; `GATES.md` records the tiling every threshold was drawn at.
+
+The shape is preserved and points are dropped by zeroing their radius — the marker
+`pointset_from_capture` already uses for a point the reference skipped. Cropping the arrays instead
+would renumber the grid, and every coordinate here is one convention away from a plausible wrong
+answer.
+
+**Coverage is not comparable across a thinned run.** A zeroed point produces `NaN`, which
+`_axis_stats` cannot distinguish from a genuine no-measurement, so `only_reference` counts the
+thinned-out points too and rises by construction. Read `exact`, `bias_core` and `correlation` from a
+thinned run; read coverage from the whole grid only.
+"""
+function _thin(grid::PointSet{2}, stride::Integer; block::Integer = 128)
+    stride >= 1 || throw(ArgumentError("stride must be >= 1, got $stride"))
+    block >= 1 || throw(ArgumentError("block must be >= 1, got $block"))
+    # One `block`-wide tile per `stride * block` period along each axis. Tiles start from the array's
+    # own first index, so an offset axis tiles the way a 1-based one does.
+    tiles(d) = [s:min(s + block - 1, lastindex(grid.radius_x, d))
+                for s in firstindex(grid.radius_x, d):(stride * block):lastindex(grid.radius_x, d)]
+    keep = falses(axes(grid.radius_x))
+    for rows in tiles(1), cols in tiles(2)
+        keep[rows, cols] .= true
+    end
+    z = zero(eltype(grid.radius_x))
+    return rebuild(grid; radius_x = ifelse.(keep, grid.radius_x, z),
+                   radius_y = ifelse.(keep, grid.radius_y, z))
 end
 
 """
@@ -273,10 +322,12 @@ Run AutoRIFT.jl on the reference's own captured inputs and diff `dx`/`dy` agains
 Returns the per-axis statistics plus the coverage split, since a point one side answered and the
 other did not is a different finding from a point they both answered differently.
 """
-function compare_correlator(c::GoldenCase; n::Integer = 100)
+function compare_correlator(c::GoldenCase; n::Integer = 100, stride::Integer = 1,
+                            block::Integer = 128)
     k = read_capture(c; n)
 
     grid = pointset_from_capture(k)
+    stride > 1 && (grid = _thin(grid, stride; block))
     kw = kwargs_from_capture(k)
 
     a = k.arrays["in_I1"]
@@ -321,7 +372,7 @@ function compare_correlator(c::GoldenCase; n::Integer = 100)
         pick(pos, neg)
     end
 
-    return (; time = t, overlap = (ny, nx), dx = stats[1], dy = stats[2],
+    return (; time = t, overlap = (ny, nx), dx = stats[1], dy = stats[2], stride,
             julia_size = size(out.dx), reference_size = size(rdx), result = out, capture = k)
 end
 
@@ -387,6 +438,14 @@ end
 function report(r)
     @printf("\ncorrelated in %.1f s; grid julia %s, reference %s, compared %s\n",
             r.time, r.julia_size, r.reference_size, r.overlap)
+    # A thinned run's coverage columns are not the scene's, and they read as a coverage collapse to
+    # anyone who does not know the stride. Stated here rather than left to the reader: `_thin` marks the
+    # points it drops the same way the reference marks one it skipped, so they land in `only ref`.
+    if r.stride > 1
+        @printf("STRIDE %d: 1 point in %d searched. `only ref` counts the thinned-out points, so read\n\
+                 exact, bias core and corr here; read coverage from a whole-grid run.\n",
+                r.stride, r.stride^2)
+    end
     # The exact **count** beside the fraction, because the fraction is not comparable between runs whose
     # coverage differs — and coverage is one of the things being fixed. Measured on the S2A case: two
     # changes moved `exact` from 92.66% to 96.74% while the count moved by 37 points of 543,071, because
@@ -416,11 +475,16 @@ function report(r)
 end
 
 function main(args)
-    isempty(args) && error("usage: correlator.jl <product-name-fragment> [--run N]")
+    isempty(args) &&
+        error("usage: correlator.jl <product-name-fragment> [--run N] [--stride S] [--block B]")
     c = only(cases(args[1]))
     n = 100
     i = findfirst(==("--run"), args); i === nothing || (n = parse(Int, args[i + 1]))
-    report(compare_correlator(c; n))
+    stride = 1
+    j = findfirst(==("--stride"), args); j === nothing || (stride = parse(Int, args[j + 1]))
+    block = 128
+    b = findfirst(==("--block"), args); b === nothing || (block = parse(Int, args[b + 1]))
+    report(compare_correlator(c; n, stride, block))
     return nothing
 end
 

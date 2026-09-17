@@ -30,6 +30,14 @@ new toolchain. Reference: autoRIFT 2.1.1 in
 > so neither the sign convention nor the nodata fill crosses it. **`3.rdr` is 6 of 8** — cases 6 and 7
 > exceed its core-bias threshold, which is the one open red gate.
 
+**`regate.jl` covers all 22 cases: `3.opt` twelve optical, `3.rdr` eight radar, `3.nisar` both NISAR.**
+`3.nisar` runs a sixteenth of each NISAR grid (`--stride 4 --block 128`, ~1 minute a case), because a
+whole-grid NISAR run in `correlator.jl` is untiled and costs 5-10 minutes at a 49-61 GiB peak — the two
+cannot even run concurrently on this machine's 96 GiB. **Its thresholds are calibrated to the thinned
+grid and are not comparable to the whole-grid figures or to `3.rdr`'s bounds**; thinning changes which
+pyramid levels resolve, which is measured under "both NISAR cases re-measured whole-grid" at the end of
+this file. The whole-grid figures are a measurement there, not a gate.
+
 ## Gate 0 — the verified floor
 
 The agreement that predates the golden work. Everything else is built on it, so it is re-run first and
@@ -3018,3 +3026,85 @@ two coarsest chip levels (192×104 and 384×208 on L1). That is the per-block fo
 behaviour recorded in `tools/golden/README.md`, and it is block-size dependent — a smaller block reaches it
 at more levels. It costs the restricted pass's saving on those levels for the blocks affected, which is
 already inside the measured runtimes above rather than additional to them.
+
+## Step: both NISAR cases re-measured whole-grid on 1.13.0, and a NISAR gate
+
+The whole-grid endpoint on both cases, `-t 10`, run sequentially because `correlator.jl` is untiled and
+the two peaks do not fit 96 GiB together. Command:
+
+```
+julia --project=tools/golden -t 10 tools/golden/correlator.jl NISAR_L1_PR_RSLC --run 100
+julia --project=tools/golden -t 10 tools/golden/correlator.jl NISAR_L2_PR_GSLC --run 100
+```
+
+**The capture is run 100 on both cases.** L1 also has a `200/` directory, but it is empty — a run named
+without a capture in it fails in `read_capture` rather than falling back, so the number has to be right.
+
+| | L1 RSLC | ledger | L2 GSLC | ledger |
+|---|---:|---:|---:|---:|
+| both-measured | 1,786,566 | 1,786,566 | 1,751,658 | 1,751,658 |
+| `dx` exact | 73.91% (1,320,364) | 73.90% (1,320,352) | 72.20% (1,264,618) | 72.20% (1,264,646) |
+| `dy` exact | 73.86% (1,319,609) | 73.86% (1,319,603) | 75.34% (1,319,689) | 75.34% (1,319,639) |
+| `dx` correlation | +0.99972 | +0.99972 | +0.99890 | +0.99890 |
+| `dy` correlation | +0.99884 | +0.99884 | +0.99330 | +0.99330 |
+| `dx` bias core | +0.0513 | +0.051 | −0.1128 | −0.113 |
+| `dy` bias core | −0.0276 | −0.028 | −0.1259 | −0.126 |
+| tail >10 px | 27 `dx`, 0 `dy` | 78, 7 | 31 `dx`, 0 `dy` | 31, 0 |
+| only jl / only ref | 11,633 / 14,897 | 11,633 / 14,897 | 30,117 / 11,493 | 30,117 / 11,493 |
+| wall clock | **9m36s** | 6h30m on 8 threads | **4m52s** | 11h41m on 1 thread |
+| peak RSS | 49.0 GiB | — | 60.7 GiB | — |
+
+**Every agreement statistic reproduces**; coverage and correlation are identical, and the exact counts move
+by 12 and 28 points in 1.75 M. The two open findings recorded when these were first measured stand
+unchanged: L2's core biases are the larger pair on both axes, and its `dy` correlation is below `dx` where
+L1's are matched.
+
+**The runtimes are 41x and 144x faster, which is the FFTW planner fix and not a NISAR-specific effect.**
+The recorded L2 figure additionally predates `kwargs_from_capture` setting `threaded`, so it spent 11h41m
+on one core; both rows here run at ~9.7 of 10 cores. A runtime from before either fix is not comparable to
+one after.
+
+**L1's `dx` tail falls 78 → 27 points beyond 10 px** with `dy` unchanged at 0. Both are under the
+sub-0.002% the tail represents either way, and `PLAN_FLAGS` moving `PATIENT` → `MEASURE` changes which
+candidate transform the planner picks, so a handful of near-flat peaks resolving differently is the
+expected shape of that change rather than an unexplained one.
+
+### The gate: `3.nisar`, on a thinned grid
+
+Nine and five minutes is still far outside the seconds-to-minutes the other gates cost, so the gate runs a
+sixteenth of each grid — `--stride 4 --block 128`, 128-px tiles on a 512-px lattice, ~1 minute per case.
+Both cases are **green**, at `core 0.0975/0.1411 corr +0.99853/+0.98765` on L1 and
+`core 0.1758/0.2343 corr +0.99962/+0.99637` on L2.
+
+**Thinning changes the answers, so its thresholds are calibrated to the thinned run and are not comparable
+to the whole-grid figures above or to the 0.010 px bound `3.rdr` holds Sentinel-1 to.** AutoRIFT.jl sees
+the sparse grid while the reference's `Dx`/`Dy` come from a capture over the full one, so the two resolve
+different pyramid levels — a level's coarse grid is the point grid decimated by 1, 2, 4, 8, and a thinned
+one can fall below its filter's width, at which point the level silently produces nothing
+(`tools/golden/README.md`). Measured on L1 at `stride 4`:
+
+| tiling | `dx` exact | `dx` corr | `dx` bias core | `dy` bias core |
+|---|---:|---:|---:|---:|
+| whole grid | **73.91%** | +0.99972 | +0.0513 | −0.0276 |
+| 128-px tiles | 16.81% | +0.99853 | +0.0975 | −0.1411 |
+| 256-px tiles | 9.41% | +0.99408 | +0.1017 | −0.1382 |
+| 512-px tiles | **0.00%** | +0.92317 | +0.1013 | −0.1506 |
+| every 16th point | **0.00%** | +0.90625 | +0.1085 | −0.1656 |
+
+Three things this table decides:
+
+- **`exact` is not gateable on a thinned L1** — it spans 73.91% to 0.00% on unchanged code, and
+  non-monotonically in tile size. The gate asserts correlation, `bias_core` and the `dy` sign only.
+- **Tiles, not a point lattice.** `filtDisp` and the level merge consult each point's neighbors, so
+  thinning to every 16th point leaves each survivor without any and its base-level measurement is replaced
+  by an interpolated one.
+- **The tile size is part of the calibration, so `regate.jl` states `--block` explicitly.** A threshold
+  measured at one tiling and re-run at another reports a regression that is only a changed default.
+
+L2 is the case where thinning is benign — `exact` 68.70% against 72.20% whole-grid — because its levels
+still clear the filter at this tiling. That the same stride is destructive on one case and not the other is
+why the gate is calibrated per case rather than to one shared bound.
+
+`bias_core` is roughly double the whole-grid value at every tiling on both axes, consistently enough to
+gate against, and it is a property of the thinning rather than of the correlator: the whole-grid run above
+reproduces +0.0513/−0.0276 exactly.
