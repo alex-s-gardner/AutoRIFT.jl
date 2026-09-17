@@ -3108,3 +3108,44 @@ why the gate is calibrated per case rather than to one shared bound.
 `bias_core` is roughly double the whole-grid value at every tiling on both axes, consistently enough to
 gate against, and it is a property of the thinning rather than of the correlator: the whole-grid run above
 reproduces +0.0513/−0.0276 exactly.
+
+## Step: the benchmark suite on 1.13.0, and one candidate rejected on Amdahl
+
+`Pkg.test()` is green at `5c68d73` — **704,304/704,304 in 3m32s**. The suite was run with
+`benchmark/run.jl --quick -t 10` and compared against the committed baseline:
+
+```
+julia --project=benchmark -t 10 benchmark/run.jl --quick --tag head1130
+julia --project=benchmark benchmark/compare.jl benchmark/results/baseline.json \
+    benchmark/results/history/head1130.json
+```
+
+`compare.jl` exits 1 on one row, `correlate/peak r50` at 1.11x against a 1.10x threshold. **It is the
+toolchain, not this branch.** `baseline.json` was recorded on Julia 1.12.5 and this ran on 1.13.0, so the
+two differ by more than the code. Measured on 1.13.0 from both checkouts, same script and machine:
+
+| `peak_index` on a 101x101 surface | min of 5 |
+|---|---:|
+| `main` (worktree at `f18660a`) | 5.677 us |
+| this branch | **5.667 us** |
+
+The branch is marginally the faster of the two, and no commit on it changes `peak_index` itself — the
+function is identical to main's, and only its call site in `track.jl` moves. `peak_index` is stable to
+0.0% over five repeats in-process, so the 1.11x is not sampling noise either — it is the 1.12.5
+baseline. **Re-record `baseline.json` on 1.13.0 before reading that row as a
+regression.** No allocation gate fired; `ZEROALLOC_PATTERNS` covers the per-point path, which is the
+property that matters across millions of pairs.
+
+### Rejected: integer bit ops in `_radius_bucket`
+
+`_radius_bucket` rounds with `ceil(Int, log2(r))`, one float transcendental per call, where
+`leading_zeros` gives the same answer in integer arithmetic. Verified identical for every
+`r ∈ -3:3000` against ten caps including 1905 and the powers of two around it, and **10.2x faster in
+isolation** — 6.37 ns against 0.63 ns per call over a million radii shaped like a NISAR L1 field.
+
+It is not worth taking. The function is called once per point in `_chunk_buckets` and once per
+`(point, bucket)` pair in the `_track_bucket!` rescan, so a 3600-point pass over five buckets makes
+43,200 calls — **1.09% of that pass's 25.2 ms, for a saving of 0.98%**. That is below the threshold
+where a change to a documented hot function pays for itself, and the rescan it is called from is
+deliberate (`_track_bucket!` notes that partitioning would allocate storage proportional to the chunk).
+The measurement is recorded so the next reader does not have to take it again.
