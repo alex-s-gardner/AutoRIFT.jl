@@ -25,6 +25,13 @@ peak, runtime, occupancy and read amplification all come from the timed arm.
 `l1_reproducibility.log` — two whole-grid untiled runs in one process (587.1 s, 575.5 s), which is what
 ruled FFTW wisdom out as the cause of the earlier timing spread.
 
+`l1_4096_profiled.log` — the chosen L1 size with the profiled arm: FFTW 56.8% of working samples, the
+blocked path's own reading and preprocessing 16.4%, profiling overhead 2.8%.
+
+`l2_2224x1110.log` — the L2 floor (smallest block a 2216x1103 halo permits): 25.91 GiB at 365.4 s, the
+lowest peak measured on that granule and 18% slower than `2304x1152`. This is the row that shows occupancy
+*falls* past ~230 blocks/thread rather than continuing to climb.
+
 `l1_fft_ladder.log` — three FFT transform-size ladders compared. The shipping power-of-two ladder wins;
 coarser costs 24%, multiples of 4 cost 27%.
 

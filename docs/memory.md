@@ -396,7 +396,8 @@ moves the halo only 2216 → 1711 px.
 | | 4096 px | 378 | 7.1 min | 40.1 GiB | 0.47× | 1.33× |
 | | 3072 px | 648 | 5.8 min | 31.2 GiB | 0.37× | 1.69× |
 | | 2304 px | 1152 | 5.5 min | 30.0 GiB | 0.35× | 2.26× |
-| | 2304×1152 px | 2304 | **5.2 min** | **28.8 GiB** | **0.34×** | 3.30× |
+| | 2304×1152 px | 2304 | **5.2 min** | 28.8 GiB | 0.34× | 3.30× |
+| | 2224×1110 px | 2500 | 6.1 min | **25.9 GiB** | **0.30×** | 3.50× |
 
 The L1 rows are re-measured with the fixed harness on an otherwise idle machine; the L2 rows are the
 earlier sweep. **Every earlier L1 timing was invalid, and by my own hand rather than the machine's**: the
@@ -414,10 +415,10 @@ this case — that blocking is a pure loss on L1 — was an artifact of the inva
 all the work in a single block (median radius 34 against a maximum of 1905). Blocking cannot balance a
 pool of 10 blocks per thread when one block is half the scene's cost.
 
-**L2 is the case that makes blocking a production requirement, and the right block size is the
-smallest shape the halo permits.** 2304×1152 px runs the granule in **28.8 GiB and 5.2 minutes** against
-an untiled 85.0 GiB and 6.2 — about a third of the peak *and* faster, at 99.98% of the untiled point
-count. Every blocked row measures the same 1,781,377 points, so the sizes differ in cost alone. On a 96
+**L2 is the case that makes blocking a production requirement.** 2304×1152 px runs the granule in **28.8
+GiB and 5.2 minutes** against an untiled 85.0 GiB and 6.2 — about a third of the peak *and* faster, at
+99.98% of the untiled point count. The floor, `2224×1110`, trades 18% more runtime for 10% less peak
+(25.9 GiB), so the smallest legal shape is the memory answer and not the overall one. Every blocked row measures the same 1,781,377 points, so the sizes differ in cost alone. On a 96
 GiB machine this is the difference between a memory-optimized instance and a general-purpose one.
 
 **Both axes want sizing separately, because the halo is not square.** At 2216×1103 px it is almost
@@ -438,9 +439,14 @@ Measured as `cpu_seconds / wall_seconds` (`tools/golden/profile_nisar.jl`):
 | 2304×1152 px | 2304 | 230.4 | **9.03** |
 
 Per-block cost spans orders of magnitude — a block whose points a finer level resolved returns before any
-I/O — so a pool with few blocks per thread waits on a handful of expensive ones while the rest idle. **Ten
-blocks per thread is not enough; occupancy is still climbing at 230.** Many small blocks is the
-configuration that keeps a wide machine fed, and there is no measured turning point on this granule.
+I/O — so a pool with few blocks per thread waits on a handful of expensive ones while the rest idle. Ten
+blocks per thread is not enough.
+
+**There is a turning point, and the sweep now brackets it.** An earlier reading of these rows said
+occupancy was still climbing at 230 blocks/thread with no measured maximum. Taking L2 to its actual floor —
+`2224×1110`, the smallest block a 2216×1103 halo permits, at 250 blocks/thread — settles it: occupancy
+*falls* to **7.77** from 9.03, and runtime rises 18% to 365 s. Peak still improves, to 25.9 GiB. So the
+optimum for occupancy sits near 230 blocks/thread on this granule and the floor is past it.
 
 Read amplification rises 0.86× → 3.30× across those rows and does not drive the ranking — the fastest row
 has the *highest* amplification. Allocation follows it (225 GiB untiled to 1727 GiB, since every block
@@ -544,10 +550,11 @@ worse.
 - **Size the two axes separately against `halo(grid, p, size)`.** A block below its own halo is rejected,
   and the halo need not be square: L2's is 2216×1103, so `(2304, 1152)` follows it and beats
   `(3072, 3072)` on peak, runtime and occupancy at once. That is the floor, not the target.
-- **Aim for at least ~100 blocks per thread.** Blocks are the unit of threaded work and their cost varies
-  by orders of magnitude, so a small pool waits on its slowest member. Measured occupancy of ten threads:
-  10 blocks/thread → **2.3**, 38 → 4.6, 76 → 6.6, 148 → **8.9**. Past ~150 the gain flattens and read
-  amplification keeps rising, which is why L1's 581 blocks/thread row is slower than its 148.
+- **Aim for 100–250 blocks per thread, and do not go to the floor.** Blocks are the unit of threaded work
+  and their cost varies by orders of magnitude, so a small pool waits on its slowest member — but past the
+  optimum, read amplification outruns the occupancy gain. Measured occupancy of ten threads: 10
+  blocks/thread → **2.3**, 38 → 4.6, 76 → 6.6, 148 → **8.9**, 230 → **9.0**, 250 → 7.8, 581 → 9.0 at 21.6×
+  amplification. Both granules are fastest above their floor and lowest-peak at it.
 - **Do not tune the FFT transform-size ladder.** It is already power-of-two quantized to a few dozen
   sizes; both coarser and finer ladders measure slower. See the section above.
 - **Reuse a `Cache` across pairs** via `init`/`reinit!`/`autorift!`. The live heap is flat, so this

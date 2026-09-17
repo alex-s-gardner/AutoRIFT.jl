@@ -2954,3 +2954,67 @@ ever. What remains is execution, which a coarser ladder makes worse.
 re-rounds to powers of two — so this row measures the cost of feeding the correlator finer radii, not the
 plan count a real interval-4 implementation would carry. The cost is the half that decides the question;
 the plan count only moves against it.
+
+## Step: attribution at the chosen L1 size, and the L2 floor
+
+Two measurements that close the NISAR block-size work.
+
+### NISAR L1 at 4096 px, profiled
+
+The chosen operating point, with the profiled arm this time (`--blocks 4096`, no `--no-profile`).
+
+| | value |
+|---|---|
+| runtime, timed arm | **676.3 s** (sweep gave 661.5 s — 2% apart) |
+| runtime, profiled arm | 695.5 s — **profiling costs 2.8%** |
+| peak | 32.47 GiB |
+| occupancy | 8.79 / 10 |
+| measured | 1,797,076 |
+| profile buffer | 15% full — not truncated |
+
+Shares of working samples, and the two rows from the sweep for comparison:
+
+| stage | untiled | 16384 px | **4096 px** |
+|---|---:|---:|---:|
+| FFTW, all stacks | 69.9% | 64.4% | **56.8%** |
+| `_read_block!` | 0.0% | 4.6% | 10.2% |
+| `preprocess` under `_prepare_block` | 0.0% | 2.8% | 6.2% |
+| blocked-path total | 0.0% | 7.4% | **16.4%** |
+| `peak_index` + `pyrup!` | 4.7% | 4.6% | 3.8% |
+| garbage collection | 0.0% | 0.1% | 0.5% |
+
+**The correlator's spectral core is the run at every block size, and the blocked path's overhead is the
+price of occupancy.** Reading plus preprocessing grows 0% → 7.4% → 16.4% as blocks shrink, exactly the
+trend L2 shows (19.3% at 3072 px, 30.9% at 2304×1152). At 4096 px on L1 it is 16.4% for a 3.27×
+improvement in runtime over 16384 px — a good trade. It also bounds what layout tuning can still win: the
+remaining 57% is FFT execution, which no block size changes.
+
+**Profiling costs 2.8% here, so the L2 finding generalizes.** That figure is worth having because an
+earlier attempt to explain a runtime discrepancy blamed profiler overhead; measured, it is small on both
+granules.
+
+### NISAR L2 at 2224×1110 px — the floor
+
+The smallest block a 2216×1103 px halo permits, which closes the L2 sweep.
+
+| block | blocks | b/thread | runtime | peak | vs untiled | occupancy | read amp |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 2304×1152 px | 2304 | 230 | **309.4 s** | 28.79 GiB | 0.34x | **9.03 / 10** | 3.30x |
+| **2224×1110 px** | 2500 | 250 | 365.4 s | **25.91 GiB** | **0.30x** | 7.77 / 10 | 3.50x |
+
+**This settles the open question about whether occupancy keeps improving as blocks shrink. It does not.**
+An earlier reading of the L2 sweep said occupancy was still climbing at 230 blocks/thread with no measured
+turning point. At the floor — 250 blocks/thread, only 8% more blocks — occupancy *falls* to 7.77 and runtime
+rises **18%**, while peak keeps improving to 25.9 GiB.
+
+So both granules have the same shape, and it is the practical rule: **peak falls monotonically to the
+floor, runtime does not.** The floor is the memory answer (L2 0.30x, L1 0.49x) and a size somewhat above it
+is the speed answer (L2 2304×1152, L1 4096 px). Which to use depends on which resource binds.
+
+### One thing both runs surfaced
+
+Each emitted two warnings that a block's coarse grid is smaller than the outlier filter's window, at the
+two coarsest chip levels (192×104 and 384×208 on L1). That is the per-block form of the reference's own
+behaviour recorded in `tools/golden/README.md`, and it is block-size dependent — a smaller block reaches it
+at more levels. It costs the restricted pass's saving on those levels for the blocks affected, which is
+already inside the measured runtimes above rather than additional to them.
