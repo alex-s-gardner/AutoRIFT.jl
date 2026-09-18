@@ -3203,3 +3203,24 @@ repeats is 2.1%.
 `Vector{Extent}` holding one entry per distinct bucket, a few dozen at most on a real scene. The count
 is constant in the point count, which is why the zero-allocation gate — `correlate/*` and `points/*`,
 the per-point path — is unaffected and still passes.
+
+### The policy: execution cost at microbenchmark sizes is accepted
+
+A 10-15% execution regression at the 13-80 us transform sizes is **accepted** in exchange for the
+planning cost `FFTW_MEASURE` removes. The rows are real and reproduce; the trade is deliberate.
+
+What this does and does not license:
+
+- It covers the `correlate/{surface,point}` and `correlate/subpixel` rows attributed to `PLAN_FLAGS`
+  above, and nothing else. A regression on a *whole-pass* benchmark — `track/*`, `multichip/*`,
+  `endtoend/*`, `throughput/*` — is not covered by it: those pay planning as well as execution, so a
+  regression there means the trade stopped paying and is a regression to fix.
+- It does not license a further execution regression. The figures above are the accepted level, so a
+  later change that takes `c32 r25` past 37.00 us is a new question rather than this one already
+  answered.
+- **The zero-allocation gate is untouched by it.** `ZEROALLOC_PATTERNS` covers the per-point path and
+  an allocation appearing there is still a failure, whatever it buys.
+
+The Benchmark job therefore stays red on this branch by decision rather than by oversight. It compares
+against the merge base, so those rows clear on their own once this lands and the base carries
+`MEASURE` too — the gate is measuring a one-time step change, not an ongoing defect.
