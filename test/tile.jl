@@ -528,3 +528,71 @@ end
     # spaced points share a block instead of each taking one.
     @test maximum(length(b.grid_cols) for b in ulayout.blocks) > 1
 end
+
+@testset "a rotated grid blocks, rather than collapsing to one block" begin
+    # A gridded `PointSet` need not have separable coordinates. A radar footprint sampled onto a map
+    # grid is rotated within its bounding box, so `x` and `y` both change along either index
+    # direction and neither one row nor one column describes an axis. Blocking read exactly one row
+    # and one column, so such a grid returned a single block at every requested size — an untiled
+    # run wearing a block size, with none of the memory bound the caller asked for.
+    #
+    # Built here rather than read from a granule: the property is geometric, and a synthetic rotation
+    # exercises it without a 6-gigapixel fixture. 45 degrees is the worst case, since it splits each
+    # coordinate's motion evenly between the two index directions.
+    n = 4096
+    p = params(; chip_size = 32, chip_size_max = 32, grid_spacing = 32, search_radius = 12)
+    step, c, s = 32.0, cospi(1 / 4), sinpi(1 / 4)
+    ng = 80
+    ctr = n / 2
+    xs = [ctr + step * (c * (i - ng / 2) - s * (j - ng / 2)) for i in 1:ng, j in 1:ng]
+    ys = [ctr + step * (s * (i - ng / 2) + c * (j - ng / 2)) for i in 1:ng, j in 1:ng]
+    rot = AutoRIFT.PointSet(xs, ys, fill(12, ng, ng), fill(12, ng, ng),
+                            zeros(ng, ng), zeros(ng, ng),
+                            fill(32, ng, ng), fill(32, ng, ng))
+
+    # Neither axis is separable: both coordinates move by a full block's worth along both indices.
+    @test maximum(rot.x[:, 1]) - minimum(rot.x[:, 1]) > 1000
+    @test maximum(rot.y[1, :]) - minimum(rot.y[1, :]) > 1000
+
+    # It divides, and a smaller request divides it further — the property that was absent.
+    coarse = AutoRIFT.block_layout(rot, p, (n, n), (2048, 2048))
+    fine = AutoRIFT.block_layout(rot, p, (n, n), (1024, 1024))
+    @test length(fine) > length(coarse) > 1
+
+    # The requested size is a *bound*, and on a rotated grid it binds through both index directions at
+    # once: a block of `a` rows by `b` columns spans `a·∂x/∂i + b·∂x/∂j` pixels of `x`. Sizing each axis
+    # from its own budget alone overshoots — 37% on the NISAR L1 grid at an 8192-pixel request.
+    for (layout, want) in ((coarse, 2048), (fine, 1024)), b in layout.blocks
+        rlo, rhi, clo, chi = AutoRIFT._searchable_span(rot, b.grid_rows, b.grid_cols)
+        isnothing(rlo) && continue
+        @test rhi - rlo <= want
+        @test chi - clo <= want
+    end
+
+    for layout in (coarse, fine), b in layout.blocks
+        # Every point still belongs to exactly one block, which the partition test below rechecks
+        # globally; here it is the read window that matters.
+        @test !isempty(b.grid_rows) && !isempty(b.grid_cols)
+        # A block reads its own neighbourhood, never the whole scene. Before the fix a block
+        # straddling the footprint edge spanned from a fill coordinate to a real one.
+        @test length(b.read_rows) < n
+        @test length(b.read_cols) < n
+    end
+
+    # Every grid point is written exactly once, rotation or not.
+    seen = falses(ng, ng)
+    for b in fine.blocks
+        seen[b.grid_rows, b.grid_cols] .= true
+    end
+    @test all(seen)
+
+    # A block whose points are all unsearchable reads nothing at all, rather than spanning its fill
+    # coordinates — which on a real geogrid is the whole scene.
+    empty_radius = AutoRIFT.PointSet(xs, ys, zeros(Int, ng, ng), zeros(Int, ng, ng),
+                                     zeros(ng, ng), zeros(ng, ng),
+                                     fill(32, ng, ng), fill(32, ng, ng))
+    for b in AutoRIFT.block_layout(empty_radius, p, (n, n), (1024, 1024)).blocks
+        @test isempty(b.read_rows)
+        @test isempty(b.read_cols)
+    end
+end

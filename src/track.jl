@@ -191,8 +191,9 @@ function _dispatch_pass!(::CPU, out::DisplacementField, ref, sec, okmask, pts::P
     # Plans are built here, on this task, before any spawning. FFTW's planner is not
     # thread-safe, so leaving this to the workers would have every one of them contend on
     # the planner lock at its first point — turning the most parallel part of the run into
-    # its most serial.
-    _warm_pass_plans(chip, radius, measure)
+    # its most serial. That matters more the more sizes a pass uses, and a pass uses one per
+    # radius bucket its points reach rather than one for the whole pass.
+    _warm_pass_plans(chip, radius, pts, measure)
 
     istrue(p.threaded) ? _track_threaded!(out, ref, sec, okmask, pts, chip, radius,
                                           up, p, measure) :
@@ -339,20 +340,30 @@ function _zeropad(A::AbstractMatrix{T}, pad::Extent) where {T}
     return out
 end
 
-# Which transform sizes this pass will use, so they can be planned up front. Only the
-# maximum extent is needed: every point either uses it or takes the direct path.
+# Which transform sizes this pass will use, so they can be planned up front — one per radius bucket
+# `pts` reaches, since that is what `_track_chunk!` takes a workspace at.
+#
+# Every one of them, not just the widest. An unplanned size is planned by whichever worker reaches it
+# first, under a planner that is not thread-safe, and `plan_flags` makes that 116-347 ms of serialised
+# work per small size and far more for a large one. Planning them here costs the same total once and
+# leaves the workers contending on nothing.
 #
 # The measure decides *which kind* of transform to warm — `Coherence` executes complex-to-complex
 # plans and the real measures real-to-complex ones, so warming without knowing the measure warms
 # the wrong pair half the time.
-function _warm_pass_plans(chip::Extent, radius::Extent, measure::SimilarityMeasure)
+function _warm_pass_plans(chip::Extent, radius::Extent, pts::PointSet,
+                          measure::SimilarityMeasure)
     (chip.X == 0 || radius.X == 0) && return nothing
-    # `(fy, fx)` and not `(fx, fy)`: an FFT buffer is a matrix, so its size follows Julia's
-    # row-first convention rather than the extent's x-first one. Naming the axes on the way in is
-    # what makes that transposition visible here instead of silent.
-    fy = next_fft_size(chip.Y + 2radius.Y - 1)
-    fx = next_fft_size(chip.X + 2radius.X - 1)
-    warm_plans!(((fy, fx),); complex = _wants_complex_plans(measure))
+    sizes = Tuple{Int,Int}[]
+    for b in _chunk_buckets(pts, radius, eachindex(pts))
+        # `(fy, fx)` and not `(fx, fy)`: an FFT buffer is a matrix, so its size follows Julia's
+        # row-first convention rather than the extent's x-first one. Naming the axes on the way in is
+        # what makes that transposition visible here instead of silent.
+        fy = next_fft_size(chip.Y + 2b.Y - 1)
+        fx = next_fft_size(chip.X + 2b.X - 1)
+        (fy, fx) in sizes || push!(sizes, (fy, fx))
+    end
+    warm_plans!(sizes; complex = _wants_complex_plans(measure))
     return nothing
 end
 
@@ -365,83 +376,144 @@ _wants_complex_plans(::Coherence) = true
 # The loop
 # ---------------------------------------------------------------------------
 
-# One chunk of points, on one task, with one workspace. Split out from the threaded
-# driver so the serial path is the same code with a single chunk — the two must agree
-# bitwise, and sharing the body is how that is guaranteed rather than tested for.
+# One chunk of points, on one task. Split out from the threaded driver so the serial path is the same
+# code with a single chunk — the two must agree bitwise, and sharing the body is how that is
+# guaranteed rather than tested for.
+#
+# **One workspace per radius bucket, held one at a time.** A workspace sizes its FFT buffers from its
+# extents, so a workspace built for the pass's widest radius makes every point execute the widest
+# point's transform. That is the pass's dominant cost wherever the radius field is skewed, which a
+# Geogrid-derived one is: on a NISAR L1 grid the median searched point has radius 34 against a maximum
+# of 1905, and correlating it through the max-sized workspace takes 56 ms against 0.32 ms through one
+# its own size. Mean transform area over that grid's radii is 35x the mean of the per-bucket sizes.
+#
+# Two properties of the loop below are what make this safe rather than merely faster:
+#
+#   * **Buckets ascending, one live at a time.** The workspace is returned before the next is taken, so
+#     a task's footprint is one bucket's workspace and not the sum. The bucket is capped at the pass
+#     radius (`_radius_bucket`), so the widest bucket is a workspace at the pass geometry and no chunk
+#     can hold more than one of those — and since 96.6% of that grid's points fall at or below an
+#     eighth of it, the footprint through almost all of a run is far smaller.
+#   * **The bucket is a function of the point.** Which points share a chunk therefore cannot change
+#     what any point computes, which is what keeps a subset's answer equal to the whole set's — see
+#     `AutoRIFT.PassGeometry`.
+#
+# The refinement workspace is taken once for the whole chunk: it is sized by `up` alone, which no
+# point varies.
 function _track_chunk!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
                        chip::Extent, radius::Extent, up::Int,
                        p::Params, measure::SimilarityMeasure, idx)
     T = eltype(ref)
-    ws = take_workspace!(T, chip, radius)
     rw = up > 1 ? take_refinement!(up) : nothing
     try
-
-        @inbounds for i in idx
-            issearchable(pts, i) || continue
-
-            prx = pts.radius_x[i]
-            pry = pts.radius_y[i]
-            # `pts` is already in padded coordinates, so the documented primitives apply
-            # directly. Recomputing their arithmetic here would put the asymmetric window
-            # convention and the even-chip half-extent -- the two most delicate index
-            # conventions in the package -- in a second, untested place.
-            chip_rows, chip_cols = chip_bounds(pts, i)
-            win_rows, win_cols = search_bounds(pts, i)
-
-            # Padding is sized so this holds, but a caller-supplied scattered point set can
-            # place a point anywhere, so it is checked rather than assumed.
-            checkbounds(Bool, ref, chip_rows, chip_cols) || continue
-            checkbounds(Bool, ref, win_rows, win_cols) || continue
-            # A chip with no valid pixel is padding, not imagery. Testing the chip rather than
-            # the window is deliberate: the window may legitimately overlap the edge, since the
-            # correlation only needs the chip to be real.
-            _any_valid(okmask, chip_rows, chip_cols) || continue
-
-            out.searched[i] = true
-
-            chip = @view sec[chip_rows, chip_cols]
-            window = @view ref[win_rows, win_cols]
-            surface = _correlate_rotations!(ws, window, chip, (prx, pry), measure, p.rotation)
-            # A chip with no texture carries no information about displacement, so it is left
-            # as no measurement. The reference reports the search-window corner here, which
-            # over masked or featureless terrain is a systematic corner-pinned bias.
-            degenerate(ws) && continue
-
-            # One location of the peak serves all four quantities this point needs — the
-            # displacement, the peak height, the boundary flag and the peak ratio — each of which
-            # has a form taking an already-located peak for exactly this reason. See
-            # `AutoRIFT.peak_ratio` for what the four naive calls cost.
-            #
-            # `c` is the correlation at the peak actually reported, so it comes from the refinement
-            # wherever there is one and from the integer peak otherwise.
-            pi_, pj = peak_index(surface)
-            railed = peak_at_boundary(surface, pi_, pj)
-            ppr = peak_ratio(surface, pi_, pj)
-            dx, dy, c = isnothing(rw) ?
-                (_offset_at(pi_, pj, (prx, pry))..., (@inbounds surface[pi_, pj])) :
-                subpixel_peak(rw, surface, (prx, pry), up, pi_, pj)
-
-            # Back to displacement about the grid point: the surface is centred on the window,
-            # which is centred on the point, and the chip was offset by the prior.
-            out.dx[i] = Float32(dx + pts.dx_prior[i])
-            out.dy[i] = Float32(dy + pts.dy_prior[i])
-            # Both quality outputs are zero where the peak lay against the search boundary: the
-            # displacement is a lower bound with no recoverable sub-pixel part, so neither the peak
-            # height nor its ratio to the best rival describes a usable measurement. Zeroing them means
-            # any positive threshold on either rejects the point without the caller having to know the
-            # condition exists — and zero is below the 1 a real ratio cannot go under. The displacement
-            # itself is still reported — it is the best available bound.
-            out.correlation[i] = railed ? 0.0f0 : c
-            out.peak_ratio[i] = railed ? 0.0f0 : ppr
+        for bucket in _chunk_buckets(pts, radius, idx)
+            ws = take_workspace!(T, chip, bucket)
+            try
+                _track_bucket!(out, ref, sec, okmask, pts, ws, rw, radius, bucket,
+                               up, p, measure, idx)
+            finally
+                # Back to the pool even if a point threw, and before the next bucket is taken. A
+                # leaked workspace is not a crash, but it silently turns the pool back into
+                # per-chunk allocation — the thing pooling exists to avoid — and at these sizes it
+                # would also mean holding several hundred MiB per leak.
+                give_workspace!(ws)
+            end
         end
         return out
     finally
-        # Back to the pool even if a point threw. A leaked workspace is not a crash, but it
-        # silently turns the pool back into per-chunk allocation, which is the thing this
-        # exists to avoid — and that would be invisible.
-        give_workspace!(ws)
         isnothing(rw) || give_refinement!(rw)
     end
+end
+
+# The distinct radius buckets `idx` reaches, ascending by area so the widest — and on a skewed grid the
+# rarest — workspace is held last and briefest.
+#
+# Returned as a vector because it is walked twice: once here to order it, and once per bucket by
+# `_track_bucket!`. It holds at most one entry per distinct bucket, which is a few dozen on a real
+# scene, so this is bounded regardless of the chunk's size.
+function _chunk_buckets(pts::PointSet, radius::Extent, idx)
+    seen = Extent[]
+    @inbounds for i in idx
+        issearchable(pts, i) || continue
+        b = Extent((_radius_bucket(pts.radius_x[i], radius.X),
+                    _radius_bucket(pts.radius_y[i], radius.Y)))
+        b in seen || push!(seen, b)
+    end
+    sort!(seen; by = b -> (b.X * b.Y, b.X))
+    return seen
+end
+
+# The points of `idx` that belong to `bucket`, correlated through `ws`.
+#
+# Scanning `idx` per bucket rather than partitioning it into per-bucket index vectors: the scan is a
+# comparison per point per bucket against a correlation that costs microseconds at its very cheapest,
+# and partitioning would allocate storage proportional to the chunk — which on the serial path is the
+# whole grid.
+function _track_bucket!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
+                        ws, rw, radius::Extent, bucket::Extent, up::Int,
+                        p::Params, measure::SimilarityMeasure, idx)
+    @inbounds for i in idx
+        issearchable(pts, i) || continue
+
+        prx = pts.radius_x[i]
+        pry = pts.radius_y[i]
+        (_radius_bucket(prx, radius.X) == bucket.X &&
+         _radius_bucket(pry, radius.Y) == bucket.Y) || continue
+
+        # `pts` is already in padded coordinates, so the documented primitives apply
+        # directly. Recomputing their arithmetic here would put the asymmetric window
+        # convention and the even-chip half-extent -- the two most delicate index
+        # conventions in the package -- in a second, untested place.
+        chip_rows, chip_cols = chip_bounds(pts, i)
+        win_rows, win_cols = search_bounds(pts, i)
+
+        # Padding is sized so this holds, but a caller-supplied scattered point set can
+        # place a point anywhere, so it is checked rather than assumed.
+        checkbounds(Bool, ref, chip_rows, chip_cols) || continue
+        checkbounds(Bool, ref, win_rows, win_cols) || continue
+        # A chip with no valid pixel is padding, not imagery. Testing the chip rather than
+        # the window is deliberate: the window may legitimately overlap the edge, since the
+        # correlation only needs the chip to be real.
+        _any_valid(okmask, chip_rows, chip_cols) || continue
+
+        out.searched[i] = true
+
+        chipview = @view sec[chip_rows, chip_cols]
+        window = @view ref[win_rows, win_cols]
+        surface = _correlate_rotations!(ws, window, chipview, (prx, pry), measure, p.rotation)
+        # A chip with no texture carries no information about displacement, so it is left
+        # as no measurement. The reference reports the search-window corner here, which
+        # over masked or featureless terrain is a systematic corner-pinned bias.
+        degenerate(ws) && continue
+
+        # One location of the peak serves all four quantities this point needs — the
+        # displacement, the peak height, the boundary flag and the peak ratio — each of which
+        # has a form taking an already-located peak for exactly this reason. See
+        # `AutoRIFT.peak_ratio` for what the four naive calls cost.
+        #
+        # `c` is the correlation at the peak actually reported, so it comes from the refinement
+        # wherever there is one and from the integer peak otherwise.
+        pi_, pj = peak_index(surface)
+        railed = peak_at_boundary(surface, pi_, pj)
+        ppr = peak_ratio(surface, pi_, pj)
+        dx, dy, c = isnothing(rw) ?
+            (_offset_at(pi_, pj, (prx, pry))..., (@inbounds surface[pi_, pj])) :
+            subpixel_peak(rw, surface, (prx, pry), up, pi_, pj)
+
+        # Back to displacement about the grid point: the surface is centred on the window,
+        # which is centred on the point, and the chip was offset by the prior.
+        out.dx[i] = Float32(dx + pts.dx_prior[i])
+        out.dy[i] = Float32(dy + pts.dy_prior[i])
+        # Both quality outputs are zero where the peak lay against the search boundary: the
+        # displacement is a lower bound with no recoverable sub-pixel part, so neither the peak
+        # height nor its ratio to the best rival describes a usable measurement. Zeroing them means
+        # any positive threshold on either rejects the point without the caller having to know the
+        # condition exists — and zero is below the 1 a real ratio cannot go under. The displacement
+        # itself is still reported — it is the best available bound.
+        out.correlation[i] = railed ? 0.0f0 : c
+        out.peak_ratio[i] = railed ? 0.0f0 : ppr
+    end
+    return out
 end
 
 # One correlation, or several at different chip rotations with the best kept.
@@ -578,24 +650,56 @@ end
     return false
 end
 
-# Threaded driver: one task and one workspace per chunk, indexed by chunk rather than by
-# thread. Indexing per-thread state by `threadid()` is unsafe under task migration, and
-# per-chunk is correct by construction.
+# Threaded driver: as many tasks as threads, each claiming the next unclaimed chunk until they run
+# out. Per-chunk workspaces rather than per-thread ones, since indexing per-thread state by
+# `threadid()` is unsafe under task migration.
 #
-# Chunks are deliberately finer than the thread count. The sparse search zeroes
-# most of the grid in spatially clustered patterns, and a skipped point costs a comparison
-# where a searched one costs microseconds — so an even split of the index range leaves some
-# tasks with almost nothing to do. Oversubscribing lets the scheduler even that out.
+# **Dynamic claiming, not a static split, because per-point cost varies by orders of magnitude.** A
+# point is correlated at its own radius bucket (`_radius_bucket`), so a chunk's cost is set by the
+# radii it happens to contain: on a Geogrid-derived field the widest bucket's transform is hundreds of
+# times the narrowest's, and the wide points are spatially clustered rather than spread. A static split
+# of the index range therefore ends with one task still working while the rest have finished — and the
+# tail is the whole problem, since a run is only as fast as its last chunk. Claiming from a shared
+# counter lets the tasks that drew cheap chunks absorb the remaining work instead of idling.
+#
+# Claiming dynamically cannot change the result. Each chunk writes a disjoint set of points, and a
+# point's bucket depends on the point alone, so neither which task runs a chunk nor the order they run
+# in is an input. `test/track.jl` asserts serial and threaded agree bitwise.
+#
+# `CHUNKS_PER_THREAD` chunks per thread rather than one, so a task that draws an expensive chunk late
+# still has small ones behind it to trade against. Finer costs one workspace take-and-give per chunk,
+# measured at 0.7 us against a chunk's own hundreds of milliseconds.
+const CHUNKS_PER_THREAD = 16
+
 function _track_threaded!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
                           chip::Extent, radius::Extent, up::Int, p::Params,
                           measure::SimilarityMeasure)
     n = length(pts)
-    nchunks = min(n, max(1, 2 * Threads.nthreads()))
+    nchunks = min(n, max(1, CHUNKS_PER_THREAD * Threads.nthreads()))
     chunk = cld(n, nchunks)
-    tasks = map(Iterators.partition(eachindex(pts), chunk)) do range
-        StableTasks.@spawn _track_chunk!(out, ref, sec, okmask, pts, chip, radius,
-                                         up, p, measure, range)
+    ranges = collect(Iterators.partition(eachindex(pts), chunk))
+    next = Threads.Atomic{Int}(1)
+    ntasks = min(length(ranges), Threads.nthreads())
+    tasks = map(1:ntasks) do _
+        StableTasks.@spawn _track_claimed!(out, ref, sec, okmask, pts, chip, radius,
+                                           up, p, measure, ranges, next)
     end
     foreach(wait, tasks)
     return out
+end
+
+# One task's share: claim the next chunk until they run out.
+#
+# A function rather than a `begin` block inside the spawn, for the reason `src/tile.jl` records at
+# `_run_task_blocks!`: a variable assigned inside a closure *and* in the enclosing scope is hoisted
+# into one `Core.Box` shared by every closure built from that frame, so per-task state declared inline
+# would be shared by all the tasks.
+function _track_claimed!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
+                         chip::Extent, radius::Extent, up::Int, p::Params,
+                         measure::SimilarityMeasure, ranges, next::Threads.Atomic{Int})
+    while true
+        i = Threads.atomic_add!(next, 1)
+        i <= length(ranges) || return out
+        _track_chunk!(out, ref, sec, okmask, pts, chip, radius, up, p, measure, ranges[i])
+    end
 end

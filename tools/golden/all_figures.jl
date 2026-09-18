@@ -14,9 +14,26 @@
 const R = @__DIR__
 include(joinpath(R, "compare_figures.jl"))
 
-# Run 200 for every case: the run numbers above it are one-off level traces and dtype pairs, and the
-# figure wants the comparison every gate reads.
+# Run 200 where it exists, because that is the comparison every gate reads; the run numbers above it are
+# one-off level traces and dtype pairs. The NISAR captures are at 100, so a hardcoded 200 skips them and
+# reports "no capture" on the two cases whose figures are most wanted. Prefer 200, fall back to the
+# highest ordinary run on disk — 201 and above are the level traces, which carry a partial grid.
 const RUN = 200
+const RUN_MAX_ORDINARY = 200
+
+function run_for(product::AbstractString)
+    base = joinpath(homedir(), "data", "autorift", "tests", "golden_tests", "runs", product)
+    isdir(base) || return nothing
+    runs = Int[]
+    for e in readdir(base)
+        n = tryparse(Int, e)
+        n === nothing && continue
+        n <= RUN_MAX_ORDINARY || continue
+        isfile(joinpath(base, e, "capture", "call1.json")) && push!(runs, n)
+    end
+    isempty(runs) && return nothing
+    return RUN in runs ? RUN : maximum(runs)
+end
 
 function main(args)
     dir = get(ENV, "AUTORIFT_GOLDEN_FIGS", tempdir())
@@ -24,7 +41,7 @@ function main(args)
     zoom = nothing
     i = findfirst(==("--zoom"), args)
     i === nothing || (zoom = parse(Int, args[i + 1]))
-    dlim = 1.0
+    dlim = 0.3
     d = findfirst(==("--dlim"), args)
     d === nothing || (dlim = parse(Float64, args[d + 1]))
     only_plat = nothing
@@ -39,10 +56,9 @@ function main(args)
     for c in cs
         # Skip a case with no capture rather than failing on it: the figure is a diagnostic and a
         # missing capture is a fact about the cache, not an error in the comparison.
-        cap = joinpath(homedir(), "data", "autorift", "tests", "golden_tests",
-                       "runs", c.product, string(RUN), "capture", "call1.json")
-        if !isfile(cap)
-            push!(failed, (c.product, "no capture at run $RUN"))
+        run = run_for(c.product)
+        if run === nothing
+            push!(failed, (c.product, "no capture at run $RUN or below"))
             continue
         end
         # **The full product name, not a prefix.** Two L8xL7 pairs each contain the other's scene id,
@@ -52,9 +68,9 @@ function main(args)
         name = c.product
         out = joinpath(dir, "golden_$(c.platform)_$(c.product).png")
         tag == "" || (out = replace(out, ".png" => "$tag.png"))
-        @info "figure" case = first(c.product, 40) platform = c.platform
+        @info "figure" case = first(c.product, 40) platform = c.platform run
         try
-            compare_figure(name; path = out, zoom, dlim, run = RUN)
+            compare_figure(name; path = out, zoom, dlim, run)
             push!(ok, out)
         catch e
             push!(failed, (c.product, sprint(showerror, e)))

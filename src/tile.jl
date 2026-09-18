@@ -212,10 +212,14 @@ than one block's read window — so the quantity worth naming is the imagery hel
 the unit everything here already works in: the halo, the read windows, and the buffers are all
 pixels.
 
-A block must be a whole number of grid points, so the size is a target that **snaps outward**: at
-`grid_spacing = 32` a request of 500 becomes 512. The conversion walks the grid's own coordinates
-rather than dividing by `grid_spacing`, because a caller-supplied grid need not be uniformly spaced.
-The trailing block in each direction is short when the grid does not divide evenly.
+A block must be a whole number of grid points, so the size is a target: the block holds as many points
+as fit within it. The count comes from the span a trial block of the grid actually covers rather than
+from `grid_spacing`, because a caller-supplied grid need be neither uniformly spaced nor axis-aligned —
+a geogrid built from a rotated radar footprint moves both coordinates along both index directions. The
+trailing block in each direction is short when the grid does not divide evenly.
+
+A block's read window spans only the points it will search, so the fill coordinates a rotated grid
+carries outside its footprint cost nothing. A block with no searchable point reads nothing at all.
 
 Throws if a block would be smaller than the halo it reads, since such a block is all overlap.
 """
@@ -240,55 +244,137 @@ function block_layout(grid::PointSet{2}, p::Params, imagesize::Tuple{Int,Int},
 
     nr, nc = size(grid)
     nrows, ncols = imagesize
-    # Where each block starts, walked from the coordinates so no block spans more than the request.
-    # `grid.y` runs down rows and `grid.x` across columns, so the row starts take the y extent. The
-    # views are free and make the axis explicit at the call rather than a parameter to be got wrong.
-    rowstarts = _block_starts(view(grid.y, :, 1), py)
-    colstarts = _block_starts(view(grid.x, 1, :), px)
+    # How many grid points fit in a block along each index axis, measured from the grid rather than
+    # walked along one row and one column: a grid's coordinates need not be separable, and a rotated
+    # footprint moves both `x` and `y` along either index direction. See `_block_shape`.
+    rowpts, colpts = _block_shape(grid, px, py)
+    rowstarts = collect(1:rowpts:nr)
+    colstarts = collect(1:colpts:nc)
 
     blocks = Block[]
     for (ci, c0) in pairs(colstarts), (ri, r0) in pairs(rowstarts)
         grows = r0:(ri == lastindex(rowstarts) ? nr : rowstarts[ri + 1] - 1)
         gcols = c0:(ci == lastindex(colstarts) ? nc : colstarts[ci + 1] - 1)
-        # The pixel extent this block writes, from the coordinates of its corner points. Taken from
-        # the grid rather than computed from `spacing` so a caller-supplied grid with its own
-        # layout still gets a correct window.
-        rlo, rhi = _pixel_span(grid.y, grows, gcols)
-        clo, chi = _pixel_span(grid.x, grows, gcols)
-        push!(blocks, Block(grows, gcols,
-                            max(rlo - hy, 1):min(rhi + hy, nrows),
-                            max(clo - hx, 1):min(chi + hx, ncols)))
+        # The pixel extent this block writes, from the coordinates of the points it will actually
+        # correlate. Taken from the grid rather than computed from `spacing` so a caller-supplied grid
+        # with its own layout still gets a correct window.
+        rlo, rhi, clo, chi = _searchable_span(grid, grows, gcols)
+        # A block with nothing to search reads nothing. `_run_one_block!` returns before any I/O for
+        # such a block, so the window only has to be empty rather than meaningful — and it must not be
+        # the whole scene, which is what a span over its fill coordinates would give.
+        rows = isnothing(rlo) ? (1:0) : max(rlo - hy, 1):min(rhi + hy, nrows)
+        cols = isnothing(rlo) ? (1:0) : max(clo - hx, 1):min(chi + hx, ncols)
+        push!(blocks, Block(grows, gcols, rows, cols))
     end
     return BlockLayout(blocks, h)
 end
 
-# The index each block starts at along one axis, so no block's coordinates span more than `want`
-# pixels. `coord` is that axis's coordinates — a gridded `PointSet` repeats the same coordinate down
-# every row and across every column, so one row or column describes the whole axis.
+# Grid points per block along each index axis, as `(rowpts, colpts)`, so a block's read window respects
+# `px` by `py` pixels.
 #
-# Walked rather than divided, because a caller-supplied grid need not be uniformly spaced:
-# `gridpoints(xs, ys)` takes arbitrary coordinate vectors, so no single `grid_spacing` describes the
-# axis. Accumulating per block also means a grid that is uniform apart from one large jump keeps
-# uniform-sized blocks either side of it, where a single points-per-block figure taken from the
-# largest step would shrink every block to fit the worst one.
+# This replaces walking one row and one column of the coordinates. That shortcut assumed the grid was
+# *separable* — `x` constant down every column, `y` constant across every row — which holds for a grid
+# `gridpoints` builds and fails for a rotated footprint sampled onto a map grid. On a NISAR L1 geogrid
+# row 1 and column 1 hold one point with real coordinates and fill everywhere else, so walking them
+# spanned 216 px instead of the scene and concluded one block covers 57760x50511. Every requested block
+# size from 3072 to 16384 px returned a single block — an untiled run wearing a block size, with none of
+# the memory bound the caller asked for.
 #
-# Each block takes as many points as fit, and always at least one — a zero-point block would divide
-# the grid into nothing. One point is therefore the only case that may exceed `want`, and it needs a
-# gap wider than a whole block to arise.
-function _block_starts(coord::AbstractVector, want::Int)
-    starts = [firstindex(coord)]
-    length(coord) <= 1 && return starts
-    origin = first(coord)
-    @inbounds for i in (firstindex(coord) + 1):lastindex(coord)
-        # Start a new block once this point would carry the current one past `want`. The comparison
-        # is on the span from the block's first point, so rounding cannot accumulate across blocks.
-        if abs(coord[i] - origin) > want
-            push!(starts, i)
-            origin = coord[i]
-        end
+# The grid *is* the index-to-pixel mapping, so the four rates below are read from it rather than
+# estimated: `rxi` is how far `x` moves per row of index, `rxj` per column, and likewise `ryi`/`ryj` for
+# `y`. A block of `a` rows by `b` columns then spans about `a*rxi + b*rxj` pixels of `x` and
+# `a*ryi + b*ryj` of `y`, and both have to fit their budget.
+#
+# **Both index directions charge both axes, which is what a separable calculation gets wrong.** Sizing
+# the rows from the `y` budget alone and the columns from the `x` budget alone gives 215 by 124 points at
+# an 8192-pixel request on the NISAR grid, whose `x` span is 11187 px — a 37% overshoot of the figure the
+# caller asked for. Scaling one factor until both constraints hold is what keeps the request a bound.
+#
+# On an axis-aligned grid `rxi` and `ryj` are zero, the two constraints decouple, and this reduces to
+# `py / ryi` rows by `px / rxj` columns — the separable answer, so a Landsat layout is unchanged. That
+# includes a full-width band, where `px` is the scene width and only the row count binds.
+function _block_shape(grid::PointSet{2}, px::Int, py::Int)
+    nr, nc = size(grid)
+    rxi = _index_rate(grid, grid.x, 1)
+    rxj = _index_rate(grid, grid.x, 2)
+    ryi = _index_rate(grid, grid.y, 1)
+    ryj = _index_rate(grid, grid.y, 2)
+    # The separable answer, from each axis's own dominant direction. Also the starting point for the
+    # coupled case, since shrinking from here can only tighten a constraint that already holds.
+    rowpts = clamp(floor(Int, py / max(ryi, rxi, EPS_RATE)), 1, nr)
+    colpts = clamp(floor(Int, px / max(rxj, ryj, EPS_RATE)), 1, nc)
+    # Shrink both together until each axis's total span fits. Halving rather than solving the pair of
+    # inequalities exactly: the shape is a target the block snaps to anyway, and a bounded loop cannot
+    # be defeated by a degenerate rate the way a division can.
+    for _ in 1:MAX_SHRINK
+        (rowpts * rxi + colpts * rxj <= px && rowpts * ryi + colpts * ryj <= py) && break
+        (rowpts == 1 && colpts == 1) && break
+        rowpts = max(1, rowpts ÷ 2)
+        colpts = max(1, colpts ÷ 2)
     end
-    return starts
+    return (rowpts, colpts)
 end
+
+# Halvings allowed while fitting a block to its budget. Twenty takes any grid to a single point, so the
+# loop terminates on its own rather than on this bound; it exists so a pathological rate cannot spin.
+const MAX_SHRINK = 20
+
+# A rate below this is treated as absent rather than divided by, so an axis a grid does not vary along
+# cannot produce an infinite block.
+const EPS_RATE = 1e-9
+
+# Pixels of `A` per unit step of index dimension `dim`, measured over the points a block must cover.
+#
+# **Reduced over pairs where both points are searchable**, which is what makes this robust on a grid whose
+# footprint is rotated within its bounding box. Such a grid is mostly fill — 65% of both NISAR grids — and
+# this cannot know the fill convention, since they pad with zeros rather than `NaN` and a finiteness test
+# finds nothing. Restricting to searchable pairs excludes fill by construction instead of by guessing a
+# sentinel, and it is the right restriction on its own terms: an unsearchable point is never correlated, so
+# its coordinate does not constrain a block.
+#
+# Both alternatives were measured and both fail, in opposite directions:
+#
+#   * **The median of the nonzero steps** cannot see a genuinely separable axis. On the L2 GSLC grid `x`
+#     really is constant down a column, so every in-footprint step is zero and the only nonzero ones are
+#     the two that cross the fill boundary — giving `dx/di = 87666` from a sample of one, and a layout of
+#     5.2 million blocks, one per grid point.
+#   * **The median of every step** is zero on any grid that is majority fill, which is both NISAR grids.
+#     All four rates come out zero, and a zero rate is an infinite block.
+#
+# Over searchable pairs the same estimator gives 33/34/19/19 px on the rotated L1 grid and 0/48/24/0 on the
+# separable L2 grid — the true rates in both cases, with the cross terms vanishing exactly where they
+# should.
+#
+# Subsampled, because this is an estimate of a spacing and reducing over five million points to produce it
+# costs more than the layout it informs.
+#
+# Returns zero when nothing can be measured, which `_block_shape` reads as "this axis does not vary".
+function _index_rate(grid::PointSet{2}, A::AbstractMatrix, dim::Int)
+    nr, nc = size(A)
+    (dim == 1 ? nr : nc) > 1 || return 0.0
+    steps = Float64[]
+    stride = max(1, (nr * nc) ÷ RATE_SAMPLES)
+    ilast = dim == 1 ? nr - 1 : nr
+    jlast = dim == 2 ? nc - 1 : nc
+    k = 0
+    @inbounds for j in 1:jlast, i in 1:ilast
+        k += 1
+        k % stride == 0 || continue
+        i2, j2 = dim == 1 ? (i + 1, j) : (i, j + 1)
+        (issearchable(grid, CartesianIndex(i, j)) &&
+         issearchable(grid, CartesianIndex(i2, j2))) || continue
+        d = Float64(A[i2, j2]) - Float64(A[i, j])
+        isfinite(d) && push!(steps, abs(d))
+    end
+    isempty(steps) && return 0.0
+    sort!(steps)
+    n = length(steps)
+    return isodd(n) ? steps[(n + 1) ÷ 2] : (steps[n ÷ 2] + steps[n ÷ 2 + 1]) / 2
+end
+
+# Differences to sample when estimating an index rate. A median over this many is stable far past the
+# precision a block layout needs, and it bounds the cost on a five-million-point grid.
+const RATE_SAMPLES = 20_000
 
 # The integer pixel span of a coordinate field over a sub-block of the grid. `floor`/`ceil` rather
 # than `round`: the span must contain every point it covers, and a coordinate carrying the
@@ -301,6 +387,34 @@ function _pixel_span(coord::AbstractMatrix, rows, cols)
         hi = max(hi, v)
     end
     return floor(Int, lo), ceil(Int, hi)
+end
+
+# The pixel window a block must read, as `(rlo, rhi, clo, chi)`, or four `nothing`s when the block has
+# no point to search.
+#
+# Reduced over the block's **searchable** points rather than all of them, which is what
+# [`AutoRIFT._pixel_span`](@ref) would do. A point with a zero radius is never correlated
+# (`issearchable`), so no imagery has to be read for it — and on a grid whose footprint is rotated
+# within its bounding box, those points carry a *fill* coordinate rather than a plausible one. Spanning
+# them is not merely wasteful, it is wrong by the width of the scene: a block straddling the footprint
+# edge holds fill at 0 and real coordinates in the tens of thousands, so its window becomes
+# `1:57760` — the whole scene, read once per such block. Measured on a NISAR L1 grid at an 8192-pixel
+# block, 28 of 209 blocks each read half the scene or more, for 99x the scene in total.
+#
+# `NaN` coordinates are skipped for the same reason: they cannot bound a window, and `min`/`max` would
+# poison the whole span.
+function _searchable_span(grid::PointSet{2}, rows, cols)
+    rlo = clo = Inf
+    rhi = chi = -Inf
+    @inbounds for j in cols, i in rows
+        issearchable(grid, CartesianIndex(i, j)) || continue
+        y, x = grid.y[i, j], grid.x[i, j]
+        (isfinite(y) && isfinite(x)) || continue
+        rlo = min(rlo, y); rhi = max(rhi, y)
+        clo = min(clo, x); chi = max(chi, x)
+    end
+    isfinite(rlo) || return (nothing, nothing, nothing, nothing)
+    return (floor(Int, rlo), ceil(Int, rhi), floor(Int, clo), ceil(Int, chi))
 end
 
 """
@@ -606,8 +720,10 @@ function _run_blocked(raw::ImagePair, pts::PointSet{2}, p::Params, layout::Block
                       subpixel::SubpixelMethod)
     out = displacement_field(pts)
     # Every block shares the geometry, so one warm-up serves all of them — and it must happen here,
-    # on this task, rather than inside a block.
-    _warm_pass_plans(geometry.chip, geometry.radius, measure)
+    # on this task, rather than inside a block. Warmed from the whole point set rather than block by
+    # block, because a block's own points reach a subset of these buckets: warming per block would
+    # plan the same sizes repeatedly and, worse, plan them concurrently.
+    _warm_pass_plans(geometry.chip, geometry.radius, pts, measure)
 
     serial = _serial_params(p)
     if istrue(p.threaded)

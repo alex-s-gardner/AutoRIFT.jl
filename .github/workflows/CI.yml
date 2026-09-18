@@ -198,17 +198,28 @@ jobs:
           version: '1'
       - uses: julia-actions/cache@v2
 
+      # **Each checkout is forced, and the tree is reset before it.** `Pkg.develop(path=".")` writes
+      # the absolute checkout path into `benchmark/Project.toml`, a tracked file — so a plain
+      # `git checkout --detach` for the second measurement aborts with "Your local changes would be
+      # overwritten" and the job dies before comparing anything. Two measurements in one job is the
+      # design (`benchmark/README.md`: only a same-runner ratio is usable), so the tree has to come
+      # back to a clean state between them.
+      #
+      # `Pkg.develop` stays rather than relying on `[sources]` in that file: the merge base can
+      # predate it, and instantiate alone cannot resolve the local package without it.
       - name: Benchmark the merge base
         run: |
-          git checkout --detach ${{ github.event.pull_request.base.sha }}
+          git checkout --force --detach ${{ github.event.pull_request.base.sha }}
           julia --project=benchmark -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
           julia --project=benchmark benchmark/run.jl --tag base
+          git checkout -- .
 
       - name: Benchmark the pull request
         run: |
-          git checkout --detach ${{ github.event.pull_request.head.sha }}
+          git checkout --force --detach ${{ github.event.pull_request.head.sha }}
           julia --project=benchmark -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
           julia --project=benchmark benchmark/run.jl --tag pr
+          git checkout -- .
 
       - name: Compare
         # `pipefail` is load-bearing, not boilerplate. `compare.jl` signals a regression by

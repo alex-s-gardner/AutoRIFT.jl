@@ -1,0 +1,27 @@
+NISAR_L1_PR_RSLC_003_170_D_053_7700_SHNA_A_20251028T235201_20251028T235238_X05009_N_P_J_001_X_NISAR_L1_PR_RSLC_007_170_D_053_7700_SHNA_A_20251215T235203_20251215T235240_X05009_N_P_J_001_G0120V02_P094
+  scene 57760 x 50511 px, grid 2328 x 2304, halo 2736 x 1500 px, 1871119 searchable points, 10 threads
+  warmup: 128 x 128 grid patch at (551, 1361), 16384 searchable points, 3.7 s compiling
+  warmup: 128 x 128 grid patch at (551, 1361), 16384 searchable points, 5.5 s compiling
+  8192 px         1078.4 s clean
+  8192 px           380 blocks   1078.4 s  peak    33.85 GiB (11.97 above floor)  readamp  4.51x  measured 1797076
+      resident peak 34.20 GiB   live peak 59.63 GiB   live at end 43.47 GiB   floor 21.88 GiB
+      allocated 1501.7 GiB   GC 4.9 s (0.5% of wall) in 766 pauses, 101 full
+      occupancy 4.61 of 10 threads (46%)   cpu 4976 s over 1078 s wall
+      buffer prediction: 18 B/px x 7588 x 13919 px window x 10 tasks = 17.7 GiB
+[33m[1m┌ [22m[39m[33m[1mWarning: [22m[39mcoarse grid smaller than the outlier filter's window; searching every point at full radius, which costs roughly 100x the restricted pass. Reduce `coarse_stride`, reduce `grid_spacing`, or process a larger area per call.
+[33m[1m│ [22m[39m  chip_size_x = 192
+[33m[1m│ [22m[39m  chip_size_y = 104
+[33m[1m└ [22m[39m[90m@ AutoRIFT ~/Documents/GitHub/AutoRIFT.jl/src/tile.jl:677[39m
+[33m[1m┌ [22m[39m[33m[1mWarning: [22m[39mcoarse grid smaller than the outlier filter's window; searching every point at full radius, which costs roughly 100x the restricted pass. Reduce `coarse_stride`, reduce `grid_spacing`, or process a larger area per call.
+[33m[1m│ [22m[39m  chip_size_x = 384
+[33m[1m│ [22m[39m  chip_size_y = 208
+[33m[1m└ [22m[39m[90m@ AutoRIFT ~/Documents/GitHub/AutoRIFT.jl/src/tile.jl:677[39m
+
+wrote /Users/gardnera/data/autorift/tests/golden_tests/mem/prof_NISAR_L1_PR_RSLC_003_170_D_053_7700_SHNA_A_20251028T235201_20251028T235238_X05009_N_P_J_001.jls — 1 new row, 5 in history
+
+every configuration measured for this case (newest per block size):
+  block           blocks   runtime vs untiled  peak GiB  vs unt  occ/thr  read amp  measured
+  16384 px           100  1852.3 s     3.27x     59.58   1.21x  2.33/10     2.89x  1797136
+  8192 px            380  1078.4 s     1.90x     33.85   0.69x  4.61/10     4.51x  1797076
+  untiled              1   567.2 s     1.00x     49.36   1.00x  9.21/10     1.00x  1798199
+  (2 superseded rows also on disk)

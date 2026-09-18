@@ -871,17 +871,24 @@ The largest chip and search radius any point in a pass uses.
 
 Two [`AutoRIFT.Extent`](@ref)s: the largest `chip` and the largest `radius`.
 
-These size the correlation workspace, and a workspace sizes its own FFT buffers from its extents
-— so they set the **transform length** every point in the pass executes, not merely how much
-memory it takes. A pass whose maxima are `chip = (X=32, Y=32)`, `radius = (X=25, Y=25)` runs an
-84-point transform where one with `radius = (X=10, Y=10)` runs a 56-point one, and the two agree
-only to about 4e-7. Pooling depends on the same property; see `take_workspace!`.
+These **bound** the pass rather than describing every point in it. A point is correlated at its own
+radius rounded up to a power of two and clamped to `radius` ([`AutoRIFT._radius_bucket`](@ref)), and
+that bucket sizes the workspace it runs through — so a pass executes one transform length per bucket
+its points reach, not one for the whole pass. The `chip` extent is the transform's other dimension and
+is uniform within a level.
 
-That is why this is a value a caller can supply rather than only something derived per pass. A
-subset of a point set has its own, generally smaller, maxima — so correlating a subset computes a
-different transform than correlating the whole and reading those points out of it. Passing the
-whole set's geometry to the subset is what makes the two agree. Measured: without it, `correlation`
-differs on 46% of the points of a sub-block, and `dx`/`dy` can flip a subpixel step.
+Transform length is not free of the answer: a different length reassociates the same floating-point sum
+differently. Two lengths agree to about 1e-7 on `correlation`, and a peak's *location* almost always
+survives a perturbation that small — but where it does not, the displacement moves by one refinement
+step. Pooling keys on the same extents; see `take_workspace!`.
+
+That leaves one way the pass geometry still reaches a point's answer, which is why this remains a value
+a caller can supply. The bucket is clamped to `radius`, so a point in the **topmost** bucket is
+correlated at whatever maximum its point set happens to contain — and a subset generally has a smaller
+one. Passing the whole set's geometry to a subset removes that dependence. Measured on a sub-block whose
+own maximum radius is 10 against a grid whose maximum is 25, so the same radius clamps to 10 in one and
+buckets to 16 in the other: `correlation` differs, `dx` is identical on all 36 points and `dy` moves on
+one by `1/64` — and all three agree exactly once the whole set's geometry is passed.
 
 Build one with [`AutoRIFT.pass_geometry`](@ref).
 """

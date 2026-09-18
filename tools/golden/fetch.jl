@@ -166,6 +166,14 @@ is a redirect chain and a 401 anywhere along it is ambiguous between a bad crede
 this account is not approved for. The answer is cached: every radar case shares one credential, and
 `--check` over ten cases should not be ten login attempts.
 
+**Three consecutive rejections lock the account out for ten minutes**, so a `:rejected` is reported
+from one reading rather than confirmed by retrying. Only transport failures are retried.
+
+`/api/users/tokens` answers 401 to an anonymous request and 200 to an authenticated one, so the status
+code alone separates the two cases. Its 401 body carries the remaining-attempt count while the
+lockout counter is active, so a `:rejected` taken from an idle account is a reading of the credential
+and not of a lockout.
+
 **A duplicate `machine` entry is reported rather than probed, because which one wins is not this
 check's to decide.** libcurl takes the first matching entry and Python's `netrc` module — which is
 what `hyp3lib.fetch` uses inside the container — takes the last, so two entries for one host with
@@ -186,27 +194,33 @@ function _probe_urs()
     path = joinpath(homedir(), ".netrc")
     isfile(path) || return :absent
     netrc_host_count(path, URS_HOST) > 1 && return :ambiguous
-    # **Retried, because one 401 does not distinguish a bad credential from a throttled endpoint.**
-    # URS answers 401 when it is rate-limiting as well as when it rejects, and this probe is cheap
-    # enough to run repeatedly while debugging — which is exactly how a working credential gets
-    # throttled. A single reading then condemns it, and the next hour is spent looking for a
-    # credential problem that does not exist. Three attempts, spaced, and a `:rejected` only when
-    # every one agrees.
+    # **A rejection is returned on the first reading, never retried.** URS locks the account out for
+    # ten minutes after three consecutive failed credential attempts, so a loop that retries a 401 to
+    # confirm it spends the whole allowance confirming and leaves the account locked — turning a
+    # readable status into ten minutes of unavailability for every caller, including the container.
+    #
+    # Transport failures *are* retried, because they cost nothing against that allowance and this
+    # endpoint drops TLS handshakes intermittently. So the loop exists for `:unreachable` only, and any
+    # HTTP answer at all ends it.
     #
     # `Downloads` reads `~/.netrc` through libcurl, so no credential is handled here — the status code
     # is the whole answer and nothing secret enters this process.
     last = :unreachable
     for attempt in 1:3
         attempt > 1 && sleep(2.0 * attempt)
+        # `throw = false` suppresses the exception for an HTTP error status but *not* for a
+        # curl-level failure: that comes back as a `RequestError`, which has no `status` field. Reading
+        # one without checking would raise a `FieldError` from inside a status probe — the failure it
+        # exists to report, delivered as a crash.
         r = try
             Downloads.request("https://$URS_HOST/api/users/tokens";
                               method = "GET", throw = false, timeout = 60)
         catch
-            last = :unreachable
             continue
         end
+        r isa Downloads.RequestError && continue
         r.status == 200 && return :ok
-        last = r.status in (401, 403) ? :rejected : :unreachable
+        return r.status in (401, 403) ? :rejected : :unreachable
     end
     return last
 end

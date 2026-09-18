@@ -294,12 +294,25 @@ end
     @test AutoRIFT.take_workspace!(Float32, 128, 25) !== small
     @test size(AutoRIFT.take_workspace!(Float32, 32, 25).chip) == (32, 32)
 
-    # The element type is deliberately not part of the key: no buffer here has the image's type,
-    # which is the same reason `CorrelationWorkspace` carries no `T`.
+    # The element *type* is not part of the key — no buffer carries the image's type, which is the
+    # same reason `CorrelationWorkspace` has no `T` — but real-versus-complex is, because `workspace`
+    # allocates only the buffers that `T`'s path can reach. So two real types share an entry:
     clear_workspaces!()
     w8 = AutoRIFT.take_workspace!(UInt8, 32, 25)
     AutoRIFT.give_workspace!(w8)
     @test AutoRIFT.take_workspace!(Float32, 32, 25) === w8
+    AutoRIFT.give_workspace!(w8)
+
+    # ...and a complex request must not be served a real workspace, whose complex buffers are 0x0.
+    # Handing one over would be an out-of-bounds write rather than an error, which is why the flag is
+    # in the key rather than checked at use.
+    wc = AutoRIFT.take_workspace!(ComplexF32, 32, 25)
+    @test wc !== w8
+    @test AutoRIFT.iscomplexworkspace(wc)
+    @test !AutoRIFT.iscomplexworkspace(w8)
+    AutoRIFT.give_workspace!(wc)
+    # Nor the reverse: a real request must not be served the complex workspace just returned.
+    @test !AutoRIFT.iscomplexworkspace(AutoRIFT.take_workspace!(Float32, 32, 25))
 
     # A scalar, a plain tuple and an `Extent` name the same geometry, so all three must key the
     # same pool entry. `Extent isa Tuple` is `false`, so normalizing by a tuple test would send an
@@ -320,6 +333,33 @@ end
     ws = workspace(Float32, extent((X = 32, Y = 16)), extent((X = 25, Y = 10)))
     @test size(ws.chip) == (16, 32)
     @test size(ws.surface) == (20, 50)
+
+    # A workspace carries one path's buffers, not both. Roughly half of a both-paths workspace is
+    # unreachable on either measure, and a run holds one pool entry per geometry, so this is the
+    # difference between holding what a pass uses and holding twice that.
+    wreal = workspace(Float32, extent(32), extent(25))
+    wcplx = workspace(ComplexF32, extent(32), extent(25))
+    for f in (:chip, :isum, :numerator, :fbuf_a, :fbuf_b, :fspec_a, :fspec_b, :wspec)
+        @test !isempty(getfield(wreal, f))
+        @test isempty(getfield(wcplx, f))
+    end
+    for f in (:cchip, :cisum, :cnumerator, :cbuf_a, :cbuf_b, :cspec_a)
+        @test isempty(getfield(wreal, f))
+        @test !isempty(getfield(wcplx, f))
+    end
+    # `isqsum` and `surface` serve both: a sum of squared magnitudes is real whichever measure reads
+    # it, and the surface is real because a similarity is.
+    for f in (:isqsum, :surface)
+        @test !isempty(getfield(wreal, f))
+        @test !isempty(getfield(wcplx, f))
+    end
+    @test Base.summarysize(wreal) < Base.summarysize(workspace(Float32, extent(32), extent(25))) +
+                                    Base.summarysize(wcplx)
+
+    # Feeding a workspace the path it was not built for is a named error rather than a corruption.
+    # `prepare_chip!` is where it is caught, since that is the first field either path writes.
+    @test_throws "built for real imagery" AutoRIFT.prepare_chip!(wreal, zeros(ComplexF32, 8, 8))
+    @test_throws "built for complex imagery" AutoRIFT.prepare_chip!(wcplx, zeros(Float32, 8, 8))
 
     # Refinement workspaces pool on `upsampling` alone, since that and the fixed 5x5 patch
     # determine every extent.

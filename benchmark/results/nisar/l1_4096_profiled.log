@@ -1,0 +1,48 @@
+NISAR_L1_PR_RSLC_003_170_D_053_7700_SHNA_A_20251028T235201_20251028T235238_X05009_N_P_J_001_X_NISAR_L1_PR_RSLC_007_170_D_053_7700_SHNA_A_20251215T235203_20251215T235240_X05009_N_P_J_001_G0120V02_P094
+  scene 57760 x 50511 px, grid 2328 x 2304, halo 2736 x 1500 px, 1871119 searchable points, 10 threads
+  warmup: 128 x 128 grid patch at (551, 1361), 16384 searchable points, 3.3 s compiling
+  warmup: 128 x 128 grid patch at (551, 1361), 16384 searchable points, 2.7 s compiling
+  4096 px          676.3 s clean
+  4096 px          1482 blocks    695.5 s  peak    32.47 GiB (13.40 above floor)  readamp  8.77x  measured 1797076
+      resident peak 32.85 GiB   live peak 37.71 GiB   live at end 31.35 GiB   floor 19.07 GiB
+      allocated 2336.3 GiB   GC 7.5 s (1.1% of wall) in 1565 pauses, 169 full
+      occupancy 8.79 of 10 threads (88%)   cpu 5947 s over 676 s wall
+      buffer prediction: 18 B/px x 5274 x 9715 px window x 10 tasks = 8.6 GiB
+      profile: 1386927 running samples at 2 ms, span 696 s of 696 s wall, buffer 15% full
+      samples: 1386927 attributed, 1379962 idle-on-cvwait, 279411 flagged sleeping
+      GC samples 0.5% of running
+      where the run spends its time (share of working samples):
+         23.3%  (FFTW transform)
+         11.3%  ifft_execute! @ plans.jl:451 ← _numerators_fft_prepared! @ correlate.jl:1156 ← _numerators_fft! @ correlate.jl:1166 ← _numerators! @ correlate.jl:1084 ← _numerators_or_prepared! @ correlate.jl:1172 ← _correlate_surface! @ correlate.jl:871
+         10.7%  fft_execute! @ plans.jl:338 ← _window_spectrum! @ correlate.jl:1132 ← _numerators_fft! @ correlate.jl:1165 ← _numerators! @ correlate.jl:1084 ← _numerators_or_prepared! @ correlate.jl:1172 ← _correlate_surface! @ correlate.jl:871
+         10.6%  fft_execute! @ plans.jl:338 ← _numerators_fft_prepared! @ correlate.jl:1149 ← _numerators_fft! @ correlate.jl:1166 ← _numerators! @ correlate.jl:1084 ← _numerators_or_prepared! @ correlate.jl:1172 ← _correlate_surface! @ correlate.jl:871
+          3.6%  preprocess @ preprocess.jl:241 ← preprocess @ preprocess.jl:266 ← _prepare @ api.jl:519 ← _prepare @ api.jl:525 ← _prepare_block @ tile.jl:581 ← _prepared_block_pair @ tile.jl:551
+          2.2%  _read_block! @ tile.jl:530 ← _block_pair! @ tile.jl:501 ← _prepared_block_pair @ tile.jl:550 ← _run_one_block! @ tile.jl:799 ← _run_task_blocks! @ tile.jl:787 ← #_run_blocked##2 @ tile.jl:753
+          2.1%  _read_block! @ tile.jl:530 ← _block_pair! @ tile.jl:502 ← _prepared_block_pair @ tile.jl:550 ← _run_one_block! @ tile.jl:799 ← _run_task_blocks! @ tile.jl:787 ← #_run_blocked##2 @ tile.jl:753
+          2.1%  _correlate_surface! @ correlate.jl:887 ← _correlate_surface! @ correlate.jl:861 ← #correlate!#60 @ correlate.jl:773 ← correlate! @ correlate.jl:746 ← _correlate_rotations! @ track.jl:525 ← _track_bucket! @ track.jl:483
+          2.1%  _numerators_fft_prepared! @ correlate.jl:1151 ← _numerators_fft! @ correlate.jl:1166 ← _numerators! @ correlate.jl:1084 ← _numerators_or_prepared! @ correlate.jl:1172 ← _correlate_surface! @ correlate.jl:871 ← _correlate_surface! @ correlate.jl:861
+          1.8%  _numerators_fft_prepared! @ correlate.jl:1159 ← _numerators_fft! @ correlate.jl:1166 ← _numerators! @ correlate.jl:1084 ← _numerators_or_prepared! @ correlate.jl:1172 ← _correlate_surface! @ correlate.jl:871 ← _correlate_surface! @ correlate.jl:861
+          1.6%  _read_block! @ tile.jl:530 ← _block_pair! @ tile.jl:503 ← _prepared_block_pair @ tile.jl:550 ← _run_one_block! @ tile.jl:799 ← _run_task_blocks! @ tile.jl:787 ← #_run_blocked##2 @ tile.jl:753
+          1.6%  _read_block! @ tile.jl:530 ← _block_pair! @ tile.jl:504 ← _prepared_block_pair @ tile.jl:550 ← _run_one_block! @ tile.jl:799 ← _run_task_blocks! @ tile.jl:787 ← #_run_blocked##2 @ tile.jl:753
+          1.6%  (no AutoRIFT frame)
+          1.5%  _window_spectrum! @ correlate.jl:1130 ← _numerators_fft! @ correlate.jl:1165 ← _numerators! @ correlate.jl:1084 ← _numerators_or_prepared! @ correlate.jl:1172 ← _correlate_surface! @ correlate.jl:871 ← _correlate_surface! @ correlate.jl:861
+[33m[1m┌ [22m[39m[33m[1mWarning: [22m[39mcoarse grid smaller than the outlier filter's window; searching every point at full radius, which costs roughly 100x the restricted pass. Reduce `coarse_stride`, reduce `grid_spacing`, or process a larger area per call.
+[33m[1m│ [22m[39m  chip_size_x = 192
+[33m[1m│ [22m[39m  chip_size_y = 104
+[33m[1m└ [22m[39m[90m@ AutoRIFT ~/Documents/GitHub/AutoRIFT.jl/src/tile.jl:677[39m
+[33m[1m┌ [22m[39m[33m[1mWarning: [22m[39mcoarse grid smaller than the outlier filter's window; searching every point at full radius, which costs roughly 100x the restricted pass. Reduce `coarse_stride`, reduce `grid_spacing`, or process a larger area per call.
+[33m[1m│ [22m[39m  chip_size_x = 384
+[33m[1m│ [22m[39m  chip_size_y = 208
+[33m[1m└ [22m[39m[90m@ AutoRIFT ~/Documents/GitHub/AutoRIFT.jl/src/tile.jl:677[39m
+
+wrote /Users/gardnera/data/autorift/tests/golden_tests/mem/prof_NISAR_L1_PR_RSLC_003_170_D_053_7700_SHNA_A_20251028T235201_20251028T235238_X05009_N_P_J_001.jls — 1 new row, 9 in history
+
+every configuration measured for this case (newest per block size):
+  block           blocks   runtime vs untiled  peak GiB  vs unt  occ/thr  read amp  measured
+  16384 px           100  1852.3 s     3.27x     59.58   1.21x  2.33/10     2.89x  1797136
+  8192 px            380  1078.4 s     1.90x     33.85   0.69x  4.61/10     4.51x  1797076
+  8192x4096 px       760   828.0 s     1.46x     30.41   0.62x  6.60/10     6.42x  1797076
+  4096 px           1482   676.3 s     1.19x     32.47   0.66x  8.79/10     8.77x  1797076
+  2816x1536 px      5814   762.5 s     1.34x     24.43   0.49x  9.03/10    21.60x  1797026
+  untiled              1   567.2 s     1.00x     49.36   1.00x  9.21/10     1.00x  1798199
+  (3 superseded rows also on disk)

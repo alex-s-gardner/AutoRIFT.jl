@@ -7,9 +7,11 @@ scene-sized array is formed, and `test/tile.jl` asserts equality with an untiled
 leaving it to have been checked once. A lazy `Raster` — or any `DiskArrays`-backed input — works
 through the core's generic windowed read, with no dependency in `src/`.
 
-`process_block_size` is in **pixels**; 512 by 512 is the measured best default. Blocking cuts total
-peak memory 40% at 4096² and 60% at 6000², and the margin grows with the scene — see "Where this
-stands", which corrects an earlier reading of these numbers that had it costing memory instead.
+`process_block_size` is in **pixels**; 1024 by 1024 is the measured best default at a narrow halo, and
+has to grow with the halo. Blocking cuts total peak memory 2.3× on a full Landsat scene for a 10%
+runtime cost, and peak tracks a block's *area* rather than the number of blocks — `docs/memory.md`
+holds the sweep, the halo arithmetic that bounds how small a block can usefully be, and the two
+misconfigurations at either end.
 
 ## What is wanted
 
@@ -69,7 +71,7 @@ defaults**, costing 1–13% extra reading at block sizes between 512 and 2048 px
 ## Shape
 
 ```julia
-autorift(reference, secondary; process_block_size = (512, 512), kwargs...)
+autorift(reference, secondary; process_block_size = (1024, 1024), kwargs...)
 ```
 
 - `process_block_size` is in **pixels**, and absent ⇒ one block over the whole scene. The wrapper
@@ -242,9 +244,15 @@ several blocks.
 
 **Blocking wins at every size measured, and the margin grows with the scene** — 40% at 4096², 60% at
 6000². So it is not only for a scene that will not fit; it is worth reaching for whenever peak memory
-matters. 512-pixel blocks are the cheapest, and peak *rises* with the block size, because a larger
-block holds more imagery at once while the halo it saves is a fixed width. Halo overhead at these
-sizes is 1–13% extra reading.
+matters. Peak *rises* with the block size, because a larger block holds more imagery at once while the
+halo it saves is a fixed width. Halo overhead at these sizes is 1–13% extra reading.
+
+The 512-against-1024 ordering here is within the run-to-run spread and does not survive a larger
+scene. On the full 17121×16961 Landsat overlap at 10 threads, 1024 px is the cheapest and 512 px is
+marginally worse — 2140 against 2248 MiB — and the whole range 256–1024 px is flat within 10%, because
+peak is set by a block's *area* times the task count rather than by the block count. `docs/memory.md`
+holds that sweep, and it is the one to size a production run from: these two scenes are small enough
+that few of their block sizes give more blocks than a wide machine has threads.
 
 **Report total peak, not each configuration's own above-baseline delta.** An untiled baseline already
 holds the two resident scenes, so subtracting it hides exactly the cost blocking removes. Measured

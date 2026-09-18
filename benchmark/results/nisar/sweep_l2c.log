@@ -1,0 +1,30 @@
+NISAR_L2_PR_GSLC_003_170_D_053_7700_SHNA_A_20251028T235201_20251028T235238_X05009_N_P_J_001_X_NISAR_L2_PR_GSLC_007_170_D_053_7700_SHNA_A_20251215T235203_20251215T235240_X05009_N_P_J_001_G0120V02_P093
+  scene 54885 x 110085 px, grid 2288 x 2288, halo 2216 x 1103 px, 1873823 searchable points, 10 threads
+  warmup: 128 x 128 grid patch at (541, 1351), 16384 searchable points, 13.5 s compiling
+  warmup: 128 x 128 grid patch at (541, 1351), 16384 searchable points, 3.3 s compiling
+  3072 px                  347.6 s clean
+  3072 px                   648 blocks    354.6 s  peak    31.18 GiB (8.67 above floor)  readamp  1.69x  measured 1781377
+      resident peak 29.44 GiB   live peak 36.56 GiB   live at end 33.74 GiB   floor 22.50 GiB
+      allocated 1063.0 GiB   GC 3.4 s (1.0% of wall) in 699 pauses, 71 full
+      occupancy 6.77 of 10 threads (68%)   cpu 2355 s over 348 s wall
+      buffer prediction: 18 B/px x 5256 x 7458 px window x 10 tasks = 6.6 GiB
+      profile: 517898 running samples at 2 ms, span 355 s of 355 s wall, buffer 12% full
+      samples: 517898 attributed, 584160 idle-on-cvwait, 391384 flagged sleeping
+      GC samples 0.5% of running
+      where the run spends its time:
+         12.7%  (FFTW transform)
+          4.1%  ifft_execute! @ plans.jl:451 ← _numerators_fft_prepared! @ correlate.jl:1156 ← _numerators_fft! @ correlate.jl:1166 ← _numerators! @ correlate.jl:1084 ← _numerators_or_prepared! @ correlate.jl:1172 ← _correlate_surface! @ correlate.jl:871
+          3.9%  fft_execute! @ plans.jl:338 ← _window_spectrum! @ correlate.jl:1132 ← _numerators_fft! @ correlate.jl:1165 ← _numerators! @ correlate.jl:1084 ← _numerators_or_prepared! @ correlate.jl:1172 ← _correlate_surface! @ correlate.jl:871
+          3.8%  fft_execute! @ plans.jl:338 ← _numerators_fft_prepared! @ correlate.jl:1149 ← _numerators_fft! @ correlate.jl:1166 ← _numerators! @ correlate.jl:1084 ← _numerators_or_prepared! @ correlate.jl:1172 ← _correlate_surface! @ correlate.jl:871
+          2.1%  preprocess @ preprocess.jl:241 ← preprocess @ preprocess.jl:266 ← _prepare @ api.jl:519 ← _prepare @ api.jl:525 ← _prepare_block @ tile.jl:581 ← _prepared_block_pair @ tile.jl:551
+          1.3%  _read_block! @ tile.jl:530 ← _block_pair! @ tile.jl:501 ← _prepared_block_pair @ tile.jl:550 ← _run_one_block! @ tile.jl:799 ← _run_task_blocks! @ tile.jl:787
+          1.3%  _read_block! @ tile.jl:530 ← _block_pair! @ tile.jl:502 ← _prepared_block_pair @ tile.jl:550 ← _run_one_block! @ tile.jl:799 ← _run_task_blocks! @ tile.jl:787
+          1.0%  _correlate_surface! @ correlate.jl:887 ← _correlate_surface! @ correlate.jl:861 ← #correlate!#60 @ correlate.jl:773 ← correlate! @ correlate.jl:746 ← _correlate_rotations! @ track.jl:525 ← _track_bucket! @ track.jl:483
+          0.9%  _numerators_fft_prepared! @ correlate.jl:1151 ← _numerators_fft! @ correlate.jl:1166 ← _numerators! @ correlate.jl:1084 ← _numerators_or_prepared! @ correlate.jl:1172 ← _correlate_surface! @ correlate.jl:871 ← _correlate_surface! @ correlate.jl:861
+          0.8%  _numerators_fft_prepared! @ correlate.jl:1159 ← _numerators_fft! @ correlate.jl:1166 ← _numerators! @ correlate.jl:1084 ← _numerators_or_prepared! @ correlate.jl:1172 ← _correlate_surface! @ correlate.jl:871 ← _correlate_surface! @ correlate.jl:861
+          0.8%  _read_block! @ tile.jl:530 ← _block_pair! @ tile.jl:503 ← _prepared_block_pair @ tile.jl:550 ← _run_one_block! @ tile.jl:799 ← _run_task_blocks! @ tile.jl:787
+          0.8%  _read_block! @ tile.jl:530 ← _block_pair! @ tile.jl:504 ← _prepared_block_pair @ tile.jl:550 ← _run_one_block! @ tile.jl:799 ← _run_task_blocks! @ tile.jl:787
+          0.7%  integral_both! @ integral.jl:210 ← _correlate_surface! @ correlate.jl:869 ← _correlate_surface! @ correlate.jl:861 ← #correlate!#60 @ correlate.jl:773 ← correlate! @ correlate.jl:746 ← _correlate_rotations! @ track.jl:525
+          0.7%  _window_spectrum! @ correlate.jl:1130 ← _numerators_fft! @ correlate.jl:1165 ← _numerators! @ correlate.jl:1084 ← _numerators_or_prepared! @ correlate.jl:1172 ← _correlate_surface! @ correlate.jl:871 ← _correlate_surface! @ correlate.jl:861
+
+wrote /Users/gardnera/data/autorift/tests/golden_tests/mem/prof_NISAR_L2_PR_GSLC_003_170_D_053_7700_SHNA_A_20251028T235201_20251028T235238_X05009_N_P_J_001.jls

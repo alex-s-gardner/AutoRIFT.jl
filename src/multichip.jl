@@ -351,28 +351,26 @@ end
 
 # How much coarser this level's grid is than the caller's, as an integer stride.
 #
-# The reference resizes its grid by `ChipSize0X / ChipSizeUniX[i]` at every level
-# (`autoRIFT.py:507-524`) and resizes the results back afterwards (`820-878`), so a level's grid
-# spacing grows with its chip and the chip-to-spacing ratio is the same at every level. That is what
-# makes one filter width correct throughout, and what keeps a level from posting sixteen estimates
-# per chip footprint — sixteen views of mostly the same pixels, which no coherence filter can tell
-# apart.
+# **The chip ratio, applied to both axes.** The reference resizes its grid by
+# `ChipSize0X / ChipSizeUniX[i]` at every level (`autoRIFT.py:510-514`) and resizes the results back
+# by the reciprocal afterwards (`:820-878`) — one factor, from the x extents, used for rows and
+# columns alike. So a level's grid spacing grows in proportion to its chip, every level sees the same
+# chip-to-spacing ratio, and one filter width is correct throughout.
+#
+# The invariant this holds: a level posts one estimate per chip footprint. Half this stride posts
+# four, which are four views of mostly the same pixels — the coherence filter cannot tell them apart,
+# so they survive as mutually corroborating outliers. `_check_levels` makes the division exact at
+# every level, so the stride is a power of two and the guard only covers the finest level.
+#
+# **Both axes take the x factor, which is not obviously right for a rectangular chip** — a 96x52 chip
+# on a 48 px grid reaches a stride of 8 in y, coarsening the grid past what a 52 px chip supports.
+# Matched rather than endorsed; see `tools/golden/README.md`.
 #
 # A stride rather than a resize: the levels are powers of two of the base chip, so the coarse grid is
 # exactly every `n`-th point of the fine one, and taking a subset keeps the coordinates the caller
 # supplied instead of interpolating new ones.
-#
-# Derived from the *grid spacing*, not from `chip_size_min`. The invariant to hold is that every
-# level sees the same chip-to-spacing ratio, so the stride is whatever makes this level's effective
-# spacing proportional to its chip: `chip / (ratio * spacing)`, where the ratio is the finest
-# level's. Defining it against `chip_size_min` instead gives a stride of 1 whenever a single coarse
-# level runs alone — `chip_size_min` is then that same coarse size — and the ratio jumps to 8, where
-# the filter demands 877 of 1089 neighbours agree and nothing survives.
 function _level_decimation(p::Params, chip_size::Extent)
-    ratio = _oversample(p)
-    sx = chip_size.X ÷ max(ratio * p.grid_spacing.X, 1)
-    sy = chip_size.Y ÷ max(ratio * p.grid_spacing.Y, 1)
-    return max(min(sx, sy), 1)
+    return max(chip_size.X ÷ p.chip_size_min.X, 1)
 end
 
 # One point per `stride`-by-`stride` cell of `grid`, placed at the cell's centre.
@@ -485,11 +483,15 @@ end
 #
 # Three properties of a production grid make the obvious readings wrong, and each has been measured:
 #
-#   * **It is zeroed at nodata.** The driver clears `xGrid` wherever there is no data
-#     (`testautoRIFT.py:394-403`), so `x[1, 2] - x[1, 1]` is `0` on a scene whose first row and column
-#     are ocean. Reading the spacing there gives zero, `_cell_centres` shifts by nothing, and every
-#     coarse node sits at its cell's first point — half a cell from where `_undecimate_level` reads it
-#     back.
+#   * **It is constant at nodata, and not always zero.** The driver clears `xGrid` wherever there is no
+#     data (`testautoRIFT.py:394-403`), so `x[1, 2] - x[1, 1]` is `0` on a scene whose first row and
+#     column are ocean. Reading the spacing there gives zero, `_cell_centres` shifts by nothing, and
+#     every coarse node sits at its cell's first point — half a cell from where `_undecimate_level`
+#     reads it back. The fill survives the half-sample snap as a *constant*, which need not be zero: on
+#     both NISAR grids it is `0.5`, covering 55.7% of the L2 array and 56.8% of the L1 one. So the
+#     property to exclude is a **zero step**, which is what a constant region produces whatever its
+#     value; testing the endpoints against zero alone let 2,895,601 steps inside the L2 fill outvote the
+#     2,297,235 real ones and returned a spacing of `0`.
 #   * **It is rotated, by an arbitrary amount.** A step along a row moves `x` by the spacing times the
 #     cosine of the rotation, which is `8` on a near-axis-aligned Landsat grid and `-1` on a Sentinel-2
 #     grid rotated near 90°. So the step is not the grid spacing, it is *signed*, and a rule that keeps
@@ -499,8 +501,8 @@ end
 #     they are always a minority of the array, so the mode excludes them without needing to identify
 #     them.
 #
-# Zero only when no two adjacent points both carry a coordinate, which means the caller has no grid.
-# `_cell_centres` then shifts by nothing, which is right for a grid with no spacing to speak of.
+# Zero only when no two adjacent points are a step apart, which means the caller has no grid along this
+# axis. `_cell_centres` then shifts by nothing, which is right for a grid with no spacing to speak of.
 function _grid_step(x::AbstractMatrix, dim::Int)
     n = size(x, dim)
     n > 1 || return 0.0
@@ -511,6 +513,9 @@ function _grid_step(x::AbstractMatrix, dim::Int)
         # touching one describes the margin rather than the spacing.
         (iszero(a) || iszero(b)) && continue
         d = Float64(b) - Float64(a)
+        # A zero step is a constant region, not a spacing. That is the nodata fill wherever it survived
+        # the snap as a nonzero constant, and it can be the majority of the array — see above.
+        iszero(d) && continue
         counts[d] = get(counts, d, 0) + 1
     end
     isempty(counts) && return 0.0
@@ -751,8 +756,9 @@ end
 # **The X axis alone, which is what the reference uses.** Its ratio is
 # `int(self.ChipSize0X / self.GridSpacingX)` (`autoRIFT.py:481`) — one number, from the X chip and the
 # X spacing, with no Y term anywhere. Taking the smaller of the two axes agrees whenever the chip is
-# square, which every optical case in the golden set is, and diverges as soon as it is not: a
-# Sentinel-1 pair runs `ScaleChipSizeY = 0.25`, so a 64x16 chip on a grid spaced 32 gives 2 in X and
+# square in pixels — that is, wherever the pixel itself is square, since the chip is a fixed size in
+# metres — and diverges as soon as it is not: a Sentinel-1 pair runs `ScaleChipSizeY = 0.25`, an
+# azimuth pixel four times the range pixel, so a 64x16 chip on a grid spaced 32 gives 2 in X and
 # **0** in Y, and the minimum collapses the ratio to 1. The filter then judges over a 5-wide window at
 # `FracValid = 0.32` where the reference uses 9 at a threshold raised by its overlap term, which
 # rejects far less — measured as 176,211 points answered against the reference's 70,508 on
@@ -772,8 +778,12 @@ function _oversample(p::Params)
     # is 877 of 1089, which no real velocity field clears — measured as zero coverage for a 64 px
     # chip on a grid spaced 8. The reference never exceeds 2 because it decimates every level to
     # keep the ratio fixed, so the formula it uses (`autoRIFT.py:498-502`) was only ever exercised
-    # there. A caller who posts a grid four times finer than its chips gets the same neighbourhood
-    # in ground units that the reference would use, and `_level_decimation` does the rest.
+    # there.
+    #
+    # The cap therefore bites only on a grid finer than any the reference runs, and it bites on the
+    # filter neighbourhood alone: `_level_decimation` is the chip ratio and does not consult this, so
+    # a capped ratio leaves the level grids where the reference puts them and widens the window less
+    # than the true ratio would.
     return clamp(ox, 1, 2)
 end
 

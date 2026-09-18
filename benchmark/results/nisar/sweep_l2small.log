@@ -1,0 +1,29 @@
+NISAR_L2_PR_GSLC_003_170_D_053_7700_SHNA_A_20251028T235201_20251028T235238_X05009_N_P_J_001_X_NISAR_L2_PR_GSLC_007_170_D_053_7700_SHNA_A_20251215T235203_20251215T235240_X05009_N_P_J_001_G0120V02_P093
+  scene 54885 x 110085 px, grid 2288 x 2288, halo 2216 x 1103 px, 1873823 searchable points, 10 threads
+  warmup: 128 x 128 grid patch at (541, 1351), 16384 searchable points, 13.1 s compiling
+  warmup: 128 x 128 grid patch at (541, 1351), 16384 searchable points, 2.4 s compiling
+  2304 px          328.3 s clean
+  2304 px          1152 blocks    339.4 s  peak    29.95 GiB (7.83 above floor)  readamp  2.26x  measured 1781377
+      resident peak 28.09 GiB   live peak 34.42 GiB   live at end 32.34 GiB   floor 22.12 GiB
+      allocated 1301.0 GiB   GC 4.0 s (1.2% of wall) in 924 pauses, 83 full
+      occupancy 7.87 of 10 threads (79%)   cpu 2586 s over 328 s wall
+      buffer prediction: 18 B/px x 4488 x 6690 px window x 10 tasks = 5.0 GiB
+      profile: 619103 running samples at 2 ms, span 339 s of 339 s wall, buffer 14% full
+      samples: 619103 attributed, 580159 idle-on-cvwait, 283614 flagged sleeping
+      GC samples 0.6% of running
+      where the run spends its time (share of working samples):
+         25.6%  (FFTW transform)
+          8.4%  ifft_execute! @ plans.jl:451 ← _numerators_fft_prepared! @ correlate.jl:1156 ← _numerators_fft! @ correlate.jl:1166 ← _numerators! @ correlate.jl:1084 ← _numerators_or_prepared! @ correlate.jl:1172 ← _correlate_surface! @ correlate.jl:871
+          7.8%  fft_execute! @ plans.jl:338 ← _window_spectrum! @ correlate.jl:1132 ← _numerators_fft! @ correlate.jl:1165 ← _numerators! @ correlate.jl:1084 ← _numerators_or_prepared! @ correlate.jl:1172 ← _correlate_surface! @ correlate.jl:871
+          7.7%  fft_execute! @ plans.jl:338 ← _numerators_fft_prepared! @ correlate.jl:1149 ← _numerators_fft! @ correlate.jl:1166 ← _numerators! @ correlate.jl:1084 ← _numerators_or_prepared! @ correlate.jl:1172 ← _correlate_surface! @ correlate.jl:871
+          5.4%  preprocess @ preprocess.jl:241 ← preprocess @ preprocess.jl:266 ← _prepare @ api.jl:519 ← _prepare @ api.jl:525 ← _prepare_block @ tile.jl:581 ← _prepared_block_pair @ tile.jl:551
+          3.3%  _read_block! @ tile.jl:530 ← _block_pair! @ tile.jl:501 ← _prepared_block_pair @ tile.jl:550 ← _run_one_block! @ tile.jl:799 ← _run_task_blocks! @ tile.jl:787
+          3.3%  _read_block! @ tile.jl:530 ← _block_pair! @ tile.jl:502 ← _prepared_block_pair @ tile.jl:550 ← _run_one_block! @ tile.jl:799 ← _run_task_blocks! @ tile.jl:787
+          2.0%  _read_block! @ tile.jl:530 ← _block_pair! @ tile.jl:503 ← _prepared_block_pair @ tile.jl:550 ← _run_one_block! @ tile.jl:799 ← _run_task_blocks! @ tile.jl:787
+          2.0%  _read_block! @ tile.jl:530 ← _block_pair! @ tile.jl:504 ← _prepared_block_pair @ tile.jl:550 ← _run_one_block! @ tile.jl:799 ← _run_task_blocks! @ tile.jl:787
+          2.0%  _correlate_surface! @ correlate.jl:887 ← _correlate_surface! @ correlate.jl:861 ← #correlate!#60 @ correlate.jl:773 ← correlate! @ correlate.jl:746 ← _correlate_rotations! @ track.jl:525 ← _track_bucket! @ track.jl:483
+          1.9%  _numerators_fft_prepared! @ correlate.jl:1151 ← _numerators_fft! @ correlate.jl:1166 ← _numerators! @ correlate.jl:1084 ← _numerators_or_prepared! @ correlate.jl:1172 ← _correlate_surface! @ correlate.jl:871 ← _correlate_surface! @ correlate.jl:861
+          1.8%  _numerators_fft_prepared! @ correlate.jl:1159 ← _numerators_fft! @ correlate.jl:1166 ← _numerators! @ correlate.jl:1084 ← _numerators_or_prepared! @ correlate.jl:1172 ← _correlate_surface! @ correlate.jl:871 ← _correlate_surface! @ correlate.jl:861
+          1.6%  (no AutoRIFT frame)
+          1.5%  _window_spectrum! @ correlate.jl:1130 ← _numerators_fft! @ correlate.jl:1165 ← _numerators! @ correlate.jl:1084 ← _numerators_or_prepared! @ correlate.jl:1172 ← _correlate_surface! @ correlate.jl:871 ← _correlate_surface! @ correlate.jl:861
+  2816 px          343.8 s clean

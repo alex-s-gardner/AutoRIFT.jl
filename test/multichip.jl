@@ -385,6 +385,32 @@ end
     end
 end
 
+@testset "a level's stride is its chip ratio, in both axes" begin
+    # The reference resizes a level's grid by `ChipSize0X / ChipSizeUniX[i]` (`autoRIFT.py:510-514`) —
+    # one factor, from the x extents, applied to rows and columns alike. So the stride is the chip
+    # ratio and nothing else, and in particular it does not consult the y extent.
+    #
+    # Asserted directly rather than through a correlation, because a rule that decimates y less than
+    # the reference does still produces a plausible field: the level posts several estimates per chip
+    # footprint instead of one, which reads as blunders against the reference's smooth one rather than
+    # as a coverage or accuracy failure any end-to-end statistic isolates.
+    #
+    # The rectangular cases are the ones that discriminate. Every optical golden pair has a square
+    # chip, where a per-axis rule and this one agree at every level.
+    for (chip, cmax, spacing) in (((X = 96, Y = 52), (X = 768, Y = 416), 48),   # NISAR L1 RSLC
+                                  ((X = 96, Y = 48), (X = 768, Y = 384), 48),   # NISAR L2 GSLC
+                                  ((X = 32, Y = 8),  (X = 256, Y = 64),  32),   # Sentinel-1, 4:1
+                                  ((X = 32, Y = 32), (X = 256, Y = 256), 16))   # square control
+        p = params(; chip_size = chip, chip_size_max = cmax,
+                   grid_spacing = (X = spacing, Y = spacing))
+        @test [AutoRIFT._level_decimation(p, cs) for cs in AutoRIFT.chip_sizes(p)] == [1, 2, 4, 8]
+    end
+
+    # A grid coarser than the chip does not lift the finest level off its own points.
+    p = params(; chip_size = 32, chip_size_max = 64, grid_spacing = 64)
+    @test AutoRIFT._level_decimation(p, (X = 32, Y = 32)) == 1
+end
+
 @testset "a coarse level is correlated where it is read back from" begin
     # The round trip a decimated level makes: `_decimate_level` picks where to correlate, and
     # `_undecimate_level` interpolates the answers back with the half-sample convention, which places
@@ -691,7 +717,7 @@ end
     @test_throws ArgumentError params(; chip_size = 32, chip_size_max = 96)
 end
 
-@testset "grid spacing survives a zeroed nodata margin" begin
+@testset "grid spacing survives a constant nodata fill" begin
     # A production grid is zeroed wherever there is no data (`testautoRIFT.py:394-403`), so a scene
     # whose first rows and columns are ocean has `x[1, 2] == x[1, 1]`. Reading the spacing from the
     # first two points gives zero there, `_cell_centres` then shifts by nothing, and every coarse node
@@ -720,9 +746,23 @@ end
     xrot = Float64[(c <= 5 || r <= 5) ? 0.0 : 5000.0 - (c - 1) for r in 1:12, c in 1:12]
     @test AutoRIFT._grid_step(xrot, 2) == -1
 
-    # No spacing at all: a single column, or an all-zero grid.
+    # **The nodata fill is a constant, and it is not always zero.** Both NISAR grids arrive filled with
+    # `0.5`, which the half-sample convention carries to `1.5` — covering 55.7% of the L2 array and
+    # 56.8% of the L1 one. A rule that excludes only steps *touching a zero* therefore counts every step
+    # inside the fill: on the L2 grid that is 2,895,601 zero steps against 2,297,235 real ones, so the
+    # mode is `0`, `_cell_centres` shifts by nothing, and every coarse node sits at its cell's first
+    # point. The property to exclude is the zero *step*, which a constant region produces whatever its
+    # value.
+    #
+    # Majority fill, since that is the case where the old rule flipped sign rather than merely wobbled.
+    xfill = Float64[(r <= 9) ? 1.5 : 1.5 + 8 * (c - 1) for r in 1:12, c in 1:12]
+    @test count(==(1.5), xfill) > length(xfill) ÷ 2     # the trap: the fill is the majority
+    @test AutoRIFT._grid_step(xfill, 2) == 8
+
+    # No spacing at all: a single column, an all-zero grid, or a grid that is nothing but fill.
     @test AutoRIFT._grid_step(zeros(4, 4), 2) == 0.0
     @test AutoRIFT._grid_step(reshape(Float64[1.5], 1, 1), 2) == 0.0
+    @test AutoRIFT._grid_step(fill(1.5, 4, 4), 2) == 0.0
 
     # And the consequence the helper exists for: a decimated node lands at the cell centre, half a
     # cell from its first point, even when the grid's first row and column are margin.

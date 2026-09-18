@@ -13,10 +13,11 @@
 #   distinguish a field of +0.1 px from one of ±0.1 px, and that distinction is the difference between
 #   a bias and tie-breaking. Exact agreement is the background colour either way.
 #
-#   The range is `dlim` pixels, ±1 by default. Set it small (a few times the quantization step) to see
-#   whether the *sign* of a near-threshold residual is organised, and larger to see how far the worst
-#   disagreements actually reach — a tight range saturates them all to the same colour and makes a
-#   3-pixel error indistinguishable from a 0.3-pixel one.
+#   The range is `dlim` pixels, **±0.3 by default** — a few times the quantization step, which is where
+#   the residuals that decide agreement actually live: the measured core biases across the golden set are
+#   hundredths of a pixel, and at ±1 every one of them renders as background. Raise it to see how far the
+#   worst disagreements reach, since a tight range saturates them all to one colour and makes a 3-pixel
+#   error indistinguishable from a 0.3-pixel one.
 #
 #   **`NaN` reads as blank.** A zero displacement is a real measurement; an unmeasured point is not, and
 #   the two must not look alike.
@@ -92,11 +93,27 @@ plotting the slow step, and the whole reason for plotting is to look at a result
 The cache key includes the settings, so changing a parameter re-runs rather than silently plotting the
 previous configuration. That is the failure mode worth designing against: a stale figure that looks
 current is worse than no figure.
+
+**The imagery's element type is part of the key.** A `CAPTURE_FLOAT32` capture and an ordinary one of
+the same case have identical settings and grid, and differ only in `in_I1`'s element type; a key
+without it serves the `UInt8` field for a `Float32` comparison and reports the quantization's effect
+as zero. The hash of the arrays themselves is not used — it costs a pass over 17,000² of imagery per
+figure, and `eltype` separates the two captures that exist.
+
+**The `PointSet`'s own contents are part of the key too**, not just its size. The priors, the radii and
+the coordinates all decide the answer and none of them is in `kw`, so a key over `kw` and `size` alone
+is unchanged by a fix to any of them — and then serves the field computed *before* the fix, under a
+log line saying it is reusing a run. That is the failure this cache has produced twice; both times the
+figure looked current. Hashing the grid arrays is cheap because the grid is 1/1000 the size of the
+imagery.
 """
 function cached_run(name::AbstractString, k::Capture, grid, kw)
     dir = get(ENV, "AUTORIFT_GOLDEN_CACHE",
               joinpath(homedir(), "data", "autorift", "tests", "golden_tests"))
-    key = string(hash((name, kw, size(grid.x))), base = 16)
+    key = string(hash((name, kw, size(grid.x), eltype(k.arrays["in_I1"]),
+                       grid.x, grid.y, grid.radius_x, grid.radius_y,
+                       grid.dx_prior, grid.dy_prior,
+                       grid.chip_size_x, grid.chip_size_y)), base = 16)
     path = joinpath(dir, "runs", "field_$(first(name, 24))_$key.jls")
 
     if isfile(path)
@@ -124,13 +141,13 @@ both sides together, so one outlier cannot flatten the whole field. Chip size is
 difference column shows *where* the levels disagree rather than by how much — a signed difference in
 level number would imply an ordering the merge does not have.
 
-`dlim` is the half-range of the difference panels in pixels.
+`dlim` is the half-range of the difference panels in pixels, ±0.3 by default.
 """
 function compare_figure(name::AbstractString;
                         path = joinpath(tempdir(), "golden_$(first(name, 24)).png"),
                         zoom::Union{Nothing,Integer} = nothing,
                         center::Union{Nothing,Tuple{Integer,Integer}} = nothing,
-                        dlim::Real = 1.0,
+                        dlim::Real = 0.3,
                         run::Integer = 100)
     # `run` because a capture is not always at the default: the radar cases live at 200, and the
     # optical ones at 100 or 200 depending on when they were taken. Reading the wrong number fails on
@@ -154,6 +171,26 @@ function compare_figure(name::AbstractString;
     pdx = rdx[1:ny, 1:nx]
     pdy = .-rdy[1:ny, 1:nx]
     pcs = rcs[1:ny, 1:nx]
+
+    # Crop to the bounding box of the points either side answered. A swath crosses its grid diagonally,
+    # so the measured region can be a small fraction of the array — 7.0% on the Sentinel-1 burst pair
+    # `20250416T010159` — and mapping the whole array spends the panel on nodata while shrinking the part
+    # being read. The union rather than the intersection, so a coverage difference stays visible: cropping
+    # to where *both* answered would hide exactly the points one side rejected.
+    #
+    # Before `zoom`, so a zoom centre is found and applied inside the cropped frame rather than in
+    # coordinates that include the margin.
+    dvalid = (.!isnan.(jdx)) .| (.!isnan.(pdx))
+    vrows = findall(any(dvalid; dims = 2)[:])
+    vcols = findall(any(dvalid; dims = 1)[:])
+    isempty(vrows) && error("neither side answered any point on $name; nothing to map")
+    vr, vc = first(vrows):last(vrows), first(vcols):last(vcols)
+    if length(vr) < ny || length(vc) < nx
+        @info "cropping to valid data" rows = "$(first(vr)):$(last(vr)) of $ny" cols = "$(first(vc)):$(last(vc)) of $nx" fraction = @sprintf("%.1f%%", 100 * length(vr) * length(vc) / (ny * nx))
+        jdx = jdx[vr, vc]; jdy = jdy[vr, vc]; jcs = jcs[vr, vc]
+        pdx = pdx[vr, vc]; pdy = pdy[vr, vc]; pcs = pcs[vr, vc]
+        ny, nx = length(vr), length(vc)
+    end
 
     # A whole-scene panel decimates roughly 3:1, which averages the outlet — the place the residual
     # actually lives — down to a few cells. Cropping to it shows every grid point at full resolution,
@@ -241,7 +278,7 @@ function main(args)
     center = nothing
     j = findfirst(==("--at"), args)
     j === nothing || (center = Tuple(parse.(Int, split(args[j + 1], ","))))
-    dlim = 1.0
+    dlim = 0.3
     d = findfirst(==("--dlim"), args)
     d === nothing || (dlim = parse(Float64, args[d + 1]))
     run = 100

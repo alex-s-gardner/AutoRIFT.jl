@@ -313,6 +313,49 @@ keep when the scene will not fit at all; on a scene that fits, it trades peak fo
 `benchmark/memory.jl` figures (−36% at 4096², −56% at 6000²) are measured against *windowed,
 never-resident* input, which is the case blocking is for.
 
+**Read that table as being about this window, not about blocking.** It is three block sizes on a scene
+where every one of them is a handful of blocks — 1024 px on 3072² is 9 blocks against 12 threads, so
+every block is in flight at once and the run holds nine working sets. On the full scene the same three
+sizes give 289, 1089 and 4160 blocks and the ordering reverses: blocking cuts peak 2.3× and 1024 px is
+the cheapest. The two tables do not disagree; a block size is only a block size relative to the scene,
+and a sweep whose block count never exceeds the thread count is measuring concurrency rather than
+block size. `mem_blocks.jl` below is the sweep to size a production run from.
+
+## Block size against peak memory, with the peak pinned to a stack
+
+```bash
+julia --project=tools/ab tools/ab/bench_scene.jl ~/data/autorift/bench   # once: split the planes
+julia --project=tools/ab tools/ab/mem_blocks.jl --threads 10
+julia --project=tools/ab tools/ab/mem_blocks.jl --replot --threads 10    # re-render, no measuring
+```
+
+Writes `plots/mem_blocks_t<N>.png` and one trace per configuration under the work directory.
+
+What this adds over the tables above is *when* and *why*, not only how much. Each child process
+(`mem_child.jl`) samples its own physical footprint every 4 ms and runs the CPU profiler alongside, on
+the same clock, so the run reports which stacks were executing in the window where the trace peaked.
+That is what separates a plateau the whole run holds from a spike one stage sets, and what identified
+the 128-pixel failure as GC contention rather than as reading.
+
+Three things it measures that a single `maxrss` cannot:
+
+- **`phys_footprint`, not `resident_size`.** Input is memory-mapped, so resident size counts the clean
+  file-backed pages a read populated — pages the kernel evicts under pressure rather than OOM-killing
+  for. Charging a lazily-read run for its own page cache would credit the untiled run, which touches
+  each page once, over a blocked run whose halo touches some of them several times. Both are recorded;
+  the footprint is the headline.
+- **The sampler needs an interactive thread** (`-t N,1`). On the default pool it queues behind the
+  correlation's own tasks and leaves second-long gaps exactly where the peak is.
+- **The CPU profiler, not `@profile_walltime`.** The wall-time profiler samples *tasks*, so idle
+  scheduler tasks crowd out the work: measured on a saturating two-task load, 66 of 77 samples were
+  `try_yieldto` and the actual computation appeared in none. Its samples also carry the task profiler's
+  fake sleep state, so there is no running/sleeping flag to filter on. See `peak_stacks` in
+  `memtrace.jl`, which additionally drops threads parked in `__psynch_cvwait` — 1399 of 1650 otherwise
+  unattributable samples on this scene.
+
+The findings are in `docs/memory.md`: peak tracks a block's area rather than the block count, runtime
+tracks the halo, and both ends of the sweep are misconfigurations for opposite reasons.
+
 ## The full scene: every configuration, end to end
 
 The tables above are a 3072² window, where nothing is large enough to force a choice. This one is the

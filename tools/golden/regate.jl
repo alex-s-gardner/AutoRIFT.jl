@@ -3,6 +3,10 @@
 #   julia --project=tools/golden tools/golden/regate.jl              # the cheap gates
 #   julia --project=tools/golden tools/golden/regate.jl --all        # including the slow ones
 #
+# The verdict table goes to stdout and per-case progress to stderr, so `regate.jl --all >table.txt`
+# leaves the progress on the terminal. `--all` runs for tens of minutes; keep the streams separate or
+# redirect both and watch the file.
+#
 # **What this is for.** A ladder whose lower rungs are not re-checked is a ladder that slides: a fix
 # justified against one measurement can undo another, and the five `src/` commits that prompted
 # `GATES.md` row 0.2 are the case in point — each was justified against a golden comparison and none
@@ -49,6 +53,45 @@ end
 last_line(text) = begin
     ls = filter(!isempty, strip.(split(text, '\n')))
     isempty(ls) ? "(no output)" : ls[end]
+end
+
+# Live progress on stderr, one flushed line per step, while the verdict table accumulates on stdout.
+# Two streams because they answer different questions: the table is the result, and this is only
+# evidence that a run lasting tens of minutes is still moving. stdout is block-buffered under a
+# redirect, so a single stream into a log file shows nothing at all until the run exits.
+function progress(msg::AbstractString)
+    print(stderr, "  … ", msg, "\n")
+    flush(stderr)
+    return nothing
+end
+
+# `correlator.jl`'s report, as `(; bx, by, corr, sgn, both, tailx)` — or `(state, detail)` when there is
+# nothing to read, which a caller distinguishes with `isa Tuple`.
+#
+# Shared because both endpoint gates read the same report and each threshold is the *caller's*: this
+# parses, and asserts nothing. The regexes are the coupling to `correlator.jl`'s output format, so they
+# live once — a column added to the axis table otherwise has to be found in every gate that reads it.
+#
+# `tailx` is `nothing` when the report carries no tail line. `3.rdr` requires one and treats its absence
+# as red; a thinned run has no meaningful tail to bound, so `3.nisar` ignores it.
+function parse_endpoint(text)
+    occursin("no call1.json", text) && return (:skipped, "no capture on disk")
+    rows = collect(eachmatch(r"^(dx|dy)\s+([+-])\s+(\d+)\s+\d+\s+\d+\s+[\d.]+%\s+\d+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+([+-][\d.]+)"m, text))
+    length(rows) == 2 || return (:red, "could not read both axes: " * last_line(text))
+    # **The core bias, not the mean over everything.** A pair correlating at a median of 0.148 — SAR
+    # speckle over a 24-day repeat — puts a few hundred of its points on the other side of a nearly flat
+    # peak surface, two-sided, by tens of pixels. On `20151120` that drags the plain mean to +0.027 px
+    # while the 78% agreeing within a pixel sit at −0.0008. Gating the plain mean would set a threshold
+    # around the tail's cancellation, which is noise; the core catches the systematic offset a threshold
+    # is for, and the tail is bounded separately by the caller.
+    bm = match(r"bias core: dx ([+-]?[\d.e-]+), dy ([+-]?[\d.e-]+)", text)
+    bm === nothing && return (:red, "no bias core line: " * last_line(text))
+    tm = match(r"tail >10px: dx (\d+), dy (\d+) of (\d+)", text)
+    return (; bx = abs(parse(Float64, bm.captures[1])), by = abs(parse(Float64, bm.captures[2])),
+            corr = Dict(r.captures[1] => parse(Float64, r.captures[4]) for r in rows),
+            sgn = Dict(r.captures[1] => r.captures[2] for r in rows),
+            both = parse(Int, first(rows).captures[3]),
+            tailx = tm === nothing ? nothing : parse(Int, tm.captures[1]))
 end
 
 # The first capture group of `re` in `text`, as a Float64, or `nothing`.
@@ -149,7 +192,8 @@ const GATES = Gate[
         results = String[]
         red = 0
         skipped = 0
-        for c in cases
+        for (i, c) in enumerate(cases)
+            progress(@sprintf("3.opt %d/%d %s", i, length(cases), c))
             cmd = `julia --project=$(@__DIR__) -t 8 $(joinpath(@__DIR__, "stages.jl")) $c --run 200 --all`
             state, detail = capture_run(cmd) do t
                 occursin("no stage trace", t) && return (:skipped, "no capture")
@@ -159,6 +203,7 @@ const GATES = Gate[
             end
             state === :red && (red += 1)
             state === :skipped && (skipped += 1)
+            progress(@sprintf("3.opt %d/%d %s → %s %s", i, length(cases), c, String(state), detail))
             push!(results, "$(first(c, 22)) $(state === :green ? "ok" : String(state))")
         end
         return (red == 0 ? :green : :red,
@@ -194,41 +239,34 @@ const GATES = Gate[
         results = String[]
         red = 0
         skipped = 0
-        for c in cases
+        for (i, c) in enumerate(cases)
+            progress(@sprintf("3.rdr %d/%d %s", i, length(cases), c))
             cmd = `julia --project=$(@__DIR__) -t 8 $(joinpath(@__DIR__, "correlator.jl")) $c --run 200`
             state, detail = capture_run(cmd) do t
-                occursin("no call1.json", t) && return (:skipped, "no capture on disk")
-                rows = collect(eachmatch(r"^(dx|dy)\s+([+-])\s+(\d+)\s+\d+\s+\d+\s+[\d.]+%\s+\d+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+([+-][\d.]+)"m, t))
-                length(rows) == 2 || return (:red, "could not read both axes: " * last_line(t))
-                # **The core bias, not the mean over everything.** A pair correlating at a median of
-                # 0.148 — SAR speckle over a 24-day repeat — puts a few hundred of its points on the
-                # other side of a nearly flat peak surface, two-sided, by tens of pixels. On
-                # `20151120` that drags the plain mean to +0.027 px while the 78% agreeing within a
-                # pixel sit at −0.0008. Gating the plain mean would set a threshold around the tail's
-                # cancellation, which is noise; the core catches the systematic offset the threshold is
-                # for, and the tail is bounded separately below.
-                bm = match(r"bias core: dx ([+-]?[\d.e-]+), dy ([+-]?[\d.e-]+)", t)
-                bm === nothing && return (:red, "no bias core line: " * last_line(t))
-                bx, by = abs(parse(Float64, bm.captures[1])), abs(parse(Float64, bm.captures[2]))
-                tm = match(r"tail >10px: dx (\d+), dy (\d+) of (\d+)", t)
-                tm === nothing && return (:red, "no tail line: " * last_line(t))
-                tailx = parse(Int, tm.captures[1])
-                corr = Dict(r.captures[1] => parse(Float64, r.captures[4]) for r in rows)
-                sgn = Dict(r.captures[1] => r.captures[2] for r in rows)
-                both = parse(Int, first(rows).captures[3])
+                p = parse_endpoint(t)
+                p isa Tuple && return p
+                (; bx, by, corr, sgn, both, tailx) = p
+                tailx === nothing && return (:red, "no tail line: " * last_line(t))
                 fails = String[]
                 # A systematic offset over the agreeing population is held an order of magnitude
-                # tighter than the optical 0.035 px, because that is what the measurement supports:
-                # the eight cases span 0.0002 to 0.0065 px.
+                # tighter than the optical 0.035 px. Six of the eight sit within 0.0072 px on both
+                # axes, which is what the bound is drawn from.
+                #
+                # **Two cases exceed it and are expected red**: the burst pairs `20250416T010159` at
+                # -0.0431/-0.0166 and `20240618T025533` at +0.0118. `GATES.md` records the measurement
+                # and why the bound is not the thing to widen — the same two cases gained coverage and
+                # correlation while their bias grew, which is a behaviour change wanting an
+                # explanation rather than a threshold set too tight.
                 bx <= 0.010 || push!(fails, "dx core bias $bx > 0.010")
                 by <= 0.010 || push!(fails, "dy core bias $by > 0.010")
-                # The floor is the weakest measured case less a margin. `20150828` correlates at 0.820
-                # and 0.825 — the lowest of the eight — where the rest reach 0.95-0.99.
+                # The floor is the weakest measured case less a margin. `20150828` is the lowest of the
+                # eight at 0.903 and 0.906, where the rest reach 0.94-0.99.
                 corr["dx"] >= 0.78 || push!(fails, "dx corr $(corr["dx"]) < 0.78")
                 corr["dy"] >= 0.78 || push!(fails, "dy corr $(corr["dy"]) < 0.78")
                 sgn["dy"] == "-" || push!(fails, "dy sign $(sgn["dy"]), expected -")
                 # The tail is bounded rather than ignored: it cancels today, and a tail that grew would
-                # otherwise hide behind a core bias that stayed small. Six of the eight report zero.
+                # otherwise hide behind a core bias that stayed small. Four of the eight report zero and
+                # `20151120` is the largest at 167, on the pair whose base level runs no fine pass.
                 tailx <= 400 || push!(fails, "dx tail $tailx > 400 beyond 10 px")
                 isempty(fails) || return (:red, join(fails, "; "))
                 return (:green, @sprintf("core %.4f/%.4f corr %+.3f/%+.3f both %d tail %d",
@@ -236,7 +274,81 @@ const GATES = Gate[
             end
             state === :red && (red += 1)
             state === :skipped && (skipped += 1)
+            progress(@sprintf("3.rdr %d/%d %s → %s %s", i, length(cases), c, String(state), detail))
             push!(results, "$(first(c, 24)) $(state === :green ? "ok" : String(state))")
+        end
+        return (red == 0 ? :green : :red,
+                "$(length(cases) - red - skipped)/$(length(cases)) green" *
+                (skipped > 0 ? ", $skipped without a capture" : "") *
+                (red > 0 ? ": " * join(filter(r -> !endswith(r, "ok"), results), ", ") : ""))
+    end),
+
+    Gate("3.nisar", "the endpoint on both NISAR cases, thinned", false, function ()
+        # **Thinned, because the whole grid does not fit a gate.** `correlator.jl` is untiled and these
+        # are whole-scene comparisons: 1.8 M searchable points on a 2.9 Gpx pair, peaking at 55-81 GiB
+        # against this machine's 96, so the two cannot even run concurrently. `--stride 4` searches 128-px
+        # tiles on a 512-px lattice — a sixteenth of the grid, ~1 minute per case — which is what puts
+        # NISAR in the ladder at all. The whole-grid figures are a measurement in `GATES.md`, not a gate.
+        #
+        # **The two cases run one after another.** Thinning cuts the points searched, not the resident
+        # imagery: the pair, the full-shape output arrays and the FFT workspaces are sized by the scene and
+        # the search radius, so a thinned run's peak is not a sixteenth of a whole-grid one and is
+        # unmeasured. Overlapping them risks an OOM kill that loses both, against a saving of about a
+        # minute.
+        #
+        # **Thresholds are calibrated to the thinned run, not to the whole-grid figures**, because
+        # thinning changes the answers rather than only sampling them. AutoRIFT.jl sees the sparse grid
+        # while the reference's `Dx`/`Dy` come from a capture taken over the full one, so the two resolve
+        # different pyramid levels: a level's coarse grid is the point grid decimated by 1, 2, 4, 8, and a
+        # thinned one can fall below the width its filter needs, at which point the level silently produces
+        # nothing (`tools/golden/README.md`). L1's `exact` is the statistic this destroys — 73.90% on the
+        # whole grid against 16.81% here, and 0.00% at a 512-px tile — so it is *not* asserted. L2's
+        # survives (72.20% whole against 68.70%) because its levels still clear the filter at this tiling.
+        #
+        # What is asserted is what proved stable across three tilings: correlation and `bias_core`. Both
+        # are reproducible bit-for-bit at a given tiling, so a threshold is meaningful; both sit above the
+        # whole-grid bias by a consistent tiling offset, so the bound is drawn from the thinned
+        # measurement and is not comparable to the 0.010 px `3.rdr` holds Sentinel-1 to.
+        # Named rather than positional: each bound is the case's own measured value plus a margin, and the
+        # two cases differ by more than a factor of two on bias, so a reader at the assertion needs to know
+        # which number they are looking at.
+        cases = [(case = "NISAR_L1_PR_RSLC", corr_x = 0.99, corr_y = 0.98, bias_x = 0.12, bias_y = 0.17),
+                 (case = "NISAR_L2_PR_GSLC", corr_x = 0.99, corr_y = 0.99, bias_x = 0.21, bias_y = 0.27)]
+        results = String[]
+        red = 0
+        skipped = 0
+        for (i, g) in enumerate(cases)
+            c = g.case
+            progress(@sprintf("3.nisar %d/%d %s", i, length(cases), c))
+            # Run 100 holds the capture on both cases; L1's run 200 directory exists but is empty, so
+            # naming the run explicitly is what keeps this from skipping.
+            # `--block` is stated rather than defaulted: the tile size *is* the calibration. At a 512-px
+            # tile L1's `dx` correlation is 0.923 against 0.9985 here, so a threshold inherited by one
+            # tiling and measured at another reports a regression that is only a changed default.
+            cmd = `julia --project=$(@__DIR__) -t 8 $(joinpath(@__DIR__, "correlator.jl"))
+                   $c --run 100 --stride 4 --block 128`
+            state, detail = capture_run(cmd) do t
+                p = parse_endpoint(t)
+                p isa Tuple && return p
+                (; bx, by, corr, sgn, both) = p
+                fails = String[]
+                corr["dx"] >= g.corr_x || push!(fails, "dx corr $(corr["dx"]) < $(g.corr_x)")
+                corr["dy"] >= g.corr_y || push!(fails, "dy corr $(corr["dy"]) < $(g.corr_y)")
+                # L2's core bias is the larger of the two on both axes, which is the whole-grid finding as
+                # well and is unexplained there.
+                bx <= g.bias_x || push!(fails, "dx core bias $bx > $(g.bias_x)")
+                by <= g.bias_y || push!(fails, "dy core bias $by > $(g.bias_y)")
+                # The `dy` sign, for the same reason `3.rdr` asserts it: a reintroduced flip shows up here
+                # and nowhere in the value statistics.
+                sgn["dy"] == "-" || push!(fails, "dy sign $(sgn["dy"]), expected -")
+                isempty(fails) || return (:red, join(fails, "; "))
+                return (:green, @sprintf("core %.4f/%.4f corr %+.5f/%+.5f both %d",
+                                         bx, by, corr["dx"], corr["dy"], both))
+            end
+            state === :red && (red += 1)
+            state === :skipped && (skipped += 1)
+            progress(@sprintf("3.nisar %d/%d %s → %s %s", i, length(cases), c, String(state), detail))
+            push!(results, "$(first(c, 12)) $(state === :green ? "ok" : String(state))")
         end
         return (red == 0 ? :green : :red,
                 "$(length(cases) - red - skipped)/$(length(cases)) green" *
@@ -264,18 +376,25 @@ function main(args)
     all = "--all" in args
     @printf("%-6s %-52s %-9s %s\n", "gate", "what", "state", "detail")
     states = Symbol[]
+    scheduled = count(g -> all || !g.slow, GATES)
+    done = 0
     for g in GATES
         if g.slow && !all
             @printf("%-6s %-52s %-9s %s\n", g.id, g.what, "deferred", "pass --all to run it")
             continue
         end
+        progress(@sprintf("gate %d/%d %s: %s", done + 1, scheduled, g.id, g.what))
         state, detail = try
             g.run()
         catch e
             (:red, sprint(showerror, e))
         end
         push!(states, state)
+        done += 1
         @printf("%-6s %-52s %-9s %s\n", g.id, g.what, uppercase(String(state)), detail)
+        # Flush per gate: the table is the only record of a gate that has already run, and a redirect
+        # block-buffers stdout, so an interrupted run would otherwise lose every verdict it reached.
+        flush(stdout)
     end
     red = count(==(:red), states)
     skipped = count(==(:skipped), states)

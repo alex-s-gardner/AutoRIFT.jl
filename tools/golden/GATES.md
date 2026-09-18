@@ -8,9 +8,35 @@ a regression to fix rather than a number to update.
 implementations. This records what has been *verified at a commit*, which is a different claim and the
 one that decays. A gate whose command cannot be re-run is not a gate.
 
-Machine: Apple M2 Max, 12 cores, macOS 26.5.2, Julia 1.12.5. Reference: autoRIFT 2.1.1 in
+Machine: Apple M2 Max, 12 cores, macOS 26.5.2. Julia 1.12.5 for every row recorded below; the
+toolchain has since moved to **1.13.0**, on which the suite passes 704,363/704,363 and the untiled
+point count on the S2B case is unchanged at 612,607. Re-measure before quoting a *runtime* against the
+new toolchain. Reference: autoRIFT 2.1.1 in
 `micromamba -n arift-ref`, whose `autoRIFT.py` is byte-identical to the pinned v2.1.2; container
 `ghcr.io/asfhyp3/hyp3-autorift:0.28.4` for the golden cases.
+
+> **Read case-level figures from the re-measurement sections at the end of this file, not from the
+> sections that first recorded them.** Three defects invalidated case-level numbers in sequence. All
+> twenty cases have since been re-measured, so no row is awaiting a measurement — but a row's *original*
+> section still carries the superseded figure, because these are re-measured rather than edited.
+>
+> | defect | what it broke | re-measured in |
+> |---|---|---|
+> | `pointset_from_capture` handed AutoRIFT.jl a wrong-sign `Dy0`, the prior *before* `arImgDisp_*` flips it | every `exact`, `bias` and coverage number on all twenty cases | "Re-measurement after the Dy0 sign fix" |
+> | `_level_decimation` consulted the y extent, so a level's stride was half the reference's — on three radar pairs no level coarsened at all | every anisotropic chip: eight radar, both NISAR | the NISAR and radar steps below |
+> | `_grid_step` read a spacing of zero past a majority nonzero nodata fill | nine of twelve optical, all eight radar, both NISAR | the optical and radar steps below |
+>
+> Gate 0 (`tools/ab`) is unaffected by all three: it passes a zero prior on an unrotated synthetic grid,
+> so neither the sign convention nor the nodata fill crosses it. **`3.rdr` is 6 of 8** — cases 6 and 7
+> exceed its core-bias threshold, which is the one open red gate.
+
+**`regate.jl` covers all 22 cases: `3.opt` twelve optical, `3.rdr` eight radar, `3.nisar` both NISAR.**
+`3.nisar` runs a sixteenth of each NISAR grid (`--stride 4 --block 128`, ~1 minute a case), because a
+whole-grid NISAR run in `correlator.jl` is untiled and costs 5-10 minutes at a 49-61 GiB peak — the two
+cannot even run concurrently on this machine's 96 GiB. **Its thresholds are calibrated to the thinned
+grid and are not comparable to the whole-grid figures or to `3.rdr`'s bounds**; thinning changes which
+pyramid levels resolve, which is measured under "both NISAR cases re-measured whole-grid" at the end of
+this file. The whole-grid figures are a measurement there, not a gate.
 
 ## Gate 0 — the verified floor
 
@@ -741,19 +767,184 @@ coverage admits. LC09 is the one case where both moved the same way: +16,459 mor
 
 ### What this settles about the residual
 
-The `exact` spread across cases — 54% to 93% — tracks the **scene**, not the code:
+**Nothing — every `exact` figure in this section was measured against a wrong-sign y prior and is
+superseded.** See "The fast-flow residual was a harness sign error" below. The readings this section
+reached, in the order they were reached and refuted:
 
-- Every stage is exact or reported-as-designed on all five, so the pipeline is not case-sensitive.
-- Both S2 cases and LC09 sit at 67–93%; both LC08 cases at 54–63%. The 15 m panchromatic band quantizes
-  harder onto 256 levels than S2's, and `tools/ab` stage 1 measures that path at 84.8% exact with a
-  35.8 px maximum against 100% on the float path.
-- So the case-to-case variation is the `UInt8` quantization interacting with scene contrast, which is
-  the reference's own preprocessing and not something a change here can recover.
+| reading | refuted by |
+|---|---|
+| the spread is `UInt8` quantization interacting with scene contrast | `Float32` moves `exact` by 0.15 points |
+| the residual is a search-radius effect | radius sweep in `tools/ab` is flat; radius was a proxy |
+| the residual is competing-maxima tie-breaking | the residual is spatially autocorrelated at +0.80 |
 
-**The correlator work is converged.** Five of five cases pass the ladder, coverage improved on all five,
-and the remaining `exact` shortfall is attributable to a quantization step the reference applies before
-the correlator sees anything. The gate should move to the post-correlation chain, which is where a
-product comparison becomes possible.
+The `exact` spread across cases — 54% to 93% — was read as tracking the **scene** rather than the
+code. It tracked the **prior**, which is largest on fast ice, which is why the spread looked
+scene-dependent.
+
+## The fast-flow residual was a harness sign error
+
+The whole-case figures show disagreement concentrated on the fast-flow tongues rather than scattered
+by contrast, and that shape is the finding. Three explanations were offered for it here and all three
+were wrong; what settled it was refusing to accept a *spatially coherent* residual as tie-breaking.
+
+### The discriminating test, which should have been run first
+
+Tie-breaking is independent per point, so its residual must be spatially white. Measured on the base
+level of LC08 Jakobshavn, `dx`:
+
+| | lag 1 | lag 2 | lag 4 | lag 8 | lag 16 |
+|---|---:|---:|---:|---:|---:|
+| whole base level | +0.64 | +0.56 | +0.51 | +0.33 | +0.09 |
+| fastest 10% | **+0.80** | +0.72 | +0.63 | +0.41 | +0.07 |
+| fastest 10%, correlation ≥ 0.5 | **+0.71** | +0.57 | +0.48 | +0.31 | −0.04 |
+
+Block means over 16×16 cells have sd **0.418** where white noise would give 0.032 — **13.1×** — and
+72.7% are positive. It also survives a strong-peak gate, so no ambiguity argument reaches it. **A
+residual that autocorrelates is a convention error, whatever its magnitude.**
+
+### Root cause: `Dy0` is flipped before the correlator sees it
+
+`arImgDisp_u`/`arImgDisp_s` set `Dy0 = -Dy0` as their first act (`autoRIFT.py:1058`, `:1231`),
+converting the prior from cartesian-Y to matrix-Y before any chip is cut. `capture.py` records
+`self.Dy0`, which is **pre-flip**, and `pointset_from_capture` passed it through unchanged — so
+AutoRIFT.jl cut its chip `2 * Dy0` rows from where the reference cut its own.
+
+The correlator flips the prior going *in* and the answer coming *out*. Undoing only the output is the
+natural mistake, because `Dy` is what gets compared.
+
+### The ladder that found it, on a 64×64 crop
+
+The crop reproduces the bias in **14 s** against 31 min for the scene, which is what made stepping
+through the chain affordable. Each rung is measured against an array the reference itself produced:
+
+| step | measurement | verdict |
+|---|---|---|
+| raw `Dx_rev0_L0` vs final `out_Dx` | **100.00% equal** on 1,211,482 points | nothing downstream alters values |
+| chip/window bounds, C `int()` vs `floor` | identical at all 2,188,984 points | not integer truncation |
+| window width, surface size, zero-sample column | identical at every radius, 15 → 181 | not geometry |
+| **ZNCC surface vs OpenCV `TM_CCOEFF_NORMED`**, byte-identical chip and window | **max diff 1.2e-6, same argmax**, 4 points | not the measure, not peak selection |
+| the reference's own formula on that surface | fails to reproduce its own answer by **+3.2…+4.6 px** | the window it used differs |
+| emulating its C++ index arithmetic | reproduces its answer to < 1 px | the chip rectangle differs |
+| chip rectangle, reference vs AutoRIFT.jl | x **+0**, y **+28 = 2 × Dy0** | the prior's sign |
+
+The surface comparison is the rung that made it unambiguous: **identical surfaces with a 3.9 px
+disagreement** puts the defect downstream of correlation and kills the quantization, measure and
+tie-breaking explanations at once.
+
+### The fix, and what it recovers
+
+`pointset_from_capture` negates `Dy0`. Worst 64×64 block, base level, against the reference's own raw
+level-0 output:
+
+| | exact | mean residual | p95 \|d\| |
+|---|---:|---:|---:|
+| `dx` before | 6.10% | +0.9043 | 3.875 |
+| `dx` after | **99.61%** | **−0.0004** | **0.000** |
+| `dy` before | 8.15% | −0.0158 | 1.875 |
+| `dy` after | **99.55%** | **+0.0007** | **0.000** |
+
+### Why it hid, and what that costs the ledger
+
+Two properties, both of which this ledger should now treat as warning signs:
+
+- **The error scales with the prior**, so it is absent on slow ice and largest on fast ice. That makes
+  it look like a velocity-dependent physical effect, and it made the case-to-case `exact` spread look
+  scene-dependent.
+- **A y-axis error surfaces in `dx`.** A chip misplaced in y still correlates best at a similar
+  vertical offset, so `dy`'s mean residual is −0.016 px while `dx` carries +0.90. Inspecting the axis
+  whose sign is in question finds nothing.
+
+**Every `exact`, `bias` and coverage figure measured through `pointset_from_capture` is superseded** —
+that is all twelve optical and all eight radar cases, since every one of them reaches AutoRIFT.jl
+through this function. Those rows have to be re-measured rather than edited. Coverage and `bias` are
+affected too, not only `exact`: a misplaced chip changes which points are degenerate.
+
+`AutoRIFT.jl was not at fault.` It was handed a wrong-sign prior and propagated it correctly, which is
+also why no synthetic test caught this: the package's own tests never construct a prior with the
+reference's sign convention. `REFERENCE.md` records the convention itself, all four flip sites, and
+the three tests that settle one.
+
+## Superseded: the residual is a search-radius effect, not quantization
+
+**Both claims in this section are wrong.** The `Float32` measurement is sound and is the reason the
+quantization explanation was dropped; the search-radius conclusion that replaced it is not — radius is
+a proxy for prior magnitude, and a radius sweep in `tools/ab` at fixed prior is flat (84.8% at radius
+20 against 87.5% at 120, bias 0.0000). Kept for the `Float32` rows and as a record of the wrong turn.
+
+```bash
+julia --project=tools/ab -t 8 tools/golden/compare_figures.jl LC08_L1TP_009011_20200703 --run 200
+julia --project=tools/ab -t 8 tools/golden/compare_figures.jl LC08_L1TP_009011_20200703 --run 301
+```
+
+The whole-case figures show the disagreement concentrated on the fast-flow tongues, not scattered by
+contrast. That is the wrong shape for a quantization tie-break, and running the dtype pair over the whole
+case settles it. LC08 Jakobshavn, `dx`, run 200 against run 301:
+
+| comparison | shared | exact | p99 |
+|---|---:|---:|---:|
+| AutoRIFT.jl vs reference, `UInt8` (production) | 1,660,132 | 55.12% | 0.9375 |
+| AutoRIFT.jl vs reference, `Float32` | 1,659,941 | **55.27%** | 0.9375 |
+| reference `UInt8` vs its own `Float32` (floor) | 1,715,662 | 95.00% | 0.0072 |
+| AutoRIFT.jl `UInt8` vs AutoRIFT.jl `Float32` | 1,595,699 | **100.00%** | 0.0000 |
+
+**Widening to `Float32` moves `exact` by 0.15 points**, and the profile across speed deciles is unchanged
+to a tenth of a point. So the quantization is not what the residual is made of. The last row is why the
+lever is worth having: AutoRIFT.jl is bit-identical across element types, so the two rows above it differ
+only in the reference, and the 95.00% floor is the reference disagreeing with itself.
+
+### It is the search radius, at fixed speed and fixed chip size
+
+Two confounds have to come out first. Fast points preferentially get a coarser chip (chip 16 covers 94.8%
+of the slowest speed decile but 52.2% of the ninth), and a coarse level is unquantized, where `exact` is
+0% by construction. Holding **both sides at chip 16** removes both, leaving 1,194,613 points at 76.60%:
+
+| speed decile (median px) | 0.06 | 0.14 | 0.44 | 0.79 | 0.96 | 1.13 | 1.38 | 1.96 | 3.10 | 6.60 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| exact | 99.7 | 99.3 | 97.4 | 93.0 | 88.8 | 81.1 | 66.4 | 61.5 | 51.5 | **27.8** |
+| mean residual | −0.000 | −0.000 | −0.003 | −0.004 | −0.003 | −0.005 | −0.002 | +0.005 | +0.011 | **+0.118** |
+
+The speed dependence survives at one chip size, and the fastest decile carries a **one-sided** residual
+where every other decile is centred on zero. Within that decile, binning by search radius separates the
+two: agreement falls from 90.7% at radius 15 to 13.4% at radius 72, and the mean residual rises with it.
+Speed is the proxy; **radius is the variable**.
+
+| base-level radius | 0–8 | 8–12 | 16–20 | 24–32 | 40–56 | 56–80 | 80–300 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| same integer sample | 97.8% | 93.0% | 97.9% | 93.8% | 90.8% | 80.7% | **71.1%** |
+| \|Δ\| ≥ 1 px | 0.06% | 0.63% | 0.08% | 0.17% | 0.45% | 3.75% | **13.6%** |
+| mean residual | −0.0004 | −0.0029 | +0.0094 | +0.0233 | +0.0827 | +0.1316 | **+0.4171** |
+
+Everything grows monotonically with radius, and at the widest windows one point in seven picks a
+**different integer sample** — a different match, not a rounded one.
+
+### What it is not
+
+Each of these is measured, and each rules out a candidate that the fast-flow shape would otherwise fit:
+
+- **Not reachability.** The reference's answer lies inside the window AutoRIFT.jl searched at
+  **0.000% outside on all ten speed deciles**, and neither side rails against its search limit at any
+  decile (0.000% both). The p95 of `|ref − prior| / radius` never exceeds 0.18, so both sides find their
+  peak well inside a window neither one exhausts. A radius too small, a prior too far off, or a coarse
+  mask restricting the wrong region would all show here, and none does.
+- **Not the sub-pixel refinement kernel.** Where the peak falls inside a pixel is independent of how fast
+  the ice moves, so a kernel defect cannot produce a monotonic speed or radius profile — and it would not
+  spare the 0–8 radius bin at 97.8%. The residual is also 98.3% on the 1/16 lattice with a median of
+  exactly zero, which is a refinement agreeing with the reference's own quantization step.
+- **Not the coarse pass's decision.** Already measured separately: at chip 32 the fine pass searches the
+  **identical** 348,397 points on both sides, symmetric difference 0.
+
+### The harness bug this was hiding behind, and why the earlier reading was wrong
+
+`cached_run`'s key was `(name, kw, size(grid.x))` — which is identical for run 200 and run 301, because a
+`CAPTURE_FLOAT32` capture differs from an ordinary one **only** in `in_I1`'s element type. So a `Float32`
+comparison silently reused the `UInt8` field and reported the quantization's effect as zero by
+construction. `eltype(k.arrays["in_I1"])` is now in the key.
+
+The earlier conclusion was not built on that bug, but on a narrower measurement: the dtype pair had been
+run on one traced level at a time, where the floor at chip 96 (98.54%) does equal AutoRIFT.jl's agreement
+and the reading "nothing attributable" is correct *for that level*. Generalizing it to the whole case was
+the error. The lesson is the one this ledger already applies elsewhere: **a per-level floor does not
+compose into a whole-case one**, because the levels are weighted by how many points each resolves.
 
 # Phase 2 — the remaining seven optical pairs
 
@@ -1151,8 +1342,8 @@ construction. Bias and correlation are the gate there.
 **Every stage of every pair is exact or reported-as-designed.** `|bias|` is under 0.035 px on eleven of
 twelve and correlation is 0.89–0.997 across the set. `exact` spans 27–93% and tracks the *scene* rather than
 the code: it is highest on the two Sentinel-2 pairs and lowest where the base chip size resolves fewest
-points, which is the `UInt8` quantization interacting with scene contrast — `tools/ab` stage 1 measures that
-path at 84.8% exact with a 35.8 px maximum against 100% on the float path.
+points. The cause is the search radius, not the `UInt8` quantization — see "The residual is a
+search-radius effect, not quantization".
 
 ### What this phase added
 
@@ -1475,6 +1666,8 @@ ISCE3 per-burst intermediates, then the endpoint. Sequential, because a capture 
 
 ## The eight, all green
 
+Superseded by three later fixes and re-measured at the end of this file, where `3.rdr` is 6 of 8.
+
 | # | case | driver | both | exact | only jl | only ref | core bias dx / dy | corr dx / dy | tail |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
 | 1 | `S1A_..._20150828T162412` | SLC | 1,327,618 | 29.03% | 77,340 | 69,830 | −0.0009 / +0.0020 | +0.820 / +0.825 | **0** |
@@ -1523,9 +1716,1511 @@ All seven new captures took **3h50m total**, against the ~18 hours estimated fro
 `product/` and `product_sec/` immediately after each capture is what made a sequential run possible on a
 pool with ~60 GB free: those per-burst ISCE3 intermediates are 70–80% of a run and are read by no gate.
 
+**A capture and a whole-scene endpoint comparison are different costs, and the second is the larger
+one.** A capture runs the reference and dumps its arrays; `correlator.jl` then runs AutoRIFT.jl over
+every point of the same grid — 5,363,712 points across a 57760x50511 pair on L1 RSLC (2.9 Gpx), and
+5,234,944 across 54885x110085 on L2 GSLC (6.0 Gpx). The capture cost is the table above; the endpoint
+comparison is hours. Do not quote one for the other — a whole-scene endpoint duration is not a statement
+about how long the reference takes.
+
+**`threaded` is what the endpoint's cost turns on, and it was `false` for every golden run before
+`kwargs_from_capture` set it.** `Params` defaults it to `false`, so `-t 8` allocated eight threads and
+used one. Measured on a 201x201 window of the L1 RSLC grid, all five output fields bit-identical either
+way: 148.9 s serial against 22.3 s on eight threads.
+
+**The speedup does not hold across a whole scene, because a scene has a serial phase.** The L1 endpoint
+on eight threads ran at ~7.8 cores for its first 2.5 hours and then dropped to **1.0 core**, sampled
+over 90 s of CPU time rather than read from an instantaneous `%CPU`. `threaded` parallelises over grid
+points within a correlation pass (`src/params.jl:392`), so a serial phase is work outside one: the hole
+fill, the merge across levels, or the comparison itself. A window benchmark sees only the parallel part
+and overstates what the flag buys on a scene — the 6.7x above did, and an estimate built on it was
+wrong by more than a factor of two.
+
+That serial time is **FFTW plan construction**, not any of the three candidates guessed at above, and
+it is fixed. See "the serial phase was the FFTW planner" at the end of this file.
+
 ## Step: the gate covers every radar case
 
 `3.rdr` now runs all eight rather than one, for the same reason `3.opt` runs all twelve: the two
 `_oversample` and `chip_size_max` bugs were invisible on twelve optical pairs and surfaced only on an
 anisotropic chip. Thresholds are the weakest measured case less a margin — core bias 0.010 px,
 correlation 0.78 (case 1 is the floor at 0.820/0.825), tail 400 points.
+
+Those thresholds were calibrated against the table above, which three later fixes superseded. The eight
+pairs are re-measured at the end of this file: coverage and correlation improve on nearly every one, and
+two cases now exceed the core-bias threshold.
+
+---
+
+# Re-measurement after the Dy0 sign fix
+
+The prior's sign convention was wrong in two places, not one. `dc55e09` fixed
+`pointset_from_capture`; `b10c8ba` fixed the stage ladder's own two `PointSet` constructions and
+rung 3.6c's comparison. Every case-level figure recorded before those two commits was measured
+through one or the other, so this section re-measures them rather than editing them.
+
+All twelve optical cases are re-measured here. The eight radar rows are not, so the warning at the top
+of this file stands until they are.
+
+The nine cases whose grid step carries a zero are re-measured again later in this file, under "the twelve
+optical cases, re-measured after the grid-step fix" — read that table for those. The three whose step is
+already nonzero reproduce this one exactly, which is what makes them the control there.
+
+Measured at `6dd337b` (2026-09-10). Command per case:
+
+```
+julia --project=tools/golden -t 8 tools/golden/correlator.jl <case> --run 200
+```
+
+## The stage ladder, and why `3.opt` was red
+
+The fix is visible as a rung before it is visible as a figure. On `LC08_L1TP_009011`, rung 3.7
+(coarse correlation against the reference's own level-0 output):
+
+| | before | after |
+|---|---|---|
+| exact | 86.54% | **99.95%** |
+| bias | −0.0916 | **−0.0008** |
+| p99 / max | 63 / 342 | **0 / 9** |
+
+Rung 3.6c compares the y prior against the trace, which holds it in cartesian-Y while a `PointSet`
+holds matrix-Y. Comparing across the flip reported all 11,562 nonzero points of 85,556 as
+disagreements while the chips placed were identical.
+
+All twelve optical cases were red on that one rung and no other. `3.opt` is **12/12** and `3.x` is
+**23 of 23 rungs**.
+
+## The optical endpoint, re-measured
+
+All twelve, in the order the earlier table used.
+
+| # | case | filter | both | exact | was | Δ | bias core dx | corr dx | tail |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | S2A Malaspina | `hps` | 586,129 | **94.24%** | 92.65% | +1.59 | +0.0018 | +0.998 | **0** |
+| 2 | LC09 Antarctic | `hps` | 464,316 | **83.01%** | 68.42% | +14.59 | −0.0048 | +0.998 | **0** |
+| 3 | S2B Jakobshavn | `hps` | 605,987 | **78.85%** | 67.34% | +11.51 | −0.0047 | +1.000 | 2 (dy) |
+| 4 | LC08 East Greenland | `hps` | 691,714 | **72.74%** | 63.21% | +9.53 | −0.0226 | +0.991 | 3 |
+| 5 | LC08 Jakobshavn | `hps` | 1,662,200 | **71.84%** | 54.45% | +17.39 | −0.0080 | +0.998 | **0** |
+| 6 | `LE07_..._20130314` | `wallis_fill` | 713,305 | 59.94% | 59.83% | +0.11 | −0.0326 | +0.920 | **0** |
+| 7 | `LC08_060018` × `LE07` | `wallis_fill` | 672,912 | 58.56% | 58.49% | +0.07 | +0.0115 | +0.955 | **0** |
+| 8 | `LE07_..._20040810` | `wallis_fill` | 918,180 | **52.91%** | 50.18% | +2.73 | −0.0084 | +0.975 | **0** |
+| 9 | `LE07_..._20120428` | `wallis_fill` | 106,228 | 0.00% † | 0.00% | — | +0.0083 | +0.891 | **0** |
+| 10 | `LT04_063018` | `fft` | 272,875 | 56.02% | 55.95% | +0.07 | **+0.0008** | +0.982 | **0** |
+| 11 | `LT05_060018` | `fft` | 124,397 | 27.09% | 27.09% | 0.00 | −0.0031 | +0.993 | **0** |
+| 12 | `LT05_001013` (`P000`) | `fft` | 18,540 | 0.00% † | 0.00% | — | −0.0847 | +0.997 | **0** |
+
+† base level skipped on both sides, so every point is coarse and unquantized and `exact` is 0 by
+construction. Bias and correlation are the gate there.
+
+**Eleven of twelve report a zero tail beyond 10 px**, and the two that do not report 2 and 3 points
+against populations of 605,987 and 691,714. Before the fix `LC08_L1TP_009011` alone reached a
+maximum residual of 399 px; it is now **5.4 px**, with 0 of 1,662,200 points beyond 10 on either
+axis. This is the clearest single effect of the fix.
+
+**The gain lands entirely on the five `hps` cases**, +1.6 to +17.4 points, while the four
+`wallis_fill` and three `fft` cases move by at most +2.73 and mostly by under 0.15. That split is not
+a filter effect: cases 6, 7, 8 and 10 quantize 53–60% of their points, so they had as much room to
+gain as case 5 at 72%. The prior is the discriminating quantity — the misplacement was `2 * Dy0`
+rows, so a scene whose prior is near zero was never displaced far enough to lose its peak. Case 11 at
+27.09% is unchanged to four figures.
+
+**Case 12's bias is the one figure to keep an eye on.** At −0.0847 px it is the largest in the set by
+6×, on the smallest population (18,540) and the only `P000` case. It did not move with the fix, so it
+is not a sign-convention artifact; it predates this work and is unexplained. (Part of it was the missing
+cell-centre shift: the grid-step fix takes it to −0.0691, measured later in this file.)
+
+
+---
+
+# The coarse-level residual is not the interpolation
+
+The NISAR L2 GSLC case disagrees by +1.03 px at chip 384 and +2.15 px at chip 768 while the base level
+agrees at 98.0%. Above the base level a reported value is a `cv2.resize(..., INTER_CUBIC)` of a filtered
+field rather than a measurement (`autoRIFT.py:856-866`), so "interpolation" is the available
+explanation. It is the wrong one, and the arithmetic says so before any measurement does.
+
+## Why interpolation cannot produce a pixel
+
+Bicubic resampling is a deterministic 16-tap weighted sum. Identical inputs, weights and sample
+positions give identical outputs up to float32 summation order, which is bounded by `16 * eps * |value|`:
+
+| displacement | summation-order bound |
+|---|---|
+| 1 px | 1.9e-06 px |
+| 10 px | 1.9e-05 px |
+| 30 px | 5.7e-05 px |
+
+The observed residual is 1.1e+05 times the bound at a 10 px displacement. Five orders of magnitude is
+not an arithmetic effect.
+
+Measured against OpenCV's own output in `test/fixtures/resize/` — 63 and 64 samples, six scale factors
+including a non-integer 0.4286 — the worst disagreement over all twelve `INTER_AREA` fixtures is
+**1.79e-07** and over all twelve `INTER_CUBIC` fixtures **4.17e-07**, both at the float32 rounding
+floor, several bit-identical. (Only one of the 48 fixtures is asserted by the suite; the rest are
+checked here and should be added to it.)
+
+## Every step of the merge chain reproduces the reference exactly
+
+Taken from a stage trace of level 2 at `CAPTURE_STAGES=1 CAPTURE_STAGE_LEVEL=2` (run 201), replaying
+each operation on the reference's **own** traced input and comparing against its own traced output:
+
+| line | operation | max abs difference |
+|---|---|---|
+| `:831` | `INTER_AREA` downsample of `DxF0` | 3.05e-05 — float32 floor |
+| `:847` | `DxFM` patched from `DxF0` | **0.000e+00 — bit-exact, 100.00%** |
+| `:852` | `DxF` patched from `DxFM` | **0.000e+00 — bit-exact, 100.00%** |
+| `:856` | `INTER_CUBIC` upsample of `DxF` | 3.05e-05 — float32 floor |
+
+At the 87,913 points the merge assigns to chip 384, the two agree on definedness for **all** of them.
+
+One difference exists and is inert: after the upsample our field defines 203,648 points the reference
+leaves `NaN`, because OpenCV propagates a `NaN` tap over the whole 4x4 kernel footprint while a rule that
+skips and renormalizes keeps the point. None of those points is one the merge reads, so it cannot
+contribute to the residual — but it is a real difference in the NaN-propagation rule and would matter to
+any step that read the field directly.
+
+## What that leaves
+
+Given the reference's own `DxF` the whole chain is reproduced bit-for-bit, so the residual enters
+*before* it — in `DxF_rev0`, the level's own raw measurement at chip 384. That is the correlator at a
+coarse chip size, not the merge.
+
+Two further constraints on the cause, both measured:
+
+- **The sign differs between the two NISAR cases.** L1 RSLC coarse means are −0.017 / −0.077 / −0.575
+  at chips 192 / 384 / 768; L2 GSLC are −0.040 / +1.034 / +2.145. Same code, same ladder, same `Scale`
+  values, opposite signs — so not a fixed arithmetic or registration error.
+- **Emptiness does not explain it.** L1's coarse levels are *more* sparse (93.2% and 94.6% NaN at chips
+  384 and 768) than L2's (90.6%, 92.6%) and its residuals are smaller.
+
+Hypotheses closed by measurement, so they are not re-opened: integer truncation at `:821` (2288 = 2^4 *
+143, so every `Scale` divides exactly); a fixed fraction of a coarse pixel (the per-point distributions
+differ in shape — chip 384 is right-skewed at median +0.055 against mean +0.259, chip 768 symmetric at
+median +0.281 against mean +0.268, so the equal means were coincidence); a whole-coarse-pixel shift
+(2.1% of chip-768 points lie within 0.15 px of any `k * Scale`); `InterpMask` (the level scaling survives
+restricting to unflagged points); the interpolator and its NaN rule (above).
+
+## Where it is not: five steps and two selection mechanisms, each closed by measurement
+
+Continuing from the section above, on the NISAR L2 GSLC case at chip 384 and 768.
+
+**The raw fine pass agrees.** Re-running the level-2 fine pass on the reference's own traced inputs —
+its lattice, its post-`MC2` search radii, its rounded prior, `chip 384 x 192`, oversample 64 — gives
+**99.41% bit-exact** over 30,115 both-defined points, with `p50 = p90 = p99 = 0`. Both sides sit exactly
+on the 1/64 lattice. What remains is 177 points differing by up to 94.56 px, which is a different
+correlation peak rather than a subpixel disagreement, and 548 points the reference reports and
+AutoRIFT.jl declines.
+
+**Those points are not what the heatmap shows.** Mapped on the level's own 572² grid, the 548 declined
+points lie on a thin diagonal along the footprint edge and the 177 are scattered; `ddx` at the raw pass
+renders blank on the same ±2 px scale where the merged residual shows strong blocks, and the merged
+chip-384 points fall where level 2 *agreed*. `figs/nisar_l2_level2_classes.png`.
+
+The arithmetic also rules them out on their own: 177 points at up to 94.56 px supply at most 16,832 px
+of displacement sum, against the 90,902 px needed to move 87,913 merged points by +1.034.
+
+**Level ownership agrees, and disagreeing about it costs little.** `chip_size` records which level
+answered each point, so the two maps can be compared rather than a proxy for them. Over a 401² window,
+124,159 both-measured points:
+
+| | n | share | mean ddx | median | std |
+|---|---:|---:|---:|---:|---:|
+| same owning level | 118,887 | 95.75% | +0.0017 | +0.0000 | 0.2541 |
+| different level | 5,272 | 4.25% | −0.0421 | −0.0279 | 0.2542 |
+
+The two groups have the *same* spread, and the largest per-pair mean anywhere in the ownership confusion
+matrix is −0.0474 px (`jl 384 -> ref 192`, n = 4,594). Nothing approaches +1.03 or +2.15, so a level
+mismatch does not produce a large residual.
+
+Ownership is exclusive and cumulative, which the trace confirms: `ChipSizeX_rev0_L2` holds
+0/96/192/384 counts of 3,590,592 / 1,215,214 / 341,225 / 87,913, summing to 2288², and the 96/192/384
+counts are identical in the final `out_ChipSizeX` — chip 768's 118,799 comes out of the points still at
+0. That is the `ChipSizeX == 0` guard at `autoRIFT.py:863-864`.
+
+**The residual is local, and no single coordinate explains it.** Windows disagree with each other. At
+rows 113–513 the chip-384 mean is +1.034 and chip 768 is +2.145; at rows 891–1291 chip 384 is −0.026 and
+no chip-768 point appears, with a whole-window mean of −0.00018 px. A sweep of 121² windows across the
+grid shows chip 96 within 0.023 px of zero in **every** window while the coarse levels swing widely — and
+the swing is not a function of position: row 781 spans −0.073 to +0.108 at chip 384, and row 541 spans
++0.063 to +2.488 at chip 768. A row-dependent law fits the first few windows and is falsified by the
+within-row spread.
+
+**So the base level agrees everywhere and the coarse levels disagree locally**, while every step that
+builds a coarse level — correlate, median-fill, previous-level fill, `INTER_AREA`, `INTER_CUBIC`, merge
+— reproduces the reference exactly on the reference's own inputs. The candidates that were tested and
+failed are listed above so they are not retested.
+
+### The cause: two coupled bugs in the coarse grid, not in any step on it
+
+Every step was right and every step ran on the wrong grid. Two independent defects, both in AutoRIFT.jl,
+both invisible on a square chip:
+
+1. **The level stride ignored the reference's rule and consulted the y extent.**
+   `_level_decimation` returned `min(sx, sy)` over per-axis ratios where the reference resizes a level's
+   grid by `ChipSize0X / ChipSizeUniX[i]` (`autoRIFT.py:510-514`) — one factor, from the x extents,
+   applied to rows and columns alike. On NISAR that gave 1, 1, 2, 4 against the reference's 1, 2, 4, 8.
+   At half the stride a level posts **four estimates per chip footprint** instead of one: four views of
+   mostly the same pixels, which the coherence filter cannot separate, so they survive as mutually
+   corroborating outliers. That is the blunder texture — a rough field where the reference's is smooth.
+
+2. **`_grid_step` read a spacing of zero, so the cell-centre shift never happened.** It excluded steps
+   whose endpoints were zero, on the grounds that zero marks nodata. Both NISAR grids are filled with
+   `0.5`, carried to `1.5` by the half-sample snap, and the fill is the *majority* of the array — 55.7%
+   on L2, 56.8% on L1. The guard never fired, 2,895,601 zero steps inside the L2 fill outvoted 2,297,235
+   real 48 px ones, and the mode came out `0`. `_cell_centres` then shifted by nothing and every coarse
+   node sat at its cell's first point, half a cell from where `_undecimate_level` reads it back.
+
+**The coupling is why this resisted single-variable testing.** An earlier attempt at (1) alone measured
+*worse* — neighbour disagreement 3.0x to 10.2x, `exact` down — because at the wrong stride and a zero
+shift the two errors partly cancel. Fixing either alone breaks that cancellation. Both candidate
+"second differences" that were hunted instead have been eliminated by direct measurement: scipy's
+even-window origin matches `_window_margins` at w = 2, 4, 8, and the coarse node placement rule is
+identical to the reference's `INTER_AREA` block centre once converted to 1-based indices — but it is a
+*function of the stride*, which is exactly how one bug masqueraded as two.
+
+**What the ladder was doing wrong.** Every rung in `stages.jl` derived its own stride as `chip ÷ chip0`
+— the reference's rule — rather than calling `_level_decimation`. So the ladder compared the reference
+against a reimplementation of the reference and stayed green whatever production computed. Rung 3.1's
+shape check also *reported* rather than failed. The rungs now call the production function, and a level
+whose grid size disagrees with the reference's is red.
+
+Measured at level 2 of the L2 GSLC case, whose reference grid is 572²:
+
+| | our level grid | reduced prior vs reference | rung 3.1 cell |
+|---|---|---|---|
+| before | 1144 x 1144 | not comparable — shapes differ | `NaN of a 0 px cell` |
+| after | **572 x 572** | 327,145 of 327,184 agree (99.988%) | 192 px, offset 0.375 of a cell |
+
+Of the 39 residual nodes, 27 are the documented 1 px `INTER_NEAREST` mapping difference, 8 sit on the
+nodata boundary, and 8 exceed 5 px.
+
+**Every level grid and every coarse lattice now matches the reference's traced arrays**, on both cases —
+sixteen shapes, no exceptions. The stage trace dumps the level grid at `lvl{3,7,11,15}_xgrid` and the
+coarse lattice at `lvl{1,5,9,13}_xgrid`:
+
+| | level grids | coarse lattices |
+|---|---|---|
+| L1 RSLC, ours and the reference | 2328x2304, 1164x1152, 582x576, 291x288 | 291x288, 145x144, 72x72, 36x36 |
+| L2 GSLC, ours and the reference | 2288x2288, 1144x1144, 572x572, 286x286 | 286x286, 143x143, 71x71, 35x35 |
+
+Before the fix three of the four level grids were wrong on each case.
+
+**A windowed pass cannot measure this fix, and the reason is worth recording.** `_coarse_points` returns
+`nothing` when a level's coarse lattice is narrower than the outlier filter's window, so a level whose
+lattice does not fit is skipped outright. Halving each stride to its correct value halves each lattice,
+so windows that previously ran a level now skip it: on a 201² window chip 384 and 768 both return
+`nothing`, and on a 61² window *every* level does. That is the extent dependence
+`window_endpoint.jl`'s header already documents, made sharper — so the level grids above were verified
+on the full grid, where every lattice survives, and a case-level residual still has to come from
+`correlator.jl`.
+
+Cost per level rises with chip size despite the point count falling: on a 61² window the four levels take
+4.4, 6.2, 8.3 and 18.8 s at strides 1, 2, 4, 8. Chip area grows 64x across the pyramid while the point
+count falls 64x, and area wins — the FFT is over the padded chip-plus-search extent, not over the grid.
+
+**Which cases the fix moves.** The stride changes wherever the chip is anisotropic, which is every radar
+pair as well as both NISAR ones — not NISAR alone:
+
+| configuration | old stride | new stride | |
+|---|---|---|---|
+| optical, `ScaleChipSizeY = 1.0`, spacing 16, max 64/128/256 | 1, 2, 4, 8 | 1, 2, 4, 8 | unchanged |
+| Sentinel-1, `ScaleChipSizeY = 0.25`, chip 32x8, spacing 32 | 1, 1, 1, 2 | 1, 2, 4, 8 | **changed** |
+| NISAR L1, chip 96x52, spacing 48 | 1, 1, 2, 4 | 1, 2, 4, 8 | **changed** |
+| NISAR L2, chip 96x48, spacing 48 | 1, 1, 2, 4 | 1, 2, 4, 8 | **changed** |
+
+So no optical case's stride moves — all three optical configurations give the same strides under both
+rules — and the eight radar pairs are invalidated along with the two NISAR ones. Every figure above is
+read from the real `kwargs_from_capture` path on a capture on disk, radar included: all eight radar
+captures are intact, so `3.rdr` was re-measurable without a container run. It is re-measured at the end of
+this file, where the radar strides are also given per pair rather than as one Sentinel-1 row — three pairs
+decimated by 1, 1, 1, 1 before the fix, not 1, 1, 1, 2.
+
+**The stride is only half the scope.** The grid-step fix travels on a different axis, and an unchanged
+stride does not imply an unchanged case: it moves **nine of the twelve optical cases**, measured through
+`kwargs_from_capture` on each capture's own `in_xGrid`/`in_yGrid`. The majority-constant fill is not a
+NISAR property.
+
+| case | step before | step after |
+|---|---|---|
+| `LC08_L1TP_009011` | **0, 0** | 8, 8 |
+| `LC08_L1TP_062018`, both `LE07_061018`, `LE07_063018`, `LC08_060018`×`LE07`, `LT05_060018`, `LT04_063018` | **0, 0** | −1, −1 |
+| `LT05_001013` | **0, 0** | 4, 4 |
+| `LC09_L1GT_215109`, `S2A`, `S2B` | 8/−1/12 | unchanged |
+
+The three whose grid arrives without a zero-valued step are the control: they must reproduce the previous
+table exactly, and they do — see below.
+
+The stride also changes on a *square* chip whenever `grid_spacing` does not divide `chip_size_min` — 296
+of the swept combinations — but no golden case is configured that way, since `_oversample * grid_spacing`
+equals `chip_size_min.X` exactly in every one of them.
+
+## Step: the NISAR endpoint, on both cases, after the stride and grid-step fixes
+
+The case-level numbers, from `correlator.jl` over the whole grid — the only source of one. Both cases
+run the reference's own captured inputs through AutoRIFT.jl and diff against the reference's own `Dx`/`Dy`.
+
+| | L1 RSLC | L2 GSLC |
+|---|---:|---:|
+| grid | 2328 x 2304 | 2288 x 2288 |
+| scene | 57760 x 50511 (2.9 Gpx) | 54885 x 110085 (6.0 Gpx) |
+| both-measured | 1,786,566 | 1,751,658 |
+| `dx` exact | **73.90%** (1,320,352) | **72.20%** (1,264,646) |
+| `dy` exact | 73.86% (1,319,603) | 75.34% (1,319,639) |
+| `dx` correlation | **+0.99972** | +0.99890 |
+| `dy` correlation | +0.99884 | +0.99330 |
+| `dx` median \|d\| | 0.078 px | 0.132 px |
+| `dy` median \|d\| | 0.093 px | 0.054 px |
+| `dx` p99 | 0.887 px | 3.608 px |
+| `dx` bias / bias core | +0.055 / +0.051 | −0.010 / −0.113 |
+| `dy` bias / bias core | +0.027 / −0.028 | **−0.378** / **−0.126** |
+| tail >10 px | 78 `dx`, 7 `dy` | 31 `dx`, 0 `dy` |
+| only julia / only reference | 11,633 / 14,897 | 30,117 / 11,493 |
+| wall clock | 6h30m on 8 threads | 11h41m on 1 thread |
+
+**Read `bias_core`, not `bias`, when asking whether there is a systematic offset** — the reason is at
+`correlator.jl:371`. L2's `dy` `bias` of −0.378 is largely a two-sided tail on a flat SAR correlation
+surface; its systematic component is −0.126 over the 364,798 points agreeing within a pixel. That is
+still the largest core bias of the four axes and is unexplained.
+
+**What the fixes bought, measured against the pre-fix L2 run** (`dx` / `dy`):
+
+| L2 GSLC | pre-fix | post-fix | |
+|---|---:|---:|---|
+| both-measured | 1,646,459 | **1,751,658** | +105,199 (+6.4%) |
+| only reference | **116,692** | **11,493** | −105,199 — the recovered points |
+| only julia | 30,805 | 30,117 | ~unchanged |
+| `dx` exact | 72.90% | 72.20% | −0.70 pt |
+| `dy` exact | 73.08% | **75.34%** | +2.26 pt |
+| `dx` correlation | +0.99877 | +0.99890 | + |
+| `dy` correlation | +0.99511 | +0.99330 | − |
+| `dx` bias core | −0.0131 | −0.1128 | worse |
+| `dy` bias core | −0.0366 | −0.1259 | worse |
+
+**The coverage gap is what closed.** Before the fix the reference measured 116,692 points we did not;
+now it measures 11,493 — a tenfold reduction, and the direct consequence of the coarse levels finally
+running on the reference's own lattice. Those 105,199 recovered points are coarse-level ones, which is
+also why `dx` exact fell slightly while `dy` exact rose: the population being scored grew by 6.4%, and
+the added points are the unquantized coarse-level kind where exact agreement is unreachable by
+construction. A fraction over a changed population is not comparable to itself — the counts are.
+`dx` exact **n** rose 1,200,214 → 1,264,646.
+
+**Both core biases got worse**, from −0.013/−0.037 to −0.113/−0.126 px, and that is unexplained. It is
+the one number that moved the wrong way on a population that grew, so it is not a denominator artifact.
+`bias_core` is the statistic to read here, per `correlator.jl:371`; L2's `dy` `bias` of −0.378 is largely
+a two-sided tail on a flat SAR surface.
+
+So the coarse-grid fixes were necessary — the level grids were provably wrong, and 105,199 points of
+coverage came back — and they did not close the coarse-level residual. Open, not attributed:
+
+- Both core biases roughly tripling, on both axes, while coverage improved.
+- L2's `dy` correlation slipping +0.99511 → +0.99330 where `dx` improved.
+
+**`exact` is the wrong statistic above the base level and these are whole-scene figures**, so a large
+part of both cases is coarse-level points where neither side is quantized and exact agreement is
+unreachable by construction (recorded earlier in this file). Correlation and bias are the numbers that
+carry meaning here; `exact` is reported for continuity with the optical cases.
+
+## Step: the twelve optical cases, re-measured after the grid-step fix
+
+The stride does not move on any optical case, but the grid step moves on nine of the twelve, so the
+optical table above is superseded on those nine and confirmed on the other three.
+
+**Gate `3.opt` is 12/12 green** — 254 rungs, 0 red, ~28 s per case on 10 threads. Every capture and its
+stage trace is still on disk, so this needed no container run.
+
+The endpoint, from `correlator.jl` over the whole grid, in the previous table's order. `both` is points
+both sides measured; `mv` marks a case whose grid step moved:
+
+| # | case | mv | both | Δ both | exact | exact n | Δ | bias core dx | corr dx | tail |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | S2A Malaspina | | 586,129 | **0** | 94.24% | 552,351 | — | +0.00179 | +0.99782 | 0 |
+| 2 | LC09 Antarctic | | 464,316 | **0** | 83.01% | 385,409 | — | −0.00479 | +0.99755 | 0 |
+| 3 | S2B Jakobshavn | | 605,987 | **0** | 78.85% | 477,819 | — | −0.00471 | +0.99967 | 2 (dy) |
+| 4 | LC08 East Greenland | * | 692,088 | +374 | 72.70% | 503,146 | ~ | **+0.00424** | +0.99200 | 1 (dx) |
+| 5 | LC08 Jakobshavn | * | 1,685,673 | **+23,473** | 70.87% | 1,194,637 | **+596** | −0.00888 | +0.99931 | 0 |
+| 6 | `LE07_..._20130314` | * | 713,575 | +270 | 59.92% | 427,581 | ~ | **−0.02658** | +0.92601 | 0 |
+| 7 | `LC08_060018` × `LE07` | * | 672,440 | −472 | 58.60% | 394,041 | ~ | +0.01127 | +0.95656 | 0 |
+| 8 | `LE07_..._20040810` | * | 919,043 | +863 | 52.86% | 485,817 | ~ | **+0.00478** | +0.97552 | 0 |
+| 9 | `LE07_..._20120428` | * | 112,064 | **+5,836** | 0.00% † | 0 | — | +0.00666 | +0.88999 | 0 |
+| 10 | `LT04_063018` | * | 272,851 | −24 | 56.02% | 152,861 | ~ | +0.00102 | +0.98253 | 0 |
+| 11 | `LT05_060018` | * | 137,259 | **+12,862** | 24.61% | 33,774 | **+68** | −0.00341 | +0.99210 | 0 |
+| 12 | `LT05_001013` (`P000`) | * | 19,408 | +868 | 0.15% † | 29 | **+29** | **−0.06907** | +0.99819 | 0 |
+
+† base level skipped on both sides, so every point is coarse and unquantized.
+
+**The three unmoved cases are the control, and they reproduce the previous table exactly** — identical
+`both` counts, exact counts within rounding of the recorded percentage, and core bias agreeing to five
+figures. All nine moved cases changed. Prediction and measurement agree in both directions, which is what
+separates a scoped change from an untested one.
+
+**`exact` as a *fraction* falls on cases 5, 11 and 12 while its *count* rises.** Case 5 gains 23,473
+both-measured points and 596 more exact ones; case 11 gains 12,862 and 68. The added points are the ones
+the zero shift had been placing half a cell from where `_undecimate_level` read them back, and they land
+at coarse levels where neither side is quantized — so a fraction over a grown population is not
+comparable to itself. The counts are, and they rise on every case that moved except where `both` fell.
+
+**Two cases lose coverage** — case 7 by 472 and case 10 by 24, against gains of 23,473 and 12,862
+elsewhere. A shifted coarse node can fall outside the image where the unshifted one did not, so a small
+two-sided movement is the expected signature rather than a regression.
+
+**Case 12's bias moved, and it was the one recorded as not moving.** `LT05_001013` was flagged above as
+the largest bias in the optical set at −0.0847 px, unchanged by the `Dy0` fix and therefore not a
+sign-convention artifact. The grid-step fix takes it to **−0.0691** and its coverage from 18,540 to
+19,408. So part of it was the missing cell-centre shift. At 4.5× the next largest core bias it is still
+the outlier in the set, and the residual is still unexplained.
+
+**Case 4's core bias improves by 5×**, −0.0226 → +0.0042, and case 6's by a fifth. Both are cases whose
+`x` step is −1 — a grid rotated near 90°, where a wrong shift moves a node along the wrong axis entirely.
+
+**Coverage across all twelve**: 6,880,833 both-measured, 232,610 julia-only, 333,402 reference-only —
+4.85% of `both`. The reference-only fraction is not uniform: 1.4–2.0% on the three `hps` cases with the
+highest agreement, against 23.8% on case 9 and 15.0% on case 11, both `wallis_fill`/`fft` cases whose
+base level is skipped or nearly so.
+
+**Eleven of twelve report a zero tail beyond 10 px.** The exceptions are 2 points of 605,987 on case 3
+(`dy`) and 1 of 692,088 on case 4 (`dx`); case 4's `dx` maximum of 11.03 px is the largest single residual
+in the set.
+
+## Step: the eight radar pairs, re-measured after the stride and grid-step fixes
+
+`3.rdr` was the last gate standing on superseded figures. **All eight captures are still on disk** —
+`call1.json` present in every `200/capture` — so this needed no container run. The eight endpoints take
+**14m37s** total on 10 threads.
+
+Both fixes move every pair, on both axes. The stride change is larger here than anywhere else in the set:
+three pairs decimated by **1, 1, 1, 1** before, so no level coarsened at all.
+
+| case | `ScaleChipSizeY` | chip0 | old stride | new stride | old step | new step |
+|---|---:|---|---|---|---|---|
+| `20150828`, `20151120`, `20250416T010214`, `20240618T025533` | 0.2500 | 64x16 | 1, 1, 1, 2 | 1, 2, 4, 8 | **0, 0** | varies |
+| `20170221`, `20180809`, `20240618T025528` | 0.2353 | 68x16 | **1, 1, 1, 1** | 1, 2, 4, 8 | **0, 0** | varies |
+| `20250416T010159` | 0.2857 | 56x16 | 1, 1, 1, 2 | 1, 2, 4, 8 | **0, 0** | −6, 2 |
+
+The endpoint, whole grid, against "The eight, all green" above. That baseline predates the `Dy0` fix as
+well, so this is the effect of all three defects together and not of the stride alone:
+
+| # | case | driver | both | Δ both | exact | only jl | only ref | Δ only ref | core bias dx / dy | corr dx / dy | tail | gate |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | `S1A_..._20150828T162412` | SLC | 1,310,564 | −17,054 | 29.41% | 35,053 | 86,884 | +17,054 | **−0.00000** / −0.00029 | +0.903 / +0.906 | 0 | green |
+| 2 | `S1A_..._20151120T080202` | SLC | 60,072 | −539 | 0.00% † | 8,668 | 10,436 | +539 | −0.00428 / +0.00408 | +0.968 / +0.930 | 167 | green |
+| 3 | `S1A_..._20170221T204710` | SLC | 1,666,631 | **+132,369** | 69.08% | 23,633 | 50,508 | **−132,369** | +0.00715 / +0.00239 | +0.996 / +0.985 | 35 | green |
+| 4 | `S1B_..._20180809T204617` | SLC | 489,946 | +35,632 | 69.26% | 12,453 | 35,528 | −35,632 | +0.00479 / +0.00475 | +0.987 / +0.971 | 0 | green |
+| 5 | `S1C_..._20250416T010214` | SLC | 484,471 | +8,065 | 46.54% | 26,585 | 46,362 | −8,065 | +0.00560 / −0.00155 | +0.983 / +0.896 | 0 | green |
+| 6 | `S1C_..._20250416T010159` | BURST 7 | 35,986 | +2,773 | 36.17% | 3,499 | 5,949 | −2,773 | **−0.04313** / **−0.01656** | +0.941 / +0.850 | 0 | **red** |
+| 7 | `S1A_..._20240618T025533` | BURST 10 | 546,899 | **+106,874** | 63.24% | 34,030 | 36,156 | **−106,874** | **+0.01181** / +0.00556 | +0.992 / +0.982 | 14 | **red** |
+| 8 | `S1A_..._20240618T025528` | BURST 24 | 1,505,773 | **+274,063** | 54.77% | 73,479 | 84,463 | **−274,063** | −0.00107 / +0.00010 | +0.988 / +0.961 | 12 | green |
+
+† base level runs a coarse pass and a `filtDisp` but no fine pass, so every point is bicubic-resized
+rather than quantized and `exact` is 0 by construction.
+
+**Gate `3.rdr` is 6 of 8**, red on cases 6 and 7 against its `0.010 px` core-bias threshold.
+
+**The coverage gap closes, as it did on NISAR.** `only ref` falls **898,469 → 356,286**, from 16.16% of
+`both` to **5.84%**, and `both` rises 5,558,159 → 6,100,342 (**+542,183**). Every reference-only point
+recovered becomes a both-measured one — the two Δ columns are equal and opposite on all eight rows, so
+nothing moved to `only jl`, which itself falls 465,303 → 217,400. The direction matches the NISAR L2
+result and has the same cause: the coarse levels finally run on the reference's own lattice.
+
+**Correlation improves on 7 of 8 on each axis.** Case 1 gains most, +0.820 → **+0.903** on `dx` and
++0.825 → +0.906 on `dy`, and its core `dx` bias is now **−0.0000005 px**. Case 7's `dx` slips by 0.001
+and case 8's `dy` rises 0.951 → 0.961.
+
+**`exact` falls as a fraction on six of eight while `both` rises**, the same construction as on the
+optical and NISAR cases: the recovered points are coarse-level ones where neither side is quantized, so
+they cannot be exact. **The exact *count* rises on six and is flat on the other two.** Case 8 is the
+extreme — 65.81% → 54.77% on a population that grew by 274,063 — and its count still rises, from a
+baseline percentage implying 810,526–810,650 to a measured **824,654**. Case 1's count is flat at 385,404,
+which is the one case whose population *fell*; case 2's is 0 either way by construction.
+
+### The two red cases are both `process_burst`, and the bias is systematic
+
+Case 6's core `dx` bias is **−0.0431 px**, 4.3× the gate threshold and **62× its former −0.0007**. Case 7
+is +0.0118, 10.7× its former +0.0011. The five `process_slc` pairs stay within 0.0072.
+
+It is not a tail-cancellation artifact, which is what the core statistic exists to exclude: case 6's mean
+is −0.0642 and its core −0.0431, so the core carries **67%** of the mean, and case 7's carries 88%. A
+two-sided tail would leave the core near zero, as it does on case 2, where the mean is dragged while the
+core sits at −0.0043.
+
+Two properties separate the red pair from the green ones, and neither is established as the cause:
+
+- **Both are burst-mosaicked**, but so is case 8, which is the *best* core bias in the set at −0.0011.
+  So `process_burst` alone does not predict it; 7 and 10 bursts do while 24 does not.
+- **Case 6 is the only `ScaleChipSizeY = 0.2857` pair** and has the smallest chip in the set at 56x16.
+  It is also the smallest population, 35,986 points, and had the second-lowest `dy` correlation before
+  the fix.
+
+Case 6's `dy` core bias of −0.0166 is also over threshold, so it is not a single-axis effect. Both cases
+report a `dx` maximum well above their `dy` one — 6.97 against 2.18 on case 6, 18.04 against 5.93 on
+case 7 — so whatever it is, it is stronger along x, which is the axis the stride is now derived from.
+
+**The gate's threshold is not obviously the thing to change.** It was calibrated as "the weakest measured
+case less a margin" against figures that are now known to have been measured through three defects, so it
+describes the old behaviour rather than a physical requirement. But the two fixes improved coverage and
+correlation on these same two cases while the bias grew, which is not the signature of a threshold set
+too tight — a case whose systematic offset over its agreeing population grew 62× has changed behaviour
+that wants an explanation, not a wider bound. `3.rdr` stays red on 6 and 7 until there is one.
+
+## Step: the serial phase was the FFTW planner
+
+The one-core phase this file records twice — L1 running ~7.8 cores for 2.5 hours then dropping to 1.0 —
+is **FFTW plan construction under `FFTW_PATIENT`**. Not the hole fill, the merge or the comparison, each
+of which was guessed at and none of which is where the time goes.
+
+**How it was localized.** `sample(1)` on the live process, on an otherwise idle machine so contention
+could not explain it: every worker thread parked in `uv_cond_wait`, and the one busy thread was the
+*main* thread inside `libfftw3f`, running many different radix codelets (`hb_12`, `r2cb_32`, `n1_64`,
+`fftwf_cpy2d_pair_ci`) beneath `apply` at top level. That is the planner timing candidate algorithms,
+not a correlation executing. Two candidates were eliminated by direct measurement first: `_fill_holes!`
+takes **0.6 s** on the full 2328x2304 L1 grid with its real 66.4% hole pattern, and chunk load imbalance
+gives a greedy makespan 1.16x ideal, not the 4.2x an earlier `(2r+1)^2` cost proxy suggested.
+
+**Why `PATIENT` was the wrong flag, measured rather than argued.** Cold plan against warm execution, both
+flags, real-to-complex forward:
+
+| size | PATIENT plan | MEASURE plan | execution gain | repaid after |
+|---|---:|---:|---:|---:|
+| 28x28 | 97 ms | 0.0 ms | **0.98x** — slower | never |
+| 84x84 | 517 ms | 0.0 ms | **0.93x** — slower | never |
+| 84x160 | 1479 ms | 0.0 ms | 1.13x | 905,696 executions |
+| 320x640 | 6346 ms | 0.0 ms | 1.01x | 4,427,357 executions |
+| 576x1152 | 16,122 ms | 0.1 ms | 1.00x | never |
+| 2304x4608 | **306,787 ms** | 3873 ms | 1.05x | 13,016 executions |
+
+Five minutes to plan one 2304x4608 transform, which is what a 1905-pixel search radius on the L1 grid
+reaches. And `src/plans.jl`'s recorded justification for `PATIENT` — 1.41x at 28², 1.28x at 84² — **does
+not reproduce**: at those sizes it is not faster at all. `PLAN_FLAGS` is now `FFTW_MEASURE`.
+
+**The endpoint, same window and machine, `-t 10`.** A 201x201 window of the L1 grid, 40,360 searchable
+points:
+
+| | before | after | |
+|---|---:|---:|---|
+| wall clock | 1576.3 s | **104.6 s** | **15.1x** |
+| per searchable point | 39.06 ms | **2.59 ms** | |
+| peak RSS | 57.97 GiB | 61.45 GiB | 1.06x |
+
+**Peak RSS rises 6%, which is unexplained.** The prediction from the workspace arithmetic was 1.00x, so
+this is 6% unaccounted for rather than a known cost. It is not the dominant term in production — imagery
+is lazy and a block reads its own window — but the discrepancy stands.
+
+### What it costs in agreement: 0.0013% of one case's exact count
+
+A point is now correlated at its own radius bucketed to a power of two and clamped to the pass maximum
+(`AutoRIFT._radius_bucket`), rather than at the pass's widest radius. Transform length reassociates the
+same floating-point sum differently, so this perturbs results by construction and every golden figure is
+in principle affected. Measured on `LC08_L1TP_009011`, 1,685,673 both-measured points:
+
+| quantity | before | after | delta |
+|---|---:|---:|---:|
+| both-measured | 1,685,673 | 1,685,673 | **identical** |
+| only reference | 30,387 | 30,387 | **identical** |
+| only julia | 19,505 | 19,571 | +66 (0.0039% of what julia measures) |
+| `dx` exact | 70.87% | 70.87% | identical to 2 dp |
+| `dx` exact count | 1,194,637 | 1,194,621 | **−16 of 1.19 M** |
+| `dy` exact count | 1,195,999 | 1,195,987 | −12 |
+| `dx` correlation | +0.99931 | +0.99931 | identical to 5 dp |
+| `dy` correlation | +0.99904 | +0.99904 | identical to 5 dp |
+| bias core `dx` | −0.008884 | −0.008883 | +7.6e-07 |
+| bias core `dy` | −0.005186 | −0.005185 | +1.8e-06 |
+| wall clock | 332.0 s | **75.9 s** | **4.4x** |
+
+So the drift is at the seventh decimal on bias and 16 points in 1.19 million on exact agreement — far
+below the level any gate reads, and below the run-to-run wisdom variability this file already records
+(`correlation` reproducible to ~1e-7 against a fixed wisdom file, not absolutely). The 4.4x on an
+*optical* case is worth noting: optical radii are barely skewed, so almost all of that is the flag.
+
+**Both changes are needed together and neither is sufficient.** Bucketing alone multiplies the plan
+count — 43 distinct sizes for the L1 window against 4 — which under `PATIENT` is a large regression, not
+a gain. The flag alone leaves every point executing the widest point's transform. The commits are
+separate so each is bisectable, but the first is not an improvement on its own.
+
+`Pkg.test()`: **704,173 tests pass**, and the suite itself drops from 16m48s to **11m35s** — the tests
+were paying the same planning cost.
+
+## Step: a per-block halo is not worth having, and the reason is arithmetic
+
+The halo is one `Extent` on the `BlockLayout` (`src/tile.jl:60`), taken from the whole grid's maxima
+and applied to every block. Since the correlation reach is per point and a Geogrid radius field is
+spatially clustered, deriving each block's halo from its own points looks like a large saving. It is
+not, and this records the measurement so it is not re-attempted.
+
+**Implemented and measured, then reverted.** A `_block_halo` reducing over each block's own sanitized
+radii and priors, capped at the grid-wide halo, with `read_rows`/`read_cols` per block — which are
+already per-`Block` fields, so the plumbing needed nothing. All 36,492 tiling tests passed, so a
+blocked run still equalled an untiled one. The saving in imagery read, on the real L1 grid:
+
+| block (grid points) | blocks | adaptive | shared | saving |
+|---:|---:|---:|---:|---:|
+| 64 | 1332 | 454.4 GiB | 505.5 GiB | **1.11x** |
+| 128 | 342 | 209.2 GiB | 226.8 GiB | 1.08x |
+| 256 | 90 | 97.0 GiB | 102.0 GiB | 1.05x |
+| 512 | 25 | 45.3 GiB | 46.6 GiB | 1.03x |
+
+**Why the gain is 5% and not the 18x an earlier estimate gave.** That estimate assumed a block with no
+wide-radius point gets a small halo. It does not: the halo is
+`chip_size_max/2 + radius + |prior| + 2 + filter_reach + level_centre_offset`, and only the `radius`
+term is per point. `chip_size_max/2` alone is 384 px on this configuration, so the *floor* on a
+per-block halo is **561 px** against a grid-wide 2684 — and the median block reaches the full 2684
+anyway, because 53-60% of blocks contain at least one wide-radius point at every block size tried. A
+clustered radius field is not clustered finely enough to matter at block scale.
+
+## Step: the wide halo is a skewed search radius, and the radius is the geogrid's own
+
+The halo above is dominated by the search radius, and a radius of 1905 px is worth interrogating before
+it is designed around. It survives interrogation: it is what the geogrid produced.
+
+`window_search_range.tif` — the geogrid's raw output, before `autoRIFT` reads anything — carries band 1
+min 0, **max 1905**, mean 72.5 and band 2 min 0, **max 830**, mean 41.6. Those are bit-identical to
+`in_SearchLimitX`/`in_SearchLimitY` in the capture, so nothing between the geogrid and the correlator
+rescales them.
+
+**The nodata value is not being read as data**, which is the first thing to suspect of a field whose
+maximum is 73x its median. The sentinel is `-32767` in `window_search_range.tif` and
+`window_offset.tif`, and the ITS_LIVE parameter rasters use `32767` for the search ranges and `-32767`
+for the velocities. None of the four values appears anywhere in the captured grid: no `32767`, no
+`-32767`, nothing with `|v| > 3000`, no `NaN`. The observed maxima in the source rasters — 11576 m/yr
+for `vxSearchRange`, 8147 for `vySearchRange` — are that data's own extrema, reported by `gdalinfo` as
+statistics separate from the declared nodata.
+
+**The field is genuinely skewed rather than corrupt.** Over the 2.3 M points with real coordinates and
+a nonzero chip size, `SearchLimitX` has median 26 and p99 959, then 1486 at p99.9, 1592 at p99.99 and
+1905 at the maximum — a continuous tail, not the spike of identical values a misread fill would give.
+The maximum is reached at exactly **4 points**, rows 1246-1247 and cols 1105-1106, a 2x2 cluster in the
+scene interior; the `-640` prior is 54 points at rows 1316-1333, cols 1113-1140, spatially adjacent to
+it. One fast feature, not a fill artifact.
+
+**Converting a pixel radius to a velocity needs `off2vel`, not the pixel spacing.** This is where a
+check of whether 1905 px is physically plausible goes wrong: `radius * spacing / days * 365.25` assumes
+an offset maps to ground displacement through the pixel size, which in radar geometry it does not. The
+geogrid stores the correct projection in `window_rdr_off2vel_x_vec.tif`, whose band 1 means 14.2 m/yr
+per pixel of range offset — against 19.4 implied by the naive form, so that step alone is 1.37x off.
+Through the stored conversion the median 26 px is 369 m/yr, p99 959 px is 13.6 km/yr and the maximum
+1905 px is 27 km/yr.
+
+27 km/yr is still fast for ice, and `off2vel` band 1 itself spans -377 to +393 across the scene, so a
+fixed pixel radius maps to wildly different velocities depending on where it sits. Whether those 4
+points are fast ice or poorly-conditioned geometry is a geogrid question and is left open. What is
+settled is that they are the geogrid's own numbers, correctly carried, with the nodata handled.
+
+**A second finding, which is the one worth acting on.** The guard at `src/tile.jl:236` compares the
+requested block size against the grid-wide halo and rejects anything smaller, so on this case the
+smallest permitted block is **2684x1448 px** — 6.8 by 6.4 km at this granule's 2.55 m ground-range and
+4.44 m along-track spacing.
+
+**That guard is not what stopped blocking here, and an earlier version of this section said it was.** A
+2684 px block divides a 57760x50511 scene about 19 by 20 ways. Yet every requested block size from 3072
+up to 16384 px returned **one block**, which no halo argument explains — the halo only sets a floor.
+
+Two independent defects, both silent, and both now fixed.
+
+**The grid is not separable.** `block_layout` derived its block boundaries from `grid.y[:, 1]` and
+`grid.x[1, :]`, on the assumption a gridded `PointSet` repeats each coordinate down every row and across
+every column. A NISAR geogrid is a rotated radar footprint sampled onto a map grid, so it is not
+axis-aligned in pixel space: `x` varies by 50502 px down column 1152, `y` by 43164 px across row 1164,
+only 43.2% of the 2328x2304 points carry real coordinates, and row 1 and column 1 contain **one** valid
+point each. Walking them spanned 216 px rather than the scene, so one block appeared to cover
+everything.
+
+The grid is itself the index-to-pixel mapping, so the block shape now comes from it: `x` moves 33 px per
+row of index *and* 33 px per column, `y` moves 19 px per each. A block of `a` by `b` index points spans
+`a*33 + b*33` px of `x`, and both axes have to fit. Sizing each axis from its own budget alone —
+`rowpts = py/dy_di`, `colpts = px/dx_dj` — gives 215 by 124 points at an 8192-px request, whose `x` span
+is 11187 px, a 37% overshoot. On an axis-aligned grid two of the four rates are zero and this reduces to
+the separable answer.
+
+**The read window spanned unsearchable points.** `_pixel_span` reduced over every point in the block,
+and outside the footprint the coordinates are *fill* — zero on this grid, not `NaN`, so finiteness does
+not detect them. A block straddling the footprint edge spanned 0 to the real coordinates and read
+`1:57760`: at an 8192 px block, 28 of 209 blocks each read half the scene or more, 99x the scene in
+total. `_searchable_span` now reduces over searchable points only, which is sound because
+`_run_one_block!` returns before any I/O for a block with nothing to search.
+
+Measured after both fixes, on the captured L1 grid:
+
+| block | blocks | max read window | read amplification |
+|---:|---:|---:|---:|
+| 4096 px | 1444 | 5217x9747 | 8.31x |
+| 8192 px | 361 | 7572x14020 | 4.34x |
+| 16384 px | 100 | 12277x22519 | 2.85x |
+
+So blocking *is* available on a NISAR grid, at a block size scaled to the halo. The amplification is set
+by the 2684x1448 px halo rather than by the layout: even a 16384 px block pays 2.9x, which is what a
+fixed-width halo costs when it is a large fraction of the block. Axis-aligned grids are unaffected — the
+Landsat sweep in `docs/memory.md` reproduces its previous block counts and amplification, a full-width
+band stays a band, and `dx`/`dy`/`correlation` stay bit-identical to an untiled run at every block size.
+
+## Step: what the 44 GiB peak is, and it is not the imagery
+
+The obvious reading of a whole-scene peak near 50 GiB is that the scene is resident and should be read
+lazily. Measured on the L1 window at `-t 10`, that is wrong on both counts.
+
+| component | GiB |
+|---|---:|
+| imagery, both scenes as captured `UInt8` | 5.43 |
+| everything reachable **before** the pass | 6.26 |
+| maximum reachable **during** the pass (`gc_live_bytes`) | **50.40** |
+| peak RSS | 44.17 |
+
+Three findings, each of which rules something out:
+
+- **No padded copy is made.** `_pass_geometry` reports `fits = true` on this window, so the pass reads
+  the captured arrays in place. Padding is a real cost on a grid whose points reach outside the scene,
+  but it is not what this peak is.
+- **The memory is reachable, not uncollected.** `gc_live_bytes` peaks slightly *above* RSS, so the
+  collector is not behind — the process genuinely holds it.
+- **Lazy imagery would recover 5.43 GiB of ~50.** In production it is worth having, since the blocked
+  path reads a window per block; it is not the dominant term and it is unavailable in the harness
+  anyway, where `read_capture` materialises `UInt8` matrices from disk.
+
+**The dominant term is workspaces, and their count is larger than it should be.** After one pass the
+pool holds **51 workspaces across 28 keys, 9.97 GiB**, with the per-key cap of 2 working as intended.
+28 keys is the problem: `_radius_bucket` clamps to *each level's* own maximum radius, and the levels'
+maxima differ — 1905x830, 1918x1015, 1689x907, 1828x972 — so the top bucket is a different geometry at
+every level rather than one shared entry. **7.74 of the 9.97 GiB is those eight near-duplicate top
+buckets.**
+
+Dropping the clamp so every bucket is a clean power of two collapses them to one key per chip size, but
+costs 11-45% more transform area for every point in the top bucket (measured: `1792x4096` becomes
+`2304x4608` at chip 96x52), which is the regression the clamp exists to prevent. Clamping every level to
+one grid-wide maximum instead would collapse them to four keys — but a level's radii can *exceed* the
+grid's, since `sanitize!` floors them and the coarse pass rewrites them per level (1918 against a
+grid-wide 1905), so a single clamp needs that relationship established first rather than assumed. Left
+open deliberately.
+
+## Step: blocking on a real geogrid, and what the outlier filter does to a last-bit difference
+
+Fixing the rotated-grid layout above made blocking actually divide a golden grid, and the first real
+multi-block run did not reproduce the untiled answer. **The blocked correlation is right; the
+disagreement is the outlier filter amplifying a floating-point difference the package already
+documents.** Recorded because the intermediate readings each pointed somewhere else.
+
+Measured on `S2B_MSIL1C_20200612`, a 10980x10980 scene on a 1008x1008 grid with 787,186 searchable
+points, at a 2048 px block giving 144 blocks:
+
+| configuration | untiled | blocked | differing |
+|---|---:|---:|---:|
+| full ladder, `outliers` default | 612,607 | 611,467 | 3713 |
+| single chip size, `outliers` default | 481,037 | 481,036 | 1 |
+| single chip size, `outliers = :none` | 787,190 | 787,190 | **0, bit-identical** |
+
+The last row is the finding. With rejection off the two paths agree to the last bit, so nothing about
+reading, filtering, padding or the layout differs.
+
+**What the one point is.** Grid (918,827), `x = 9812.5`, `y = 10010.5`, radius 6, chip 24, zero prior.
+Correlated in isolation through its own block it answers `dx = 0.1875`, `correlation = 0.1534135` —
+exactly the untiled values — and its `peak_ratio` comes out **1.6192024 through the whole grid's pass
+geometry against 1.6192014 through the block's own**. That is a 6e-7 relative difference in a *quality
+metric*, from executing a different-sized transform: `src/plans.jl` already records that `correlation` is
+reproducible only to ~1e-7 while `dx`/`dy` are bit-identical, because a peak's location is insensitive to
+a perturbation that size. Here the metric feeds `reject_outliers`, which compares each point against its
+neighbours and takes a keep-or-drop decision — so a 6e-7 difference lands on either side of a threshold
+and the point is kept untiled and dropped blocked.
+
+The ladder then multiplies one point into 3713. A point the base level drops changes what the coarse
+gate, the hole fill and every level above it see, so the discrepancy compounds rather than accumulating
+linearly.
+
+**Why the synthetic suite cannot see this.** 36,620 tiling assertions pass, and every grid they build
+comes from `gridpoints`: uniform radii, no fill, and — before the layout fix — a golden grid collapsed to
+one block, so the harness compared an untiled run against itself and reported agreement. That agreement
+was vacuous. Reproducing the failure needs a grid whose radius field is skewed enough that a block's own
+pass geometry differs materially from the whole grid's, which is a geogrid property.
+
+**Four things this is not**, each measured and ruled out before the above was found: a halo effect at a
+seam (only 9% of discrepant points lie within 2 grid points of a boundary, against ~13% by chance);
+padding over real imagery (37 of 144 blocks do get `_zeropad`ed, all at the scene edge where the untiled
+pass pads too, and a synthetic grid whose points deliberately reach outside the scene stays
+bit-identical); per-point radius variety, `preprocess = :none`, a clustered unsearchable region, or a
+`grid_spacing` disagreeing with the grid's true spacing (48 declared against 12 measured here — all four
+reproduce bit-identically in isolation); and the chip ladder or the fine rejection themselves, since one
+point still differs with a single chip size.
+
+**What it means for the bit-identity promise.** `docs/memory.md` states bit-identity as one of two things
+`process_block_size` guarantees. That holds for the correlation and fails for the *rejection decision* on
+a grid with a skewed radius field, because the decision is a threshold on a quantity only reproducible to
+~1e-7. Two honest resolutions, neither applied: hand every block the whole grid's pass geometry for the
+quality metrics as well as the transform — which `_run_blocked` already does for `geometry`, so the
+remaining difference is that a bucket's workspace is sized to the bucket — or state the promise as
+bit-identical `dx`/`dy` *given the same keep mask*, and treat the mask as reproducible only where no point
+sits within ~1e-6 of a threshold. The Landsat sweep in `docs/memory.md` is unaffected either way: uniform
+radii mean a block's geometry equals the grid's, and those runs are bit-identical at every block size.
+
+## Step: what a whole NISAR scene costs, and a GC deadlock under contention
+
+Blocking works on these grids once the layout is fixed, and the figures are what a production instance
+would be sized from. Measured at `-t 10` on an M2 Max with 96 GiB, whole grid, one process per row.
+
+**NISAR L1 RSLC** — 57760x50511 px, grid 2328x2304, halo 2736x1500 px, 1.87 M searchable points:
+
+| block | blocks | runtime | peak | vs untiled | read amp | measured |
+|---|---:|---:|---:|---:|---:|---:|
+| untiled | 1 | 10.9 min | **55.2 GiB** | 1.00x | 1.00x | 1,798,199 |
+| 16384 px | 100 | — | 68.6 GiB | 1.24x | 2.89x | killed |
+| 8192 px | 380 | 41.1 min | 34.8 GiB | 0.63x | 4.51x | 1,797,076 |
+| 4096 px | 1482 | 45.0 min | **31.5 GiB** | 0.57x | 8.77x | 1,797,076 |
+
+**Superseded — see "Step: the L1 sweep, re-measured on an idle machine" below.** Every runtime in this
+table is inflated, and every peak is a few GiB high, because these rows shared the machine with other work.
+The re-measured figures are 9.5 min untiled and 24.4-30.9 min across the blocked rows.
+
+**The peaks are the measurement; the blocked runtimes are upper bounds.** Those two rows were re-measured
+after `_index_rate` was corrected, on a machine that was also running the L2 job for part of their life. An
+earlier uncontended pass over the same block sizes — at the flawed rates, so a slightly different partition
+— gave 18.4 and 16.9 min. Peak RSS is insensitive to a competing process in a way wall clock is not, so the
+memory column stands and the time column wants a quiet machine before it is quoted.
+
+**NISAR L2 GSLC** — 54885x110085 px (6.0 Gpx), grid 2288x2288, halo 2216x1103 px:
+
+| block | blocks | runtime | peak | vs untiled | read amp | measured |
+|---|---:|---:|---:|---:|---:|---:|
+| untiled | 1 | 12.1 min | **80.9 GiB** | 1.00x | 1.00x | 1,781,775 |
+| 8192 px | 98 | **11.9 min** | **40.8 GiB** | **0.50x** | 0.86x | 1,781,377 |
+
+**Both runtimes in this table are superseded** — see "Step: the L2 block-size sweep" below, which spans
+five sizes with the JIT warmed and times each row with the profiler off. The untiled row here carries the
+process's compilation, and 8192 px is not the size to choose.
+
+**This is the case that makes blocking a production requirement rather than a tuning knob: peak halves at
+identical runtime.** 80.9 GiB against 40.8 on a machine with 96, and 99.98% of the untiled point count. An
+instance sized from the untiled figure is memory-optimized; one sized from the blocked figure is not.
+
+Three things worth stating.
+
+**The untiled peaks are the reason blocking matters here.** 55 GiB on L1 and **81 GiB on L2, on a 96 GiB
+machine** — a production instance sized from the L2 figure is a memory-optimized instance costing several
+times a general-purpose one, for a scene blocking runs at 37 GiB.
+
+**A block can be too large, and the crossover is arithmetic.** `BlockBuffers` holds nine block-sized
+arrays — two `UInt8` planes, three `Float32`, four `Bool` — totalling **18 bytes per pixel**, one set per
+task, so a run holds `min(nblocks, nthreads)` sets. At 16384 px on L1 the read window is 12232x22222,
+which is 4.56 GiB per set and **45.6 GiB across ten tasks** before any imagery or workspace: measured peak
+68.6 GiB against an untiled 55.2. The prediction and the measurement agree to 1%, so the rule is usable
+rather than empirical — compute `18 bytes x (block + 2*halo)^2 x min(nblocks, nthreads)` and keep it well
+under the untiled peak.
+
+The 18 bytes are the total across the nine arrays, not each array's share. `tools/golden/profile_nisar.jl`
+holds the constant and measures it off the struct's own fields (exactly 18.0 B/px at a 2000x1500 window);
+reading it as 18 bytes *per array* predicts 410 GiB for that L1 window and rejects every block size the
+granule runs at.
+
+**L2 reads *less* than the scene when blocked** — 0.87x at 8192 px, against 4.51x for L1 at the same size.
+Two reasons compound: its halo is smaller relative to the block, and 64% of its grid is fill, so those
+blocks have no searchable point and `_searchable_span` gives them an empty read window. A read
+amplification below 1.0 is the signature of a grid whose footprint does not fill its bounding box.
+
+### The deadlock, as first seen — superseded by "The root cause" below
+
+The heading this section carried, "which is contention-dependent", was wrong; keep reading to the root
+cause rather than stopping here.
+
+**Reproduced once, then not.** The first attempt at the L2 8192 px row reached 44.4 GiB and stopped dead:
+0% CPU across three `sample` runs six minutes apart, unresponsive to `SIGTERM`, killed with `SIGKILL`. All
+31 threads sat in a wait — 16 in `__psynch_cvwait`, 4 in `__psynch_mutexwait` — and each of the four was
+
+    ijl_gc_small_alloc / ijl_gc_managed_malloc -> ijl_gc_collect -> jl_safepoint_start_gc -> uv_mutex_lock
+
+so every thread that tried to allocate was queued behind a collection that never started. The trace is at
+`~/data/autorift/tests/golden_tests/mem/l2_deadlock_sample.txt`.
+
+**The same configuration then completed cleanly on an idle machine**, in 716 s at 41.8 GiB peak — the row
+in the table above. The difference between the two runs was a concurrent L1 job holding tens of GiB, so at
+the time this read as a deadlock needing memory pressure from *outside* the process.
+
+**That qualification is wrong on both counts.** It reproduces on an idle machine, and it needs neither
+external pressure nor a multi-configuration process: the macOS profiler suspends a thread mid-way through
+libpthread's thread-list lock and then blocks on that lock itself, inside the Julia runtime and
+reproducible in a script with no AutoRIFT in it. See "The root cause" below. Because it is a race, the
+clean retry that motivated the contention theory was simply a run that did not lose it.
+
+Not an artifact of the harness. The sampler thread `mem_nisar.jl` runs appears on no stack in the trace,
+and it allocates only two small vectors per sample.
+
+### The deadlock, requalified: an idle machine is enough
+
+**Reproduced on an idle machine with nothing else running**, so the "needs external memory pressure"
+qualification above does not hold. Hit while sweeping smaller block sizes: the 2816 px row stopped dead at
+**25.4 GiB** — a third of the untiled peak, and well under the 44.4 GiB of the first occurrence — after its
+2304 px predecessor had completed normally in the same process.
+
+Same signature as the original, at a different block size and a much lower footprint:
+
+| | first occurrence | this one |
+|---|---|---|
+| block | 8192 px | 2816 px |
+| footprint at stop | 44.4 GiB | **25.4 GiB** |
+| other load on machine | concurrent L1 job, tens of GiB | **none** |
+| `__psynch_cvwait` | 16 | 16 |
+| `__psynch_mutexwait` | 4 | 4 |
+| through `ijl_gc_collect -> jl_safepoint_start_gc -> uv_mutex_lock` | yes | yes |
+
+**No thread is collecting.** Zero frames in the sample match `gc_mark`, `sweep` or `gc_scan`, so this is a
+collection that never starts rather than one taking a long time — every allocating thread is parked at the
+safepoint waiting for a collector that does not exist. Trace at
+`~/data/autorift/tests/golden_tests/mem/l2_deadlock_2816_sample.txt`.
+
+**Root cause: the profiler suspends a thread that is holding libpthread's global thread-list lock, then
+blocks on that same lock.** A Julia runtime bug, not memory pressure, not the block size, and not this
+package — see "The root cause" below. The multi-configuration correlation is incidental; what matters is
+that a profiled run allocates hard on many threads for long enough to lose a race.
+
+**A second stuck process was found at the same time**, left over from the five-configuration sweep: 0% CPU,
+16 threads in `__psynch_cvwait`, still resident at 11.8 GiB. It had been assumed dead — no output, no
+exception, empty stderr — and the assumption was wrong in a way worth recording: **a Julia process
+deadlocked this way looks exactly like one that was killed**, since both stop writing and neither leaves a
+message. Check `ps` for a 0%-CPU survivor before concluding a run died, and `sample` it before killing it.
+
+The earlier note in this file attributing the 3072 px sweep row to an OOM kill is superseded: that process
+was hung, not killed.
+
+### The root cause: the profiler suspends a thread holding libpthread's thread-list lock
+
+**A Julia runtime bug in `src/signals-mach.c`, present in every release through 1.13.0, and nothing to do
+with AutoRIFT.** It is *not* a symmetric lock-order inversion between two lock types — an earlier reading
+of these traces recorded it that way and was wrong. There is **one** lock, and the profiler freezes its
+holder:
+
+`pthread_mach_thread_np(t)` looks `t` up in libpthread's global thread list under
+**`_pthread_list_lock`**, an `os_unfair_lock`. A lookup of *another* thread must take it; a self-lookup
+takes a lock-free fast path. Both parties here look up other threads.
+
+1. A Julia thread finishes a collection, enters `jl_mach_gc_end` (`signals-mach.c:97`), and calls
+   `thread_resume(pthread_mach_thread_np(ptls2->system_id))` to wake the threads it stopped. It is now
+   **inside libpthread holding `_pthread_list_lock`**.
+2. The profiler's sampling thread picks that thread as its next target and, in
+   `jl_thread_suspend_and_get_state2`, calls `thread_suspend` on it — freezing it *mid-critical-section
+   with the lock held*. `jl_profile_thread_mach` then unwinds the target's stack and only calls
+   `jl_thread_resume` at the very end.
+3. Before reaching that resume, the sampler needs `pthread_mach_thread_np` again, blocks on
+   `_pthread_list_lock`, and waits on a lock whose holder is suspended and can only be resumed by the
+   sampler itself. **The sampler deadlocks against a thread it stopped.**
+
+The lock is process-global, so the two need not be interacting through Julia at all — which is why block
+size, memory pressure and the multi-configuration harness are all irrelevant to it.
+
+**The traces say exactly this, and the offsets are the evidence.** Only ever *two* threads are inside
+`pthread_mach_thread_np`, at different offsets and with different frames beneath:
+
+| thread | offset | frame beneath | reading |
+|---|---|---|---|
+| sampler (`jl_profile_thread_mach:797`) | `+56` in every trace | `_os_unfair_lock_lock_slow` → `__ulock_wait2` | **blocked acquiring** the lock |
+| victim (`jl_mach_gc_end:97`) | `+76`, `+164` — varies | **none** | **suspended holding** it, frozen at an arbitrary instruction |
+
+A blocked thread is always at the same instruction; a *suspended* one stops wherever it happened to be,
+which is why the victim's offset differs between traces and the sampler's never does. And **no thread is
+collecting** — zero frames matching `gc_mark`, `sweep` or `gc_scan` — so this is a collection that cannot
+finish rather than one taking a long time. Every remaining thread queues at `jl_safepoint_start_gc` behind
+it.
+
+**Reproduced without AutoRIFT.** `tools/golden/profiler_gc_deadlock.jl` is allocation churn on every
+thread while `Profile` samples at 0.5 ms — no imagery, no correlation:
+
+```bash
+julia -t 10,1 tools/golden/profiler_gc_deadlock.jl off       # always completes
+julia -t 10,1 tools/golden/profiler_gc_deadlock.jl profile   # hangs ~2 runs in 5
+```
+
+Measured 2 hangs in 5 attempts, at rounds 25 and 106 of 200, with the same two-thread signature; the
+control arm runs the same workload unprofiled and has never hung. **It is a race, so one clean run proves
+nothing** — which is exactly the trap that made the first occurrence look contention-dependent after it
+completed on a retry.
+
+**Fixed upstream, but not in any release yet.** `ca49fc2e2` ("[macOS] Handle GC safepoint on-thread",
+2026-03-17) deletes `jl_mach_gc_end` and the `suspended_threads` list outright and handles the safepoint on
+the signalled thread — so no thread calls `pthread_mach_thread_np` to resume another, and step 1 above
+cannot happen. Checked against the tags: `jl_mach_gc_end` is still present in v1.12.5, v1.12.6,
+v1.13.0-beta1, v1.13.0-rc1 and v1.13.0, and gone in 1.14-DEV. Not backported to `release-1.12` or
+`release-1.13`.
+
+**What this means for the measurements.** Nothing in the recorded figures is suspect: peaks and runtimes
+come from unprofiled runs, and a hang costs an attribution rather than a measurement. It does mean the
+profiled arm of a long threaded run on macOS may need retrying, and that `profile_nisar.jl`'s split
+between a timed run and a separately profiled one is load-bearing rather than tidiness. Production is
+unaffected — a worker that does not profile never starts the sampler thread.
+
+## Step: the L2 block-size sweep, and what a threaded whole-granule run actually costs
+
+Seven configurations on NISAR L2 GSLC, whole grid, `-t 10,1` on the M2 Max with 96 GiB. Command:
+
+```bash
+julia --project=tools/golden -t 10,1 tools/golden/profile_nisar.jl NISAR_L2_PR_GSLC \
+    --blocks 0,8192,6144,4096,3072
+julia --project=tools/golden -t 10,1 tools/golden/profile_nisar.jl NISAR_L2_PR_GSLC --blocks 3072
+julia --project=tools/golden -t 10,1 tools/golden/profile_nisar.jl NISAR_L2_PR_GSLC --blocks 2304x1152
+```
+
+`profile_nisar.jl` differs from `mem_nisar.jl` in three ways that each moved a number: it warms the JIT
+before recording anything, it times every row with the profiler **off** and profiles a second run, and it
+measures occupancy from CPU time rather than from profile samples. Runtime is the unprofiled figure.
+
+| block | blocks | runtime | peak | floor | vs untiled | occupancy | read amp | alloc | measured |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| untiled | 1 | 6.2 min | **85.0 GiB** | 39.6 | 1.00x | 6.06 / 10 | 1.00x | 225 GiB | 1,781,775 |
+| 8192 px | 98 | 11.2 min | 47.8 GiB | 29.9 | 0.56x | **2.96 / 10** | 0.86x | 784 GiB | 1,781,377 |
+| 6144 px | 162 | 6.2 min | 45.7 GiB | 29.1 | 0.54x | 5.50 / 10 | 1.00x | 799 GiB | 1,781,377 |
+| 4096 px | 378 | 7.1 min | 40.1 GiB | 28.9 | 0.47x | 5.17 / 10 | 1.33x | 897 GiB | 1,781,377 |
+| 3072 px | 648 | 5.8 min | 31.2 GiB | 22.5 | 0.37x | 6.77 / 10 | 1.69x | 1063 GiB | 1,781,377 |
+| 2304 px | 1152 | 5.5 min | 30.0 GiB | 22.1 | 0.35x | 7.87 / 10 | 2.26x | — | 1,781,377 |
+| 2304x1152 px | 2304 | **5.2 min** | **28.8 GiB** | 21.3 | **0.34x** | **9.03 / 10** | 3.30x | 1727 GiB | 1,781,377 |
+
+The 3072 px, 2304 px and 2304x1152 px rows are each from their own process; the first four share one.
+Every blocked row measures the same 1,781,377 points, so the sizes differ in cost alone.
+
+**2304x1152 px dominates every axis: 0.34x the untiled peak, 0.83x its runtime, 90% occupancy.** The
+previously recorded choice of 8192 px is the worst blocked row measured. Note the ordering is monotonic in
+block *count* over all six blocked rows, on peak and runtime alike.
+
+**Both axes need sizing separately, and sweeping squares alone misses the best shape.** The halo is
+2216x1103 px — almost exactly 2:1 — so a square block clears X and over-provisions Y twofold. The square
+floor is 2304 (2048 is rejected on the X halo) while Y's floor is half that, and following the halo's
+aspect ratio is what produced the best row. `--blocks 2304x1152` reaches these; `--blocks N` still means
+square.
+
+**Runtime is set by thread occupancy, and occupancy by blocks per thread — hundreds, not tens.**
+
+| block | blocks/thread | occupancy of 10 |
+|---|---:|---:|
+| 8192 px | 9.8 | 2.96 |
+| 6144 px | 16.2 | 5.50 |
+| 4096 px | 37.8 | 5.17 |
+| 3072 px | 64.8 | 6.77 |
+| 2304 px | 115.2 | 7.87 |
+| 2304x1152 px | 230.4 | **9.03** |
+
+Per-block cost varies by orders of magnitude — a block whose points a finer level resolved returns before
+any I/O — so a pool with few blocks per thread spends the run waiting on a few expensive ones. **There is no
+turning point in the measured range**: occupancy was still improving at 230 blocks/thread, so an earlier
+version of this section recommending "near 10x the thread count" understated it by an order of magnitude.
+Note the untiled row reaches 6.06 through the intra-pass path, so it is a different decomposition rather
+than a one-block version of the others.
+
+**Read amplification does not drive the ranking.** It rises 0.86x → 1.69x across the rows while runtime
+*falls*. Allocation rises with it (225 → 1063 GiB, since `_read_block!` allocates a block-sized temporary
+per read) and GC still absorbs ≤1.0% of wall clock at 699 pauses. Redundant reading is cheap next to idle
+threads.
+
+**Where the time goes, over the whole run rather than at the peak.** Shares of *working* samples —
+running samples with a stack, excluding the parked ones, since folding those in would mix the occupancy
+result into every stage's share:
+
+| stage | 3072 px | 2304x1152 px |
+|---|---:|---:|
+| FFTW, all stacks (`(FFTW transform)` + `fft_execute!` / `ifft_execute!` under `_numerators_fft!`) | **53.1%** | **45.7%** |
+| `_read_block!` under `_prepared_block_pair` | 11.9% | 19.0% |
+| `preprocess` under `_prepare_block` | 7.4% | 11.9% |
+| `peak_index` under `subpixel_peak` | 3.2% | 2.6% |
+
+Both columns are measured against every stack. The four rows above them in the sweep were read from the
+top-14 stacks each run printed, which is complete enough for FFTW (its stacks are all large) and not for
+the smaller entries: that treatment gives `_read_block!` 4.6% at 4096 px where a full accounting gives
+11.9% at 3072. On the FFTW total the truncated reads are usable — 62.5% untiled, 56.9% at 8192 px, 56.4%
+at 6144, 54.4% at 4096.
+
+**The correlator's spectral core is the run**, and the blocked path's own overhead is what grows as blocks
+shrink: reading plus preprocessing goes from 19.3% at 3072 px to **30.9%** at 2304x1152, while FFTW falls
+53.1% → 45.7%. That is the price paid for occupancy, and at these sizes it is still worth paying — the
+2304x1152 row is faster in wall clock despite spending a third of its working time on block handling.
+It also locates the ceiling: with ~31% of the run in reading and preprocessing, shrinking blocks further
+has less and less headroom, and a real speedup means fewer FFTs per point rather than a better layout.
+
+The `(FFTW transform)` bucket is samples whose stack unwound no further than the codelet, so it is
+FFTW's own frames rather than a separate stage; it is listed apart only because those samples cannot be
+attributed to a call site.
+
+### Three instrument faults this found, two of them in the recorded figures
+
+**The profile buffer was undersized by 3x, and the failure is silent.** `mem_nisar.jl` requests
+`n = 60_000_000` words at `delay = 0.002`. A block costs `stack depth + 6` words per *running thread*, so
+ten threads over a 716 s run need ~165 M. Julia warns on `fetch` and stops recording at roughly a third of
+the run — which leaves a peak-window query correct, because the peak is early, and every whole-run query
+silently describing the first third. `plan_profile` sizes the buffer from a measured runtime and widens
+`delay` rather than truncating; the fill fraction is reported next to every attribution (9–13% here).
+
+**Profile-sample occupancy is not occupancy.** The obvious ratio — running samples over
+`ticks x nthreads` — reads **5.26** on a load that CPU time and construction both put at 1.0 threads, and
+8.55 on a genuinely saturating ten-thread load. The profiler samples parked threads and flags them only
+coarsely. `cpu_seconds / wall_seconds` from `proc_pid_rusage` measures 1.00 / 1.99 / 3.99 / 9.77 on 1, 2,
+4 and 10 spin loops, so that is the figure quoted above. Its fields are **mach ticks**: read as
+nanoseconds they give 0.02 threads for a one-thread load.
+
+**The buffer rule was written as a 9x overcount.** `docs/memory.md` and this file both said
+`9 x 18 bytes x (block + 2*halo)^2 x nthreads` while their prose said "18 bytes per pixel" — the nine
+arrays *total* 18 B/px for a `UInt8` pair (two `UInt8`, three `Float32`, four `Bool`), measured at exactly
+18.0 off the struct's fields. The derived figures in those sections (4.56 GiB per set, 45.6 across ten
+tasks) were computed correctly at 18 B/px, so only the formula was wrong — but applied as written it
+predicts 410 GiB for that L1 window and rejects every size this granule runs at.
+
+**The untiled 12.1 min in the table above was compilation.** The old harness had no warmup and measured
+untiled first, so that row carries the process's JIT; the blocked rows measured after it did not, which is
+what made blocking look free. Profiler overhead is not the explanation and this is worth recording because
+it was the first guess: measured over all five configurations, a profiled run costs **2–4%** (1.02x, 1.03x,
+1.03x, 1.04x).
+
+### The sweep's own casualty was the deadlock, not a kill
+
+The 3072 px row stopped mid-profile in the five-configuration sweep with no exception, empty stderr and no
+crash report, which was read as a kernel memory kill. **It was the runtime deadlock**: the process was
+still alive at 0% CPU and 11.8 GiB when found later, and its trace carries the same
+`jl_mach_gc_end`/`jl_profile_thread_mach` pair as the other two. A hung Julia process and a killed one are
+indistinguishable from their output alone, so check `ps` for a 0%-CPU survivor before concluding a run died.
+
+The row was re-measured as the only configuration in a fresh process, at 347.6 s against 340.9 in the
+sweep, so the figures are sound. Nothing about the shared-process design is implicated — the cause is the
+profiler, and the sweep merely profiled for long enough to hit a race.
+
+## Step: the L1 sweep, re-measured on an idle machine
+
+Six configurations on NISAR L1 RSLC, whole grid, `-t 10,1`, one process each, `--no-profile`. Command:
+
+```bash
+for bs in 0 16384 8192 4096 8192x4096 2816x1536; do
+  julia --project=tools/golden -t 10,1 tools/golden/profile_nisar.jl \
+      NISAR_L1_PR_RSLC --blocks $bs --no-profile
+done
+```
+
+Scene 57760x50511 px, grid 2328x2304, halo **2736x1500 px**, 1,871,119 searchable points. The square block
+floor is 2736; per-axis it is 2736x1500, so `2816x1536` is essentially the smallest legal block.
+
+| block | blocks | blocks/thread | runtime | vs untiled | peak | vs untiled | occupancy | read amp | measured |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| untiled | 1 | — | **567.2 s** | 1.00x | 49.36 GiB | 1.00x | **9.21 / 10** | 1.00x | 1,798,199 |
+| 16384 px | 100 | 10 | 1852.3 s | 3.27x | 59.58 GiB | 1.21x | **2.33 / 10** | 2.89x | 1,797,136 |
+| 8192 px | 380 | 38 | 1078.4 s | 1.90x | 33.85 GiB | 0.69x | 4.61 / 10 | 4.51x | 1,797,076 |
+| 8192x4096 px | 760 | 76 | 828.0 s | 1.46x | 30.41 GiB | 0.62x | 6.60 / 10 | 6.42x | 1,797,076 |
+| **4096 px** | 1482 | 148 | **661.5 s** | **1.17x** | 27.72 GiB | 0.56x | **8.94 / 10** | 8.77x | 1,797,076 |
+| 2816x1536 px | 5814 | 581 | 762.5 s | 1.34x | **24.43 GiB** | **0.49x** | 9.03 / 10 | 21.60x | 1,797,026 |
+
+**L1 agrees with L2 after all.** An earlier reading of this case — that blocking is a pure loss here —
+came from invalid timings (below). Blocking halves the peak: 4096 px runs at 0.56x untiled for 1.17x the
+runtime, and 2816x1536 reaches 0.49x. What differs from L2 is only that L1's untiled row is *fast*, at
+9.21/10 occupancy, so no blocked row beats it on wall clock.
+
+**The two resources disagree, which they did not on L2.** Peak falls monotonically with block size all the
+way to the floor, but runtime bottoms out at 4096 px and rises again by 2816x1536 — read amplification
+reaches **21.6x** there, and paying 21x the I/O eventually outruns the occupancy gain. So on L1 the answer
+depends on which resource binds: 4096 px for speed, 2816x1536 for memory.
+
+**16384 px is the one configuration that is bad on both axes**, at 1.21x the peak and 3.27x the runtime.
+Occupancy explains it: **2.33 of 10 threads**. With 100 blocks over 10 threads and L1's radius field
+putting an estimated 47% of all correlation work in a single block — median radius 34 against a maximum of
+1905 — the pool cannot balance. The same arithmetic gives 25% in one block at 8192 px, and by 4096 px the
+imbalance is diluted enough that occupancy reaches 8.94.
+
+### Every earlier L1 timing was invalid, and the harness was not at fault
+
+Three attempts produced three different untiled figures before this one. None of the spread was the
+configuration, the machine, or FFTW wisdom; all of it was **me observing the run**:
+
+| untiled measurement | concurrent activity | result |
+|---|---|---|
+| first sweep | two scripts each `read_capture`-ing the same 12 GB NISAR capture | 649.8 s |
+| "quiet" sweep | my own `sample` calls, twice, on the live process | **2592.1 s** |
+| reproducibility test, run 1 | nothing | 587.1 s |
+| reproducibility test, run 2 | nothing | 575.5 s |
+| this sweep | nothing | 567.2 s |
+
+`sample` suspends every thread to unwind it. On a 34 GiB ten-thread process, calling it twice inflated the
+row **4.5x** — and the process looked healthy at every check, because it was: it was being stopped and
+restarted thousands of times by the observer. The three clean measurements agree to 3.5%.
+
+**Wisdom was ruled out explicitly**, since it was the leading hypothesis. Two whole-grid runs inside one
+process — where nothing but FFTW planning state can differ — measured 587.1 s and 575.5 s with the wisdom
+file byte-identical (324,653 bytes) before and after both. `benchmark/results/nisar/l1_reproducibility.log`.
+
+The rule this establishes: **poll a running measurement with `ps` or `pgrep` and nothing heavier.** A
+`sample` is a measurement of its own and cannot be taken during one.
+
+## Step: whether fewer FFT transform sizes would help — measured, and it does not
+
+The premise checked first, because it was wrong in a way that matters. Distinct *raw* `(radius_x, radius_y)`
+pairs on the NISAR L1 grid number **29,761**, and an earlier note in this session quoted that as the number
+of FFT plans a pass builds. It is not: `AutoRIFT._radius_bucket` rounds every radius up to a power of two
+and caps it at the pass radius, so the ladder actually reached is **37 sizes** on L1 and 44 on L2 — nine
+rungs per axis (8, 16, 32 … 1024, cap), each reused by tens of thousands of points.
+
+So the ladder is already quantized far more aggressively than "intervals of 4", which would admit 476 x 207
+size pairs on L1 against 9 x 8. Three ladders measured on a 400x400 window of the L1 grid
+(`tools/golden/fft_ladder_test.jl`):
+
+| ladder | sizes reached | runtime | vs shipping | measured points |
+|---|---:|---:|---:|---:|
+| powers of two — **ships** | 25 | **363.3 s** | **1.00x** | 128,675 |
+| every second power of two | 10 | 452.1 s | 1.24x | 127,008 |
+| multiples of 4 | 25† | 462.0 s | 1.27x | 130,564 |
+
+**Both alternatives lose, for opposite reasons.** Halving the ladder to every second power of two still
+costs **24%**: a coarser rung makes a point execute a *larger* transform than it needs, and that waste
+exceeds the planning it saves. Going finer, to multiples of 4, costs **27%** while admitting far more plans.
+The shipping ladder is at the minimum of a real tradeoff rather than an arbitrary choice.
+
+The reason there is nothing to win: planning is already amortized to nothing. The wisdom file turns three
+cold plans from 822 ms into 0.1 ms, and it is per-size-per-machine, so a production worker pays it once
+ever. What remains is execution, which a coarser ladder makes worse.
+
+† The harness rewrites the radii and hands them to the *unmodified* correlator, whose own `_radius_bucket`
+re-rounds to powers of two — so this row measures the cost of feeding the correlator finer radii, not the
+plan count a real interval-4 implementation would carry. The cost is the half that decides the question;
+the plan count only moves against it.
+
+## Step: attribution at the chosen L1 size, and the L2 floor
+
+Two measurements that close the NISAR block-size work.
+
+### NISAR L1 at 4096 px, profiled
+
+The chosen operating point, with the profiled arm this time (`--blocks 4096`, no `--no-profile`).
+
+| | value |
+|---|---|
+| runtime, timed arm | **676.3 s** (sweep gave 661.5 s — 2% apart) |
+| runtime, profiled arm | 695.5 s — **profiling costs 2.8%** |
+| peak | 32.47 GiB |
+| occupancy | 8.79 / 10 |
+| measured | 1,797,076 |
+| profile buffer | 15% full — not truncated |
+
+Shares of working samples, and the two rows from the sweep for comparison:
+
+| stage | untiled | 16384 px | **4096 px** |
+|---|---:|---:|---:|
+| FFTW, all stacks | 69.9% | 64.4% | **56.8%** |
+| `_read_block!` | 0.0% | 4.6% | 10.2% |
+| `preprocess` under `_prepare_block` | 0.0% | 2.8% | 6.2% |
+| blocked-path total | 0.0% | 7.4% | **16.4%** |
+| `peak_index` + `pyrup!` | 4.7% | 4.6% | 3.8% |
+| garbage collection | 0.0% | 0.1% | 0.5% |
+
+**The correlator's spectral core is the run at every block size, and the blocked path's overhead is the
+price of occupancy.** Reading plus preprocessing grows 0% → 7.4% → 16.4% as blocks shrink, exactly the
+trend L2 shows (19.3% at 3072 px, 30.9% at 2304×1152). At 4096 px on L1 it is 16.4% for a 3.27×
+improvement in runtime over 16384 px — a good trade. It also bounds what layout tuning can still win: the
+remaining 57% is FFT execution, which no block size changes.
+
+**Profiling costs 2.8% here, so the L2 finding generalizes.** That figure is worth having because an
+earlier attempt to explain a runtime discrepancy blamed profiler overhead; measured, it is small on both
+granules.
+
+### NISAR L2 at 2224×1110 px — the floor
+
+The smallest block a 2216×1103 px halo permits, which closes the L2 sweep.
+
+| block | blocks | b/thread | runtime | peak | vs untiled | occupancy | read amp |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 2304×1152 px | 2304 | 230 | **309.4 s** | 28.79 GiB | 0.34x | **9.03 / 10** | 3.30x |
+| **2224×1110 px** | 2500 | 250 | 365.4 s | **25.91 GiB** | **0.30x** | 7.77 / 10 | 3.50x |
+
+**This settles the open question about whether occupancy keeps improving as blocks shrink. It does not.**
+An earlier reading of the L2 sweep said occupancy was still climbing at 230 blocks/thread with no measured
+turning point. At the floor — 250 blocks/thread, only 8% more blocks — occupancy *falls* to 7.77 and runtime
+rises **18%**, while peak keeps improving to 25.9 GiB.
+
+So both granules have the same shape, and it is the practical rule: **peak falls monotonically to the
+floor, runtime does not.** The floor is the memory answer (L2 0.30x, L1 0.49x) and a size somewhat above it
+is the speed answer (L2 2304×1152, L1 4096 px). Which to use depends on which resource binds.
+
+### One thing both runs surfaced
+
+Each emitted two warnings that a block's coarse grid is smaller than the outlier filter's window, at the
+two coarsest chip levels (192×104 and 384×208 on L1). That is the per-block form of the reference's own
+behaviour recorded in `tools/golden/README.md`, and it is block-size dependent — a smaller block reaches it
+at more levels. It costs the restricted pass's saving on those levels for the blocks affected, which is
+already inside the measured runtimes above rather than additional to them.
+
+## Step: both NISAR cases re-measured whole-grid on 1.13.0, and a NISAR gate
+
+The whole-grid endpoint on both cases, `-t 10`, run sequentially because `correlator.jl` is untiled and
+the two peaks do not fit 96 GiB together. Command:
+
+```
+julia --project=tools/golden -t 10 tools/golden/correlator.jl NISAR_L1_PR_RSLC --run 100
+julia --project=tools/golden -t 10 tools/golden/correlator.jl NISAR_L2_PR_GSLC --run 100
+```
+
+**The capture is run 100 on both cases.** L1 also has a `200/` directory, but it is empty — a run named
+without a capture in it fails in `read_capture` rather than falling back, so the number has to be right.
+
+| | L1 RSLC | ledger | L2 GSLC | ledger |
+|---|---:|---:|---:|---:|
+| both-measured | 1,786,566 | 1,786,566 | 1,751,658 | 1,751,658 |
+| `dx` exact | 73.91% (1,320,364) | 73.90% (1,320,352) | 72.20% (1,264,618) | 72.20% (1,264,646) |
+| `dy` exact | 73.86% (1,319,609) | 73.86% (1,319,603) | 75.34% (1,319,689) | 75.34% (1,319,639) |
+| `dx` correlation | +0.99972 | +0.99972 | +0.99890 | +0.99890 |
+| `dy` correlation | +0.99884 | +0.99884 | +0.99330 | +0.99330 |
+| `dx` bias core | +0.0513 | +0.051 | −0.1128 | −0.113 |
+| `dy` bias core | −0.0276 | −0.028 | −0.1259 | −0.126 |
+| tail >10 px | 27 `dx`, 0 `dy` | 78, 7 | 31 `dx`, 0 `dy` | 31, 0 |
+| only jl / only ref | 11,633 / 14,897 | 11,633 / 14,897 | 30,117 / 11,493 | 30,117 / 11,493 |
+| wall clock | **9m36s** | 6h30m on 8 threads | **4m52s** | 11h41m on 1 thread |
+| peak RSS | 49.0 GiB | — | 60.7 GiB | — |
+
+**Every agreement statistic reproduces**; coverage and correlation are identical, and the exact counts move
+by 12 and 28 points in 1.75 M. The two open findings recorded when these were first measured stand
+unchanged: L2's core biases are the larger pair on both axes, and its `dy` correlation is below `dx` where
+L1's are matched.
+
+**The runtimes are 41x and 144x faster, which is the FFTW planner fix and not a NISAR-specific effect.**
+The recorded L2 figure additionally predates `kwargs_from_capture` setting `threaded`, so it spent 11h41m
+on one core; both rows here run at ~9.7 of 10 cores. A runtime from before either fix is not comparable to
+one after.
+
+**L1's `dx` tail falls 78 → 27 points beyond 10 px** with `dy` unchanged at 0. Both are under the
+sub-0.002% the tail represents either way, and `PLAN_FLAGS` moving `PATIENT` → `MEASURE` changes which
+candidate transform the planner picks, so a handful of near-flat peaks resolving differently is the
+expected shape of that change rather than an unexplained one.
+
+### The gate: `3.nisar`, on a thinned grid
+
+Nine and five minutes is still far outside the seconds-to-minutes the other gates cost, so the gate runs a
+sixteenth of each grid — `--stride 4 --block 128`, 128-px tiles on a 512-px lattice, ~1 minute per case.
+Both cases are **green**, at `core 0.0975/0.1411 corr +0.99853/+0.98765` on L1 and
+`core 0.1758/0.2343 corr +0.99962/+0.99637` on L2.
+
+**Thinning changes the answers, so its thresholds are calibrated to the thinned run and are not comparable
+to the whole-grid figures above or to the 0.010 px bound `3.rdr` holds Sentinel-1 to.** AutoRIFT.jl sees
+the sparse grid while the reference's `Dx`/`Dy` come from a capture over the full one, so the two resolve
+different pyramid levels — a level's coarse grid is the point grid decimated by 1, 2, 4, 8, and a thinned
+one can fall below its filter's width, at which point the level silently produces nothing
+(`tools/golden/README.md`). Measured on L1 at `stride 4`:
+
+| tiling | `dx` exact | `dx` corr | `dx` bias core | `dy` bias core |
+|---|---:|---:|---:|---:|
+| whole grid | **73.91%** | +0.99972 | +0.0513 | −0.0276 |
+| 128-px tiles | 16.81% | +0.99853 | +0.0975 | −0.1411 |
+| 256-px tiles | 9.41% | +0.99408 | +0.1017 | −0.1382 |
+| 512-px tiles | **0.00%** | +0.92317 | +0.1013 | −0.1506 |
+| every 16th point | **0.00%** | +0.90625 | +0.1085 | −0.1656 |
+
+Three things this table decides:
+
+- **`exact` is not gateable on a thinned L1** — it spans 73.91% to 0.00% on unchanged code, and
+  non-monotonically in tile size. The gate asserts correlation, `bias_core` and the `dy` sign only.
+- **Tiles, not a point lattice.** `filtDisp` and the level merge consult each point's neighbors, so
+  thinning to every 16th point leaves each survivor without any and its base-level measurement is replaced
+  by an interpolated one.
+- **The tile size is part of the calibration, so `regate.jl` states `--block` explicitly.** A threshold
+  measured at one tiling and re-run at another reports a regression that is only a changed default.
+
+L2 is the case where thinning is benign — `exact` 68.70% against 72.20% whole-grid — because its levels
+still clear the filter at this tiling. That the same stride is destructive on one case and not the other is
+why the gate is calibrated per case rather than to one shared bound.
+
+`bias_core` is roughly double the whole-grid value at every tiling on both axes, consistently enough to
+gate against, and it is a property of the thinning rather than of the correlator: the whole-grid run above
+reproduces +0.0513/−0.0276 exactly.
+
+## Step: the benchmark suite on 1.13.0, and one candidate rejected on Amdahl
+
+`Pkg.test()` is green at `5c68d73` — **704,304/704,304 in 3m32s**. The suite was run with
+`benchmark/run.jl --quick -t 10` and compared against the committed baseline:
+
+```
+julia --project=benchmark -t 10 benchmark/run.jl --quick --tag head1130
+julia --project=benchmark benchmark/compare.jl benchmark/results/baseline.json \
+    benchmark/results/history/head1130.json
+```
+
+`compare.jl` exits 1 on one row, `correlate/peak r50` at 1.11x against a 1.10x threshold. **It is the
+toolchain, not this branch.** `baseline.json` was recorded on Julia 1.12.5 and this ran on 1.13.0, so the
+two differ by more than the code. Measured on 1.13.0 from both checkouts, same script and machine:
+
+| `peak_index` on a 101x101 surface | min of 5 |
+|---|---:|
+| `main` (worktree at `f18660a`) | 5.677 us |
+| this branch | **5.667 us** |
+
+The branch is marginally the faster of the two, and no commit on it changes `peak_index` itself — the
+function is identical to main's, and only its call site in `track.jl` moves. `peak_index` is stable to
+0.0% over five repeats in-process, so the 1.11x is not sampling noise either — it is the 1.12.5
+baseline. **Re-record `baseline.json` on 1.13.0 before reading that row as a
+regression.** No allocation gate fired; `ZEROALLOC_PATTERNS` covers the per-point path, which is the
+property that matters across millions of pairs.
+
+### Rejected: integer bit ops in `_radius_bucket`
+
+`_radius_bucket` rounds with `ceil(Int, log2(r))`, one float transcendental per call, where
+`leading_zeros` gives the same answer in integer arithmetic. Verified identical for every
+`r ∈ -3:3000` against ten caps including 1905 and the powers of two around it, and **10.2x faster in
+isolation** — 6.37 ns against 0.63 ns per call over a million radii shaped like a NISAR L1 field.
+
+It is not worth taking. The function is called once per point in `_chunk_buckets` and once per
+`(point, bucket)` pair in the `_track_bucket!` rescan, so a 3600-point pass over five buckets makes
+43,200 calls — **1.09% of that pass's 25.2 ms, for a saving of 0.98%**. That is below the threshold
+where a change to a documented hot function pays for itself, and the rescan it is called from is
+deliberate (`_track_bucket!` notes that partitioning would allocate storage proportional to the chunk).
+The measurement is recorded so the next reader does not have to take it again.
+
+## Step: the CI benchmark gate's 19 rows, attributed
+
+The Benchmark job compares the merge base and the pull request in one job on one runner, which is the
+only comparison free of the toolchain confound. It reports 19 rows past its 1.10x threshold. Two
+harness facts first, because the job had not reached its own comparison before this branch:
+
+**The job used to die before comparing anything.** `Pkg.develop(path=".")` writes the absolute
+checkout path into `benchmark/Project.toml`, a tracked file, so the second measurement's
+`git checkout --detach` aborted. Each checkout is now forced and the tree reset after each run.
+
+**`--quick` skips the memory group**, and a full local suite cannot be recorded in a sandboxed shell:
+four attempts died at ~20 minutes with `exit=137` while peak RSS across all Julia processes stayed at
+**3.9 GiB of 96**, sampled every 20 s with `ps`. Neither the `gpu` group nor the memory group is
+responsible — each completes alone. It is an elapsed-time limit on the shell, so a full-suite recording
+belongs to CI or to an interactive terminal.
+
+### The planner accounts for the size-dependent rows
+
+`PLAN_FLAGS` moved `FFTW_PATIENT` → `FFTW_MEASURE`. Every benchmark in `suite/correlate.jl` builds its
+workspace once and times `correlate!` against a warm plan, so the suite sees `PATIENT`'s *execution*
+gain and never its *planning* cost. Measured by flipping that one const on this tree and re-running the
+flagged rows, execution only:
+
+| case | PATIENT | MEASURE | ratio | CI ratio |
+|---|---:|---:|---:|---:|
+| c32 r6 | 9.31 us | 9.35 us | **1.00x** | 1.10x |
+| c32 r25 | 32.71 us | 37.00 us | **1.13x** | 1.15x |
+| c64 r25 | 57.92 us | 60.33 us | 1.04x | 1.13x |
+| c64 r50 | 131.88 us | 132.50 us | **1.00x** | 1.04x |
+| c128 r25 | 142.00 us | 146.54 us | 1.03x | 1.04x |
+
+`c32 r25` reproduces the CI ratio almost exactly, and the two rows CI did *not* flag measure 1.00x and
+1.03x here — so the flag is the mechanism and its cost is real, concentrated at mid sizes. It does not
+account for all of the gap: `c32 r6` is 1.00x here against CI's 1.10x, and `c64 r25` 1.04x against
+1.13x, so a shared runner contributes the remainder.
+
+**The trade is the one `src/plans.jl` records, and the suite is structurally unable to see its
+benefit.** Planning one 2304x4608 transform costs 306,787 ms under `PATIENT` against 3,873 ms, the
+windowed NISAR endpoint went 1576.3 s → 104.6 s, and the whole-grid cases 6h30m → 9m36s and 11h41m →
+4m52s. A 10-15% execution cost at 13-80 us sizes buys 15-144x on a production scene. No benchmark in
+the suite pays a cold plan, so no benchmark can show the second number.
+
+### Two rows that are not the planner
+
+**`points/pointset scattered n=100000` at 1.34x is runner noise.** `src/points.jl` has no diff on this
+branch. Measured here: **80.88 us**, against CI's *baseline* of 84.2 us and candidate of 113.2 us — so
+this tree is faster than the figure CI calls the baseline, on identical code. Local spread over five
+repeats is 2.1%.
+
+**`+13 allocs` on `track/*` and `multichip/*` is per chunk, not per point.** `_chunk_buckets` returns a
+`Vector{Extent}` holding one entry per distinct bucket, a few dozen at most on a real scene. The count
+is constant in the point count, which is why the zero-allocation gate — `correlate/*` and `points/*`,
+the per-point path — is unaffected and still passes.
+
+### The policy: execution cost at microbenchmark sizes is accepted
+
+A 10-15% execution regression at the 13-80 us transform sizes is **accepted** in exchange for the
+planning cost `FFTW_MEASURE` removes. The rows are real and reproduce; the trade is deliberate.
+
+What this does and does not license:
+
+- It covers the `correlate/{surface,point}` and `correlate/subpixel` rows attributed to `PLAN_FLAGS`
+  above, and nothing else. A regression on a *whole-pass* benchmark — `track/*`, `multichip/*`,
+  `endtoend/*`, `throughput/*` — is not covered by it: those pay planning as well as execution, so a
+  regression there means the trade stopped paying and is a regression to fix.
+- It does not license a further execution regression. The figures above are the accepted level, so a
+  later change that takes `c32 r25` past 37.00 us is a new question rather than this one already
+  answered.
+- **The zero-allocation gate is untouched by it.** `ZEROALLOC_PATTERNS` covers the per-point path and
+  an allocation appearing there is still a failure, whatever it buys.
+
+The Benchmark job therefore stays red on this branch by decision rather than by oversight. It compares
+against the merge base, so those rows clear on their own once this lands and the base carries
+`MEASURE` too — the gate is measuring a one-time step change, not an ongoing defect.

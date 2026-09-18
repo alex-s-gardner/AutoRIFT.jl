@@ -384,10 +384,12 @@ end
 end
 
 @testset "a subset correlates as the whole set does, given its geometry" begin
-    # The property tiled processing needs, and it does not hold by default. A pass sizes its
-    # workspace from its own largest chip and radius, and a workspace sizes its FFT buffers from
-    # its extents — so a subset whose radii are all smaller runs a *shorter transform* than the
-    # full grid did over the same points, and the two agree only to ~4e-7.
+    # The property tiled processing needs. A point is correlated at its own radius bucketed to a
+    # power of two and *clamped to the pass maximum*, so a point below the top bucket is unaffected
+    # by which other points share the pass — but one at the top is clamped to whatever maximum its
+    # point set contains, and a subset generally has a smaller one. Here the subset's own maximum is
+    # 10, which clamps to 10, where the full grid buckets the same radius up to 16: a different
+    # transform length, agreeing only to ~1e-7 on `correlation`.
     #
     # Radii that vary across the grid are what expose it, and that is the realistic case: the
     # coarse pass zeroes and `sanitize!` floors radii in spatially clustered patterns.
@@ -427,6 +429,58 @@ end
     # so the keyword cannot be quietly dropped as redundant.
     without = track(pair, sub, p)
     @test !all(isequal.(full.correlation[rows, cols], without.correlation))
+    # The displacement is far less sensitive but not immune: a peak's location survives a ~1e-7
+    # perturbation of the surface almost everywhere, and where it does not it moves by one
+    # refinement step. Measured here: `dx` identical on all 36 points, `dy` moving on 1 by 0.015625,
+    # which is exactly `1/64`. Bounded rather than asserted equal, so a regression that moved a
+    # displacement by a *pixel* still fails.
+    dstep = 1 / 64
+    for (a, b) in ((full.dx[rows, cols], without.dx), (full.dy[rows, cols], without.dy))
+        @test all(i -> isnan(a[i]) == isnan(b[i]), eachindex(a))
+        @test all(i -> isnan(a[i]) || abs(a[i] - b[i]) <= dstep, eachindex(a))
+    end
+end
+
+@testset "a point is correlated at its own bucketed radius" begin
+    # The rule that decides which transform a point executes. Pinned directly, because the pass-level
+    # tests cannot distinguish a bucket from the pass maximum on a grid of uniform radius — and the
+    # cost of getting it wrong is either a wrong answer or, at the widest radii, hundreds of MiB per
+    # workspace.
+    cap = 1905
+    @test AutoRIFT._radius_bucket(0, cap) == 0          # unsearchable; `sanitize!` clears both axes
+    @test AutoRIFT._radius_bucket(-3, cap) == 0
+    @test AutoRIFT._radius_bucket(1, cap) == 1
+    @test AutoRIFT._radius_bucket(32, cap) == 32        # a power of two is its own bucket
+    @test AutoRIFT._radius_bucket(33, cap) == 64
+    @test AutoRIFT._radius_bucket(1024, cap) == 1024
+    # Clamped, never above the pass maximum: 1025 would round to 2048 and demand a wider transform
+    # than the pass itself was sized for.
+    @test AutoRIFT._radius_bucket(1025, cap) == cap
+    @test AutoRIFT._radius_bucket(cap, cap) == cap
+    @test AutoRIFT._radius_bucket(cap + 100, cap) == cap
+    @test AutoRIFT._radius_bucket(8, 8) == 8
+
+    # The buckets a pass reaches are ascending by transform area, so the widest workspace is held
+    # last and briefest.
+    n = 256
+    ref, sec = shifted_pair(n, (3, -2); T = Float32)
+    pair = ImagePair(ref, sec)
+    p = params(; chip_size = 32, search_radius = 40)
+    grid = gridpoints((n, n), 32; chip_size = 32, search_radius = 40)
+    for i in eachindex(grid.radius_x)
+        r = (5, 9, 20, 40)[mod1(i, 4)]
+        grid.radius_x[i] = r
+        grid.radius_y[i] = r
+    end
+    bks = AutoRIFT._chunk_buckets(grid, AutoRIFT.pass_geometry(grid).radius, eachindex(grid))
+    @test [b.X for b in bks] == [8, 16, 32, 40]
+    @test issorted([b.X * b.Y for b in bks])
+
+    # A mixed-radius pass agrees with itself across thread counts: which points share a chunk must
+    # not change what any point computes.
+    @test all(isequal.(track(pair, grid, p).correlation,
+                       track(pair, grid, params(; chip_size = 32, search_radius = 40,
+                                                  threaded = true)).correlation))
 end
 
 @testset "validation" begin
