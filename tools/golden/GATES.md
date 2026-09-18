@@ -3149,3 +3149,57 @@ It is not worth taking. The function is called once per point in `_chunk_buckets
 where a change to a documented hot function pays for itself, and the rescan it is called from is
 deliberate (`_track_bucket!` notes that partitioning would allocate storage proportional to the chunk).
 The measurement is recorded so the next reader does not have to take it again.
+
+## Step: the CI benchmark gate's 19 rows, attributed
+
+The Benchmark job compares the merge base and the pull request in one job on one runner, which is the
+only comparison free of the toolchain confound. It reports 19 rows past its 1.10x threshold. Two
+harness facts first, because the job had not reached its own comparison before this branch:
+
+**The job used to die before comparing anything.** `Pkg.develop(path=".")` writes the absolute
+checkout path into `benchmark/Project.toml`, a tracked file, so the second measurement's
+`git checkout --detach` aborted. Each checkout is now forced and the tree reset after each run.
+
+**`--quick` skips the memory group**, and a full local suite cannot be recorded in a sandboxed shell:
+four attempts died at ~20 minutes with `exit=137` while peak RSS across all Julia processes stayed at
+**3.9 GiB of 96**, sampled every 20 s with `ps`. Neither the `gpu` group nor the memory group is
+responsible — each completes alone. It is an elapsed-time limit on the shell, so a full-suite recording
+belongs to CI or to an interactive terminal.
+
+### The planner accounts for the size-dependent rows
+
+`PLAN_FLAGS` moved `FFTW_PATIENT` → `FFTW_MEASURE`. Every benchmark in `suite/correlate.jl` builds its
+workspace once and times `correlate!` against a warm plan, so the suite sees `PATIENT`'s *execution*
+gain and never its *planning* cost. Measured by flipping that one const on this tree and re-running the
+flagged rows, execution only:
+
+| case | PATIENT | MEASURE | ratio | CI ratio |
+|---|---:|---:|---:|---:|
+| c32 r6 | 9.31 us | 9.35 us | **1.00x** | 1.10x |
+| c32 r25 | 32.71 us | 37.00 us | **1.13x** | 1.15x |
+| c64 r25 | 57.92 us | 60.33 us | 1.04x | 1.13x |
+| c64 r50 | 131.88 us | 132.50 us | **1.00x** | 1.04x |
+| c128 r25 | 142.00 us | 146.54 us | 1.03x | 1.04x |
+
+`c32 r25` reproduces the CI ratio almost exactly, and the two rows CI did *not* flag measure 1.00x and
+1.03x here — so the flag is the mechanism and its cost is real, concentrated at mid sizes. It does not
+account for all of the gap: `c32 r6` is 1.00x here against CI's 1.10x, and `c64 r25` 1.04x against
+1.13x, so a shared runner contributes the remainder.
+
+**The trade is the one `src/plans.jl` records, and the suite is structurally unable to see its
+benefit.** Planning one 2304x4608 transform costs 306,787 ms under `PATIENT` against 3,873 ms, the
+windowed NISAR endpoint went 1576.3 s → 104.6 s, and the whole-grid cases 6h30m → 9m36s and 11h41m →
+4m52s. A 10-15% execution cost at 13-80 us sizes buys 15-144x on a production scene. No benchmark in
+the suite pays a cold plan, so no benchmark can show the second number.
+
+### Two rows that are not the planner
+
+**`points/pointset scattered n=100000` at 1.34x is runner noise.** `src/points.jl` has no diff on this
+branch. Measured here: **80.88 us**, against CI's *baseline* of 84.2 us and candidate of 113.2 us — so
+this tree is faster than the figure CI calls the baseline, on identical code. Local spread over five
+repeats is 2.1%.
+
+**`+13 allocs` on `track/*` and `multichip/*` is per chunk, not per point.** `_chunk_buckets` returns a
+`Vector{Extent}` holding one entry per distinct bucket, a few dozen at most on a real scene. The count
+is constant in the point count, which is why the zero-allocation gate — `correlate/*` and `points/*`,
+the per-point path — is unaffected and still passes.
