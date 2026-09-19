@@ -577,7 +577,7 @@ end
 end
 
 @testset "nodata is excluded rather than correlated" begin
-    # A sentinel fill value, which is what most sensors write, rather than `missing`. The pixels it
+    # An in-band fill value, which is what most sensors write, rather than `missing`. The pixels it
     # marks must produce no measurement: reading a fill value as a number would correlate -9999
     # against -9999 and report a confident zero displacement over the gap.
     n = 384

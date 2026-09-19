@@ -237,8 +237,23 @@ def install_levels(module, manifest):
             }
             # The grid too: a level's coarse pass runs on a decimated grid, and the decimation is
             # what places a coarse estimate over the fine points it stands for.
+            #
+            # **The prior as well, and it is not redundant with `in_Dx0`.** A level is handed `Dx00`, the
+            # cell-mean of `Dx0` over `1/Scale` cells resized to the level's lattice
+            # (`autoRIFT.py:161-179`) — a different array from the full-resolution `in_Dx0` the outer
+            # capture records. The prior decides which window each point searches, so replaying a level's
+            # pass without it searches somewhere else: reconstructing it instead of recording it is
+            # possible, since `self.Dx0` is never mutated in the loop, but it puts the reference's
+            # `colfilt` and two `cv2.resize` calls in the replay's path, where a reconstruction error is
+            # indistinguishable from a correlator difference. Recording what the correlator was actually
+            # handed removes that whole class of doubt.
+            #
+            # Note the sign: this is `Dx00`/`Dy00` as passed, so `Dy00` is still cartesian-Y — the
+            # correlator's own `Dy0 = -Dy0` happens inside the call, after this wrapper sees it. A replay
+            # must negate it exactly as `pointset_from_capture` negates `in_Dy0`.
             for label, arr in (('dx', dx), ('dy', dy), ('xgrid', xGrid), ('ygrid', yGrid),
-                               ('searchx', SearchLimitX), ('searchy', SearchLimitY)):
+                               ('searchx', SearchLimitX), ('searchy', SearchLimitY),
+                               ('dx0', Dx0), ('dy0', Dy0)):
                 a = np.asarray(arr)
                 if a.ndim != 2 or a.dtype.str not in xchg.TAGS:
                     continue

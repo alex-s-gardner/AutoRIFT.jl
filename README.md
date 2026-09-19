@@ -59,6 +59,13 @@ deal), what the production drivers change (including the order of the pipeline),
 and how validation works given that neither upstream repository has a test that
 exercises the correlator.
 
+Matching it means reproducing its defects as well as its behaviour, because a
+deliberate difference and a bug are indistinguishable in a comparison.
+[`CORRECTNESS.md`](CORRECTNESS.md) is the register of those: each entry is a
+measured defect AutoRIFT.jl reproduces on purpose, why, and what to change once
+the golden set agrees. **Do not implement from it while golden cases are red** —
+every entry reduces agreement by construction.
+
 ## Progress
 
 - [x] Package scaffold, parameter resolution, point sets

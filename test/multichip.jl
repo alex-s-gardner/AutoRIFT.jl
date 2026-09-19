@@ -720,7 +720,7 @@ end
 @testset "grid spacing survives a constant nodata fill" begin
     # A production grid is zeroed wherever there is no data (`testautoRIFT.py:394-403`), so a scene
     # whose first rows and columns are ocean has `x[1, 2] == x[1, 1]`. Reading the spacing from the
-    # first two points gives zero there, `_cell_centres` then shifts by nothing, and every coarse node
+    # first two points gives zero there, so a caller that scales by the step gets no scaling, and a node
     # sits at its cell's first point — half a cell from where `_undecimate_level` reads it back. On the
     # golden Landsat case that left 99.8% of level-1 nodes 4 or 5 px from the reference's.
     # Zero is the nodata marker, so the margin is zeroed rather than held at the first coordinate --
@@ -750,7 +750,7 @@ end
     # `0.5`, which the half-sample convention carries to `1.5` — covering 55.7% of the L2 array and
     # 56.8% of the L1 one. A rule that excludes only steps *touching a zero* therefore counts every step
     # inside the fill: on the L2 grid that is 2,895,601 zero steps against 2,297,235 real ones, so the
-    # mode is `0`, `_cell_centres` shifts by nothing, and every coarse node sits at its cell's first
+    # mode is `0`, a caller scaling by the step gets nothing, and a coarse node would sit at its cell's first
     # point. The property to exclude is the zero *step*, which a constant region produces whatever its
     # value.
     #
@@ -770,9 +770,28 @@ end
                             x, y)
     sub = AutoRIFT._decimate_level(grid, trues(12, 12), 2)
     @test sub !== nothing
-    # Cell (r, c) spans full columns 2c-1 and 2c, whose x differ by the spacing, so the centre is
-    # half a spacing above the first — 4 px here.
-    @test sub.grid.x[4, 4] == grid.x[7, 7] + 4
+    # **A node is its cell's mean coordinate**, which is the reference's `INTER_AREA` and is what
+    # `_cell_means` computes. Cell (4, 4) spans rows 7-8 and columns 7-8 of `x`, which is real data there
+    # and varies with column alone: `1.5 + 8*6 = 49.5` and `1.5 + 8*7 = 57.5`, mean `53.5`, snapped to `54.0`
+    # on the half-integer lattice this grid uses. Half a spacing above the cell's first point, which is the
+    # property the helper exists for — stated as the mean, since that is what generalizes to a rotated grid
+    # where a fixed offset from the first point does not.
+    # The snap is what separates `54.0` from the raw mean `53.5`: averaging two half-integers lands on a
+    # whole one, and the node is put back on the lattice the grid's own coordinates use. That is the reference's
+    # `round(x + 0.5) - 0.5` (`autoRIFT.py:120-122`) with the phase read from the grid instead of assumed.
+    @test sub.grid.x[4, 4] == 54.0
+    @test grid.x[7, 7] + 4 == 53.5
+
+    # And where a cell straddles the nodata fill, the mean is of the *whole* cell, fill included — matched to
+    # the reference rather than endorsed, since `cv2.resize` has no concept of nodata. Cell (1, 1) spans rows
+    # and columns 1-2, all margin, so it stays at the margin value; cell (1, 4) spans columns 7-8 of rows 1-2,
+    # still all margin. The boundary cells are the ones whose node lands between the fill and real data, at a
+    # coordinate inside no data — which is why `tools/golden/README.md` lists NISAR edge masking as the fix
+    # rather than a special case here.
+    @test sub.grid.x[1, 1] == 0.0
+    @test sub.grid.x[4, 1] == 0.0                       # rows 7-8, columns 1-2: real rows, margin columns
+    # Row 3 spans rows 5-6: row 5 is margin and row 6 is data, so the node sits between them.
+    @test 0.0 < sub.grid.x[3, 4] < 54.0
 end
 
 @testset "an even sparse stride reduces over an odd window" begin

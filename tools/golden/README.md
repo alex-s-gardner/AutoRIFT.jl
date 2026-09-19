@@ -536,6 +536,36 @@ nothing about a window width.
 
 ### Open, in priority order
 
+0. **NISAR input masking at the swath edge, which is a production defect rather than an agreement one.**
+   A NISAR geogrid is a rotated radar footprint on a map grid, so the valid data has a long diagonal
+   boundary and the nodata fill is the *majority* of the array — 56.8% on L1, 55.7% on L2. Nothing
+   currently keeps a correlation chip off that boundary, and at a coarse level the chip is large: 768x416
+   px, so a chip centred one lattice cell (384 px) inside the edge is still substantially fill.
+
+   Measured at chip 768 on the L1 case, replaying the level on the reference's own captured inputs
+   (`tools/golden/level_replay.jl`): of 1,732 nodes, **88 disagree with the reference by more than a pixel
+   and every one of them lies in a one-cell-wide line along the swath boundary** — none in the interior.
+   Excluding one ring of 8-connected boundary nodes takes the `dx` residual from rms 2.31 px to 0.35 and
+   the count beyond 1 px to **2 of 1,476**, leaving a median of +0.0078 px, exactly one quantization step.
+   `figs/nisar_l1_replay_chip768.png` maps it; the line is invisible in any percentile and unmistakable in
+   the map.
+
+   This is **not new and not confined to the coarse levels or to L1** — an earlier L2 stage trace found
+   "548 points the reference reports and AutoRIFT.jl declines" lying "on a thin diagonal along the
+   footprint edge" (`GATES.md`, `figs/nisar_l2_level2_classes.png`), and a blocked-processing measurement
+   found the same boundary confusing a block's coordinate range. Each was recorded locally as an artifact
+   of the comparison at hand; together they are one defect.
+
+   Both implementations correlate these chips and neither is measuring ground there, so **agreement says
+   nothing about whether the answers are right** — this is the agreement-vs-correctness split in its
+   clearest form. The fix is input masking: a chip whose footprint is not sufficiently inside the valid
+   region should be declined before it is correlated, rather than producing a value that a coherence
+   filter may or may not remove. `valid` already carries the per-pixel validity both images share; what is
+   missing is a *fractional* test over the chip's own footprint, and a threshold for it.
+
+   Until that exists, **read a NISAR coarse-level comparison on the interior**, which is what
+   `level_replay.jl` does and why it does it.
+
 1. **The remaining 32%, which is mostly the coarse levels.** Decomposed on the aligned grid:
 
    | population | points | exact | within 1/16 |
@@ -744,6 +774,10 @@ Two cases need the gate stated differently, and both for reasons that are proper
 
 ## Matched for agreement, not endorsed
 
+> **The work list lives in [`CORRECTNESS.md`](../../CORRECTNESS.md)**, at the repository root, ordered by
+> what to do first. This section is the evidence behind it: each row's measurement and the condition under
+> which it should be revisited. Neither is to be implemented while golden cases are red.
+
 **Agreement with the reference is the current objective, and it is not the same objective as being
 correct.** Where the two conflict, this exercise chooses agreement — because a deliberate difference
 and a bug are indistinguishable in a comparison, so every difference has to be removed before the
@@ -764,6 +798,10 @@ before the product comparison passes.
 | **Agreement threshold is a fraction of the full window area** | A point at the grid border is held to the same absolute neighbour count as one in the interior, despite having fewer neighbours to corroborate it. Defensible as conservatism, and it is the reference's behaviour, but it is a choice rather than a derivation. | Only if border coverage turns out to matter to the product's cropped extent. |
 | **Outlier-filter neighbourhood derived from the X axis alone** | The chip-to-grid ratio that sets the filter's window width and its agreement fraction is `int(ChipSize0X / GridSpacingX)` (`autoRIFT.py:481`) — one number, from X, applied to both axes. On a square chip that is unambiguous, and every optical golden pair has one. A Sentinel-1 pair does not: `ScaleChipSizeY = 0.25` makes every chip 64x16, so a window sized from X covers **four times as much ground across track as along it**, and the neighbours judged to corroborate a point are drawn from a region the chip's own geometry says are not comparable. The Y ratio is 0 there — the grid is coarser than the chip in Y — which is a fact about the configuration the reference never consults. | Once the radar pairs agree. Then measure what an axis-aware neighbourhood does to coverage and to the residual on an anisotropic chip; `_oversample` is the single place it is decided. |
 | **Level decimation derived from the X axis alone** | `Scale = ChipSizeUniX[i] / self.ChipSize0X` (`autoRIFT.py:820`, reciprocal at `:510`) reads only the x extent, so a level's grid is coarsened by the same factor in both axes however anisotropic the chip is. On NISAR's 96x52 chip that decimates y by 2, 4 and 8 for a chip 52 px tall against a 48 px grid spacing — a coarse grid several times coarser than the chip supports, so a level posts estimates from a footprint its own geometry cannot corroborate. **Now matched** (`_level_decimation` is `chip_size.X ÷ chip_size_min.X`): see the closed table for why the earlier attempt appeared to make things worse. | After the golden set agrees, together with the row below — the decimation and the filter neighbourhood are the same question asked of two different windows. |
+| **A coarse node on a footprint-edge cell is placed outside its own data, and the reference is internally inconsistent there** | `INTER_AREA` averages the whole cell, so a cell that is part nodata fill yields a node coordinate pulled toward the fill constant — outside the range the cell's real coordinates span for **99.0%** of straddling cells at chip 384 and **94.2%** at chip 768, and the reference *searches* 4,962 and 3,967 of them. Worse, on those cells its two halves disagree: `INTER_AREA` places the node at the cell mean while `INTER_CUBIC` reads it back from the geometric centre, a gap of **0.25 px on fill-free cells but 1,865 px median (up to 27,538) on straddling ones** — 88% of the chip-768 searched nodes. Verified by calling OpenCV directly, independent of AutoRIFT.jl. **Now matched**, because the node position is a property of the *grid* and any difference there desynchronizes every downstream comparison. | Together with the NISAR masking entry above, which is the same fix: decline a chip whose footprint is not sufficiently inside the valid region, and the straddling cells stop mattering. Until then neither implementation is measuring ground at those nodes and agreement there says nothing. |
+| **The level-grid snap assumes the grid is on half-integers** | `round(x + 0.5) - 0.5` (`autoRIFT.py:120-122`) snaps to half-integers, which is right for the reference only because `runAutorift` has already set `xGrid = round(xGrid) + 0.5`. On an integer-valued grid it moves every node half a pixel — verified against OpenCV: block means of 15, 55, 95 become 15.5, 55.5, 95.5. Latent in the reference, since its grid always satisfies the assumption. **Not matched:** `_cell_means` reads the phase from the grid, which reproduces the reference exactly on a captured grid and is a no-op on an integer one. | Never; taking the phase from the data is strictly more general and costs nothing. |
+| **Coarse nodes are placed by a Jacobian shift, not by resampling the coordinate arrays** — FIXED | **Fixed**: `_cell_means` now takes the cell's mean coordinate and the lattice matches the reference's exactly (MAD 0.0000, 100.00% within 1 px, every level). Previously it shifted by `(stride - 1) / 2` times the modal grid step, which is exact only on a north-up affine grid. The reference resizes its coordinate *arrays* with `INTER_AREA` (`autoRIFT.py:109-118`), which is the cell's block mean at any rotation and any curvature — a stronger construction, not a weaker one. On the NISAR L1 grid the shift also omits its cross term (`dx/drow = +34` against `dx/dcol = +33`, a swath rotated near 45°), leaving a node 109 px from its cell centre at stride 8. **Correcting either one alone measures slightly worse** — `rms(ours) / rms(reference)` against the reference's own raw level goes 5.19 → 5.46 with the cross term and → 5.50 with the exact mean — so this is not the whole of the coarse residual and is not fixable in isolation. See `GATES.md`. | Together with the read-back in `_undecimate_level`, which is the other half and the dominant one. The two must move together; changing the correlation position without the read-back is what the two measurements above are showing. |
+| **Which side's coarse value is more nearly correct is not settled, and the reference may be the less accurate one** | The coarse-level residual is currently charged to AutoRIFT.jl because the reference reproduces its own raw level field 5.2× more closely. That is a statement about self-consistency, not accuracy. Judged instead against a local truth — the base level, where the two agree bit-for-bit on the reference's measured points — neither side wins cleanly on NISAR L1: at chip 768 the reference is closer on `dx` (median error 0.078 vs 0.093 px) while **AutoRIFT.jl is closer on `dy`, and by a wide margin on the tail** (rms 0.234 vs 0.466 px); at chip 384 the same split appears (`dx` to the reference, `dy` rms 0.237 vs 0.512 to AutoRIFT.jl). The reference's `dy` error distribution has roughly twice our rms at a comparable median, which is a heavy tail rather than a bias. So matching it on `dy` would mean adopting the worse field. | Once the coarse levels agree. Then judge on a case with independent ground truth rather than on either implementation: the base-level-neighbour test used here is a proxy, and it is weakest exactly where the coarse levels are used, which is where the base level declined to measure. |
 | **Rectangular chips are not obviously handled correctly by either implementation** | Both now decimate a level by its x chip ratio, and that rule is not self-evidently right for a 96x52 chip: it coarsens y by 8 at the top level for a chip 52 px tall on a 48 px grid, so the level posts estimates from a footprint its own geometry cannot corroborate. The two windows the anisotropy feeds — the level stride here and the filter neighbourhood in the row above — are both sized from x, and the physically defensible rule is probably per-axis in both. **Agreement now says nothing about this**, since the two implementations make the same choice; only a measurement against ground truth can. | After the golden set agrees. Then measure a per-axis decimation and a per-axis filter neighbourhood together on an anisotropic case, judged on coverage and neighbour consistency rather than on agreement. `_level_decimation` and `_oversample` are the two places it is decided. |
 
 Two differences run the *other* way — AutoRIFT.jl is more nearly correct and deliberately does not
