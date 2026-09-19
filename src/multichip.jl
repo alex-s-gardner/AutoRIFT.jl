@@ -437,47 +437,42 @@ function _decimate_level(grid::PointSet{2}, wanted::AbstractMatrix{Bool}, stride
                   dx_prior = [Float64(mx[i, j]) for i in rows, j in cols],
                   dy_prior = [Float64(my[i, j]) for i in rows, j in cols])
 
-    return (; grid = _cell_centres(sub, grid, rows, cols, stride),
+    return (; grid = _cell_means(sub, grid, rows, cols, stride),
             wanted = keep, rows, cols)
 end
 
-# `sub`, whose points are the first of each cell of `full`, moved to the centre of the cell each covers.
+# `sub`, whose points are the first of each cell of `full`, moved to the mean coordinate over the cell.
 #
 # Only `x` and `y` move. Every other field is a property of the cell — its radius, its prior, its chip
 # size — and is already the value this level will use.
 #
-# The centre, and specifically the centre of the cell as this grid indexes it, because
-# `_undecimate_level` reads node `k` back from fine position `(k - 0.5) * stride + 0.5` — the same
-# place. Correlating anywhere else measures the field somewhere other than where every consumer then
-# assumes, and a displacement field varies over that distance.
+# **The mean, which is what the reference's `INTER_AREA` computes.** A level's grid is
+# `cv2.resize(xGrid, 1/Scale, INTER_AREA)` snapped with `round(x + 0.5) - 0.5`
+# (`autoRIFT.py:109-125`), and `INTER_AREA` at an integer scale is exactly the block mean. That is right
+# at any rotation and any curvature, where a shift by half a cell is right only on a north-up grid: over
+# 83,808 nodes of the NISAR L1 chip-768 lattice a uniform `(stride - 1) / 2` shift by the modal grid step
+# places every node **115.5 px** from the reference's. The two axes are not symmetric, so no single shift
+# fixes both — on that grid `dx/dcol = +33` and `dx/drow = +34` add, while `dy/drow = +19` and
+# `dy/dcol = -19` cancel. The mean gets both right without a per-axis case.
 #
-# The reference's own two halves do *not* coincide here, and matching either one alone is worse than
-# matching neither. Instrumenting it on a Jakobshavn pair, the grid it hands each level places node `k`
-# a further `stride - 1` cells along than the cell centre, while its `cv2.resize` read-back stays on the
-# plain size ratio — so its coarse values land `stride - 1` cells from where they were measured, exactly
-# the offset its own read-back carries. Moving our nodes to its correlation positions while keeping a
-# consistent read-back took the coarse levels from 1% of points beyond 0.2 px to 39%. Self-consistency
-# between the two halves is what the accuracy depends on, not agreement with either half separately.
+# **`_undecimate_level` reads node `k` back from this same position**, so the two halves move together.
+# Reading back from one place while correlating at another measures the field where no consumer thinks it
+# was measured, and a displacement field varies over that distance.
 #
-# Per cell, from the rows and columns that cell actually spans, rather than a uniform half-`stride`
-# shift. `nr` need not be a multiple of `stride`, so the last cell along an axis can be short, and
-# shifting it by a full half-cell puts it past the last grid point: `gridpoints` insets the grid by
-# exactly the correlation reach, so a point beyond it no longer fits the unpadded image and the pass
-# silently switches to the zero-padded path. The displacements come out the same, but the surface is
-# computed by a different transform and its peak height differs in the last bits — enough that a blocked
-# run stops matching an untiled one exactly.
+# **The nodata fill is averaged in, not excluded**, because `cv2.resize` has no concept of it. Excluding
+# it is the more defensible rule — a cell straddling the footprint edge would then keep a coordinate
+# inside the swath rather than one pulled toward the fill constant — and it is measurably not the
+# reference's: against the captured chip-768 lattice the plain average differs by a single constant (that
+# level's pad) where the fill-excluding form gives 3,288 different offsets over 4,585 searched nodes,
+# 87.9% of whose cells contain fill. Matched rather than endorsed; `CORRECTNESS.md` carries it, and those
+# same edge cells are what its input-masking entry is about.
 #
-# The shift is in the grid's own coordinates, taken from `full`'s spacing rather than assumed: a
-# `PointSet` carries positions in image pixels, and the grid spacing need not be 1.
-#
-# No rounding to a pixel lattice here, and the reference's `round(x + 0.5) - 0.5` at
-# `autoRIFT.py:525-530` is not a missing step. That snap restores the half-pixel convention its
-# `INTER_AREA` grid resize destroys — the reference's `xGrid` already carries `+ 0.5` baked in from
-# `runAutorift`, and averaging an even number of such coordinates lands back on an integer. This
-# decimates by taking every `stride`-th point and shifting by whole grid cells, so the convention
-# survives untouched, and `_shift_points` applies the `+ 0.5` at correlation time for every level
-# alike. Snapping on top of that would move a coarse centre half a pixel off the lattice the finest
-# level uses.
+# Per cell, over the rows and columns that cell actually spans. `nr` need not be a multiple of `stride`,
+# so the last cell along an axis can be short, and treating it as full-width would put its node past the
+# last grid point: `gridpoints` insets the grid by exactly the correlation reach, so a point beyond it no
+# longer fits the unpadded image and the pass silently switches to the zero-padded path. The
+# displacements come out the same, but the surface is computed by a different transform and its peak
+# height differs in the last bits — enough that a blocked run stops matching an untiled one exactly.
 # How far one step along `dim` moves this coordinate, as the modal signed step between adjacent points
 # that both carry a coordinate.
 #
@@ -485,9 +480,8 @@ end
 #
 #   * **It is constant at nodata, and not always zero.** The driver clears `xGrid` wherever there is no
 #     data (`testautoRIFT.py:394-403`), so `x[1, 2] - x[1, 1]` is `0` on a scene whose first row and
-#     column are ocean. Reading the spacing there gives zero, `_cell_centres` shifts by nothing, and
-#     every coarse node sits at its cell's first point — half a cell from where `_undecimate_level`
-#     reads it back. The fill survives the half-sample snap as a *constant*, which need not be zero: on
+#     column are ocean. Reading the spacing there gives zero, so a caller that scales by it gets no
+#     scaling at all. The fill survives the half-sample snap as a *constant*, which need not be zero: on
 #     both NISAR grids it is `0.5`, covering 55.7% of the L2 array and 56.8% of the L1 one. So the
 #     property to exclude is a **zero step**, which is what a constant region produces whatever its
 #     value; testing the endpoints against zero alone let 2,895,601 steps inside the L2 fill outvote the
@@ -502,7 +496,7 @@ end
 #     them.
 #
 # Zero only when no two adjacent points are a step apart, which means the caller has no grid along this
-# axis. `_cell_centres` then shifts by nothing, which is right for a grid with no spacing to speak of.
+# axis, which is the honest answer for a grid with no spacing to speak of.
 function _grid_step(x::AbstractMatrix, dim::Int)
     n = size(x, dim)
     n > 1 || return 0.0
@@ -527,40 +521,61 @@ function _grid_step(x::AbstractMatrix, dim::Int)
     return best
 end
 
-function _cell_centres(sub::PointSet{2}, full::PointSet{2}, rows, cols, stride::Int)
+function _cell_means(sub::PointSet{2}, full::PointSet{2}, rows, cols, stride::Int)
     stride == 1 && return sub
-    # The grid's spacing, taken as the most common step between adjacent points rather than from the
-    # first two. A production grid is **zeroed wherever there is no data** — the driver clears `xGrid`,
-    # `yGrid`, the priors and the search limits at nodata before correlating
-    # (`testautoRIFT.py:394-403`) — so a scene whose first row and column are ocean has
-    # `x[1, 2] - x[1, 1] == 0`, and reading the spacing there gives zero. The shift then vanishes and
-    # every coarse node stays at its cell's first point, half a cell from where `_undecimate_level`
-    # reads it back.
-    #
-    # That is a silent, systematic offset: on the golden Landsat case it left 99.8% of level-1 nodes 4
-    # or 5 pixels from the reference's, which reads as a correlator disagreement concentrated where the
-    # velocity field varies.
     nr, nc = size(full)
-    sx = _grid_step(full.x, 2)
-    sy = _grid_step(full.y, 1)
-    # The reference reaches the same cell centre by a different route and lands half a pixel away on a
-    # **rotated** grid. Its `INTER_AREA` averages a `stride`-by-`stride` block, so on a grid whose `x`
-    # varies down a column — which a projected grid's does, by 1 px per row on the golden Landsat case —
-    # the block mean is not the x-centre of the column pair, and `round(x + 0.5) - 0.5` then snaps it to
-    # the next half-integer up. Measured at level 1: the cell centre is 3992.5 on both sides, the
-    # reference's block mean is exactly 3993.0, and its snapped node is 3993.5.
-    #
-    # The half pixel is *not* reproduced here. `_undecimate_level` reads a coarse node back from the cell
-    # centre, so shifting the correlation position without shifting the read-back would measure the field
-    # in one place and attribute it to another — and `src/multichip.jl` records the measurement that
-    # self-consistency between the two halves is what the accuracy depends on, not agreement with either
-    # of the reference's halves separately. `tools/golden/README.md` carries this as matched-not-endorsed
-    # in the other direction: a deliberate difference, with the reason it is deliberate.
-    # Half the span of this cell, which is `stride` points except where the grid ran out.
-    halfx = [(min(c + stride - 1, nc) - c) / 2 for c in cols]
-    halfy = [(min(r + stride - 1, nr) - r) / 2 for r in rows]
-    return rebuild(sub; x = sub.x .+ sx .* reshape(halfx, 1, :),
-                        y = sub.y .+ sy .* halfy)
+    # **Snapped onto the grid's own sub-pixel lattice, not onto a hardcoded half integer.** The reference's
+    # `round(x + 0.5) - 0.5` (`autoRIFT.py:120-122`) snaps to half-integers, which is right for *its* grid
+    # because `runAutorift` has already set `xGrid = round(xGrid) + 0.5` and averaging an even number of
+    # half-integers lands back on a whole one. A `PointSet` carries no such guarantee — `gridpoints`
+    # produces integer coordinates and a captured grid half-integer ones — so the reference's literal form
+    # would move every node of an integer grid by half a pixel. Reading the phase from the grid reproduces
+    # the reference exactly on a captured grid and is a no-op on an integer one.
+    offx = _grid_phase(full.x)
+    offy = _grid_phase(full.y)
+    return rebuild(sub;
+                   x = [_cell_mean(full.x, r, c, stride, nr, nc, offx) for r in rows, c in cols],
+                   y = [_cell_mean(full.y, r, c, stride, nr, nc, offy) for r in rows, c in cols])
+end
+
+# The sub-pixel offset a grid's coordinates sit on, as the modal fractional part.
+#
+# `0.0` for a grid on whole pixels and `0.5` for one carrying the reference's half-sample convention. Modal
+# rather than taken from the first element, for the reason `_grid_step` is modal: the nodata fill is a
+# constant whose fractional part need not match the real data's, and on a rotated footprint it is the
+# majority of the array — but it is one value against many, so a mode over the whole grid finds the
+# convention the real coordinates use.
+function _grid_phase(x::AbstractMatrix)
+    counts = Dict{Float64,Int}()
+    @inbounds for v in x
+        d = Float64(v)
+        f = d - floor(d)
+        counts[f] = get(counts, f, 0) + 1
+    end
+    best = 0.0
+    bestn = 0
+    for (f, c) in counts
+        c > bestn && (best = f; bestn = c)
+    end
+    return best
+end
+
+# The mean of `x` over the `stride`-by-`stride` cell whose first point is `(r, c)`, snapped to the lattice
+# `offset` names.
+#
+# `INTER_AREA` at an integer scale — what the reference resizes a level's coordinate arrays with — is exactly
+# this block mean, and the snap is its `round(x + 0.5) - 0.5` generalized to an arbitrary sub-pixel phase.
+# Clipped at the grid's far edge, so a grid whose extent is not a multiple of `stride` has a short last cell
+# rather than one reaching past the end: `cv2.resize` cannot produce such a cell, since a level's shape is
+# `floor(n * Scale)`, but a caller-supplied grid can.
+function _cell_mean(x::AbstractMatrix, r::Int, c::Int, stride::Int, nr::Int, nc::Int, offset::Float64)
+    s = 0.0
+    n = 0
+    @inbounds for j in c:min(c + stride - 1, nc), i in r:min(r + stride - 1, nr)
+        s += Float64(x[i, j])
+        n += 1
+    end
+    return round(s / n - offset) + offset
 end
 
 # `A` with every `NaN` replaced by its nearest finite neighbour, so an interpolant reading a
@@ -673,7 +688,7 @@ end
 #
 # Every resample here is on the *stride* lattice — `step(rows)` source samples per destination sample —
 # and not on the size ratio a bare `resample` would infer. `_decimate_level` takes every `stride`-th
-# point and `_cell_centres` moves each to its cell's centre, so coarse node `k` stands at fine position
+# point and `_cell_means` moves each to its cell's mean, so coarse node `k` stands at fine position
 # `(k - 0.5) * stride + 0.5`; the ratio `length(rows) / nr` describes that lattice only when `stride`
 # divides `nr`. Where it does not, the inferred scale is slightly too large, the two lattices drift
 # apart along the axis, and every coarse value beyond the crossing point is read one fine cell off. At

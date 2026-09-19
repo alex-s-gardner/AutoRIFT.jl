@@ -336,7 +336,7 @@ _level_stride(p::Params, L::Int) = AutoRIFT._level_decimation(p, AutoRIFT.chip_s
 #
 # Above the base size the reference resizes with `INTER_AREA` and snaps an even chip's grid to
 # `round(x + 0.5) - 0.5` (`autoRIFT.py:509-530`), where AutoRIFT.jl decimates by taking every
-# `stride`-th point and shifting to the cell centre (`_decimate_level`, `_cell_centres`). Those two
+# `stride`-th point and taking the cell mean (`_decimate_level`, `_cell_means`). Those two
 # reach the same place by different routes, so the rung compares the positions rather than the method.
 function rung_grid(k::Capture, p::Params, L::Int, chip::Int, chip0::Int)
     xg0 = _consumed_grid(k, "xGrid0", L)
@@ -346,7 +346,7 @@ function rung_grid(k::Capture, p::Params, L::Int, chip::Int, chip0::Int)
     # **AutoRIFT.jl decimates where the reference resizes, and the two reach different positions by
     # design.** The reference builds its grid with `INTER_AREA` and snaps to `round(x + 0.5) - 0.5`,
     # which averages `stride` coordinates and lands on the cell's centre; `_decimate_level` takes every
-    # `stride`-th point and shifts it to the same centre (`_cell_centres`). Those agree in the interior
+    # `stride`-th point and takes the cell mean (`_cell_means`). Those agree in the interior
     # and cannot agree at the grid's zero margin, where the reference averages real coordinates with the
     # zeros the driver wrote and AutoRIFT.jl does not.
     #
@@ -368,7 +368,7 @@ function rung_grid(k::Capture, p::Params, L::Int, chip::Int, chip0::Int)
         "decimation and the reference's resize disagree about the level's grid size")
     # **Above the base chip size the two constructions differ by design, and this rung reports the
     # difference rather than gating on it.** The reference resizes with `INTER_AREA` and snaps to
-    # `round(x + 0.5) - 0.5`; `_decimate_level` takes every `stride`-th point and `_cell_centres` shifts
+    # `round(x + 0.5) - 0.5`; `_decimate_level` takes every `stride`-th point and `_cell_means` averages
     # it to the cell centre. Three things separate them and only the first is arithmetic noise:
     #
     #   * On a **rotated** grid — `x` varies by 1 px per row on this scene — the reference's block mean is
@@ -519,7 +519,7 @@ function rung_priors(k::Capture, p::Params, L::Int, chip::Int, chip0::Int, spaci
                                 bad, length(jl), 100bad / length(jl), worst))
 end
 
-# The grid's own spacing, from the same helper `_cell_centres` uses — a mode over adjacent steps, so a
+# The grid's own spacing, as a mode over adjacent steps, so a
 # production grid's zeroed nodata margin cannot make it read as zero.
 _grid_step_of(pts::PointSet{2}) = AutoRIFT._grid_step(pts.x, 2)
 

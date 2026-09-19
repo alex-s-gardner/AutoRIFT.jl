@@ -1,7 +1,7 @@
 # The geogrid handoff: a `PairGeometry` becomes a `PointSet`.
 #
 # Every assertion here corresponds to a way the conversion could silently misbehave rather than fail:
-# an index off by one, a half pixel applied twice, a nodata sentinel arriving as a negative search
+# an index off by one, a half pixel applied twice, a nodata fill value arriving as a negative search
 # radius, a per-point chip bound dropped.
 
 using AutoRIFT
@@ -60,7 +60,7 @@ end
 
     invalid = findall(==(SENTINEL), IPG_R.location_x)
     @test !isempty(invalid)     # the window overhangs the image, so some points are outside
-    # Zero radius is how a point is marked to skip. Passing the sentinel through would make the
+    # Zero radius is how a point is marked to skip. Passing the fill value through would make the
     # radius negative, which `gridpoints`' margin logic would then size itself from.
     @test all(iszero, pts.radius_x[invalid])
     @test all(iszero, pts.radius_y[invalid])

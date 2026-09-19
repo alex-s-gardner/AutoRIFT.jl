@@ -506,7 +506,7 @@ windowmedmad(A::AbstractMatrix, w) = _window_sorted(A, w, _medmad_of!, Val(2))
 #
 # `Val(N)` is how many values the reducer returns, and so how many output arrays are
 # produced. That is what lets a fused pair like median-and-MAD share this traversal
-# rather than copy it: the gather, the left-bias margins, and the all-missing sentinel
+# rather than copy it: the gather, the left-bias margins, and the all-missing result
 # exist once. The window convention in particular is the thing this file's header warns
 # is easy to get backwards, so having one transcription of it matters more than the
 # handful of lines saved.

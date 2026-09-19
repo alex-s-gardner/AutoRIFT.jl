@@ -4,6 +4,11 @@ Every measurement that has been confirmed green, with the command that produced 
 this list only while it still passes: `regate.jl` re-runs all of them, and a row that stops holding is
 a regression to fix rather than a number to update.
 
+**Deferred correctness work is not here.** A gate records what is *verified*; a defect this project
+reproduces on purpose is in [`CORRECTNESS.md`](../../CORRECTNESS.md) at the repository root, with
+`tools/golden/README.md` holding the per-item evidence. When every gate below is green, that file is the
+work list.
+
 **Why a ledger rather than a report.** `tools/golden/README.md` records what is *known* about the two
 implementations. This records what has been *verified at a commit*, which is a different claim and the
 one that decays. A gate whose command cannot be re-run is not a gate.
@@ -2376,7 +2381,7 @@ min 0, **max 1905**, mean 72.5 and band 2 min 0, **max 830**, mean 41.6. Those a
 rescales them.
 
 **The nodata value is not being read as data**, which is the first thing to suspect of a field whose
-maximum is 73x its median. The sentinel is `-32767` in `window_search_range.tif` and
+maximum is 73x its median. The fill value is `-32767` in `window_search_range.tif` and
 `window_offset.tif`, and the ITS_LIVE parameter rasters use `32767` for the search ranges and `-32767`
 for the velocities. None of the four values appears anywhere in the captured grid: no `32767`, no
 `-32767`, nothing with `|v| > 3000`, no `NaN`. The observed maxima in the source rasters — 11576 m/yr
@@ -3224,3 +3229,689 @@ What this does and does not license:
 The Benchmark job therefore stays red on this branch by decision rather than by oversight. It compares
 against the merge base, so those rows clear on their own once this lands and the base carries
 `MEASURE` too — the gate is measuring a one-time step change, not an ongoing defect.
+
+## Step: where the coarse-level residual comes from, and one candidate fix rejected
+
+The striped residual in the upper-right of both NISAR comparison figures — the region where ionospheric
+defocus broadens the correlation peak — is **entirely a coarse-level effect, and the levels' own
+measurements are not what disagrees.** Measured on L1 RSLC over the top-right third of the grid (rows
+1–776, cols 1537–2304, 273,447 both-measured points), which is where the figure shows it.
+
+### The base level is exact where the reference measured
+
+Split by the reference's `out_InterpMask`, which marks a value it filled rather than measured:
+
+| level | `InterpMask = 0` (measured) | | `InterpMask = 1` (filled) | |
+|---|---:|---:|---:|---:|
+| | n | `dx` exact | n | `dx` exact |
+| chip 96 | 150,866 | **99.992%** | 23,712 | 85.5% |
+| chip 192 | 1,018 | 0.00% | 51 | 0.00% |
+| chip 384 | 20,863 | 0.00% | 1,791 | 0.00% |
+| chip 768 | 70,926 | 0.00% | 1,805 | 0.00% |
+
+**Effectively every point the reference measured at the base chip size agrees bit-for-bit**, inside the
+high-ionosphere region included: **12 points of 150,866 differ in the window, every one of them by exactly
+one 1/32 quantization step**, which is tie-breaking on a flat peak and not a systematic error. Over the
+whole grid it is 904 of 1,234,293 (0.073%), same magnitude. (An earlier revision of this section rounded
+that to 100.00%; the figure panel reports 99.99%, and the exact count is above.)
+
+So the peak broadening the ionosphere causes is not what the whole-scene figure shows: it degrades both
+implementations identically, and they still agree to one quantization step.
+
+Above the base level neither side is on its own quantization lattice — 0.00–0.03% of values sit on a
+`1/oversample` multiple against 95–96% at chip 96 — because both replace the measurement with a resize.
+`exact` is therefore meaningless there, which `stages.jl` already records.
+
+### It is not decimation of the imagery, and not the quantization
+
+**A `Float32` pair would show the same disagreement.** Both NISAR captures are `UInt8` and
+`CAPTURE_FLOAT32` needs a container run, but the hypothesis makes a prediction about the bytes already
+on disk: if the 256-level collapse were responsible, the residual would concentrate where quantization
+costs something. It does not. Binning by how many distinct byte values each chip actually spans:
+
+| level | fewest levels (worst quantized) | middle | most levels (best quantized) |
+|---|---:|---:|---:|
+| chip 96, median \|ddx\| | 0.0000 (n=1,553) | 0.0000 | 0.0000 |
+| chip 768, median \|ddx\| | 0.1516 (n=1,619) | 0.1355 | 0.1471 |
+
+The residual is flat in chip contrast — 0.1355 to 0.1516 px across the terciles, non-monotonically —
+while the chips themselves span 209–224 of 256 levels, so quantization has left almost nothing to lose.
+The discriminator that settles it is chip 96: the same imagery, the same bytes, the same points, and
+100% agreement. A quantization effect cannot be absent at one chip size and present at the next.
+
+### It is the read-back of a decimated level, and it is ours
+
+The capture holds each level's raw measurement on the level's own lattice (`lvl{N}_dx`). Comparing each
+side's *merged* fine-grid value against the *reference's own* raw level value at the node standing over
+it separates the measurement from the merge:
+
+| level | `ref_merged − ref_raw` rms | `our_merged − ref_raw` rms | ratio |
+|---|---:|---:|---:|
+| chip 96 (stride 1) | 2.9909 | 2.9909 | **1.000** |
+| chip 192 (stride 2) | 1.5904 | 1.6023 | 1.007 |
+| chip 384 (stride 4) | 0.0984 | 0.2646 | **2.688** |
+| chip 768 (stride 8) | 0.0490 | 0.2542 | **5.190** |
+
+The reference's own read-back returns its raw measurement almost unchanged — 0.049 px rms at chip 768 —
+where ours lands 0.254 px away, and the ratio grows with the stride. `figs/nisar_l1_merge_vs_rawlevel_chip768.png`
+maps all three: the reference-against-itself panel is blank on the ±0.3 px scale while ours carries the
+full striped structure, which is the same structure the whole-scene difference panel shows.
+
+**Where the placements part company.** Reconstructing the reference's level lattice from `in_xGrid` as
+`INTER_AREA` to the level shape then `round(x + 0.5) − 0.5` (`autoRIFT.py:109-125`) reproduces every
+captured `lvl{N}_xgrid` up to exactly one constant per level — one unique offset, all three coarse
+levels, both axes — so its lattice is fully determined. Against it, our `_cell_centres` node sits:
+
+| level | within 1 px of the reference's node, fill-free cells | worst |
+|---|---:|---:|
+| chip 192 | 100.00% (n=563,661) | 0.5 px |
+| chip 384 | 75.06% | 19.25 px at p90 |
+| chip 768 | 54.56% | 1313 px at p90, 65 px on fill-free cells |
+
+**The half-cell shift is missing its cross term.** A cell's centre lies `(stride − 1)/2` points further
+along in *both* axes, so on a grid where `x` varies with row as well as column the displacement to the
+centre is `(dx/dcol + dx/drow) * (stride − 1)/2`. `_cell_centres` applies the `dx/dcol` half only. Fitted
+over the L1 grid's real points, `dx/dcol = +33` and `dx/drow = +34` — a swath rotated near 45°, where the
+two terms are the same size — and likewise `dy/drow = +19` against `dy/dcol = −19`:
+
+| stride | x shift applied | x shift an affine cell centre needs | x term omitted | y term omitted |
+|---|---:|---:|---:|---:|
+| 2 | 16.50 | 33.50 | 17.00 | −9.50 |
+| 4 | 49.50 | 100.50 | 51.00 | −28.50 |
+| 8 | 115.50 | 234.50 | 119.00 | −66.50 |
+
+Measured against each fill-free cell's own block mean, which is the position `_cell_centres` is trying to
+reach, adding the cross term accounts for nearly all of the gap:
+
+| stride | current placement | with the cross term |
+|---|---|---|
+| 2 | med −14.75 px, rms 14.7 | med +2.25, **rms 2.5** |
+| 4 | med −45.00 px, rms 45.3 | med +6.00, **rms 8.2** |
+| 8 | med −109.48 px, rms 112.1 | med +9.52, **rms 20.2** |
+
+**This is not the half-pixel convention, and rotation matters here for a different reason.** The
+`round(x + 0.5) − 0.5` snap is a sub-pixel offset in *image* space and is rotation-independent; this is a
+whole-cell offset in *grid* space that scales with the grid step. It vanishes wherever `dx/drow` is zero —
+every north-up optical grid — which is why no optical golden case shows it and both NISAR cases do.
+
+Genuine cell-scale curvature exists and is a second-order term: an affine fit *within* a fill-free cell
+has a worst-point residual of median 1.2 px at stride 4 and 2.9 px at stride 8. (An earlier note here
+attributed the whole offset to curvature on the strength of a 73 px second difference along a row slice;
+that slice crossed the nodata fill in its interior, and a per-cell fit is the right test.) Roughly 40% of
+the nodes disagreeing with the reference are cells straddling the footprint edge; the rest are interior.
+
+### Rejected: adopting the reference's block-mean placement
+
+Placing each coarse node at its cell's fill-excluding mean coordinate brings the lattice to **100.00%
+within 1 px of the reference's on fill-free cells at every level**, median offset 0.0000 — and makes the
+answer **worse**:
+
+| | before | after |
+|---|---:|---:|
+| chip 384, `rms(ours vs raw) / rms(ref vs raw)` | 2.688 | **3.329** |
+| chip 768, same | 5.190 | **5.497** |
+| L1 whole-grid correlate wall clock | 649.8 s | **7166.3 s** |
+
+`_undecimate_level` reads a coarse node back from the geometric cell centre, so moving where the level
+correlates without moving where it is read back measures the field in one place and attributes it to
+another. The 11× runtime has the same cause — a node whose cell straddles the footprint edge moves far
+enough that its search window grows.
+
+(The pre-existing comment in `_cell_centres` predicted this outcome, but for a reason that turns out to be
+wrong — it attributed the hazard to the reference's own two halves disagreeing. They agree to 0.016 px;
+see below. The prediction was right and its stated mechanism was not.)
+
+### Also rejected: adding the missing cross term
+
+The cross term is the self-consistent version of the same correction — it makes `_cell_centres` compute
+the geometric cell centre its own read-back already assumes, rather than moving to the reference's
+position — so it does not carry the desynchronization the block mean does. It is also **slightly worse**,
+at no runtime cost:
+
+| chip 768, `rms(ours vs raw) / rms(ref vs raw)` | wall clock |
+|---|---:|
+| as written | 5.190 — 649.8 s |
+| + cross term | **5.455** — 682.6 s |
+| node at the cell's exact mean | 5.497 — 7166.3 s |
+
+Both corrections move the lattice much closer to the reference's (109 px → 5.5 px median offset in x at
+stride 8 for the cross term; to 0.0 for the exact mean) and neither improves the answer. **So the coarse
+residual is not primarily a correlation-position error**. Where it *is* follows below — not the read-back,
+which the next section rules out.
+
+### The merge and the read-back are faithful; the coarse measurement is what differs
+
+`chipsize_level` is callable on its own, so our level can be run and its undecimated field compared against
+our own merged output. Over the 72,731 chip-768 points in the window:
+
+| | med | rms |
+|---|---:|---:|
+| `our_merged − our_readback` | +0.0000 | **0.0082** |
+| `our_readback − ref_raw` | +0.1167 | 0.2545 |
+| `our_merged − ref_raw` | +0.1165 | 0.2542 |
+
+**The merge reproduces our own read-back to 0.008 px**, so the merge is not the defect and the whole 0.254 px
+is already present in the read-back's input. Comparing the two sides *on the coarse lattice*, before any
+interpolation, both sit **100.00% on the 1/128 quantization lattice** — two genuine measurements — and they
+agree at only 2.52%.
+
+**So the residual is in the coarse measurement itself, not in the merge, not in the read-back, and not in
+the node position.** This supersedes the earlier statement in this section that `_undecimate_level` was where
+the remaining work is; that was written before the read-back was measured separately.
+
+Our `resample` with `Bicubic` was checked against OpenCV's `INTER_CUBIC` directly and **matches exactly**,
+including the tap layout and the `a = -0.75` weights: a ramp upsampled by 8 gives the identical −0.0881
+node offset on both sides, which is cubic convolution's own behaviour at half-integer offsets rather than a
+misalignment.
+
+### Not yet localized, and the harness that would do it is not trustworthy yet
+
+Three attempts to replay our coarse pass on the reference's captured per-level inputs landed at rms 1.9–3.6
+px against a 0.25 px target, i.e. they were not reproducing the reference's pass at all. The diagnosis of
+those attempts:
+
+- **The per-level prior was missing.** The reference's fine pass is handed `Dx00` — the cell mean of `Dx0`
+  over `1/Scale` cells, resized to the lattice (`autoRIFT.py:161-179`) — and `install_levels` recorded
+  `dx`, `dy`, `xgrid`, `ygrid`, `searchx`, `searchy` and not the prior. **`capture.py` now records it**
+  (`dx0`/`dy0` per level); a re-capture is needed to pick it up.
+- **A `dy` sign error in the replay**, which double-negated the prior. Once corrected, single-node
+  instrumentation shows `dx` agreeing to ~0.05 px per node while `dy` is offset 4.8–6.1 px with a spread,
+  which is still a harness fault on the anisotropic `768x416` chip and not a correlator finding.
+
+What the least-broken replay does show, on a 65² window of the lattice, is that the `dx` disagreement is a
+**tail, not a bias**: median +0.0078 px, |Δ| p50 0.055, p75 0.109, p90 0.203, then p95 1.95 and p99 13.06.
+A small population of nodes lands on a different peak while the bulk agrees to a fraction of a step. That is
+consistent with the ionospheric peak broadening the case is known for, and it is **the hypothesis to test
+next**, not a conclusion — the replay has to reproduce the reference when primed with the reference's own
+answer before any number from it is usable, and it does not yet.
+
+**The self-consistency gate is the thing to fix first.** `step17`-style replays now assert it explicitly:
+prime the pass with the reference's own answer and require rms ≤ 0.1 px, because three earlier rounds of
+numbers were reported from a harness that would have failed it.
+
+### The reference is self-consistent, so that is not the explanation either
+
+An earlier note here and in `src/multichip.jl` justified our deliberate placement difference on the
+grounds that the reference's two halves disagree with each other. **They do not.** Checked against OpenCV
+directly:
+
+- `INTER_AREA` at an integer scale is the exact block mean (max difference 0.000000 against a hand
+  computed mean), and for an affine grid the block mean is the value at the cell centroid, fine index
+  `k*s + (s-1)/2` (max difference 0.000000).
+- `INTER_CUBIC` upsampling places source node `k` at destination `(k + 0.5)*s − 0.5`, which is that same
+  `k*s + (s-1)/2` — verified exactly at `k = 1, 2, 3, 10` for `s = 8`.
+
+On the real L1 grid, the position where the reference correlates a node and the position its read-back
+attributes it to differ by a **median of 0.016 px, rms 4.94 px = 1.3% of a 384 px cell**, all of it local
+curvature within the cell. Its only deliberate self-inconsistency is the `round(x + 0.5) − 0.5` snap, at
+most 0.5 px.
+
+That matters twice. It removes the stated reason for our placement differing from the reference's — the
+`INTER_AREA` construction is *stronger* than a Jacobian shift, being exact at any rotation and any
+curvature. And it means a 0.25 px coarse residual cannot be charged to the reference disagreeing with
+itself; the remaining candidate is our own read-back.
+
+### Agreement is not correctness here, and the reference may hold the worse field
+
+The 5.2× ratio above is a self-consistency measurement, not an accuracy one. Judged against an independent
+local truth — the base level, where the two agree bit-for-bit on the reference's measured points, averaged
+over base-level neighbours within 3 grid points — neither side wins cleanly on L1:
+
+| level | axis | AutoRIFT.jl error vs local truth | autoRIFT.py | closer |
+|---|---|---|---|---|
+| chip 384 | `dx` | med 0.105, rms 0.181 | med **0.060**, rms **0.170** | reference |
+| chip 384 | `dy` | med **0.114**, rms **0.237** | med 0.123, rms 0.512 | AutoRIFT.jl |
+| chip 768 | `dx` | med 0.093, rms 0.152 | med **0.078**, rms 0.166 | reference (median) |
+| chip 768 | `dy` | med 0.160, rms **0.234** | med **0.103**, rms 0.466 | split |
+
+The reference is better on `dx` and its `dy` carries **roughly twice our rms at a comparable median**,
+which is a heavy tail rather than a bias. So converging on it in `dy` would mean adopting the less
+accurate field. This is recorded as an agreement-vs-correctness item in `tools/golden/README.md` under
+"Matched for agreement, not endorsed", to be settled after the coarse levels agree and against real ground
+truth rather than against either implementation — the base-level-neighbour proxy used here is weakest
+exactly where the coarse levels do their work, which is where the base level declined to measure.
+
+Reverted; `src/multichip.jl` is unchanged apart from a comment recording the measurement so the candidate
+is not retried. The L1 whole-grid figures reproduce exactly after the revert — 73.9% / 73.9% `exact`,
+11,633 / 14,897 coverage, 0.7% level disagreement, 665.1 s — so nothing regressed.
+
+`figs/nisar_l1_topright_by_level.png` is the by-level map of the window: `ddx` at chip 96 alone is blank,
+`ddx` at chip ≥ 192 carries every stripe, and the stripes coincide with the chip-size panel's coarse
+bands rather than with the level-disagreement panel, which covers only 0.88% of points.
+
+## Step: the coarse residual localized to the level's own measurement, and a synthetic reproducer
+
+Continuing the section above, which established that the merge reproduces our own read-back to 0.008 px
+and that the two sides' coarse *lattice* values agree at only 2.52%. This narrows that further and
+supplies a reproducer that needs no capture and runs in seconds.
+
+### The heat map, which the summary statistics were hiding
+
+`figs/nisar_l1_coarse_lattice_chip768.png` maps the chip-768 difference on the **level's own lattice**, so
+one cell is one measurement and nothing is spread by the read-back. It is **a smooth, spatially coherent,
+one-signed field of +0.1 to +0.3 px over the fast-flow region** — not scattered outliers: 4.0% of nodes
+exceed 0.5 px and **none** exceeds 2 px. The earlier report of "rms 2.1-3.6 px, a heavy tail" came from a
+replay harness with a `dy` sign error and a missing prior, and was wrong about the data.
+
+Two mechanisms are ruled out by that shape plus one regression:
+
+- **Not a node-position error.** Regressing the lattice residual on the reference field's own gradient
+  gives an implied offset of **+0.005 lattice cells** along the column axis and **R² = 0.0004**, against
+  the +0.31 cells the missing cross term would produce. A position error shows up as `gradient x offset`;
+  this residual is not proportional to the gradient at all.
+- **Not search-radius saturation.** Binned by the reference's own radius, the residual *falls* as the
+  radius grows — median +0.083 px in the smallest third against +0.008 in the largest.
+
+### The synthetic reproducer: where the two correlators part company
+
+A 3000² random pair, warped by a linear `dx` gradient of 6 px per 1000 px, correlated at one row of
+points by both implementations on byte-identical arrays. No capture, no container, seconds per run:
+
+| chip | window | agreement (73 points) |
+|---|---|---:|
+| 96x52, 192x104, 384x208 | to 431x751 | rms **0.007 px** — one quantization step |
+| 512x280, 576x312, 640x348, 512x512 | to 395x687 | rms 0.007-0.010 px |
+| **704x384** | 431x751 | rms **0.360**, max 2.97 |
+| **768x416** | 463x815 | rms **0.136**, max 1.15 |
+| 768x768, 1024x556 | 815x815, 603x1071 | rms 0.72, 0.44 |
+
+**Agreement is exact-to-one-step up to a ~690 px window and breaks past it.** `512x512` agrees while
+`768x768` does not, so it is absolute size and not anisotropy. On a *pure translation* both sides are
+bit-exact at every chip size including 768 — the gradient is what exposes it.
+
+### What breaks, mechanically
+
+As the chip grows the correlation peak flattens — peak height falls 0.92 → 0.83 → 0.53 → 0.27 across
+96 → 768 — and the peak's plateau widens from 1 sample to 3. The 5x5 refinement patch is clamped to the
+surface, so a plateau reaching the patch edge puts the upsampled maximum **on the patch border**, which
+maps back exactly to a source node and yields an **exact-integer** displacement with no subpixel part.
+The detector is perfect on the synthetic set: at chip 768, **9 border maxima and 9 exact-integer `dx`
+values, the same 9 points**; zero of each at chip 96, 192 and 384.
+
+**But this behaviour is matched, not broken.** Asked for its integer peak (`SubPixFlag=False`) the
+reference returns the *same* integer peak we do — −2.00 at chip 704, +0.00 at chip 768 — and on 8 of those
+9 border points its refined answer is **also** the exact integer, bit-identical to ours. Only one point of
+73 differs, and it alone carries the whole chip-768 rms: x=1320, ours −2.00000 against its −0.85156,
+1.148 px of the 0.136 total. Decomposed:
+
+| population | n | rms | note |
+|---|---:|---:|---|
+| refined (non-integer) | 64 | **0.024** | max 0.109 px, sub-step |
+| border (exact-integer) | 9 | 0.383 | **8 of 9 bit-identical to the reference** |
+| the one mismatch | 1 | — | 1.148 px, a bistable plateau |
+
+So on synthetic data the two correlators agree to a quantization step except at rare bistable plateau
+points, and the plateau/border behaviour itself is shared.
+
+### Why that does not yet explain the real case
+
+The real chip-768 residual has a **different shape**, and the synthetic model does not predict it. On the
+L1 lattice, top-right third, 72,731 merged points:
+
+| bin | n | share of points | share of squared error | median |
+|---|---:|---:|---:|---:|
+| \|d\| <= 0.125 | 33,826 | 46.5% | 3.0% | +0.037 |
+| 0.125 < \|d\| <= 0.5 | 34,128 | 46.9% | **56.4%** | **+0.227** |
+| 0.5 < \|d\| <= 1 | 4,775 | 6.6% | 40.5% | +0.602 |
+| \|d\| > 1 | **2** | 0.0% | 0.0% | +1.017 |
+
+**Two points of 72,731 exceed 1 px.** There is no bistable-plateau tail. Instead half the population sits
+at a one-signed median of +0.227 px — a broad systematic bias, which is what the heat map shows. The
+synthetic experiment reproduces the *quantization-step* agreement and the plateau mechanism but **not**
+this bias, so the bias is driven by something the synthetic pair does not contain: real speckle, the
+Wallis-filtered texture, a prior the synthetic runs set to zero, or the level's hole-fill.
+
+**The next measurement is the per-level prior**, which is the input the synthetic runs set to zero and the
+real level receives as `Dx00` (a cell mean). `capture.py` now records it and `tools/golden/level_replay.jl`
+replays a level on it behind a self-consistency gate; an L1 re-capture was started for this and had not
+finished when this was written. The reproducer above is the cheap path for everything that does not need
+it.
+
+## Step: the L1 re-capture, the replay gate, and `dy` localized to a one-cell position offset
+
+The L1 re-capture completed (~75 min, 186 GB) and carries the per-level prior: 16 `lvl*_dx0`/`_dy0` arrays
+across the 8 correlator calls, 72 `lvl*` arrays, `call1.json` listing `dx, dx0, dy, dy0, searchx, searchy,
+xgrid, ygrid` on every fine pass. `tools/golden/level_replay.jl` now runs on it.
+
+### Two harness faults the maps found, both of which had been reported as correlator findings
+
+**The `dy` negation was on the wrong side.** `arImgDisp_*` returns cartesian-Y — its last act is
+`Dy = -Dy` — so the captured `lvl*_dy` is up-positive while AutoRIFT.jl's `dy` is row-positive. All four
+sign combinations were scored rather than reasoned about: negating **our output** gives `dy` rms 0.90 px
+against 4.82 for the same sign, and the *prior's* sign changes almost nothing (0.8971 against 0.9019),
+because a per-level prior is only a few pixels. The earlier "+4.8 px `dy` offset" was this.
+
+**Every `dx` outlier is a footprint-edge chip.** `figs/nisar_l1_replay_chip768.png` maps it: the nodes
+disagreeing by more than a pixel form a **one-cell-wide line along the swath's diagonal boundary**, with
+none in the interior. A 768x416 chip centred a cell inside the boundary is still part nodata fill, so the
+two sides break a partly-empty correlation differently and neither is measuring ground. This is invisible
+in a percentile and obvious in a map. Excluding one ring of 8-connected boundary nodes:
+
+| | n | `dx` med | `dx` rms | `dx` p95 | beyond 1 px |
+|---|---:|---:|---:|---:|---:|
+| all nodes | 1732 | +0.0078 | 2.3055 | 1.949 | 88 (5.1%) |
+| interior only | 1476 | **+0.0078** | 0.3538 | **0.211** | **2** |
+
+So **`dx` at the coarse level agrees to one quantization step over the interior** — median +0.0078 px is
+exactly 1/128 — and the level's `dx` measurement is not where the merged residual comes from.
+
+### `dy` is a position error of about one lattice cell, and `dx` is not
+
+`figs/nisar_l1_replay_dy_chip768.png` puts the two side by side on the same interior population. They look
+nothing alike: `ddx` is salt-and-pepper about zero, while **`ddy` is smooth diagonal bands alternating
+±1-2 px, parallel to the swath edge**. A banded, signed, spatially coherent field is a sampling-position
+difference, not tie-breaking.
+
+Regressing `ddy` on the reference's own `dy` field derivatives over the 1,476 interior nodes:
+
+| predictor | correlation | slope |
+|---|---:|---:|
+| `d(dy)/dcol` | **−0.513** | **−0.942** |
+| `d(dy)/drow` | **+0.455** | +0.839 |
+| `d²(dy)/dcol²` | +0.328 | +0.299 |
+| `d²(dy)/drow²` | +0.350 | +0.266 |
+
+Joint fit **R² = 0.560**, rms 0.574 → 0.377 px, with first-derivative coefficients of −0.815 and +0.528
+lattice cells. **So `ddy` is `gradient x offset` with an offset of order one lattice cell** — 384 px at
+stride 8 — in opposite senses along the two axes.
+
+Ruled out along the way, each by measurement: the prior (`ddy` vs `dy0` slope +0.09, where a wrong prior
+sign would give +2.0); search-boundary railing (**0 of 1476** nodes at the bound on either side); and the
+`dy` magnitude itself (the error *falls* as `|dy|` grows, rms 0.835 → 0.211 across quartiles of `|ref dy|`).
+
+**This is the first positive identification of a mechanism**, and it is `dy`-only. The earlier
+gradient-regression that returned R² = 0.0004 was run on the *merged* `dx` field, which is why it found
+nothing: the defect is in `dy`, at the level's own pass, and worth about 0.4-0.6 px there.
+
+### The gate does not pass yet
+
+Interior, chip 768: **rms 0.479 px against a 0.1 threshold**, `dx` p99 0.31 and `dy` p99 2.66. `dx` is
+effectively clean, so the gate is now measuring the `dy` offset above rather than a harness fault. The
+threshold stays at 0.1 — it is what a replay on identical inputs should reach — and the next step is to
+find which `dy` position the level's pass uses that the reference's does not, now that the offset's size
+and sign are known.
+
+## Step: the `dy` offset sweep, and why its answer is not yet trustworthy
+
+Sweeping the node's y coordinate and minimizing the `dy` residual against the reference's own level field is
+the direct way to locate a position offset — no convention reading required. Run on the chip-768 level of L1
+over a 201² window of the 291×288 lattice, it gives a clean trough:
+
+| y shift | `dy` rms | `dy` MAD | `dx` rms |
+|---:|---:|---:|---:|
+| 0 | 0.738 | 0.227 | 0.138 |
+| −192 | 0.418 | 0.102 | 0.124 |
+| −336 | **0.174** | 0.055 | 0.122 |
+| −384 | 0.241 | **0.055** | 0.124 |
+
+and the MAD minima across levels land on **exactly one lattice cell** at each stride — −96 at stride 2,
+−192 at stride 4, −384 at stride 8, against a grid spacing of 48. That is a tidy result and it is **not yet
+believable**, for two reasons the heat maps show and the statistics hid.
+
+**The chip-192 replay is broken, not merely noisy.** `figs/nisar_l1_replay_levels.png` maps it: `ddy` is
+saturated across the *entire* 201² window at a ±0.3 px scale and still structured at ±3 px, over 30,828
+interior nodes, with MAD 5.1 px at every shift tested — flat, so its "minimum at −96" is the floor of a
+broken measurement rather than a located offset. Whatever the replay is doing wrong at that level, the same
+harness produced the stride-2 and stride-4 rows of the table above, so the "one lattice cell at every
+stride" pattern rests on two rows that cannot be trusted and one that can.
+
+**The chip-768 window is mostly empty.** The same figure shows the level's data occupying only the top-right
+corner of a window centred on the lattice: the reference measures 4,585 of 83,808 nodes on that lattice, and
+a 201² window at its centre catches a few hundred of them. So the trough above is drawn from a small corner
+population, which is exactly the hyper-locality a wider window was meant to rule out — widening the *window*
+does not help when the *level* only covers a corner.
+
+**What stands, and what does not.** The `dy` residual at chip 768 is banded, spatially coherent, and fits
+`gradient x offset` with R² = 0.56 over the interior — that measurement is on the earlier 65² window inside
+the data and is unaffected. The *size* of the offset is not established: −336 and −384 px are
+indistinguishable on MAD, the levels that would discriminate the scaling law are broken, and a trough this
+shallow over a corner population does not pin a number.
+
+The next step is to fix the replay at chips 192 and 384 — where the reference's own `dy` spans ±957 px
+against ±6 at chip 768, so the two levels are not the same kind of measurement — and to place the window on
+the level's own data rather than on its lattice centre. Both are harness work, and neither justifies a
+change to `src/` yet.
+
+## Step: the coarse-level measurements agree; the whole residual is downstream of them
+
+**The replay gate passes.** The fault was in the replay, not the correlator, and the sweep results above are
+withdrawn along with it.
+
+### The defect: every level's captured grid is in its own padded frame
+
+`arImgDisp_*` pads both images by `Px = max(ChipSizeX)/2 + max(SearchLimitX + |Dx0|) + 2` and then shifts the
+grid it was handed by `Px + 0.5` **in place** (`arImgDisp_u:78-90`), so `install_levels` records the
+*post-shift* grid. The pad is a function of that level's own chip and search extent, so it is one constant
+per level and not one constant overall. Measured on L1:
+
+| level | stride | x pad | y pad |
+|---|---:|---:|---:|
+| chip 96 | 1 | +2231.5 | +1149.5 |
+| chip 192 | 2 | +2605.5 | +1228.5 |
+| chip 384 | 4 | +788.5 | +274.5 |
+| chip 768 | 8 | +933.5 | +371.5 |
+
+Every replay before this treated the captured grid as unpadded, adding only the index base. That placed each
+node hundreds of pixels from where the reference correlated — and because the imagery is smooth at that
+scale, the result was not an obvious failure but a *plausible-looking* disagreement. It is why the earlier
+replays sat at rms 1.9-3.6 px, why chip 192 correlated **−0.03** with the reference over 5,661 nodes, and
+why the `dy` residual looked banded and gradient-like: a fixed positional error on a smooth field is exactly
+`gradient x offset`. `level_replay.jl` now recovers the pad by reconstructing the level grid from
+`in_xGrid` (`INTER_AREA` block mean plus the even-chip snap) and requires the difference to be a *single*
+value per axis, erroring otherwise.
+
+A second harness fault compounded it: the window was centred on the level's *lattice*, but a level covers
+only part of its lattice and that part moves up the pyramid — chip 768 measures 4,585 of 83,808 nodes. At
+chips 192 and 384 the window landed on empty grid (`both-measured 0`). It is now centred on the centroid of
+the reference's own measured nodes.
+
+### With both fixed, the levels agree bit-for-bit
+
+65² windows on each level's own data, replaying our fine pass on the reference's captured lattice, priors and
+search radii, interior nodes only:
+
+| level | n | `dx` exact | `dx` max | `dy` exact | `dy` max | gate |
+|---|---:|---:|---:|---:|---:|---:|
+| chip 192 | 3,318 | 99.28% | 229.28 | 99.40% | 36.56 | 113.1 |
+| chip 384 | 1,309 | **99.92%** | **0.008** | 99.69% | 0.008 | 0.78 |
+| chip 768 | 2,817 | **99.96%** | **0.008** | **99.96%** | 0.008 | **0.060** |
+
+`figs/nisar_l1_level_replay.png` maps it: **1 nonzero node of 2,817** at chip 768, **1 of 1,309** at chip
+384, and 24 scattered specks of 3,318 at chip 192 — no structure at any level, on a ±0.05 px scale. The
+surviving maxima at chip 192 (229 px) are a handful of points on fast-flow ice, and they are what its gate
+figure reports; the median and the 99th percentile are both exactly zero.
+
+**Sanity-checked against a shifted grid rather than assumed:** displacing the grid 500 px takes exact
+agreement from **97.06% to 6.58%**, so the pass is genuinely correlating and the agreement is not an echo of
+its inputs.
+
+### What this settles, and what it moves
+
+**Our coarse-level measurement is not the defect.** Given the reference's own inputs, our fine pass at chips
+384 and 768 reproduces its answer to better than 1 part in 1,000, bit-exact. So the merged residual — median
++0.117 px, rms 0.254 at chip 768 — enters *after* the measurement, and the merge is faithful to our read-back
+at 0.008 px rms. What remains between them is the read-back's **input**: the level's hole fill
+(`_fill_level_holes` and the reduced prior it fills from) and the `wanted`/coarse mask deciding which nodes
+the level measures at all. Those are the only steps left between a measurement that matches to 1e-3 px and a
+merged field that differs by 0.25.
+
+Every earlier localization in this file that rested on a replay — the `dy` "one lattice cell" offset, the
+R² = 0.56 gradient fit, the per-stride minima — is an artifact of the frame error and should not be carried
+forward. The heat maps are what exposed it each time the statistics looked plausible.
+
+## Step: the three-way split, and the decimated grid is where the error enters
+
+Asking the question in the order the pyramid builds — (1) are the decimated inputs identical, (2) do the
+levels agree *on* the decimated lattice, (3) do they agree after interpolation to the fine grid — localizes
+it exactly.
+
+**(2) The measurements agree.** Handed the reference's own captured lattice, priors and search radii, our
+fine pass reproduces its answer at **99.96% bit-exact** at chip 768 and 99.92% at chip 384 (above).
+
+**(3) The interpolation is faithful.** Our merged value reproduces our own read-back at **0.008 px rms**
+over 72,731 chip-768 points (above).
+
+**(1) The inputs are NOT identical, and that is where the residual enters.** Comparing our derived
+`_decimate_level` output against the reference's captured per-level arrays, in each level's own padded frame:
+
+| level | our searchable | reference | ratio | x grid offset | y grid offset |
+|---|---:|---:|---:|---:|---:|
+| chip 192 | 474,845 | 262,744 | 1.8x | +16.5 px | +9.5 px |
+| chip 384 | 119,615 | 22,661 | 5.3x | +49.5 px | +28.5 px |
+| chip 768 | 30,337 | 4,585 | 6.6x | **+115.5 px** | **+66.5 px** |
+
+Both differences are real and independent.
+
+### The grid offset is the missing Jacobian cross term, and it is asymmetric between the axes
+
+The reference's node is the cell's block mean, verified exactly — at node (120,150) of the chip-768 lattice
+its coordinate is 19092.5 and the block mean of `in_xGrid` over that cell is 19092.06, snapping to 19092.5;
+the same holds at every node checked. Ours is the cell's *first* point plus `dx/dcol * (stride-1)/2`, so it
+is short by the `dx/drow` term. With `dx/dcol = +33` and `dx/drow = +34` at stride 8 that is
+`33 * 3.5 = 115.5` applied where `67 * 3.5 = 234.5` was needed — and **+115.5 px is exactly the measured
+median offset over all 83,808 nodes.**
+
+The correction is not the same on both axes, which is what makes this subtle:
+
+| | applied | needed | adding the cross term |
+|---|---|---|---|
+| x (`dx/dcol +33`, `dx/drow +34`) | +115.5 | +234.5 | **worse**: +115.5 → +234.5 median |
+| y (`dy/drow +19`, `dy/dcol −19`) | +66.5 | ~0 | **fixed**: +66.5 → **0.000** median, 74-98% within 1 px |
+
+On the y axis the two terms have *opposite* signs and cancel, so the correct shift is near zero and our
+`+66.5` is pure error. On the x axis they have the *same* sign, so the correct shift is larger than ours —
+but adding the row term alone overshoots, because the block mean of a snapped, non-linear grid is not the
+value at the affine cell centre. **So neither the current formula nor the cross-term formula is right; the
+node has to be the cell's mean coordinate**, which is what the reference computes and what
+`_undecimate_level`'s read-back position then has to match.
+
+**An earlier measurement in this file reported this lattice as "100.00% within 1 px on fill-free cells" and
+that was wrong.** It compared `_decimate_level(grid, trues(...))` — every point wanted — against a
+reconstruction, on a population dominated by the nodata fill where every candidate rule agrees. Restricted
+to the nodes the reference actually searched, the same comparison gives 0.0% within 1 px.
+
+### The searchable-set difference is separate and larger
+
+We search 6.6x more nodes than the reference at chip 768 (30,337 against 4,585), with only 35 nodes the
+reference searches that we do not. Every one of our 25,787 extra nodes is a point where the reference's
+`out_ChipSizeX` records that a *finer* level already won. So our `wanted`/coarse-mask combination lets the
+coarse level attempt points the reference had already resolved; those measurements then reach
+`_undecimate_level` and the merge. That is a second mechanism for the merged residual, independent of the
+grid offset, and it is not yet quantified.
+
+**Both are in `_decimate_level`, and neither is in the correlator or the merge.** That is the answer to
+where the coarse-level residual is introduced.
+
+## Step: the cell-mean fix, and whether the reference is right
+
+### The fix
+
+`_cell_centres` now places a coarse node at its cell's **mean coordinate**, snapped back onto the grid's own
+sub-pixel lattice, replacing the uniform `(stride - 1) / 2` shift by the modal grid step. That is the
+reference's `INTER_AREA` block mean plus its `round(x + 0.5) - 0.5`, and it is correct at any rotation and any
+curvature where a Jacobian shift is not.
+
+**The lattice now reproduces the reference's exactly** — `MAD 0.0000`, `100.00%` within 1 px, on every level
+and on the nodes the reference actually searches:
+
+| level | before (ref-searched nodes) | after |
+|---|---|---|
+| chip 192 | med +16.5 px, 0.3% within 1 px | **med 0.0000, MAD 0.0000, 100.00%** |
+| chip 384 | med +49.5 px, 0.0% | **med 0.0000, MAD 0.0000, 100.00%** |
+| chip 768 | med +115.5 px, 0.0% | **med 0.0000, MAD 0.0000, 100.00%** |
+
+Two details the implementation had to get right, each measured rather than assumed:
+
+- **The nodata fill is averaged in, not excluded.** Excluding it is the more defensible rule and is *not*
+  what the reference does: against the captured chip-768 lattice the plain average differs by a single
+  constant (the level's pad) where the fill-excluding form gives **3,288 different offsets**. Matched, not
+  endorsed.
+- **The snap takes its phase from the grid.** `round(x + 0.5) - 0.5` is a snap to half-integers, correct for
+  the reference because `runAutorift` has already set `xGrid = round(xGrid) + 0.5`. A `PointSet` carries no
+  such guarantee — `gridpoints` gives integers — and the literal form moves every node of an integer grid by
+  half a pixel. Verified against OpenCV: on an integer-valued grid the reference's snap pushes block means of
+  `15, 55, 95` onto `15.5, 55.5, 95.5`, off the input lattice; on a half-integer grid it is a no-op.
+
+### Whole-grid effect on L1
+
+```
+julia --project=tools/golden -t 10 tools/golden/compare_figures.jl NISAR_L1_PR_RSLC --run 100
+```
+
+| | before | after |
+|---|---:|---:|
+| `dx` exact | 73.9% | **76.9%** |
+| `dy` exact | 73.9% | **78.2%** |
+| level disagreement | 0.7% | **0.4%** |
+| jl-only / py-only coverage | 11,633 / 14,897 | **3,410 / 10,159** |
+| correlate wall clock | 649.8 s | 767.1 s |
+
+`figs/nisar_l1_after_cellmean_fix.png`: **the broad one-signed red bias over the fast-flow region is gone.**
+What remains is thin dark lines tracing the swath's diagonal boundary — the input-masking defect
+`tools/golden/README.md` records as item 0, not a coarse-level bias.
+
+**The 18% runtime cost is not the cell averaging, and is work that should always have been done.** Profiled
+on a NISAR-L1-shaped 2328x2304 grid, `_cell_centres` costs 107-115 ms per decimating level, **0.33 s of a
+767 s run (0.04%)** — against 40 ms for the `_grid_step` scan it replaced, so the helper itself cannot
+account for a 117 s difference. The searchable set and the radii are unchanged by the fix (both come from
+`windowmax`/`windowrange` over the cell, which does not depend on where the node sits). What changes is how
+many points *fit the image*: `track!` skips a point whose chip or search window falls outside it, and the old
+rule's nodes were ~115 px from where they belonged, pushing some out of bounds. Counted per level:
+
+| level | searchable | fit the image, old rule | fit, cell mean |
+|---|---:|---:|---:|
+| chip 192 | 474,845 | 466,010 (98.1%) | **472,340 (99.5%)** |
+| chip 384 | 119,615 | 116,901 (97.7%) | **118,848 (99.4%)** |
+| chip 768 | 30,337 | 30,007 (98.9%) | **30,020 (99.0%)** |
+
+So about 8,000 coarse points per run were being silently skipped for being out of bounds at a position they
+should never have had, and the correlator now does that work. Both helpers are type-stable (`Float64`) and
+`_cell_mean` allocates nothing, so there is no optimization to make here — the cost is the correlation, not
+the averaging.
+
+Tests pass 704,367/704,367. Two assertions in `test/multichip.jl` were updated: one asserted the node sits at
+a fixed offset from its cell's first point, which is the rule that was wrong, and is now stated as the cell
+mean plus the snap; the other now also pins the fill-straddling behaviour so the matched-not-endorsed choice
+is covered.
+
+### Is the reference correct? No — and we now mirror two of its errors
+
+Tested independently of AutoRIFT.jl, on synthetic grids and on the L1 grid, by calling OpenCV directly.
+
+**1. A coarse node on a footprint-edge cell is placed at a coordinate that is not in the data.** `INTER_AREA`
+averages the whole cell, so a cell that is part nodata fill yields a coordinate pulled toward the fill
+constant. On a synthetic grid with a diagonal boundary, every straddling cell's node lands outside the range
+its real coordinates span. On the L1 grid:
+
+| level | straddling cells | node outside the real data | of those, the reference searches |
+|---|---:|---:|---:|
+| chip 384 | 15,614 | 15,458 (99.0%) | 4,962 |
+| chip 768 | 7,141 | 6,728 (94.2%) | 3,967 |
+
+At chip 768 that is **87.2% of the reference's 4,585 searched nodes** sitting on a straddling cell. The
+correlator is then pointed at a place the grid does not describe.
+
+**2. It is internally inconsistent on exactly those cells.** `INTER_AREA` puts the node at the cell *mean*
+while `INTER_CUBIC` reads it back from the cell's geometric *centre* — the same position only when the cell is
+uniform. Measured on the L1 chip-768 lattice, in grid coordinates:
+
+| population | n | correlate-vs-readback gap |
+|---|---:|---:|
+| fill-free cells | 556 | **0.25 px** — self-consistent |
+| straddling cells | 4,029 | **1,865 px** median, up to 27,538 |
+
+So the reference measures at one place and attributes the answer to another, by a median of nearly two
+thousand pixels, on 88% of the nodes its coarsest level searches. An earlier section here concluded the
+reference "is self-consistent, and a coarse residual cannot be charged to it disagreeing with itself" — that
+was measured on fill-free cells only and is correct only there.
+
+**3. Its snap assumes its own grid convention** (above), which is a latent defect rather than an active one,
+since its grid always satisfies the assumption.
+
+**What this means for the golden work.** Matching the reference on (1) and (2) was still the right move: they
+are properties of its *grid*, so a difference there desynchronizes everything downstream and makes every other
+comparison unreadable — which is exactly what the 115.5 px offset was doing. But both are now on the
+matched-not-endorsed register, and both have the same fix as item 0: **mask the input** so a chip whose
+footprint is not sufficiently inside the valid region is never correlated. That removes the straddling cells
+from the problem rather than arguing about how to average them, and it is a correctness improvement neither
+implementation currently has.

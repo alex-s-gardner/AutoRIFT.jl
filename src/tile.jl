@@ -176,7 +176,7 @@ Pixels past its own grid point that the coarsest level's correlation reaches, fr
 centre.
 
 A decimated level correlates at the centre of each `stride`-by-`stride` cell rather than at the cell's
-first grid point (see `AutoRIFT._cell_centres`), which is up to `(stride - 1) / 2` cells further along
+first grid point (see `AutoRIFT._cell_means`), which is up to `(stride - 1) / 2` cells further along
 each axis. A halo derived from grid points alone is short by that much, and a block would read too
 little to reproduce the untiled run — visible only as a last-bits difference in the peak height at
 points near a block seam, since the displacement itself survives a slightly different transform.
@@ -184,7 +184,7 @@ points near a block seam, since the displacement itself survives a slightly diff
 Taken over every level rather than at `chip_size_max`, because the stride is set by the chip-to-spacing
 ratio and it is the *largest* offset that has to fit, whichever level produces it.
 
-Half a pixel is added for the parity snap `AutoRIFT._cell_centres` applies, which can move a centre
+Half a pixel is added for the parity snap `AutoRIFT._cell_means` applies, which can move a node
 that much further out again.
 """
 function _level_centre_offset(p::Params)
@@ -329,7 +329,7 @@ const EPS_RATE = 1e-9
 # footprint is rotated within its bounding box. Such a grid is mostly fill — 65% of both NISAR grids — and
 # this cannot know the fill convention, since they pad with zeros rather than `NaN` and a finiteness test
 # finds nothing. Restricting to searchable pairs excludes fill by construction instead of by guessing a
-# sentinel, and it is the right restriction on its own terms: an unsearchable point is never correlated, so
+# fill value, and it is the right restriction on its own terms: an unsearchable point is never correlated, so
 # its coordinate does not constrain a block.
 #
 # Both alternatives were measured and both fail, in opposite directions:
