@@ -508,6 +508,60 @@ alone suggests. On L2 the highest-amplification row measured is also the fastest
 reading is cheap next to leaving threads idle, so the halo tells you the smallest block you may use and
 the thread count tells you which of the permitted sizes to pick.
 
+## A disk-backed pair is read once, not a window per pass
+
+Every sweep above reads from memory or a memory-mapped file, where a read is a page touch and the
+amplification column is about the halo. Reading from a **file** makes the same amplification a decode,
+and the halo is then the smaller half of it.
+
+A block reads its window once *per pass*, and a three-level run makes six — a coarse and a fine pass at
+each chip size. So the volume is a multiple of the sum of the read windows, not the sum itself. Measured
+on a 15901×13435 Landsat 8 GeoTIFF pair (`UInt16`, 0.40 GiB for the pair):
+
+| block | blocks | one pass's windows | whole run | vs one pass |
+|---|---:|---:|---:|---:|
+| 512 px | 924 | 0.96× the scene | 4.41× | 4.6× |
+| 1024 px | 238 | 0.74× | 3.60× | 4.9× |
+| 2048 px | 63 | 0.66× | 3.37× | 5.1× |
+
+The halo contributes the amount by which one pass exceeds 1.0× — which at these block sizes is nothing,
+since the grid does not cover the scene's margins. Almost all of the redundancy is the repeat across
+passes, and **no block size removes it**: a larger block reads less per pass but still reads several
+times. Fewer than six, because a coarse pass sweeps a strided subset of the blocks and a level whose
+points a finer one resolved may not run at all.
+
+**A pair whose own bytes are less than that can be read once instead.** `cache_budget = :auto` compares
+the two volumes — the pair's bytes against the sum of the read windows times the passes — and caches when
+the first is smaller, capped at an eighth of `Sys.free_memory()`, divided by the thread count when
+`threaded = false` since that is the batch shape where each pair's task decides for itself. Both figures
+follow from the scene and the block layout, so the decision is taken before anything is read.
+
+At 10 threads, one process per arm so each peak belongs to that arm alone:
+
+| block | windowed | cached | windowed peak | cached peak |
+|---|---:|---:|---:|---:|
+| 512 px | 15.2 s | **13.5 s** | 3.56 GiB | 4.16 GiB |
+| 1024 px | 14.0 s | 13.6 s | 3.56 GiB | 4.07 GiB |
+| 2048 px | 14.1 s | 14.1 s | 4.17 GiB | 4.29 GiB |
+
+**The gain is the smallest block's, and it is gone by 2048 px** — a larger block reads less to begin
+with, so there is less for caching to remove, and a block large enough to amortize its halo reaches the
+same runtime without holding the pair. Where caching earns its place is a block size forced small by
+something else, or a scene read over a network.
+
+What it costs is the raw pair: 0.5–0.6 GiB here against a 0.40 GiB pair, the excess being the read's
+own transient. Raw, not filtered — at `UInt16` input the raw pair is half the `Float32` pair an untiled
+run would hold, and a quarter at `UInt8`. `dx`/`dy` are identical either way, 0 of 3,653,760 points
+differing at all three block sizes, since where the raw pixels came from does not reach the correlation.
+
+**There is no partial cache worth sizing.** A blocked run sweeps every block once per pass, so a chunk's
+next use is a whole sweep away and a cache below the working set has evicted it by then. Replaying the
+actual chunk requests through LRU at block 1024 — 485 chunks touched, 121 MiB — gives 3.4× the scene at
+half the working set and 5.7× at a twentieth, falling below 1× only at the whole of it. The step is the
+access order, not the policy: random replacement holds 5.6× where LRU holds 6.0× at the same capacity.
+Nor can the cache be narrowed to the region actually touched, which is sparse — 475 of the 725 chunks in
+its own bounding box.
+
 ## Transform sizes are already quantized, and coarsening costs more than it saves
 
 The count of distinct FFT sizes a NISAR pass plans looks alarming until it is measured properly. Distinct
@@ -547,6 +601,12 @@ worse.
   Peak falls monotonically as blocks shrink; runtime does not. On NISAR L1 the lowest peak is
   `(2816, 1536)` at 0.49× untiled while the fastest blocked row is `4096` square, 13% quicker for 3 GiB
   more. Pick by which resource binds.
+- **Budget for the raw pair on top of the blocks when the input is a file.** A pair cheaper to read whole
+  than window is read once, which costs its own bytes of peak and buys 11% of the runtime at 512 px and
+  nothing at 2048 — a large enough block gets there without the memory. Nothing to enable; `cache_budget
+  = nothing` declines it, and a count overrides the automatic choice on a machine where free memory is a
+  poor guide. **To keep the raw pair off the heap entirely, memory-map it** — a resident input is never
+  copied, and the kernel can then reclaim its pages under pressure where an `Array` cannot.
 - **Size the two axes separately against `halo(grid, p, size)`.** A block below its own halo is rejected,
   and the halo need not be square: L2's is 2216×1103, so `(2304, 1152)` follows it and beats
   `(3072, 3072)` on peak, runtime and occupancy at once. That is the floor, not the target.

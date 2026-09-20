@@ -450,6 +450,9 @@ DiskArrays.eachchunk(a::CountingDisk) = DiskArrays.GridChunks(a.size, (256, 256)
 # Values are a deterministic function of position, so nothing is stored and the "file" is free.
 _disk_value(::Type{T}, i, j, seed) where {T} =
     T(0.5 + 0.4 * sin(i * 0.03 + seed) * cos(j * 0.021 + seed))
+# A `Bool` file is a caller-supplied valid mask, and every pixel is valid: what such a mask costs to
+# read is the point of it, not which pixels it excludes.
+_disk_value(::Type{Bool}, i, j, seed) = true
 function DiskArrays.readblock!(a::CountingDisk{T}, dest, r::AbstractUnitRange...) where {T}
     a.calls += 1
     n = prod(length.(r))
@@ -477,23 +480,60 @@ function DiskArrays.readblock!(a::CountingStripe{T}, dest, r::AbstractUnitRange.
     return nothing
 end
 
-@testset "a blocked run never reads the whole scene" begin
-    # The claim `process_block_size` exists to make: peak memory tracks the block, not the scene. A
-    # resident array cannot demonstrate it — the scene is already in memory — so the input here is
-    # one that only materializes what is asked for.
+@testset "a blocked run reads a disk-backed scene once" begin
+    # A resident array cannot demonstrate anything about reading — it is already in memory — so the
+    # input here is one that only materializes what is asked for, and counts it.
+    n = 512
+    bs = (256, 256)                      # pixels, so 8 grid points at this spacing
+    opts = (; chip_size = 32, chip_size_max = 32, grid_spacing = 32, search_radius = 12,
+            process_block_size = bs)
+    a = CountingDisk{Float32}((n, n), 1)
+    b = CountingDisk{Float32}((n, n), 2)
+    lazy = autorift(a, b; opts...)
+
+    # Once, and exactly once. Windowed reads would be 2-9x this: a block reads its own extent grown
+    # by the halo, and does it again for every pass of every chip size.
+    for img in (a, b)
+        @test img.calls >= 1
+        @test img.elements == n * n
+    end
+
+    # The mask is not read at all, because it is derived: `isfinite` over the array now in memory is
+    # the same answer the file would give. Defaulted here, which is the common case — a caller's own
+    # mask is data the imagery does not carry and is read like it.
+    pair = AutoRIFT.ImagePair(a, b)
+    @test AutoRIFT.ondisk(pair.reference_valid)
+    @test AutoRIFT._ondisk_bytes(pair) == 2 * n * n * sizeof(Float32)
+    prefetched = AutoRIFT._prefetched(pair, typemax(Int), AutoRIFT.params(; chip_size = 32))
+    @test !AutoRIFT.ondisk(prefetched.reference)
+    @test prefetched.reference_valid isa AutoRIFT.FiniteMask
+    @test prefetched.reference_valid.parent === prefetched.reference
+
+    # And the answer is the one a resident array gives, so reading up front is not a different
+    # computation. Compared against the run above rather than repeating it.
+    resident_ref = [_disk_value(Float32, i, j, 1) for i in 1:n, j in 1:n]
+    resident_sec = [_disk_value(Float32, i, j, 2) for i in 1:n, j in 1:n]
+    assert_same_result(autorift(resident_ref, resident_sec; opts...), lazy, "lazy equals resident")
+end
+
+@testset "a pair too large to hold is read window by window" begin
+    # The fallback, which is what a scene larger than the machine takes: no array the size of it is
+    # formed at any point, and the answer is the same. `correlate_tiled` is the path that never
+    # prefetches — it correlates the pair it is given — so it is what the budget selects when the
+    # pair does not fit, and what this asserts against.
     n = 512
     p = AutoRIFT.params(; chip_size = 32, chip_size_max = 32, grid_spacing = 32,
                         search_radius = 12)
     a = CountingDisk{Float32}((n, n), 1)
     b = CountingDisk{Float32}((n, n), 2)
     grid = AutoRIFT._build_grid((n, n), p)
-    bs = (256, 256)                      # pixels, so 8 grid points at this spacing
+    bs = (256, 256)
     layout = AutoRIFT.block_layout(grid, p, (n, n), bs)
+    pair = AutoRIFT.ImagePair(a, b)
 
-    opts = (; chip_size = 32, chip_size_max = 32, grid_spacing = 32, search_radius = 12,
-            process_block_size = bs)
-    lazy = autorift(a, b; opts..., reference_valid = trues(n, n),
-                    secondary_valid = trues(n, n))
+    # A budget below the pair's bytes keeps the pair as given — identically, not as a copy.
+    @test AutoRIFT._prefetched(pair, AutoRIFT._ondisk_bytes(pair) - 1, p) === pair
+    windowed = AutoRIFT.correlate_tiled(pair, grid, p, bs)
 
     # No single read is scene-sized: every read is a block's window or a chunk of one.
     largest_window = maximum(length(blk.read_rows) * length(blk.read_cols)
@@ -504,17 +544,201 @@ end
         @test img.widest < n * n                  # so the scene is never materialized at once
     end
 
-    # The halo is read more than once, by construction — that is the cost blocking pays. Bounded by
-    # the sum of the read windows, which is what the layout promises.
+    # More than the scene, because each block reads a halo its neighbour also reads — the cost the
+    # prefetch above exists to remove. A whole number of sweeps of the layout's windows, and no more
+    # sweeps than there are passes: `_windowed_bytes` is an upper bound, and this is what makes it one.
     total_window = sum(length(blk.read_rows) * length(blk.read_cols) for blk in layout.blocks)
-    @test a.elements <= total_window
-    @test a.elements > n * n                      # strictly more than the scene: the halo overlap
+    sweeps = 2 * length(AutoRIFT.chip_sizes(p))
+    @test a.elements > n * n
+    @test a.elements % total_window == 0
+    @test a.elements <= total_window * sweeps
+    @test AutoRIFT._windowed_bytes(pair, layout, p) >= a.elements * sizeof(Float32) +
+                                                      b.elements * sizeof(Float32)
 
-    # And the answer is the one a resident array gives, so the windowed read is not a different
-    # computation. Compared against the run above rather than repeating it.
+    # One read per window, not two. The default valid mask above is the image's own finiteness, so a
+    # block computes it from the window in hand; a mask over separate storage is data the imagery does
+    # not carry, and reads every window again. That second read is what the default must not do, and
+    # the run below is the measurement of what it would cost: the same windows, a third time over.
+    own_r = CountingDisk{Float32}((n, n), 1)
+    own_s = CountingDisk{Float32}((n, n), 2)
+    own_m = CountingDisk{Bool}((n, n), 3)
+    AutoRIFT.correlate_tiled(AutoRIFT.ImagePair(own_r, own_s; reference_valid = own_m), grid, p, bs)
+    @test own_r.elements == a.elements                  # the imagery read is unchanged...
+    @test own_m.elements == a.elements                  # ...and the mask adds a full pass of its own
+    @test AutoRIFT._windowed_bytes(AutoRIFT.ImagePair(a, b; reference_valid = own_m), layout, p) >
+          AutoRIFT._windowed_bytes(pair, layout, p)     # which the estimate charges and the default not
+
     resident_ref = [_disk_value(Float32, i, j, 1) for i in 1:n, j in 1:n]
     resident_sec = [_disk_value(Float32, i, j, 2) for i in 1:n, j in 1:n]
-    assert_same_result(autorift(resident_ref, resident_sec; opts...), lazy, "lazy equals resident")
+    assert_same_result(autorift(resident_ref, resident_sec; chip_size = 32, chip_size_max = 32,
+                                grid_spacing = 32, search_radius = 12),
+                       windowed, "windowed equals resident")
+end
+
+@testset "what a prefetch will hold is known before it runs" begin
+    # The decision has to be takeable without touching the imagery, or a scene too large for the
+    # machine would have to be read to find that out.
+    n = 64
+    a = CountingDisk{Float32}((n, n), 1)
+    b = CountingDisk{Float32}((n, n), 2)
+    pair = AutoRIFT.ImagePair(a, b; reference_valid = trues(n, n), secondary_valid = trues(n, n))
+    # The images, and not the caller's own masks: those are already in memory.
+    @test AutoRIFT._ondisk_bytes(pair) == 2 * n * n * sizeof(Float32)
+    # One image on disk, and a mask derived from it adds nothing: it is rebuilt over the prefetched
+    # image rather than materialized, so it stores no bytes of its own.
+    @test AutoRIFT._ondisk_bytes(AutoRIFT.ImagePair(zeros(Float32, n, n), b)) ==
+          n * n * sizeof(Float32)
+    # Nothing on disk means nothing to decide, and the pair is returned as it came.
+    dense = AutoRIFT.ImagePair(zeros(Float32, n, n), ones(Float32, n, n))
+    @test AutoRIFT._ondisk_bytes(dense) == 0
+    @test AutoRIFT._prefetched(dense, typemax(Int), AutoRIFT.params(; chip_size = 16)) === dense
+    @test a.calls == 0                             # and none of the above read anything
+
+    # A slab read is the whole array however it is split, and a serial run takes one slab.
+    p_ser = AutoRIFT.params(; chip_size = 16, threaded = false)
+    p_thr = AutoRIFT.params(; chip_size = 16, threaded = true)
+    want = [_disk_value(Float32, i, j, 1) for i in 1:n, j in 1:n]
+    @test AutoRIFT._slab_read(a, p_ser) == want
+    @test a.calls == 1                             # one slab, one read
+    @test AutoRIFT._slab_read(a, p_thr) == want
+    # A mask read the same way, since a caller's mask over a file is not derivable from the imagery.
+    @test AutoRIFT._slab_read(AutoRIFT.FiniteMask(a), p_thr) == map(isfinite, want)
+end
+
+@testset "the automatic budget compares two read volumes" begin
+    # Both volumes are computable from geometry, so the decision is a property of the scene and the
+    # layout rather than of the machine — every case below holds whatever memory happens to be free.
+    n = 1024
+    p = AutoRIFT.params(; chip_size = 32, chip_size_max = 32, grid_spacing = 32, search_radius = 12)
+    pair = AutoRIFT.ImagePair(CountingDisk{Float32}((n, n), 1), CountingDisk{Float32}((n, n), 2))
+    pairbytes = 2 * n * n * sizeof(Float32)
+    @test AutoRIFT._ondisk_bytes(pair) == pairbytes
+
+    # A grid covering the scene reads every block once per sweep, which outweighs one read of the pair.
+    full = AutoRIFT.block_layout(AutoRIFT._build_grid((n, n), p), p, (n, n), (256, 256))
+    @test AutoRIFT._windowed_bytes(pair, full, p) > pairbytes
+    # `free` fixed, so what this asserts is the comparison rather than the machine it ran on.
+    @test AutoRIFT._auto_cache_budget(pair, full, p; free = typemax(Int)) == pairbytes
+
+    # A small area of interest in a large file is the other way round: only the blocks holding points
+    # are read at all, so windowing those costs less than reading the whole pair would.
+    aoi = AutoRIFT.block_layout(
+        AutoRIFT.gridpoints(100.0:32.0:300.0, 100.0:32.0:300.0; chip_size = 32, search_radius = 12),
+        p, (n, n), (256, 256))
+    @test AutoRIFT._windowed_bytes(pair, aoi, p) < pairbytes
+    @test AutoRIFT._auto_cache_budget(pair, aoi, p; free = typemax(Int)) == 0
+
+    # The windowed figure counts a caller's own mask, which is read per block, and not one derived
+    # from its image, which `_block_pair!` computes from the window already read.
+    masked = AutoRIFT.ImagePair(pair.reference, pair.secondary;
+                                reference_valid = CountingDisk{Bool}((n, n), 3))
+    @test AutoRIFT._windowed_bytes(masked, full, p) > AutoRIFT._windowed_bytes(pair, full, p)
+
+    # Free memory is a ceiling on the answer, never the criterion: a pair that should be cached is
+    # not when the machine cannot hold it, and the windowed reads are the fallback. An eighth, so a
+    # run competes for a share of what is free rather than the last of it.
+    thr = AutoRIFT.params(; chip_size = 32, chip_size_max = 32, grid_spacing = 32,
+                          search_radius = 12, threaded = true)
+    @test AutoRIFT._auto_cache_budget(pair, full, thr; free = 8 * pairbytes) == pairbytes
+    @test AutoRIFT._auto_cache_budget(pair, full, thr; free = 8 * pairbytes - 1) == 0
+
+    # A serial run divides that share by the thread count, because that is the batch shape `autorift!`
+    # documents: one pair per task, up to `nthreads` at once, each deciding with no view of the others.
+    # `p` is serial, `threaded = false` being the default.
+    nt = Threads.nthreads()
+    @test AutoRIFT._auto_cache_budget(pair, full, p; free = 8 * pairbytes * nt) == pairbytes
+    nt > 1 && @test AutoRIFT._auto_cache_budget(pair, full, p; free = 8 * pairbytes) == 0
+
+    @test pair.reference.calls == 0                # none of the above read anything
+end
+
+@testset "cache_budget chooses between the two read strategies" begin
+    n = 512
+    opts = (; chip_size = 32, chip_size_max = 32, grid_spacing = 32, search_radius = 12,
+            process_block_size = (256, 256))
+    pairbytes = 2 * n * n * sizeof(Float32)
+    mk() = (CountingDisk{Float32}((n, n), 1), CountingDisk{Float32}((n, n), 2))
+
+    # `:auto` is the default, so passing it explicitly must not change what a run reads.
+    a, b = mk()
+    auto = autorift(a, b; opts...)
+    @test a.elements == n * n
+    a2, b2 = mk()
+    assert_same_result(autorift(a2, b2; opts..., cache_budget = :auto), auto, "explicit :auto")
+    @test a2.elements == n * n
+
+    # A budget above the pair reads it once; one below it keeps the windowed reads. The boundary is
+    # the pair's own bytes, since the cache holds the whole pair or none of it.
+    a3, b3 = mk()
+    autorift(a3, b3; opts..., cache_budget = pairbytes)
+    @test a3.elements == n * n
+    a4, b4 = mk()
+    windowed = autorift(a4, b4; opts..., cache_budget = pairbytes - 1)
+    @test a4.elements > n * n
+
+    # `nothing` is that fallback named, and the answer does not depend on which strategy ran.
+    a5, b5 = mk()
+    assert_same_result(autorift(a5, b5; opts..., cache_budget = nothing), auto, "cache_budget = nothing")
+    @test a5.elements == a4.elements
+    assert_same_result(windowed, auto, "windowed equals cached")
+
+    # Written as a float, which is how a fraction of memory arrives.
+    a6, b6 = mk()
+    autorift(a6, b6; opts..., cache_budget = 1.0e9)
+    @test a6.elements == n * n
+
+    @test_throws "must be a finite, non-negative number of bytes" autorift(mk()...; opts...,
+                                                                          cache_budget = -1)
+    @test_throws "`cache_budget = :some` is not a choice" autorift(mk()...; opts...,
+                                                                  cache_budget = :some)
+    @test_throws "must be a number of bytes" autorift(mk()...; opts..., cache_budget = "1GB")
+
+    # The cache carries the budget, so a pair swapped in later is read the way the first one was
+    # rather than the way this machine's free memory happens to suggest at that moment.
+    a7, b7 = mk()
+    cache = AutoRIFT.init(a7, b7; opts..., cache_budget = nothing)
+    @test cache.runner.cache_budget == 0
+    autorift!(cache)
+    a8, b8 = mk()
+    AutoRIFT.reinit!(cache; reference = a8, secondary = b8)
+    @test cache.runner.cache_budget == 0
+    autorift!(cache)
+    @test a8.elements == a4.elements               # still windowed, as the first pair was
+end
+
+@testset "an unblocked run refuses disk-backed input" begin
+    # The unblocked path filters the scene rather than reading windows, and its box filters accumulate
+    # elementwise — so a disk-backed image is read one pixel at a time, each read decompressing a whole
+    # chunk. On a 15901x13435 GeoTIFF pair that does not finish: 74 minutes and 1.7e9 allocations,
+    # still inside the first image's filter. Nothing about the run says so, which is why it must fail
+    # at the call rather than run.
+    n = 256
+    opts = (; chip_size = 16, chip_size_max = 16, grid_spacing = 16, search_radius = 8)
+    a = CountingDisk{Float32}((n, n), 1)
+    b = CountingDisk{Float32}((n, n), 2)
+    @test AutoRIFT.ondisk(a)                                  # the extension's method is loaded
+    @test !AutoRIFT.ondisk(zeros(Float32, 4, 4))              # and a plain array is not disk-backed
+
+    # Every unblocked entry point, since each reaches `_prepare` by a different route. The counter
+    # proves the refusal is not a slow success: no read happens at all.
+    grid = AutoRIFT._build_grid((n, n), AutoRIFT.params(; opts...))
+    @test_throws "still on disk" autorift(a, b; opts...)
+    @test_throws "still on disk" autorift(a, b, grid; opts...)
+    @test_throws "still on disk" autorift(a, b, AutoRIFT.params(; opts...))
+    @test_throws "still on disk" AutoRIFT.init(a, b; opts...)
+    @test a.calls == 0
+
+    # A scattered point set has no block layout, so blocking cannot rescue it — the error names the
+    # same cause, and `read` is the way out.
+    @test_throws "still on disk" autorift(a, b, AutoRIFT.scatter(grid); opts...)
+
+    # The message names both remedies, and both work. Blocking reads windows;
+    blocked = autorift(a, b; opts..., process_block_size = (128, 128))
+    @test a.calls > 0
+    # and materializing first is the same computation, which is what makes the advice honest.
+    dense_a = [_disk_value(Float32, i, j, 1) for i in 1:n, j in 1:n]
+    dense_b = [_disk_value(Float32, i, j, 2) for i in 1:n, j in 1:n]
+    assert_same_result(autorift(dense_a, dense_b; opts...), blocked, "materialized equals blocked")
 end
 
 # ---------------------------------------------------------------------------
@@ -613,7 +837,7 @@ end
     b = CountingDisk{Float32}((n, n), 2)
     dims2 = (Y(1:n), X(1:n))
     ra, rb = Raster(a, dims2), Raster(b, dims2)
-    @test ext._ondisk(ra)
+    @test AutoRIFT.ondisk(ra)
     # The default is `HALO_BLOCKS` halos, rounded up to a whole number of the file's chunks: blocking at
     # the chunk size alone reads 2x2 chunks per block because of the halo, so every chunk is decoded
     # several times over. Measured 4.99 s at 256 against 3.48 s at 768 on real imagery.
@@ -636,10 +860,12 @@ end
     @test ext._blocks((64, 64), ra, rb, pblk) == (64, 64)
     mem = Raster(zeros(Float32, 8, 8), (Y(1:8), X(1:8)))
     @test ext._blocks(nothing, mem, mem, pblk) === nothing
-    @test !ext._ondisk(mem)
+    @test !AutoRIFT.ondisk(mem)
 
     autorift(ra, rb; chip_size = 16, chip_size_max = 16, grid_spacing = 16, search_radius = 8)
-    # Windowed, not one read of the scene: the whole point of the default.
-    @test a.calls > 1
-    @test a.widest < n * n
+    # The run completing at all is the assertion that it blocked: the unblocked path refuses
+    # disk-backed input. A pair this size fits the prefetch budget, so the file is read exactly once
+    # rather than a window per block per pass.
+    @test a.elements == n * n
+    @test b.elements == n * n
 end

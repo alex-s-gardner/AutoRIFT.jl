@@ -188,6 +188,10 @@ const PUBLIC_NAMES = (
     :ImageElement, :preprocess, :valid, :replace_nonfinite, :highpass, :highpass!, :wallis,
     :wallis_gapfill, :decibel, :sobel, :laplacian, :deramp, :ramp_phase,
     :FiniteMask, :resident,
+    # Whether a read costs I/O. Public because it is an extension point: a disk-backed array type
+    # neither `AutoRIFTDiskArraysExt` nor `AutoRIFTRastersExt` recognizes needs a method here to be
+    # kept off the unblocked path.
+    :ondisk,
     # Post-processing steps a caller may want on their own.
     :reject_outliers, :outlier_filter, :dilate_within, :small_components, :resample, :resample!,
     :Nearest, :Area, :Bicubic, :window, :relax, :rescale,

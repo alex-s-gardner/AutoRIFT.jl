@@ -71,6 +71,8 @@ All of [`AutoRIFT.params`](@ref)'s, plus:
 - `reference_valid`, `secondary_valid`: per-pixel validity masks, as arrays or rasters.
 - `process_block_size`: `(X, Y)` pixels per block. Defaults to a halo-derived size, rounded up to the
   rasters' own chunking, for file-backed input; `nothing` — one block — for input already in memory.
+- `cache_budget = :auto`: bytes of file-backed imagery the run may hold in memory, or `nothing` to
+  read a window per block per pass instead. See [`AutoRIFT.autorift`](@ref).
 
 ```julia
 using AutoRIFT, Rasters, ArchGDAL, Dates
@@ -92,16 +94,23 @@ out = autorift(a, b; grid_spacing = 8, threaded = true)
 ```
 
 Two things happen automatically, and both matter on a scene large enough to care about. The run is
-**blocked**, so no array the size of the scene is formed — a block reads its own window and nothing
-else. And **nodata becomes mask rather than number**: a GDAL raster's
-`missingval` marks pixels that are excluded from correlation instead of being read as a dark
-measurement, which is what reading a `-9999` fill would amount to.
+**blocked**, so the filtered scene — `Float32`, and what an unblocked run holds resident — is never
+formed; a block filters its own read window and nothing else. And **nodata becomes mask rather than
+number**: a GDAL raster's `missingval` marks pixels that are excluded from correlation instead of being
+read as a dark measurement, which is what reading a `-9999` fill would amount to.
+
+The *raw* pair is read into memory once when doing so reads less than windowing it would — a block's
+window is otherwise read once per pass, and a three-level run makes six of those. Both volumes follow
+from the scene and the block layout, so the decision is taken before anything is read; `cache_budget`
+overrides it either way. See `AutoRIFT.autorift`'s `cache_budget` and `docs/memory.md`.
 
 The answer is **bit-identical** to the same pair materialized, at any block size; the tests assert
 that on all five layers, since a windowed read that computed something subtly different would be
-worse than one that was merely slow. Measured on a Landsat 8/9 pair over Jakobshavn — 17121x16961,
-4.48 M grid points — reading from the two GeoTIFFs peaks at **2.2 GiB against 7.0 GiB** for the same
-run from memory.
+worse than one that was merely slow. Measured on a Landsat 8/9 pair over Jakobshavn — 17121x16961
+`Float32`, 4.48 M grid points, 10 threads — reading from the two GeoTIFFs peaks at **5.4 GiB against
+9.0 GiB** for the same run from memory, in 41.3 s against 39.4 s. Both measure the same 915,488 points.
+The gap is smaller than the raw pair, because the lazy run holds that pair too; a `UInt16` or `UInt8`
+scene, which is what Landsat level-1 imagery ships as, holds a half or a quarter as much.
 
 !!! note "Sign convention"
     `vx` and `vy` are **feature motion in map orientation**: `+vx` points east, `+vy` north. Both
@@ -122,8 +131,8 @@ function AutoRIFT.autorift(reference::AbstractRaster, secondary::AbstractRaster;
     _check_crs(reference, secondary)
 
     # A file-backed raster is correlated where it lies: nodata becomes mask rather than number, and the
-    # run is blocked so no array the size of the scene is formed. Both are no-ops for a raster already
-    # in memory, so this path is the same computation either way — see `_ondisk` and `_blocks`.
+    # run is blocked so the filtered scene is never formed. Both are no-ops for a raster already in
+    # memory, so this path is the same computation either way — see `AutoRIFT.ondisk` and `_blocks`.
     rimg, rvalid = _lazy_input(reference, DDExt.unwrap(reference_valid))
     simg, svalid = _lazy_input(secondary, DDExt.unwrap(secondary_valid))
     # `params` resolved here as well as inside the core: the block size depends on the halo, which
@@ -156,10 +165,14 @@ end
 
 # Whether `r`'s data is still on disk.
 #
-# `DiskArrays.isdisk` rather than a trait test of our own: it is the predicate Rasters itself uses for
-# this question, and it follows the property that matters — does a read cost I/O — rather than a list of
-# backend types to keep up to date.
-_ondisk(r::AbstractRaster) = DiskArrays.isdisk(parent(r))
+# A `Raster` subtypes neither `AbstractDiskArray` nor anything else `AutoRIFTDiskArraysExt` can match,
+# so it needs its own method — and `DiskArrays.isdisk` is what answers it: the predicate Rasters itself
+# uses for this question, following the property that matters (does a read cost I/O) rather than a list
+# of backend types to keep up to date.
+#
+# The core's unblocked-path guard and the block-size default below both read this, so they cannot
+# disagree about what "on disk" means.
+AutoRIFT.ondisk(r::AbstractRaster) = DiskArrays.isdisk(parent(r))
 
 # The array and validity mask to hand the core.
 #
@@ -238,6 +251,13 @@ Base.@propagate_inbounds Base.getindex(m::_NotFill, r::AbstractUnitRange, c::Abs
 Base.@propagate_inbounds Base.getindex(m::_Both, r::AbstractUnitRange, c::AbstractUnitRange) =
     m.a[r, c] .& m.b[r, c]
 
+# Both read their parents, so both are on disk exactly when a parent is — and a nodata mask over a
+# file is on disk while subtyping nothing that says so. Without these a blocked run over a raster that
+# declares nodata reads a window of the mask from the file for every block of every pass, whatever it
+# does with the imagery.
+AutoRIFT.ondisk(m::_NotFill) = AutoRIFT.ondisk(m.parent)
+AutoRIFT.ondisk(m::_Both) = AutoRIFT.ondisk(m.a) || AutoRIFT.ondisk(m.b)
+
 # The block size to correlate at, when the caller did not choose one.
 #
 # A caller's choice always wins, and an in-memory pair keeps `nothing` — the untiled path — so nothing
@@ -265,7 +285,7 @@ const MIN_BLOCK = 256
 
 function _blocks(supplied, reference::AbstractRaster, secondary::AbstractRaster, p)
     isnothing(supplied) || return supplied
-    (_ondisk(reference) && _ondisk(secondary)) || return nothing
+    (AutoRIFT.ondisk(reference) && AutoRIFT.ondisk(secondary)) || return nothing
     cr = DiskArrays.approx_chunksize(DiskArrays.eachchunk(parent(reference)))
     cs = DiskArrays.approx_chunksize(DiskArrays.eachchunk(parent(secondary)))
     # `approx_chunksize` reports one entry per dimension; a `Raster` here is 2-D by `check_aligned`.

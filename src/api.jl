@@ -90,12 +90,13 @@ the FFT plans are then built once rather than per pair. For a single pair, call
 """
 function CommonSolve.init(reference::AbstractMatrix, secondary::AbstractMatrix;
               reference_valid = nothing, secondary_valid = nothing,
-              process_block_size = nothing, kwargs...)
+              process_block_size = nothing, cache_budget = :auto, kwargs...)
     p = params(; kwargs...)
     raw = ImagePair(reference, secondary; reference_valid, secondary_valid)
     # Before the grid and the plans, so a filter that cannot run on this element type is an error at
     # the call that configured it rather than at the first correlation.
     _check_preprocess(eltype(raw), p.preprocess)
+    _check_cache_budget(cache_budget)
     bs = _block_size(process_block_size)
     # A blocked run filters each block from its own read window, so the filtered scene is never
     # formed — which is what bounds peak memory by the block rather than by the scene, and is the
@@ -107,7 +108,7 @@ function CommonSolve.init(reference::AbstractMatrix, secondary::AbstractMatrix;
     _warm_grid_plans(grid, p)
     # The layout is built here rather than at the first run, so a block size that cannot work is an
     # error at the call that set it. `block_layout` is what knows the halo, so it is what checks.
-    return Cache{typeof(p)}(p, raw, _runner(raw, grid, p, bs), grid, nothing, true)
+    return Cache{typeof(p)}(p, raw, _runner(raw, grid, p, bs, cache_budget), grid, nothing, true)
 end
 
 # `process_block_size` as an `Extent` of pixels, or `nothing` for one block.
@@ -222,12 +223,17 @@ end
 # correlates a filtered scene, while a blocked run filters each block from raw and so never forms
 # one. Pairing each pair with its runner here is what makes handing the blocked path a prepared pair
 # — a twice-filtered image — impossible to write.
-_runner(raw::ImagePair, ::PointSet{2}, p::Params, ::Nothing) = WholeScene(_prepare(raw, p))
+_runner(raw::ImagePair, ::PointSet{2}, p::Params, ::Nothing, _cache) = WholeScene(_prepare(raw, p))
 
-function _runner(raw::ImagePair, grid::PointSet{2}, p::Params, bs::Extent)
+function _runner(raw::ImagePair, grid::PointSet{2}, p::Params, bs::Extent, cache)
     layout = block_layout(grid, p, size(raw), bs)
-    buffers = istrue(p.threaded) ? nothing : block_buffers(raw, layout)
-    return Blocked(raw, layout, layout.blocks, buffers)
+    # After the layout, because `:auto` weighs the pair's bytes against the read volume these blocks
+    # imply. The resolved count is what `Blocked` carries, so a pair swapped in by `reinit!` is read
+    # the way this one was rather than re-deciding from a machine whose free memory has moved.
+    budget = _cache_budget(cache, raw, layout, p)
+    pair = _prefetched(raw, budget, p)
+    buffers = istrue(p.threaded) ? nothing : block_buffers(pair, layout)
+    return Blocked(pair, layout, layout.blocks, buffers, budget)
 end
 
 # The runner for a cache whose images have just changed.
@@ -242,8 +248,204 @@ _reinit_runner(old_runner::WholeScene, raw::ImagePair, old::ImagePair, p::Params
 # A blocked runner has nothing to refilter — that happens per block, inside the run — so it only has
 # to point at the new pair. The layout and buffers carry over: both are sized from the grid and the
 # image size, and `reinit!` rejects a change of image size.
-_reinit_runner(old_runner::Blocked, raw::ImagePair, ::ImagePair, ::Params) =
-    Blocked(raw, old_runner.layout, old_runner.blocks, old_runner.buffers)
+#
+# The new pair is read under the budget this cache was built with: it is a different pair on disk, so
+# the previous pair's reads buy nothing for it, and the caller's choice has to outlive the first pair.
+_reinit_runner(old_runner::Blocked, raw::ImagePair, ::ImagePair, p::Params) =
+    Blocked(_prefetched(raw, old_runner.cache_budget, p), old_runner.layout, old_runner.blocks,
+            old_runner.buffers, old_runner.cache_budget)
+
+# ---------------------------------------------------------------------------
+# Reading a disk-backed scene once instead of a window per pass
+# ---------------------------------------------------------------------------
+#
+# A blocked run reads each block's window from the input, and it does that once per pass — three chip
+# sizes, each with a coarse and a fine pass. Measured on a 15901x13435 GeoTIFF pair, a whole run's
+# read volume is 3.4-4.4x the scene at blocks of 512-2048 px while the sum of one pass's windows is
+# only 0.66-0.96x, so the redundancy is the repeat across passes rather than the halo overlap between
+# neighbours, and no block size removes it. Reading the scene up front removes it instead, at 10
+# threads:
+#
+#   block  windowed  prefetched
+#     512    15.2 s    13.5 s
+#    1024    14.0 s    13.6 s
+#    2048    14.1 s    14.1 s
+#
+# So the gain is the smallest block's, which is the one that reads most, and it is gone by 2048 px.
+# What the prefetch costs is its own bytes: peak 4.2 GiB against 3.6 GiB at blocks of 512 for a
+# 0.398 GiB pair. A block large enough to amortize its halo is the cheaper way to the same place, and
+# `cache_budget = nothing` is how a run declines the trade.
+#
+# What this does *not* change is the property `process_block_size` exists for: the filtered scene is
+# still never formed, since a block still filters its own read window. Where the raw pixels come from
+# is invisible to the correlation — a blocked run over a prefetched pair is bit-identical to the same
+# blocked run over the file, measured 0 of 3653760 points at blocks of 512, 1024 and 2048.
+
+# Slabs per thread. Per-slab cost varies with compression, so several per thread keeps the slowest
+# slab from setting the wall clock.
+const PREFETCH_SLABS_PER_THREAD = 4
+
+# The ceiling on an automatic budget, as a share of free memory.
+#
+# Not the criterion — `_auto_cache_budget` decides from the read volume the two strategies imply — but
+# the bound on it, so a machine with little memory free keeps the windowed reads rather than competing
+# for the last of it. A run that would benefit and does not fit is left to an explicit `cache_budget`,
+# where the caller has said they know what the machine can take.
+const PREFETCH_SHARE = 1 // 8
+
+# The pair to correlate: `raw` read into memory if that fits `budget` bytes, and `raw` itself otherwise.
+#
+# Decided from the bytes the prefetch would hold, which is exactly `_ondisk_bytes` — no image is
+# touched to arrive at it, so a scene too large for the budget costs nothing to reject and keeps the
+# windowed reads.
+function _prefetched(raw::ImagePair, budget::Integer, p::Params)
+    n = _ondisk_bytes(raw)
+    # Zero means the pair is already in memory, so there is nothing to read and nothing to decide.
+    (0 < n <= budget) || return raw
+    ref = _prefetch(raw.reference, p)
+    sec = _prefetch(raw.secondary, p)
+    return ImagePair(ref, sec,
+                     _prefetch_mask(raw.reference_valid, raw.reference, ref, p),
+                     _prefetch_mask(raw.secondary_valid, raw.secondary, sec, p))
+end
+
+# `cache_budget` as a byte count: what `_auto_cache_budget` decides for `:auto`, the caller's number if
+# they gave one, and 0 — cache nothing, window every read — for `nothing`.
+#
+# Resolved once per run rather than consulted per read, so a run cannot change its mind partway through
+# on a machine whose free memory is moving. Resolved where the layout is known, because `:auto` compares
+# against the read volume the blocks imply; `_check_cache_budget` is what runs at the entry point, so a
+# value that cannot work is still an error at the call that set it.
+_cache_budget(::Nothing, ::ImagePair, ::BlockLayout, ::Params) = 0
+_cache_budget(bytes::Real, ::ImagePair, ::BlockLayout, ::Params) = floor(Int, bytes)
+_cache_budget(::Symbol, raw::ImagePair, layout::BlockLayout, p::Params) =
+    _auto_cache_budget(raw, layout, p)
+
+# Whether this is a `cache_budget` at all, checked at the entry point rather than where it is resolved:
+# a blocked run resolves it only after the layout is built, and an unblocked one never resolves it, so
+# neither would report a bad value at the call that set it.
+_check_cache_budget(::Nothing) = nothing
+# `Real` rather than `Integer`: a budget is naturally written as `2e9` or `0.25 * Sys.total_memory()`.
+_check_cache_budget(bytes::Real) = (bytes >= 0 && isfinite(bytes)) ? nothing : throw(ArgumentError(
+    "`cache_budget` must be a finite, non-negative number of bytes, `nothing` to cache nothing up " *
+    "front, or `:auto` to decide from the scene's chunking. Got $bytes."))
+_check_cache_budget(s::Symbol) = s === :auto ? nothing : throw(ArgumentError(
+    "`cache_budget = :$s` is not a choice. Pass `:auto` to decide from the scene's chunking, a " *
+    "number of bytes to cap it, or `nothing` to cache nothing up front."))
+_check_cache_budget(x) = throw(ArgumentError(
+    "`cache_budget` must be a number of bytes, `nothing` to cache nothing up front, or `:auto` to " *
+    "decide from the scene's chunking. Got a $(typeof(x))."))
+
+# The automatic budget: enough for this pair when caching it reads less than windowing it would, and 0
+# otherwise, capped by what the machine has free.
+#
+# The comparison is between two read volumes, both computable from geometry before anything is read:
+#
+#   * cached — the pair's own bytes, `_ondisk_bytes`, read once.
+#   * windowed — every block's read window, once per pass. `_windowed_bytes` sums those.
+#
+# There is no interior optimum to find, which is why this decides between the two rather than sizing a
+# partial cache. A blocked run is a cyclic scan: it sweeps every block once per pass, so a chunk's next
+# use is a whole sweep away and a cache below the touched set has evicted it by then. Simulated on a
+# 15901x13435 pair at blocks of 1024 — 485 chunks touched, 121 MiB — the read volume is 3.4x the image
+# at half the touched set and 5.7x at a twentieth, falling to 0.56x only at the whole of it. The step
+# is the access order rather than the eviction policy: random replacement holds 5.6x where LRU holds
+# 6.0x at the same capacity. Nor can the cache be narrowed to the touched set, which is sparse — 475 of
+# the 725 chunks in its own bounding box.
+#
+# `Threads.nthreads()` concurrent pairs for a serial run, one for a threaded one: `threaded = false` is
+# the batch shape [`autorift!`](@ref) documents — one pair per task, up to `nthreads` at once — and each
+# task decides with no view of the others, so the ceiling has to be divided or the pairs together take
+# all of it. Free memory rather than total, since what is already resident is not available.
+# `free` is a keyword so the ceiling can be exercised at a known value; a run leaves it defaulted.
+function _auto_cache_budget(raw::ImagePair, layout::BlockLayout, p::Params;
+                            free = Sys.free_memory())
+    cached = _ondisk_bytes(raw)
+    cached == 0 && return 0                  # nothing on disk, so nothing to decide
+    cached < _windowed_bytes(raw, layout, p) || return 0
+    ceiling = PREFETCH_SHARE * free / (istrue(p.threaded) ? 1 : Threads.nthreads())
+    return cached <= ceiling ? cached : 0
+end
+
+# What the windowed alternative decompresses over a whole run.
+#
+# Every block reads its own window once per pass, and a pass is a chip-size level's coarse or fine
+# sweep — so `2 * nlevels` sweeps over the blocks. Both figures are upper bounds on their own terms: a
+# coarse pass sweeps a strided subset of the blocks, and a level whose points a finer one resolved may
+# not run at all. Overestimating favours caching, which is the cheaper error — the cached arm's cost is
+# bounded and known, where the windowed arm's is neither.
+#
+# The window, not the block: a block reads its extent grown by the halo, and that overlap is read by
+# each neighbour too. Counted per image the read touches, so a caller's own mask over a file is counted
+# and a mask derived from its image is not — the same rule `_ondisk_bytes` applies.
+function _windowed_bytes(raw::ImagePair, layout::BlockLayout, p::Params)
+    window = sum(b -> length(b.read_rows) * length(b.read_cols), layout.blocks; init = 0)
+    sweeps = 2 * length(chip_sizes(p))
+    perpass = _window_bytes(raw.reference) + _window_bytes(raw.secondary) +
+              _window_mask_bytes(raw.reference_valid, raw.reference) +
+              _window_mask_bytes(raw.secondary_valid, raw.secondary)
+    return window * sweeps * perpass
+end
+
+# Bytes per windowed element, which is what `_windowed_bytes` multiplies by the window area. Zero for
+# an array already in memory: a window of it is a copy, not a read.
+_window_bytes(a::AbstractMatrix) = ondisk(a) ? sizeof(eltype(a)) : 0
+_window_mask_bytes(m::AbstractMatrix{Bool}, ::AbstractMatrix) = _window_bytes(m)
+_window_mask_bytes(m::FiniteMask, img::AbstractMatrix) = m.parent === img ? 0 : _window_bytes(m)
+
+# What a prefetch of this pair would hold resident.
+_ondisk_bytes(raw::ImagePair) =
+    _prefetch_bytes(raw.reference) + _prefetch_bytes(raw.secondary) +
+    _mask_bytes(raw.reference_valid, raw.reference) +
+    _mask_bytes(raw.secondary_valid, raw.secondary)
+
+# `length * sizeof(eltype)` rather than `sizeof(a)`, which for a lazy array is the size of its handle.
+# An array already in memory would not be read, so it costs nothing.
+_prefetch_bytes(a::AbstractMatrix) = ondisk(a) ? length(a) * sizeof(eltype(a)) : 0
+
+# A mask derived from its own image costs nothing: `_prefetch_mask` rebuilds it over the prefetched
+# array instead of materializing it, so `isfinite` is computed per window from memory. The rule is
+# shared with `_prefetch_mask` so the estimate cannot promise less than the read takes.
+_mask_bytes(m::AbstractMatrix{Bool}, ::AbstractMatrix) = _prefetch_bytes(m)
+_mask_bytes(m::FiniteMask, img::AbstractMatrix) = m.parent === img ? 0 : _prefetch_bytes(m)
+
+_prefetch(img::AbstractMatrix, p::Params) = ondisk(img) ? _slab_read(img, p) : img
+
+# A mask over the image being prefetched follows it, rather than being read: computing `isfinite` from
+# the array now in memory is the same answer for no further bytes. Any other mask — a caller's own, or
+# a nodata mask over a fill value the prefetched image no longer distinguishes — is read like the
+# imagery.
+_prefetch_mask(m::AbstractMatrix{Bool}, ::AbstractMatrix, ::AbstractMatrix, p::Params) =
+    _prefetch(m, p)
+_prefetch_mask(m::FiniteMask, img::AbstractMatrix, prefetched::AbstractMatrix, p::Params) =
+    m.parent === img ? FiniteMask(prefetched) : _prefetch(m, p)
+
+# The whole array, read in row slabs with one task each.
+#
+# Slabs rather than the backend's own chunks because the read is `img[rows, cols]` either way — a
+# chunked backend turns that into one aligned read per touched chunk — and rows are what make each
+# task's destination a contiguous strip of the output.
+#
+# Serial when the run is, for the same reason `_params_serial` exists: in the batch shape the pair is
+# already the unit of parallelism, and reading one pair across every thread would oversubscribe the
+# others.
+function _slab_read(img::AbstractMatrix, p::Params)
+    rows, cols = axes(img)
+    nslabs = istrue(p.threaded) ? PREFETCH_SLABS_PER_THREAD * Threads.nthreads() : 1
+    h = cld(length(rows), nslabs)
+    # One slab is the whole array, which indexing already materializes — no destination to fill.
+    h >= length(rows) && return _read_block(img, rows, cols)
+
+    out = similar(Array{eltype(img)}, axes(img))
+    tasks = map(first(rows):h:last(rows)) do lo
+        StableTasks.@spawn begin
+            slab = lo:min(lo + h - 1, last(rows))
+            _read_block!(view(out, slab, cols), img, slab, cols)
+        end
+    end
+    foreach(wait, tasks)
+    return out
+end
 
 """
     autorift(reference, secondary; kwargs...) -> MultichipResult
@@ -265,14 +467,21 @@ All of [`AutoRIFT.params`](@ref)'s, plus:
   these for sensors with a fill value, or to apply a cloud or shadow mask — an invalid pixel
   never contributes to a correlation.
 - `process_block_size`: `(X, Y)` **pixels** per block, or `nothing` (the default) for one block over
-  the whole scene. Reads and filters the images a block at a time, so no array the size of the scene
-  is ever formed. **1024 by 1024 is a good default at a narrow halo**, and needs to grow with the
-  halo — see below.
+  the whole scene. Filters the images a block at a time, so the filtered scene is never formed.
+  **1024 by 1024 is a good default at a narrow halo**, and needs to grow with the halo — see below.
 
   Two things are promised under semantic versioning, and only these two: the result is
-  **bit-identical** to the untiled run, and no array the size of the scene — imagery or mask — is
-  formed. The halo formula, the number and shape of the blocks, buffer reuse and the threading shape
-  are all free to change.
+  **bit-identical** to the untiled run, and the *filtered* pair — `Float32` whatever the input type,
+  and what the untiled path holds resident — is never formed at scene size. The halo formula, the
+  number and shape of the blocks, buffer reuse, the threading shape and where the raw imagery is read
+  from are all free to change.
+
+  For input already in memory — including a memory-mapped array, which the table below measures —
+  nothing scene-sized is formed at all. **Input still on disk is read into memory once** when doing so
+  reads less than windowing it would, which `cache_budget` decides and documents. A block's window is
+  otherwise read once per pass — three chip sizes, coarse and fine — which is 3.4-4.4× the scene over a
+  run on a 15901×13435 GeoTIFF pair against 0.66-0.96× for a single pass, and no block size removes it.
+  Either way the answer is the same: where the raw pixels are read from does not reach the correlation.
 
   Worth it whenever peak memory matters, not only when the scene cannot fit. Measured total process
   peak on a 17121×16961 Landsat overlap at 10 threads, from a memory-mapped input, against an untiled
@@ -313,6 +522,28 @@ All of [`AutoRIFT.params`](@ref)'s, plus:
   [`AutoRIFT.halo`](@ref). A block smaller than that halo would be almost entirely overlap and is
   rejected. A preprocessing filter that estimates from the whole image cannot be reproduced block by
   block, and is rejected rather than approximated — see [`AutoRIFT.filter_reach`](@ref).
+- `cache_budget`: how many bytes of disk-backed input a blocked run may hold in memory, as `:auto`
+  (the default), a byte count, or `nothing`.
+
+  `:auto` compares two volumes computable before anything is read: the pair's own bytes against the
+  sum of every block's read window, once per pass. It caches when the first is smaller, and is capped
+  at an eighth of free memory — divided by the thread count for `threaded = false`, the batch shape
+  where each task decides for itself — so a run competes for a share of what is free rather than the
+  last of it. A count caps it explicitly, and `nothing` caches nothing and reads a window per block per
+  pass. The budget is compared against the pair's own bytes, so either the whole pair is cached or none
+  of it is — a count between the two reads windows. Input already in memory is never copied whatever
+  this says, and the result does not depend on it.
+
+  There is no partial cache to size, because a blocked run sweeps every block once per pass: a chunk's
+  next use is a whole sweep away, so a cache below the whole working set has evicted it by then.
+  Simulated on the 15901×13435 pair at blocks of 1024, the read volume is 3.4× the scene at half the
+  working set and 5.7× at a twentieth, falling below 1× only at the whole of it.
+
+  Set a count on a machine whose free memory is a poor guide to what this process may take — a
+  container with a cgroup limit, or a host shared with work Julia cannot see. Set `nothing` to hold
+  peak memory to the blocks alone: caching a 0.398 GiB pair raised peak from 3.6 to 4.2 GiB at blocks
+  of 512 px, for 15.2 s against 13.5 s at 10 threads. The gain narrows as the block grows — 14.1 s
+  either way at 2048 px — since a larger block reads less to begin with.
 
 ```julia
 out = autorift(image1, image2; chip_size = 32, search_radius = 25)
@@ -382,7 +613,7 @@ function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, p::Param
 end
 
 """
-    autorift(reference, secondary, p::Params, block_size::Tuple{Int,Int}) -> MultichipResult
+    autorift(reference, secondary, p::Params, block_size::Tuple{Int,Int}, cache_budget::Int) -> MultichipResult
 
 Correlate a block at a time, with an already-resolved [`Params`](@ref).
 
@@ -390,12 +621,16 @@ Correlate a block at a time, with an already-resolved [`Params`](@ref).
 [`autorift`](@ref)'s keyword form for what blocking promises and costs. The result is bit-identical
 to the unblocked run.
 
+`cache_budget` is the bytes of disk-backed input this run may hold in memory, and defaults to `0` —
+window every read. An `Int` rather than the keyword form's `:auto`, because a `Symbol` reaching a
+decision is what `--trim` cannot follow; the automatic choice needs [`autorift`](@ref)'s keyword form.
+
 Positional throughout, for the same reason the three-argument form is: nothing between the call and
 the correlation is a runtime value, so a `--trim`ed binary can reach it. The keyword form resolves
 `process_block_size` through keyword machinery that `--trim` cannot follow.
 """
 function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, p::Params,
-                  block_size::Tuple{Int,Int})
+                  block_size::Tuple{Int,Int}, cache_budget::Int = 0)
     raw = ImagePair(reference, secondary)
     grid = _build_grid(size(raw), p)
     _warm_grid_plans(grid, p)
@@ -404,7 +639,7 @@ function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, p::Param
     # named error here. The trimmed binary is where that surfaced — with no method table to print
     # from, its `MethodError` recursed inside Julia's error printer and spun at 100% CPU instead of
     # failing, which is why this path looked like a slow correlation rather than a broken one.
-    return _run(raw, grid, p, _block_size(block_size))
+    return _run(raw, grid, p, _block_size(block_size), cache_budget)
 end
 
 """
@@ -423,10 +658,10 @@ operations that need a layout.
 """
 function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, grid::PointSet;
                   reference_valid = nothing, secondary_valid = nothing,
-                  process_block_size = nothing, kwargs...)
+                  process_block_size = nothing, cache_budget = :auto, kwargs...)
     p = params(; kwargs...)
     raw = ImagePair(reference, secondary; reference_valid, secondary_valid)
-    return _run(raw, grid, p, _block_size(process_block_size))
+    return _run(raw, grid, p, _block_size(process_block_size), cache_budget)
 end
 
 # Dispatch on the point set's dimensionality: only a gridded one can run multiple chip sizes.
@@ -434,17 +669,59 @@ end
 # Whether the scene is filtered at all depends on the block size, which is what `_runner` decides: a
 # blocked run filters per block and must never form a filtered scene, since that copy is the
 # allocation it exists to avoid.
-function _run(raw::ImagePair, grid::PointSet{2}, p::Params, bs::Union{Nothing,Extent})
+function _run(raw::ImagePair, grid::PointSet{2}, p::Params, bs::Union{Nothing,Extent}, cache)
     _check_preprocess(eltype(raw), p.preprocess)
-    return _multichip(_runner(raw, grid, p, bs), grid, p)
+    _check_cache_budget(cache)
+    return _multichip(_runner(raw, grid, p, bs, cache), grid, p)
 end
 
 # A scattered set runs one pass at one chip size, so there are no levels to loop over and no coarse
-# restriction to apply — `track` is the whole computation.
-function _run(raw::ImagePair, pts::PointSet{1}, p::Params, ::Nothing)
+# restriction to apply — `track` is the whole computation. It filters the scene, so there is nothing to
+# read up front: `_prepare` has already materialized everything.
+function _run(raw::ImagePair, pts::PointSet{1}, p::Params, ::Nothing, cache)
     _check_preprocess(eltype(raw), p.preprocess)
+    _check_cache_budget(cache)
     return track(_prepare(raw, p), pts, p)
 end
+
+"""
+    AutoRIFT.ondisk(a::AbstractArray) -> Bool
+
+Whether reading an element of `a` costs I/O.
+
+`false` for any array the core knows about. `AutoRIFTDiskArraysExt` answers `true` for a
+`DiskArrays.AbstractDiskArray` — the chunked backends: Zarr, NetCDF, HDF5 — and
+`AutoRIFTRastersExt` for a file-backed `Raster`, so [`autorift`](@ref) can refuse the unblocked
+path for input it would otherwise read a pixel at a time.
+
+Add a method for a disk-backed type neither recognizes. A wrapper needs one even when what it wraps
+is already recognized, since the property does not follow from the wrapper's supertype.
+"""
+ondisk(::AbstractArray) = false
+
+# A computed mask reads its parent, so it is on disk exactly when that is. Without this a lazy pair's
+# mask would be the one component a prefetch left on the file, and a blocked run would keep reading a
+# window of it per pass.
+ondisk(m::FiniteMask) = ondisk(m.parent)
+
+# The unblocked path filters the scene in place of reading windows, so it must not be handed an array
+# whose elements come from disk.
+#
+# `preprocess`'s box filters accumulate elementwise — `s += Float64(A[i, j])` in
+# `_windowmean_dense!` — and a disk-backed element reaches `getindex_disk`, which for a `Raster` over
+# a GeoTIFF reopens the file and inflates a whole tile to return one number. Measured on a
+# 15901x13435 DEFLATE pair: killed at 74 minutes and 1.7e9 allocations, still inside the first
+# image's filter, against 3.5 s blocked. That is not a slow configuration but a wrong one, and
+# nothing in the run reports it — which is why this is an error rather than a warning.
+#
+# Checked here because `_prepare` is the only way to the unblocked path, and a blocked run never
+# reaches it: it filters each block from a dense read window instead. So this needs no knowledge of
+# which entry point was called.
+_check_resident(img::AbstractMatrix) = ondisk(img) ? throw(ArgumentError(
+    "this image is still on disk, and an unblocked run would read it one pixel at a time — each " *
+    "read reopening the file and decompressing a whole chunk to return one element. Pass " *
+    "`process_block_size = (X, Y)` pixels to correlate block by block, which reads windows " *
+    "instead, or materialize the image first with `read`.")) : nothing
 
 # Whether this filter can run on this element type, checked once at the call that started the run.
 #
@@ -463,7 +740,7 @@ _check_preprocess(::Type{<:Real}, ::Deramp) = throw(ArgumentError(
 
 # Blocks are laid out over a *gridded* point set, since the halo is derived from where points sit
 # relative to each other. A scattered set has no such layout, so there is nothing to divide.
-_run(::ImagePair, ::PointSet{1}, ::Params, ::Extent) = throw(ArgumentError(
+_run(::ImagePair, ::PointSet{1}, ::Params, ::Extent, _cache) = throw(ArgumentError(
     "`process_block_size` needs a gridded `PointSet`, but this one is scattered. Blocks are " *
     "rectangles of the output grid, and a scattered point set has no grid to cut. Drop the " *
     "keyword, or pass a gridded point set."))
@@ -482,13 +759,13 @@ each rebuilding the grid and hoping it matches. Not exported: the array API has 
 """
 function autorift_with_grid(reference::AbstractMatrix, secondary::AbstractMatrix;
                             reference_valid = nothing, secondary_valid = nothing,
-                            process_block_size = nothing, kwargs...)
+                            process_block_size = nothing, cache_budget = :auto, kwargs...)
     p = params(; kwargs...)
     raw = ImagePair(reference, secondary; reference_valid, secondary_valid)
     # From the raw pair's size, which the filters preserve.
     grid = _build_grid(size(raw), p)
     _warm_grid_plans(grid, p)
-    return _run(raw, grid, p, _block_size(process_block_size)), grid
+    return _run(raw, grid, p, _block_size(process_block_size), cache_budget), grid
 end
 
 # ---------------------------------------------------------------------------
@@ -515,6 +792,7 @@ end
 # new one that forgets pays a redundant pass rather than leaking non-finite values into the correlator.
 # `WallisGapfill` is the method that still needs it: its random fill can leave them behind.
 function _prepare(img::AbstractMatrix, mask::AbstractMatrix{Bool}, p::Params)
+    _check_resident(img)
     m = resident(mask)
     out, v = _slabbed(p) ? _preprocess_slabbed(img, m, p) :
                            preprocess(img, m, p.preprocess, p.rng_seed)
