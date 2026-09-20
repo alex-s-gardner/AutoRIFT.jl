@@ -1,11 +1,15 @@
 # Run the benchmark suite and record the result as JSON.
 #
-#   julia --project=benchmark benchmark/run.jl [--tag NAME] [--quick]
+#   julia --project=benchmark benchmark/run.jl [--tag NAME] [--quick] [--only FILE]
 #
 # Writes benchmark/results/history/<tag>.json, defaulting the tag to the current
 # git SHA. History is gitignored, since absolute timings are machine-specific;
 # only baseline.json and python.json are committed, because those are the
 # references everything is compared against.
+#
+# `--only FILE` restricts the run to the `group/name` entries listed in `FILE`, one per
+# line, which is how a name `compare.jl --screen` flagged gets re-measured without paying
+# for the whole suite again. The memory group is skipped, since it is not screened.
 
 using BenchmarkTools
 using JSON3
@@ -17,21 +21,52 @@ include(joinpath(@__DIR__, "benchmarks.jl"))
 # in-process.
 include(joinpath(@__DIR__, "memory.jl"))
 
+const USAGE = "Usage: run.jl [--tag NAME] [--quick] [--only FILE]"
+
 function parse_args(args)
-    tag, quick = nothing, false
+    tag, quick, only = nothing, false, nothing
     i = 1
     while i <= length(args)
         if args[i] == "--tag" && i < length(args)
             tag = args[i + 1]
             i += 2
+        elseif args[i] == "--only" && i < length(args)
+            only = args[i + 1]
+            i += 2
         elseif args[i] == "--quick"
             quick = true
             i += 1
         else
-            error("unrecognised argument $(args[i]). Usage: run.jl [--tag NAME] [--quick]")
+            error("unrecognised argument $(args[i]). $USAGE")
         end
     end
-    return tag, quick
+    return tag, quick, only
+end
+
+"""
+    restrict!(suite, path)
+
+Drop every leaf of `suite` whose `group/name` is not listed in `path`, one name per line.
+
+Errors on a listed name the suite does not have, and on a list that leaves nothing: both mean
+the caller is measuring something other than what it asked for, and a confirmation pass that
+silently measures an empty suite reports no regression.
+"""
+function restrict!(suite::BenchmarkGroup, path::AbstractString)
+    isfile(path) || error("no such name list: $path")
+    wanted = Set(filter(!isempty, strip.(readlines(path))))
+    isempty(wanted) && error("$path lists no benchmarks")
+    have = Set(join(k, "/") for (k, _) in BenchmarkTools.leaves(suite))
+    missing_names = sort!(collect(setdiff(wanted, have)))
+    isempty(missing_names) ||
+        error("$path names benchmarks the suite does not define: " * join(missing_names, ", "))
+    for (keys, _) in BenchmarkTools.leaves(suite)
+        join(keys, "/") in wanted && continue
+        # `leaves` returns the key path from the root, so the parent group is everything but
+        # the last element.
+        delete!(suite[keys[1:(end - 1)]], last(keys))
+    end
+    return suite
 end
 
 git(cmd) = try
@@ -104,9 +139,11 @@ function flatten(results::BenchmarkGroup, prefix = "")
 end
 
 function main()
-    tag, quick = parse_args(ARGS)
+    tag, quick, only = parse_args(ARGS)
     env = environment()
     isnothing(tag) && (tag = env.git_sha == "unknown" ? "local" : env.git_sha[1:min(end, 12)])
+
+    isnothing(only) || restrict!(SUITE, only)
 
     if quick
         # Enough to check the suite runs and to catch a large regression, without
@@ -118,7 +155,7 @@ function main()
     end
 
     nbench = length(BenchmarkTools.leaves(SUITE))
-    @info "Running $nbench benchmarks" tag quick nthreads = env.nthreads
+    @info "Running $nbench benchmarks" tag quick only nthreads = env.nthreads
     # A single-threaded process makes every threaded benchmark measure the serial path,
     # silently. That is worse than not measuring it: the numbers look plausible and a real
     # threading regression would be invisible.
@@ -133,10 +170,11 @@ function main()
 
     flat = flatten(results)
 
-    # Memory, unless `--quick`: each measurement is a fresh subprocess, so the group costs a
-    # couple of minutes and is not worth paying for a smoke run.
-    if quick
-        @info "Skipping memory measurements (--quick); they spawn a process per configuration"
+    # Memory, unless `--quick` or `--only`: each measurement is a fresh subprocess, so the
+    # group costs a couple of minutes, which is not worth paying for a smoke run, and a
+    # restricted run is confirming timings the memory group has no part in.
+    if quick || !isnothing(only)
+        @info "Skipping memory measurements; they spawn a process per configuration"
     else
         @info "Measuring peak memory in subprocesses"
         merge!(flat, run_memory())

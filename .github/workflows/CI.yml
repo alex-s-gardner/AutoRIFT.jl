@@ -185,10 +185,20 @@ jobs:
     # runner. Absolute times from a hosted runner are too noisy to compare across
     # jobs, so an absolute threshold would either fire constantly or never; a
     # ratio between two runs on one machine is meaningful.
+    #
+    # A time regression fails this job only if it reproduces. The suite makes around ninety
+    # comparisons of two single measurements, so at a 1.10x threshold a few clear it on noise
+    # alone in every run — and a gate that is red whatever the diff contains stops carrying
+    # information. So the first comparison *screens*: it writes the names over the threshold and
+    # does not set the exit status, and only those names are measured again on both revisions,
+    # where a ratio that holds up fails the build. Allocation and memory results are exact and
+    # fail on the first pass.
     name: Benchmark
     if: github.event_name == 'pull_request'
+    # Four measurement steps now rather than two, but the two confirmation runs cover a handful
+    # of names against the full suite's ninety-odd.
+    timeout-minutes: 60
     runs-on: ubuntu-latest
-    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -221,14 +231,17 @@ jobs:
           julia --project=benchmark benchmark/run.jl --tag pr
           git checkout -- .
 
-      - name: Compare
-        # `pipefail` is load-bearing, not boilerplate. `compare.jl` signals a regression by
-        # `exit(1)`, and a pipeline's status is its *last* command's — so piping into `tee` reported
-        # `tee`'s success and swallowed every failure. The job had therefore never once failed a PR
-        # on a regression or an allocation: it went green while printing "REGRESSED beyond 1.1x" and
-        # "ALLOCATED where none is allowed" into its own summary. The two times it did fail, a
-        # harness bug had killed the step outright before the pipe could mask it, which is why the
-        # gate looked functional.
+      # `pipefail` in every step below is load-bearing, not boilerplate. `compare.jl` signals a
+      # regression by `exit(1)`, and a pipeline's status is its *last* command's — so piping into
+      # `tee` reported `tee`'s success and swallowed every failure. The job had therefore never
+      # once failed a PR on a regression or an allocation: it went green while printing
+      # "REGRESSED beyond 1.1x" and "ALLOCATED where none is allowed" into its own summary. The
+      # two times it did fail, a harness bug had killed the step outright before the pipe could
+      # mask it, which is why the gate looked functional.
+      - name: Screen for regressions
+        # Allocation and memory failures exit non-zero here and stop the job. Time regressions
+        # are written to the name list for the steps below instead. The list goes in `RUNNER_TEMP`
+        # rather than the working tree, which the checkouts below reset.
         run: |
           set -o pipefail
           {
@@ -236,5 +249,56 @@ jobs:
             echo
             julia --project=benchmark benchmark/compare.jl \
               benchmark/results/history/base.json \
-              benchmark/results/history/pr.json
-          } | tee "$GITHUB_STEP_SUMMARY"
+              benchmark/results/history/pr.json \
+              --screen "$RUNNER_TEMP/screen.txt"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The three steps below are each a no-op when nothing was flagged, which is the common case.
+      # The name list is always written, and is empty when there is nothing to confirm, so `test -s`
+      # is the condition rather than its existence.
+      #
+      # `git reset --hard` ends each, not `git checkout -- .`: `Pkg.develop` writes the checkout
+      # path into the tracked `benchmark/Project.toml`, and the step below stages the merge base's
+      # `src/` into the index, which `checkout -- .` would restore *from* rather than discard. The
+      # results survive it, since `benchmark/results/history/` is gitignored.
+      - name: Re-measure the flagged benchmarks on the merge base
+        # The PR's `benchmark/` against the merge base's `src/`. `--only` is the PR's flag, so the
+        # harness has to be the PR's — the merge base can predate it and would reject the
+        # argument. Taking only the package source from the base gives both confirmation runs one
+        # harness, so a difference between them is the code under measurement and nothing else.
+        run: |
+          set -o pipefail
+          test -s "$RUNNER_TEMP/screen.txt" || exit 0
+          git checkout --force --detach ${{ github.event.pull_request.head.sha }}
+          git checkout ${{ github.event.pull_request.base.sha }} -- src ext Project.toml
+          julia --project=benchmark -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
+          julia --project=benchmark benchmark/run.jl --tag base-confirm --only "$RUNNER_TEMP/screen.txt"
+          git reset --hard
+
+      - name: Re-measure the flagged benchmarks on the pull request
+        run: |
+          set -o pipefail
+          test -s "$RUNNER_TEMP/screen.txt" || exit 0
+          git checkout --force --detach ${{ github.event.pull_request.head.sha }}
+          julia --project=benchmark -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
+          julia --project=benchmark benchmark/run.jl --tag pr-confirm --only "$RUNNER_TEMP/screen.txt"
+          git reset --hard
+
+      - name: Confirm
+        # The gate on timings. A name that clears the threshold on this second, independent
+        # measurement of both revisions is a regression; one that does not was noise in the
+        # screening run, and is reported in the summary without failing the job.
+        run: |
+          set -o pipefail
+          if [ ! -s "$RUNNER_TEMP/screen.txt" ]; then
+            echo "Nothing over the threshold to confirm." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo
+            echo "### Confirmation: the flagged benchmarks, re-measured"
+            echo
+            julia --project=benchmark benchmark/compare.jl \
+              benchmark/results/history/base-confirm.json \
+              benchmark/results/history/pr-confirm.json
+          } | tee -a "$GITHUB_STEP_SUMMARY"
