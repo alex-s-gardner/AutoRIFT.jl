@@ -374,56 +374,108 @@ The figures come from `bench_figures.jl`, which reads the stage-2 bundle, so run
 is stale. Performance and accuracy are in one artifact because neither answers the question alone: a
 faster implementation that disagrees is not faster at the same job.
 
-Whole-process wall clock and peak RSS from `/usr/bin/time -l`, one fresh process per row: `ru_maxrss`
-is a high-water mark, so two configurations measured in one process both report the larger.
+Two accountings per row. Whole-process wall clock and peak RSS come from `/usr/bin/time -l`, one
+fresh process per row: `ru_maxrss` is a high-water mark, so two configurations measured in one
+process both report the larger. The `correlate` columns come from `phase.jl` and `phase.py`, which
+bracket the correlator call alone — `autorift` on this side, `runAutorift` on the reference's — and
+sample `proc_pid_rusage` while it runs. Both are needed because the whole-process figure charges the
+two implementations for different work: the reference filters and casts in separate calls before
+`runAutorift`, while AutoRIFT.jl does both inside `autorift`, and only one of them pays to load a
+language runtime. Peak in the `correlate` columns is the phys footprint, which excludes clean
+file-backed pages; peak RSS is what a memory limit sees.
 
-Apple M2 Max, 12 cores, 96 GiB, macOS 26.5.2 · Julia 1.12.5 · AutoRIFT.jl 0.1.0 (`11920b9`) ·
+**The rows labelled "reference's filtered planes" are the correlator comparison.** They read the
+uint8 planes the reference itself produced after its own high-pass filter and cast, and correlate
+them with `preprocess = :none`. Both sides then start from the same bytes at the same entry point,
+and neither timing contains a filter. Every other library row filters its own input, which is what a
+caller actually does.
+
+Apple M2 Max, 12 cores, 96 GiB, macOS 26.6.2 · Julia 1.13.0 · AutoRIFT.jl 0.1.0 (`f515f13`) ·
 reference autoRIFT 2.1.1, Python 3.10.20 with NumPy 1.26.4 and OpenCV 4.13.0 · Rasters 0.15.0,
-ArchGDAL 0.10.12, DiskArrays 0.4.22. Load average 2.1 during the run, so absolute times are a few
-percent pessimistic — equally for every row, so the ratios hold.
+ArchGDAL 0.10.12, DiskArrays 0.4.22. Load average 3.6 at the start of the run, so absolute times are
+a few percent pessimistic — equally for every row, so the ratios hold. Run-to-run spread on the reference
+is about 4% (176.5, 178.6 and 186.9 s across three runs), which is the resolution to read any
+single-row difference at.
 
 CPU time beside wall clock because the two answer different questions: wall clock is what a user
 waits, CPU time is what the work costs. A row using about one core's worth of CPU over its wall
 clock was not competing with anything, which is the check that a row is worth reading at all.
 
-| configuration | lazy | blocks | runtime | CPU time | peak RSS |
-|---|:---:|---:|---:|---:|---:|
-| python autoRIFT v2.1.2† | no | 1 | 176.5 s | 414.3 s | 6883 MiB |
-| AutoRIFT.jl, eager, no blocks, 12 threads | no | 1 | 21.3 s | 79.3 s | 7247 MiB |
-| AutoRIFT.jl, lazy, block 2048, 12 threads | yes | 81 | 45.5 s | 211.2 s | 3663 MiB |
-| AutoRIFT.jl, lazy, block 4096, 12 threads | yes | 25 | 56.6 s | 222.1 s | 9800 MiB |
-| AutoRIFT.jl, eager, no blocks, 1 thread | no | 1 | 64.7 s | 66.2 s | 6702 MiB |
-| juliac binary, lazy, no blocks, 1 thread\* | yes | 1 | 63.8 s | 65.3 s | 6361 MiB |
-| juliac binary, lazy, block 2048, 1 thread\* | yes | 81 | 89.5 s | 90.5 s | 3363 MiB |
-| juliac binary, lazy, block 1024, 1 thread\* | yes | 289 | 90.9 s | 92.5 s | 3215 MiB |
-| juliac binary, lazy, block 512, 1 thread\* | yes | 1122 | 94.5 s | 95.9 s | 3135 MiB |
-| juliac binary, lazy, block 4096, 1 thread\* | yes | 25 | 99.9 s | 101.3 s | 3957 MiB |
-| juliac binary, lazy, block 256, 1 thread\* | yes | 4422 | 109.3 s | 110.8 s | 3134 MiB |
+| configuration | lazy | blocks | correlate | correlate CPU | correlate peak | whole process | process CPU | peak RSS |
+|---|:---:|---:|---:|---:|---:|---:|---:|---:|
+| python autoRIFT v2.1.2† | no | 1 | 166.0 s | 410.3 s | 4332 MiB | 178.6 s | 418.8 s | 6879 MiB |
+| AutoRIFT.jl, reference's filtered planes, 12 threads | no | 1 | 15.5 s | 77.8 s | 4089 MiB | 16.2 s | 80.5 s | 4145 MiB |
+| AutoRIFT.jl, eager, no blocks, 12 threads | no | 1 | 19.8 s | 81.3 s | 6965 MiB | 20.7 s | 84.1 s | 7044 MiB |
+| AutoRIFT.jl, lazy, block 1024, 12 threads | yes | 289 | 36.9 s | 241.1 s | 1955 MiB | 41.0 s | 248.7 s | 2263 MiB |
+| AutoRIFT.jl, lazy, block 2048, 12 threads | yes | 81 | 40.0 s | 212.0 s | 3653 MiB | 44.0 s | 219.4 s | 3861 MiB |
+| AutoRIFT.jl, lazy, block 512, 12 threads | yes | 1122 | 40.0 s | 302.5 s | 1956 MiB | 48.9 s | 314.2 s | 2464 MiB |
+| AutoRIFT.jl, lazy, block 4096, 12 threads | yes | 25 | 55.1 s | 214.6 s | 9640 MiB | 59.2 s | 222.1 s | 9865 MiB |
+| AutoRIFT.jl, reference's filtered planes, 1 thread | no | 1 | 60.5 s | 60.4 s | 3071 MiB | 61.2 s | 63.0 s | 3237 MiB |
+| AutoRIFT.jl, eager, no blocks, 1 thread | no | 1 | 63.7 s | 63.7 s | 6906 MiB | 64.6 s | 66.5 s | 6963 MiB |
+| juliac binary, lazy, no blocks, 1 thread\* | yes | 1 | — | — | — | 64.1 s | 65.7 s | 6650 MiB |
+| juliac binary, lazy, block 2048, 1 thread\* | yes | 81 | — | — | — | 85.3 s | 87.0 s | 3459 MiB |
+| juliac binary, lazy, block 1024, 1 thread\* | yes | 289 | — | — | — | 86.7 s | 88.2 s | 3354 MiB |
+| juliac binary, lazy, block 512, 1 thread\* | yes | 1122 | — | — | — | 90.4 s | 92.1 s | 3273 MiB |
+| juliac binary, lazy, block 4096, 1 thread\* | yes | 25 | — | — | — | 95.2 s | 97.0 s | 3986 MiB |
+| juliac binary, lazy, block 256, 1 thread\* | yes | 4422 | — | — | — | 103.8 s | 105.3 s | 3252 MiB |
 
-† The reference's correlation loop is serial, but OpenCV's own threading is not: it uses 2.4 cores'
+† The reference's correlation loop is serial, but OpenCV's own threading is not: it uses 2.3 cores'
 worth over the run, which is why its CPU time exceeds its wall clock. `cv2.setNumThreads` does not
 constrain it on macOS, where OpenCV dispatches through GCD.
 
 \* The binary is single-threaded: threading in a `--trim=safe` build is blocked upstream by
 [JuliaLang/julia#61319](https://github.com/JuliaLang/julia/issues/61319), so the thread pool is
-created but a spawned task resolves its entry point in the wrong world age and fails at runtime.
+created but a spawned task resolves its entry point in the wrong world age and fails at runtime. It
+also reports no `correlate` figure: instrumenting it means a rebuild, and `--trim=safe` rejects the
+formatting the report needs.
 
-The answer is the same in every row that can be compared byte for byte: lazy at 2048 against eager, 1
+The answer is the same in every row that can be compared byte for byte: lazy at 1024 against eager, 1
 thread against 12, and the binary at each block size against its own unblocked run.
 
-Four things this table says that the windowed ones cannot:
+What this table says that the windowed ones cannot:
 
-**Lazy trades time for memory, and the trade is not free.** 45.5 s against 21.3 s for a 49% lower
-peak. Blocking a scene that fits in memory costs 2.1× the runtime and buys nothing; blocking one that
-does not fit is the only way to process it at all. That is the whole basis for choosing.
+**On the same bytes from the same entry point, AutoRIFT.jl correlates 10.7× faster on 5.3× less
+CPU.** 166.0 s and 410.3 s of CPU become 15.5 s and 77.8 s, at 4089 MiB against 4332. The single-thread
+row is the sharper number, because it removes threading from the comparison entirely: 60.5 s of wall
+clock and 60.4 s of CPU against the reference's 410.3 s, so the same correlation costs **6.8× less
+CPU** without any parallelism at all. The reference is not idle while it does it — OpenCV's filters
+pull 2.5 cores through the correlate phase — which is why its wall clock is only 2.7× the serial
+Julia row.
 
-**Block 4096 is the exception, and it is not a memory saving at all.** 9800 MiB against 7247 for the
-unblocked row: a block that large holds more per-block buffer than the whole scene costs eagerly, so
-blocking there pays 2.7× the runtime to raise peak memory by 35%. The useful range is 2048 and below.
+**Twelve threads buy 3.9×, and that is this code's ceiling, not the machine's.** 60.5 s to 15.5 s on
+identical work. By Amdahl that is a 19% serial fraction, which puts the twelfth thread's contribution
+under 3% — the limit is what remains outside the per-point loop, not core count. Part of the gap is
+overhead rather than serial work: the threaded row spends 77.8 s of CPU where the serial one spends
+60.4, so 29% more total CPU is consumed to produce the 3.9×.
+
+**Filtering the scene itself costs 4.3 s and 2.8 GiB.** That is the only difference between the eager
+row and the prepped one: 19.8 s against 15.5 s threaded, 63.7 against 60.5 serial, and 6965 MiB
+against 4089. Roughly 1.7 GiB of the memory is the input type rather than the filter — `Float32`
+planes are 2323 MiB where the reference's `UInt8` are 581 — and the rest is what the high-pass holds
+while it runs.
+
+**Lazy trades time for memory, and the trade is not free.** 41.0 s against 20.7 s for a 68% lower
+peak. Blocking a scene that fits in memory costs 2.0× the runtime and buys nothing; blocking one that
+does not fit is the only way to process it at all. That is the whole basis for choosing. The cost is
+CPU rather than serial work — 241 s against 81 s for identical correlation — which is the read path,
+not the correlator.
+
+**Block 1024 is the size to reach for, and 4096 is not a memory saving at all.** 1024 dominates 2048
+on both axes: 36.9 s against 40.0 and 1955 MiB against 3653. Below it nothing improves — 512 lands on
+the same peak, 3 s slower, burning 61 s more CPU re-reading halos, and read-path CPU falls with halo
+area across 512, 1024 and 2048 (302, 241, 212 s) then flattens. Above it 4096 inverts the point of
+blocking: 9640 MiB against the unblocked row's 6965, because a block that large holds more per-block
+buffer than the whole scene costs eagerly, so it pays 2.8× the runtime to raise peak memory by 38%.
+
+**The trimmed binary correlates at full speed and blocks at a cost.** Unblocked it is 64.1 s against
+the 1-thread library row's 64.6 — `--trim=safe` takes nothing out of the correlator. Blocking is where
+it diverges: 85–104 s against the library's 41–59, since every block pays a demand-paged read with no
+threads to overlap it, in exchange for halving peak RSS from 6650 MiB to 3252.
 
 **The two eager rows read raw planes, not rasters.** Measured through
-`autorift(::AbstractRaster, ...)` the same configuration peaks at **11590 MiB**, not 7148: `read` keeps
-the raster's `missingval`, so a filled copy of each scene is built and the nodata mask is a third array
+`autorift(::AbstractRaster, ...)` the same configuration peaks at **11590 MiB** against 7148 for the
+raw-plane row in that same pass: `read` keeps the raster's `missingval`, so a filled copy of each
+scene is built and the nodata mask is a third array
 over the original — three scene-sized arrays where a plain `Matrix` needs one. The lazy path avoids the
 copies entirely, because blocking never forms them.
 
@@ -435,11 +487,11 @@ correlator, roughly 5 GiB above where the inputs sit, so shrinking them only wid
 beneath it. The input arrays are the wrong lever for peak memory on this path; the per-thread
 workspaces and output are where the 12 GiB comes from.
 
-**Block size is nearly free above the halo, and the floor is the grid.** 2048 through 256 px spans
-81 to 4422 blocks and 54× the halo redundancy, yet peak moves by 7.7% and runtime by 24%: what is left
-resident is the output grid and the per-block buffers, and only the latter shrinks. The binary's
-unblocked row is the one that matters — 6362 against ~3.2 GiB blocked, which is the difference between
-fitting on a small instance and not.
+**The floor is the grid, so shrinking blocks past the halo only costs.** In the binary's sweep, 2048
+through 256 px spans 81 to 4422 blocks and 54× the halo redundancy, yet peak moves by 6% (3459 to
+3252 MiB) while runtime moves by 22%: what is left resident is the output grid and the per-block
+buffers, and only the latter shrinks. Blocking at all is what matters for fitting on a small
+instance; how finely, below a couple of thousand pixels, does not.
 
 ## Where the two still differ, and why
 
