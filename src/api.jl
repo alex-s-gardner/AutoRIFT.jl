@@ -263,18 +263,12 @@ _reinit_runner(old_runner::Blocked, raw::ImagePair, ::ImagePair, p::Params) =
 # sizes, each with a coarse and a fine pass. Measured on a 15901x13435 GeoTIFF pair, a whole run's
 # read volume is 3.4-4.4x the scene at blocks of 512-2048 px while the sum of one pass's windows is
 # only 0.66-0.96x, so the redundancy is the repeat across passes rather than the halo overlap between
-# neighbours, and no block size removes it. Reading the scene up front removes it instead, at 10
-# threads:
+# neighbours, and no block size removes it. Reading the scene up front removes it instead.
 #
-#   block  windowed  prefetched
-#     512    15.2 s    13.5 s
-#    1024    14.0 s    13.6 s
-#    2048    14.1 s    14.1 s
-#
-# So the gain is the smallest block's, which is the one that reads most, and it is gone by 2048 px.
-# What the prefetch costs is its own bytes: peak 4.2 GiB against 3.6 GiB at blocks of 512 for a
-# 0.398 GiB pair. A block large enough to amortize its halo is the cheaper way to the same place, and
-# `cache_budget = nothing` is how a run declines the trade.
+# The gain is the smallest block's, which is the one that reads most, and it is gone by 2048 px. What
+# the prefetch costs is its own bytes. A block large enough to amortize its halo is the cheaper way to
+# the same place, and `cache_budget = nothing` is how a run declines the trade. `docs/memory.md` has
+# the runtime and peak for each block size, per arm.
 #
 # What this does *not* change is the property `process_block_size` exists for: the filtered scene is
 # still never formed, since a block still filters its own read window. Where the raw pixels come from
@@ -346,12 +340,9 @@ _check_cache_budget(x) = throw(ArgumentError(
 #
 # There is no interior optimum to find, which is why this decides between the two rather than sizing a
 # partial cache. A blocked run is a cyclic scan: it sweeps every block once per pass, so a chunk's next
-# use is a whole sweep away and a cache below the touched set has evicted it by then. Simulated on a
-# 15901x13435 pair at blocks of 1024 — 485 chunks touched, 121 MiB — the read volume is 3.4x the image
-# at half the touched set and 5.7x at a twentieth, falling to 0.56x only at the whole of it. The step
-# is the access order rather than the eviction policy: random replacement holds 5.6x where LRU holds
-# 6.0x at the same capacity. Nor can the cache be narrowed to the touched set, which is sparse — 475 of
-# the 725 chunks in its own bounding box.
+# use is a whole sweep away and a cache below the touched set has evicted it by then. The step is the
+# access order rather than the eviction policy, and the touched set is too sparse to narrow the cache
+# to — `docs/memory.md` replays the actual chunk requests through LRU and random replacement.
 #
 # `Threads.nthreads()` concurrent pairs for a serial run, one for a threaded one: `threaded = false` is
 # the batch shape [`autorift!`](@ref) documents — one pair per task, up to `nthreads` at once — and each
@@ -390,8 +381,8 @@ end
 # Bytes per windowed element, which is what `_windowed_bytes` multiplies by the window area. Zero for
 # an array already in memory: a window of it is a copy, not a read.
 _window_bytes(a::AbstractMatrix) = ondisk(a) ? sizeof(eltype(a)) : 0
-_window_mask_bytes(m::AbstractMatrix{Bool}, ::AbstractMatrix) = _window_bytes(m)
-_window_mask_bytes(m::FiniteMask, img::AbstractMatrix) = m.parent === img ? 0 : _window_bytes(m)
+_window_mask_bytes(m::AbstractMatrix{Bool}, img::AbstractMatrix) =
+    _derived_from(m, img) ? 0 : _window_bytes(m)
 
 # What a prefetch of this pair would hold resident.
 _ondisk_bytes(raw::ImagePair) =
@@ -404,10 +395,11 @@ _ondisk_bytes(raw::ImagePair) =
 _prefetch_bytes(a::AbstractMatrix) = ondisk(a) ? length(a) * sizeof(eltype(a)) : 0
 
 # A mask derived from its own image costs nothing: `_prefetch_mask` rebuilds it over the prefetched
-# array instead of materializing it, so `isfinite` is computed per window from memory. The rule is
-# shared with `_prefetch_mask` so the estimate cannot promise less than the read takes.
-_mask_bytes(m::AbstractMatrix{Bool}, ::AbstractMatrix) = _prefetch_bytes(m)
-_mask_bytes(m::FiniteMask, img::AbstractMatrix) = m.parent === img ? 0 : _prefetch_bytes(m)
+# array instead of materializing it, so `isfinite` is computed per window from memory.
+# [`AutoRIFT._derived_from`](@ref) is the shared rule, so the estimate cannot promise less than the
+# read takes.
+_mask_bytes(m::AbstractMatrix{Bool}, img::AbstractMatrix) =
+    _derived_from(m, img) ? 0 : _prefetch_bytes(m)
 
 _prefetch(img::AbstractMatrix, p::Params) = ondisk(img) ? _slab_read(img, p) : img
 
@@ -418,7 +410,29 @@ _prefetch(img::AbstractMatrix, p::Params) = ondisk(img) ? _slab_read(img, p) : i
 _prefetch_mask(m::AbstractMatrix{Bool}, ::AbstractMatrix, ::AbstractMatrix, p::Params) =
     _prefetch(m, p)
 _prefetch_mask(m::FiniteMask, img::AbstractMatrix, prefetched::AbstractMatrix, p::Params) =
-    m.parent === img ? FiniteMask(prefetched) : _prefetch(m, p)
+    _derived_from(m, img) ? FiniteMask(prefetched) : _prefetch(m, p)
+
+# Rows per stored chunk, which is the granularity a read of `img` cannot subdivide.
+#
+# `1` — no constraint — for anything the core knows about; `AutoRIFTDiskArraysExt` answers for a
+# chunked backend. A type without a method loses only the alignment below, never correctness, which
+# is why this is a hint rather than an error like [`ondisk`](@ref).
+_chunk_rows(::AbstractMatrix) = 1
+_chunk_rows(m::FiniteMask) = _chunk_rows(m.parent)
+
+# Rows per slab when `img` is split `nslabs` ways: the even division, rounded up to whole chunk rows.
+#
+# No chunk then spans two slabs. A chunk is the smallest unit the backend can read, so a boundary
+# inside one makes both neighbouring slabs decode it — and for a compressed file that decode *is* the
+# read: on a DEFLATE GeoTIFF whose chunks are 256 rows, an even division into 209-row slabs reads the
+# same pixels in 987 ms against 278 ms aligned. See `docs/memory.md`.
+#
+# Rounding up rather than down, and never below one chunk, so alignment costs slabs rather than
+# adding them: a thread count asking for more slabs than there are chunk rows gets the chunk row.
+function _slab_height(img::AbstractMatrix, nslabs::Integer)
+    ch = _chunk_rows(img)
+    return max(ch, _round_up(cld(size(img, 1), nslabs), ch))
+end
 
 # The whole array, read in row slabs with one task each.
 #
@@ -432,7 +446,7 @@ _prefetch_mask(m::FiniteMask, img::AbstractMatrix, prefetched::AbstractMatrix, p
 function _slab_read(img::AbstractMatrix, p::Params)
     rows, cols = axes(img)
     nslabs = istrue(p.threaded) ? PREFETCH_SLABS_PER_THREAD * Threads.nthreads() : 1
-    h = cld(length(rows), nslabs)
+    h = _slab_height(img, nslabs)
     # One slab is the whole array, which indexing already materializes — no destination to fill.
     h >= length(rows) && return _read_block(img, rows, cols)
 

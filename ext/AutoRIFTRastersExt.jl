@@ -124,9 +124,11 @@ scene, which is what Landsat level-1 imagery ships as, holds a half or a quarter
     geometry, where the conversion needs Geogrid's per-pixel matrices — not yet implemented, so
     pass `dt = nothing` and convert externally in that case.
 """
+# `cache_budget` is named rather than left in `kwargs`: what remains is forwarded to
+# `AutoRIFT.params`, which takes correlation parameters only and rejects anything else.
 function AutoRIFT.autorift(reference::AbstractRaster, secondary::AbstractRaster;
                            dt = nothing, reference_valid = nothing, secondary_valid = nothing,
-                           process_block_size = nothing, kwargs...)
+                           process_block_size = nothing, cache_budget = :auto, kwargs...)
     DDExt.check_aligned(reference, secondary)
     _check_crs(reference, secondary)
 
@@ -143,7 +145,7 @@ function AutoRIFT.autorift(reference::AbstractRaster, secondary::AbstractRaster;
     result, grid = AutoRIFT.autorift_with_grid(
         rimg, simg;
         reference_valid = rvalid, secondary_valid = svalid,
-        process_block_size = blocks, kwargs...)
+        process_block_size = blocks, cache_budget, kwargs...)
 
     outdims = DDExt.grid_dims(reference, grid)
     vx, vy = _to_velocity(result, reference, dt)
@@ -258,6 +260,14 @@ Base.@propagate_inbounds Base.getindex(m::_Both, r::AbstractUnitRange, c::Abstra
 AutoRIFT.ondisk(m::_NotFill) = AutoRIFT.ondisk(m.parent)
 AutoRIFT.ondisk(m::_Both) = AutoRIFT.ondisk(m.a) || AutoRIFT.ondisk(m.b)
 
+# And a read of either is a read of the parents, so it wants the parents' chunk height. `lcm` for
+# `_Both` because one read touches both, and a boundary either would straddle is one to avoid.
+AutoRIFT._chunk_rows(m::_NotFill) = AutoRIFT._chunk_rows(m.parent)
+AutoRIFT._chunk_rows(m::_Both) = lcm(AutoRIFT._chunk_rows(m.a), AutoRIFT._chunk_rows(m.b))
+
+# A raster's chunking is its parent's; `ondisk` above reads the same field for the same reason.
+AutoRIFT._chunk_rows(r::AbstractRaster) = AutoRIFT._chunk_rows(parent(r))
+
 # The block size to correlate at, when the caller did not choose one.
 #
 # A caller's choice always wins, and an in-memory pair keeps `nothing` — the untiled path — so nothing
@@ -297,11 +307,9 @@ function _blocks(supplied, reference::AbstractRaster, secondary::AbstractRaster,
     # `halo` returns `(x, y)` while `size` is `(rows, cols)` = `(y, x)`, so the axes cross here.
     # Never larger than the scene: a block wider than the image is one block, which is the untiled path
     # wearing a block label, and it makes the trailing-block arithmetic do nothing useful.
-    return (min(max(_round_up(HALO_BLOCKS * hy, chunk[1]), MIN_BLOCK), size(reference, 1)),
-            min(max(_round_up(HALO_BLOCKS * hx, chunk[2]), MIN_BLOCK), size(reference, 2)))
+    return (min(max(AutoRIFT._round_up(HALO_BLOCKS * hy, chunk[1]), MIN_BLOCK), size(reference, 1)),
+            min(max(AutoRIFT._round_up(HALO_BLOCKS * hx, chunk[2]), MIN_BLOCK), size(reference, 2)))
 end
-
-_round_up(want::Int, unit::Int) = unit <= 0 ? want : cld(want, unit) * unit
 
 # ---------------------------------------------------------------------------
 

@@ -588,6 +588,14 @@ end
     # image rather than materialized, so it stores no bytes of its own.
     @test AutoRIFT._ondisk_bytes(AutoRIFT.ImagePair(zeros(Float32, n, n), b)) ==
           n * n * sizeof(Float32)
+    # What makes that mask free is one predicate, shared by the estimate and every read that acts on
+    # it, so the two cannot diverge. Identity, not equality: two masks over equal arrays are two reads.
+    @test AutoRIFT._derived_from(AutoRIFT.FiniteMask(a), a)
+    @test !AutoRIFT._derived_from(AutoRIFT.FiniteMask(a), b)
+    img = zeros(Float32, n, n)
+    @test AutoRIFT._derived_from(AutoRIFT.FiniteMask(img), img)
+    @test !AutoRIFT._derived_from(AutoRIFT.FiniteMask(copy(img)), img)
+    @test !AutoRIFT._derived_from(trues(n, n), a)   # a caller's own mask is never derived
     # Nothing on disk means nothing to decide, and the pair is returned as it came.
     dense = AutoRIFT.ImagePair(zeros(Float32, n, n), ones(Float32, n, n))
     @test AutoRIFT._ondisk_bytes(dense) == 0
@@ -603,6 +611,18 @@ end
     @test AutoRIFT._slab_read(a, p_thr) == want
     # A mask read the same way, since a caller's mask over a file is not derivable from the imagery.
     @test AutoRIFT._slab_read(AutoRIFT.FiniteMask(a), p_thr) == map(isfinite, want)
+
+    # A threaded read splits on a boundary the storage shares, so no chunk is decoded by two slabs —
+    # unaligned, that decode is paid twice, which `docs/memory.md` measures. The height is a whole
+    # number of chunk rows and at least one chunk, whatever the thread count asks for.
+    @test AutoRIFT._chunk_rows(a) == 256                      # the extension reads the backend
+    @test AutoRIFT._chunk_rows(AutoRIFT.FiniteMask(a)) == 256 # and a mask follows its parent
+    @test AutoRIFT._chunk_rows(want) == 1                     # an in-memory array constrains nothing
+    for nthr in (1, 4, 64)
+        h = AutoRIFT._slab_height(a, AutoRIFT.PREFETCH_SLABS_PER_THREAD * nthr)
+        @test h % 256 == 0
+        @test h >= 256
+    end
 end
 
 @testset "the automatic budget compares two read volumes" begin
@@ -868,4 +888,17 @@ end
     # rather than a window per block per pass.
     @test a.elements == n * n
     @test b.elements == n * n
+
+    # `cache_budget` reaches the core from here too, and is not forwarded to `AutoRIFT.params` —
+    # which takes correlation parameters only and rejects anything else. Every accepted form, since
+    # each leaves this method by the same route.
+    ropts = (; chip_size = 16, chip_size_max = 16, grid_spacing = 16, search_radius = 8)
+    for cb in (:auto, nothing, 0, 1.0e9)
+        c, d = CountingDisk{Float32}((n, n), 1), CountingDisk{Float32}((n, n), 2)
+        @test autorift(Raster(c, dims2), Raster(d, dims2); ropts..., cache_budget = cb) isa RasterStack
+    end
+    # And the chunking the alignment reads survives the wrappers `_lazy_input` builds over a raster
+    # that declares nodata: the mask is read from the file, so it wants the same slab boundaries.
+    @test AutoRIFT._chunk_rows(ra) == 256
+    @test AutoRIFT._chunk_rows(parent(ra)) == 256
 end

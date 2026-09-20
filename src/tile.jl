@@ -200,6 +200,11 @@ function _level_centre_offset(p::Params)
     return (ceil(Int, sx), ceil(Int, sy))
 end
 
+# `want` raised to a whole multiple of `unit`, which is how a size is aligned to the storage's own
+# granularity: a block size to the file's chunk grid, a slab height to the chunk rows a read cannot
+# subdivide. A non-positive `unit` is no constraint and returns `want` unchanged.
+_round_up(want::Integer, unit::Integer) = unit <= 0 ? want : cld(want, unit) * unit
+
 """
     AutoRIFT.block_layout(grid::PointSet{2}, p::Params, imagesize, block_size) -> BlockLayout
 
@@ -515,14 +520,12 @@ end
 # `getindex`, which asks the same array for the same rows and columns. Measured on a chunked 1024²
 # pair at blocks of 256, exactly 2.00x the elements the windows span.
 #
-# `m.parent === img` is the same test [`AutoRIFT._mask_bytes`](@ref) applies, so what the estimate
-# charges and what the read costs cannot diverge. A mask over different storage — a caller's own, or
-# a nodata mask over unfilled values — is not derivable and is read.
-_read_mask_block!(dest::AbstractMatrix, mask::AbstractMatrix, ::AbstractMatrix, _window, rows, cols) =
-    _read_block!(dest, mask, rows, cols)
-function _read_mask_block!(dest::AbstractMatrix, mask::FiniteMask, img::AbstractMatrix,
+# [`AutoRIFT._derived_from`](@ref) is the same test [`AutoRIFT._mask_bytes`](@ref) applies, so what the
+# estimate charges and what the read costs cannot diverge. A mask over different storage — a caller's
+# own, or a nodata mask over unfilled values — is not derivable and is read.
+function _read_mask_block!(dest::AbstractMatrix, mask::AbstractMatrix, img::AbstractMatrix,
                            window::AbstractMatrix, rows, cols)
-    mask.parent === img || return _read_block!(dest, mask, rows, cols)
+    _derived_from(mask, img) || return _read_block!(dest, mask, rows, cols)
     dest .= isfinite.(window)
     return dest
 end

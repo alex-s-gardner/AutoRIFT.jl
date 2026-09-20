@@ -562,6 +562,29 @@ access order, not the policy: random replacement holds 5.6× where LRU holds 6.0
 Nor can the cache be narrowed to the region actually touched, which is sparse — 475 of the 725 chunks in
 its own bounding box.
 
+### The read splits on the file's chunk rows, not on an even division
+
+The prefetch reads the scene in row slabs, one task each. A slab boundary falling inside a stored chunk
+makes both neighbouring slabs decode that chunk, and for a compressed file **the decode is the read** —
+so an evenly-divided read pays for the boundary chunks twice.
+
+Measured on an 8321×8271 DEFLATE GeoTIFF at 10 threads, where four slabs per thread asks for a height of
+209 rows against chunks 256 rows tall:
+
+| slab height | prefetch | end-to-end |
+|---|---:|---:|
+| 209 rows (even division) | 987 ms | 5.75 s |
+| 256 rows (whole chunks) | **278 ms** | **5.38 s** |
+
+The same pixels either way — `vx` identical at all 160,394 points. `AutoRIFT._slab_height` rounds the
+even division *up* to whole chunk rows and never below one chunk, so alignment costs slabs rather than
+adding them: a thread count asking for more slabs than the file has chunk rows gets one chunk row.
+
+The chunk height comes from the backend through `AutoRIFT._chunk_rows`, which answers `1` — no
+constraint — for an unchunked one. That guard is load-bearing rather than defensive: `DiskArrays`
+reports the whole extent as a single chunk for an unchunked array, and taking that literally would
+collapse a threaded read to one slab.
+
 ## Transform sizes are already quantized, and coarsening costs more than it saves
 
 The count of distinct FFT sizes a NISAR pass plans looks alarming until it is measured properly. Distinct
