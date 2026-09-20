@@ -16,11 +16,11 @@
         "cpu": "Apple M2 Max",
         "cores": 12,
         "ram_gib": 96,
-        "os": "macOS 26.5.2",
-        "julia": "1.12.5",
+        "os": "macOS 26.6.2",
+        "julia": "1.13.0",
         "autorift_jl": "0.1.0",
         "autorift_py": "2.1.1",
-        "commit": "11920b9"
+        "commit": "f515f13"
     },
     "table": [
         {
@@ -29,10 +29,56 @@
             "threads": "2.3",
             "lazy": "no",
             "blocks": 1,
-            "seconds": 176.53,
-            "peak": 6883.453125,
-            "cores": 2.346739930889934,
-            "cpu": 414.27000000000004
+            "seconds": 178.6,
+            "peak": 6878.671875,
+            "cores": 2.3446248600223965,
+            "cpu": 418.75,
+            "phase": {
+                "wall": 166.01628237497061,
+                "cpu": 410.3085385833333,
+                "peak_res": 6598590464,
+                "peak_foot": 4542288336,
+                "start_res": 3147431936,
+                "start_foot": 3065269512
+            }
+        },
+        {
+            "group": "library",
+            "label": "AutoRIFT.jl, reference's filtered planes, 12 threads",
+            "threads": "12",
+            "lazy": "no",
+            "blocks": 1,
+            "seconds": 16.22,
+            "peak": 4144.734375,
+            "cores": 4.963008631319359,
+            "cpu": 80.5,
+            "phase": {
+                "wall": 15.505671208,
+                "cpu": 77.829480125,
+                "peak_res": 4346052608,
+                "peak_foot": 4287779136,
+                "start_res": 949387264,
+                "start_foot": 891242152
+            }
+        },
+        {
+            "group": "library",
+            "label": "AutoRIFT.jl, reference's filtered planes, 1 thread",
+            "threads": "1",
+            "lazy": "no",
+            "blocks": 1,
+            "seconds": 61.22,
+            "peak": 3237.03125,
+            "cores": 1.0290754655341392,
+            "cpu": 63,
+            "phase": {
+                "wall": 60.500475125,
+                "cpu": 60.424377875,
+                "peak_res": 3307536384,
+                "peak_foot": 3219983600,
+                "start_res": 958971904,
+                "start_foot": 900613488
+            }
         },
         {
             "group": "library",
@@ -40,10 +86,18 @@
             "threads": "12",
             "lazy": "no",
             "blocks": 1,
-            "seconds": 21.3,
-            "peak": 7247.21875,
-            "cores": 3.7239436619718314,
-            "cpu": 79.32000000000001
+            "seconds": 20.72,
+            "peak": 7043.5,
+            "cores": 4.058880308880309,
+            "cpu": 84.10000000000001,
+            "phase": {
+                "wall": 19.818078084,
+                "cpu": 81.294949875,
+                "peak_res": 7359971328,
+                "peak_foot": 7303453152,
+                "start_res": 2706325504,
+                "start_foot": 2649033608
+            }
         },
         {
             "group": "library",
@@ -51,10 +105,56 @@
             "threads": "1",
             "lazy": "no",
             "blocks": 1,
-            "seconds": 64.67,
-            "peak": 6702.296875,
-            "cores": 1.0236585743002935,
-            "cpu": 66.19999999999999
+            "seconds": 64.6,
+            "peak": 6962.828125,
+            "cores": 1.028637770897833,
+            "cpu": 66.45,
+            "phase": {
+                "wall": 63.698529708,
+                "cpu": 63.69536545833333,
+                "peak_res": 7296909312,
+                "peak_foot": 7241291824,
+                "start_res": 2704359424,
+                "start_foot": 2646887040
+            }
+        },
+        {
+            "group": "library",
+            "label": "AutoRIFT.jl, lazy, block 512, 12 threads",
+            "threads": "12",
+            "lazy": "yes",
+            "blocks": 1122,
+            "seconds": 48.88,
+            "peak": 2464.078125,
+            "cores": 6.42778232405892,
+            "cpu": 314.19,
+            "phase": {
+                "wall": 39.993909958,
+                "cpu": 302.49795475,
+                "peak_res": 2583773184,
+                "peak_foot": 2051083648,
+                "start_res": 796803072,
+                "start_foot": 681969944
+            }
+        },
+        {
+            "group": "library",
+            "label": "AutoRIFT.jl, lazy, block 1024, 12 threads",
+            "threads": "12",
+            "lazy": "yes",
+            "blocks": 289,
+            "seconds": 41.04,
+            "peak": 2263.40625,
+            "cores": 6.059454191033138,
+            "cpu": 248.68,
+            "phase": {
+                "wall": 36.863973584,
+                "cpu": 241.11684904166665,
+                "peak_res": 2170306560,
+                "peak_foot": 2050198672,
+                "start_res": 717996032,
+                "start_foot": 628131496
+            }
         },
         {
             "group": "library",
@@ -62,10 +162,18 @@
             "threads": "12",
             "lazy": "yes",
             "blocks": 81,
-            "seconds": 45.54,
-            "peak": 3663.046875,
-            "cores": 4.638559508124725,
-            "cpu": 211.23999999999998
+            "seconds": 44.03,
+            "peak": 3860.921875,
+            "cores": 4.984101748807631,
+            "cpu": 219.45,
+            "phase": {
+                "wall": 39.959072666,
+                "cpu": 212.02031116666666,
+                "peak_res": 3958898688,
+                "peak_foot": 3830026776,
+                "start_res": 735870976,
+                "start_foot": 645957216
+            }
         },
         {
             "group": "library",
@@ -73,10 +181,18 @@
             "threads": "12",
             "lazy": "yes",
             "blocks": 25,
-            "seconds": 56.65,
-            "peak": 9799.6875,
-            "cores": 3.920917917034422,
-            "cpu": 222.12
+            "seconds": 59.23,
+            "peak": 9865.0625,
+            "cores": 3.7501266250211045,
+            "cpu": 222.12,
+            "phase": {
+                "wall": 55.095315375,
+                "cpu": 214.647038125,
+                "peak_res": 10230874112,
+                "peak_foot": 10108527808,
+                "start_res": 736903168,
+                "start_foot": 647005816
+            }
         },
         {
             "group": "binary",
@@ -84,10 +200,11 @@
             "threads": "1",
             "lazy": "yes",
             "blocks": 1,
-            "seconds": 63.78,
-            "peak": 6360.875,
-            "cores": 1.024459078080903,
-            "cpu": 65.34
+            "seconds": 64.08,
+            "peak": 6650.1875,
+            "cores": 1.024812734082397,
+            "cpu": 65.66999999999999,
+            "phase": null
         },
         {
             "group": "binary",
@@ -95,10 +212,11 @@
             "threads": "1",
             "lazy": "yes",
             "blocks": 25,
-            "seconds": 99.87,
-            "peak": 3957.1875,
-            "cores": 1.014118353860018,
-            "cpu": 101.28
+            "seconds": 95.23,
+            "peak": 3985.71875,
+            "cores": 1.0187965977108053,
+            "cpu": 97.02,
+            "phase": null
         },
         {
             "group": "binary",
@@ -106,10 +224,11 @@
             "threads": "1",
             "lazy": "yes",
             "blocks": 81,
-            "seconds": 89.52,
-            "peak": 3363.03125,
-            "cores": 1.0112823949955319,
-            "cpu": 90.53
+            "seconds": 85.31,
+            "peak": 3459.4375,
+            "cores": 1.0193412261165162,
+            "cpu": 86.96000000000001,
+            "phase": null
         },
         {
             "group": "binary",
@@ -117,10 +236,11 @@
             "threads": "1",
             "lazy": "yes",
             "blocks": 289,
-            "seconds": 90.92,
-            "peak": 3214.84375,
-            "cores": 1.0172679278486583,
-            "cpu": 92.49000000000001
+            "seconds": 86.68,
+            "peak": 3354.09375,
+            "cores": 1.017535763728657,
+            "cpu": 88.2,
+            "phase": null
         },
         {
             "group": "binary",
@@ -128,10 +248,11 @@
             "threads": "1",
             "lazy": "yes",
             "blocks": 1122,
-            "seconds": 94.54,
-            "peak": 3134.625,
-            "cores": 1.0143854453141525,
-            "cpu": 95.89999999999999
+            "seconds": 90.36,
+            "peak": 3272.984375,
+            "cores": 1.0191456396635679,
+            "cpu": 92.08999999999999,
+            "phase": null
         },
         {
             "group": "binary",
@@ -139,10 +260,11 @@
             "threads": "1",
             "lazy": "yes",
             "blocks": 4422,
-            "seconds": 109.34,
-            "peak": 3133.71875,
-            "cores": 1.012987012987013,
-            "cpu": 110.76
+            "seconds": 103.75,
+            "peak": 3251.890625,
+            "cores": 1.0152289156626506,
+            "cpu": 105.33,
+            "phase": null
         }
     ]
 }

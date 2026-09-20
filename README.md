@@ -76,7 +76,8 @@ every entry reduces agreement by construction.
 - [x] Multi-chip-size search (not a pyramid — the imagery is never downsampled)
 - [x] Public API and cache lifecycle
 - [x] Rasters / DimensionalData extensions
-- [x] Performance milestone — 3.1x serial, 11.1x threaded against the reference
+- [x] Performance milestone — correlator to correlator, 2.7x serial and 10.7x threaded against the
+      reference on the same bytes, at 6.8x less CPU serially
 - [x] Memory as a tracked metric, and a trimmed 27.2 MiB binary
 - [ ] Complex (SLC) input
 - [ ] Geogrid

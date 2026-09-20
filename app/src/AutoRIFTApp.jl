@@ -135,7 +135,7 @@ function app_params(chip_size::Int, search_radius::Int, grid_spacing::Int, upsam
     # than through `AutoRIFT.extent`, because a positional `Params` call is the trimmable entry point
     # and every value here is already known to be square.
     return Params(
-        (ZNCC(),), Highpass(), PyramidRefine(upsampling), GardnerFilter(), False(),
+        (ZNCC(),), Highpass(), (PyramidRefine(upsampling),), GardnerFilter(), False(),
         NoRotationSearch(),
         (X = chip_size, Y = chip_size), (X = 4chip_size, Y = 4chip_size),
         (X = grid_spacing, Y = grid_spacing),

@@ -1,17 +1,25 @@
 """The reference's row of the full-scene table: `runAutorift` over the whole Landsat overlap.
 
-`bench_table.jl` times this as a child process under `/usr/bin/time -l`, so the number it records is
-whole-process wall clock and peak RSS — the same accounting every other row gets. Nothing here times
-anything itself; printing `MEASURED <n>` at the end is the contract, matching `ROW_SCRIPT` on the Julia
-side, so the caller can confirm the row did the work rather than exiting early.
+Two accountings, both recorded. `bench_table.jl` times this as a child process under
+`/usr/bin/time -l`, which is whole-process wall clock and peak RSS; `phase.py` additionally brackets
+`runAutorift` itself, which is the correlator's own cost from its entry point. The second is what a
+comparison against AutoRIFT.jl is made on, because the reference's preprocessing is separate calls
+while AutoRIFT.jl's is inside `autorift`, and a whole-process figure charges the two differently.
+Printing `MEASURED <n>` at the end is the contract, matching `ROW_SCRIPT` on the Julia side, so the
+caller can confirm the row did the work rather than exiting early.
 
 The planes come from the work directory `bench_scene.jl` filled, which is what makes this comparable:
 both sides read the same `Float32` arrays off the same files rather than each doing its own I/O and
 preprocessing.
 
-Preprocessing runs here, unlike the stage-2 A/B, because this table measures the whole pipeline as a
-user would invoke it. `DataType = 0` selects the reference's own uint8 path, which is what its
-`preprocess_filt_hps` produces and what production runs use.
+Preprocessing runs here, unlike the stage-2 A/B, because the whole-process figure measures the
+pipeline as a user would invoke it. `DataType = 0` selects the reference's own uint8 path, which is
+what its `preprocess_filt_hps` produces and what production runs use.
+
+**The filtered planes are written out**, as `prep_ref.u8` and `prep_sec.u8` in the work directory,
+column-major uint8. The Julia rows that compare against the correlator read those and skip their own
+preprocessing, so both sides correlate the same bytes and a filter difference cannot appear in the
+comparison as a speed or coverage difference.
 
     AUTORIFT_BENCH_DIR=/path/to/work micromamba run -n arift-ref python tools/ab/bench_scene.py
 """
@@ -20,6 +28,9 @@ import os
 import sys
 
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import phase
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORK = os.environ.get("AUTORIFT_BENCH_DIR")
@@ -88,7 +99,23 @@ def main():
 
     obj.preprocess_filt_hps()
     obj.uniform_data_type()
-    obj.runAutorift()
+
+    # After `uniform_data_type` these are the uint8 arrays the correlator reads, so this is the
+    # correlator's input boundary and the bytes the Julia comparison rows are handed. Written
+    # column-major to match `ref.bin`/`sec.bin` and what `read!` on a Julia `Matrix` expects.
+    #
+    # A column at a time, because `ndarray.tofile` always writes C order: transposing or asking for a
+    # Fortran copy first would materialize a second 290 MB plane, and the peak this script reports
+    # must not include a temporary that exists only to write a file.
+    for name, plane in (("prep_ref.u8", obj.I2), ("prep_sec.u8", obj.I1)):
+        if plane.dtype != np.uint8:
+            sys.exit(f"{name}: expected uint8 after uniform_data_type, found {plane.dtype}")
+        with open(os.path.join(WORK, name), "wb") as fh:
+            for j in range(plane.shape[1]):
+                fh.write(np.ascontiguousarray(plane[:, j]).tobytes())
+
+    _, metrics = phase.measure(obj.runAutorift)
+    phase.report("autorift", metrics)
 
     print("MEASURED %d" % int(np.count_nonzero(~np.isnan(obj.Dx))))
 

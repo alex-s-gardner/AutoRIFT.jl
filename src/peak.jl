@@ -789,6 +789,13 @@ subpixel_peak(rw, surface, radius::Integer, upsampling) =
 # both are touched only at chunk boundaries, so one lock costs nothing and two would be two
 # things to reason about. See that file for why pooling is keyed on exact geometry.
 
+# The element type is load-bearing, not documentation: `take_refinement!` pops from this, so a
+# `Vector{Any}` here makes its return type `Any` and every downstream call that carries a workspace
+# a dynamic dispatch — which also makes the `--trim=safe` build of `app/` unverifiable. Declared in
+# this file rather than beside the correlation pool because `RefinementWorkspace` is defined here and
+# `correlate.jl` is included first.
+const REFINEMENT_POOL = Dict{Int,Vector{RefinementWorkspace}}()
+
 """
     AutoRIFT.take_refinement!(upsampling) -> RefinementWorkspace
 
