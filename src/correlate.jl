@@ -479,10 +479,6 @@ function clear_workspaces!()
     return nothing
 end
 
-# Declared here and filled in `peak.jl`, which is where `RefinementWorkspace` is defined. Split
-# because each pool belongs with its type, and this file is included first.
-const REFINEMENT_POOL = Dict{Int,Vector{Any}}()
-
 """
     next_fft_size(n) -> Int
 
