@@ -66,6 +66,15 @@ Base.@propagate_inbounds function Base.getindex(m::FiniteMask, rows::AbstractUni
     return map(isfinite, m.parent[rows, cols])
 end
 
+# Whether `m` is the finiteness of exactly `img`, so that a read of `m` follows from a read of `img`
+# and costs nothing further: `_read_mask_block!` computes it from the window already in the buffer,
+# `_prefetch_mask` rebuilds it over the prefetched array, and `_mask_bytes` charges nothing for it.
+#
+# One predicate rather than the test at each of those, so what the estimate charges and what the read
+# costs cannot diverge. Identity, not equality: two masks over equal arrays are still two reads.
+_derived_from(::AbstractMatrix{Bool}, ::AbstractMatrix) = false
+_derived_from(m::FiniteMask, img::AbstractMatrix) = m.parent === img
+
 """
     AutoRIFT.resident(mask) -> AbstractMatrix{Bool}
 

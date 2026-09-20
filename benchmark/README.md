@@ -15,6 +15,11 @@ julia --project=benchmark benchmark/run.jl --tag my-experiment
 julia --project=benchmark benchmark/compare.jl \
     benchmark/results/baseline.json \
     benchmark/results/history/<tag>.json
+
+# Screen instead of gate: write the names over the threshold and exit zero on them.
+julia --project=benchmark benchmark/compare.jl base.json cand.json --screen screen.txt
+# Then re-measure only those, on each revision in turn.
+julia --project=benchmark -t auto benchmark/run.jl --tag confirm --only screen.txt
 ```
 
 `compare.jl` exits non-zero on a regression, so it works as a CI gate. It prints
@@ -40,7 +45,31 @@ The threshold is 1.10x on the minimum time. Minimum rather than mean because
 interference can only ever make a sample slower, so it is the least noisy estimate
 of what the code actually costs.
 
-Allocations are treated differently: benchmarks matching `ZEROALLOC_PATTERNS` in
+A ratio of two single measurements still has no error bar, though, and the suite makes
+around ninety of them at once. Empirically the 95th percentile of that distribution sits
+right at 1.10x, so on any diff at all a handful of benchmarks clear the threshold on noise
+alone. Two mechanisms separate a change from the runner.
+
+**Centering.** Every time ratio is divided by the median ratio over the gated benchmarks —
+what the runner contributed, since the two revisions are measured sequentially and a machine
+that drifts between the halves moves all of them together. One run shifted 36 of 95 entries
+a uniform 1.03–1.14x; another was centered at 1.030x and flagged 18 names raw against 6
+centered. A regression is a benchmark moving relative to its peers. The center is itself
+checked against the threshold, so a change that really does slow the whole suite down cannot
+hide inside its own median. Below 20 gated comparisons — a confirmation pass over a few names
+— there are too few peers to locate the shift and ratios are compared raw.
+
+**Confirmation.** A time regression is a *screening* result. `compare.jl --screen FILE`
+writes the names over the threshold to `FILE` without setting the exit status; CI then
+re-measures only those, on both revisions, with `run.jl --only FILE`, and gates on that
+second comparison. A ratio that survives two independent measurements is the code. One that
+does not is reported in the job summary and fails nothing. Roughly a dozen names get
+re-measured against the full suite's ninety-odd, so the second pass is minutes rather than
+another full run; past 25 flagged names the screen fails outright, because a run that noisy
+or a change that broad needs a person reading the table, not a longer list.
+
+Allocations are treated differently: they are exact at any duration, so they need neither
+mechanism and fail on the first pass. Benchmarks matching `ZEROALLOC_PATTERNS` in
 `compare.jl` fail on *any* allocation, not on an increase. Allocating once per grid
 point would be invisible in a microbenchmark and ruinous across millions of image
 pairs, so it is a correctness property rather than a performance one — and it is

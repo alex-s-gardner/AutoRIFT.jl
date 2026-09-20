@@ -31,6 +31,7 @@ Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 [extensions]
 AutoRIFTAkazeFeaturesExt = "AkazeFeatures"
 AutoRIFTDimensionalDataExt = "DimensionalData"
+AutoRIFTDiskArraysExt = "DiskArrays"
 AutoRIFTImageFeaturesExt = ["ImageFeatures", "ImageCore"]
 AutoRIFTImagePairGeometryExt = "ImagePairGeometry"
 AutoRIFTMetalExt = ["Metal", "KernelAbstractions"]

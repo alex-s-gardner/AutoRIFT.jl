@@ -200,6 +200,11 @@ function _level_centre_offset(p::Params)
     return (ceil(Int, sx), ceil(Int, sy))
 end
 
+# `want` raised to a whole multiple of `unit`, which is how a size is aligned to the storage's own
+# granularity: a block size to the file's chunk grid, a slab height to the chunk rows a read cannot
+# subdivide. A non-positive `unit` is no constraint and returns `want` unchanged.
+_round_up(want::Integer, unit::Integer) = unit <= 0 ? want : cld(want, unit) * unit
+
 """
     AutoRIFT.block_layout(grid::PointSet{2}, p::Params, imagesize, block_size) -> BlockLayout
 
@@ -500,9 +505,29 @@ function _block_pair!(buf::BlockBuffers, pair::ImagePair, b::Block)
     sv = @view buf.secondary_valid[1:nr, 1:nc]
     _read_block!(r, pair.reference, b.read_rows, b.read_cols)
     _read_block!(s, pair.secondary, b.read_rows, b.read_cols)
-    _read_block!(rv, pair.reference_valid, b.read_rows, b.read_cols)
-    _read_block!(sv, pair.secondary_valid, b.read_rows, b.read_cols)
+    # After the imagery, because a mask derived from an image is computed from the window just read
+    # rather than read again.
+    _read_mask_block!(rv, pair.reference_valid, pair.reference, r, b.read_rows, b.read_cols)
+    _read_mask_block!(sv, pair.secondary_valid, pair.secondary, s, b.read_rows, b.read_cols)
     return ImagePair(r, s, rv, sv)
+end
+
+# A mask window: read from `mask`, unless it is `img`'s own finiteness — in which case `window`, the
+# image window already in the buffer, is the same data and `isfinite` over it is the same answer.
+#
+# `ImagePair` defaults each valid mask to `FiniteMask` of its image, so without this the common case
+# reads every window of a disk-backed pair twice: once as imagery, once through the mask's own
+# `getindex`, which asks the same array for the same rows and columns. Measured on a chunked 1024²
+# pair at blocks of 256, exactly 2.00x the elements the windows span.
+#
+# [`AutoRIFT._derived_from`](@ref) is the same test [`AutoRIFT._mask_bytes`](@ref) applies, so what the
+# estimate charges and what the read costs cannot diverge. A mask over different storage — a caller's
+# own, or a nodata mask over unfilled values — is not derivable and is read.
+function _read_mask_block!(dest::AbstractMatrix, mask::AbstractMatrix, img::AbstractMatrix,
+                           window::AbstractMatrix, rows, cols)
+    _derived_from(mask, img) || return _read_block!(dest, mask, rows, cols)
+    dest .= isfinite.(window)
+    return dest
 end
 
 """
@@ -618,7 +643,7 @@ end
 # Steps 2 and 4 work on the grid, which is ~1/1024 the scene at the default spacing and stride.
 
 """
-    AutoRIFT.Blocked(raw, layout, blocks, buffers)
+    AutoRIFT.Blocked(raw, layout, blocks, buffers, cache_budget)
 
 Correlate each pass a block at a time. See [`AutoRIFT.PassRunner`](@ref).
 
@@ -630,6 +655,10 @@ runner holds is never formed.
 strided subset [`AutoRIFT._coarse_block_layout`](@ref) derives for a coarse one. `layout` is kept
 alongside it because `block_buffers` sizes from the whole layout's largest read window, which no pass
 changes. `buffers` is `nothing` for a threaded run, where each task takes its own set.
+
+`cache_budget` is the bytes of disk-backed input that may be read into memory up front, carried so that
+`reinit!` decides the same way for a later pair as `init` did for the first; `0` keeps the windowed
+reads. `raw` is already whatever that decision produced — see [`AutoRIFT._prefetched`](@ref).
 
 !!! warning "`blocks` indexes one grid, and only that grid"
     A `Block` holds *grid index ranges*, so this runner is bound to the grid shape its partition was
@@ -647,6 +676,9 @@ struct Blocked{P<:ImagePair,B<:Union{Nothing,BlockBuffers}} <: PassRunner
     layout::BlockLayout
     blocks::Vector{Block}
     buffers::B
+    # Bytes of disk-backed input this runner may read up front, so `reinit!` decides the same way for
+    # a pair swapped in later as `init` did for the first one. See `AutoRIFT._prefetched`.
+    cache_budget::Int
 end
 
 # `pass_geometry(pts)` is computed here rather than by the caller: it is a mechanism of blocking —
@@ -665,7 +697,7 @@ run_pass(r::Blocked, pts::PointSet{2}, p::Params, measure::SimilarityMeasure,
 # level restricts, and its coarse pass restricts that result again. `r.layout` is carried through
 # untouched because it sizes the buffers from the largest read window, which no striding changes.
 restrict(r::Blocked, setup, _gridsize::Tuple{Int,Int}) =
-    Blocked(r.raw, r.layout, _coarse_block_layout(r.blocks, setup), r.buffers)
+    Blocked(r.raw, r.layout, _coarse_block_layout(r.blocks, setup), r.buffers, r.cache_budget)
 
 # Loud, unlike the whole-scene runner: blocking is asked for when the scene will not fit, so a coarse
 # grid too small to filter means every point is searched at full radius — roughly a hundred times the
@@ -701,7 +733,9 @@ function correlate_tiled(raw::ImagePair, grid::PointSet{2}, p::Params, block_siz
     # no level changes, so allocating per pass would allocate the same nine arrays twice per level.
     # A threaded run takes its own set per task instead, since blocks then write concurrently.
     buffers = istrue(p.threaded) ? nothing : block_buffers(raw, layout)
-    return _multichip(Blocked(raw, layout, layout.blocks, buffers), grid, p)
+    # Budget 0: this correlates the pair it is handed, reading windows from wherever that pair lives.
+    # Deciding to read it into memory belongs to the entry points, where the caller can say otherwise.
+    return _multichip(Blocked(raw, layout, layout.blocks, buffers, 0), grid, p)
 end
 
 # Correlate `pts` block by block, writing into one field.
