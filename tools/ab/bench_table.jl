@@ -1,8 +1,11 @@
 # The full-scene comparison table: the reference, the library eager and lazy, and the trimmed binary
 # at each block size. Prints the table as Markdown, records it as JSON, and renders it to PDF.
 #
-# One fresh process per row, timed by `/usr/bin/time -l`, so runtime is whole-process wall clock and
-# peak RSS is what a memory limit would see. A process per row is required rather than tidy:
+# Two accountings per row. One fresh process per row, timed by `/usr/bin/time -l`, gives whole-process
+# wall clock and the peak RSS a memory limit would see; `phase.jl`/`phase.py` additionally bracket the
+# correlator call itself, which is what the reference and AutoRIFT.jl are compared on — the reference
+# filters and casts in separate calls while AutoRIFT.jl does it inside `autorift`, so a whole-process
+# figure charges the two for different work. A process per row is required rather than tidy:
 # `ru_maxrss` is a high-water mark, so two configurations measured in one process both report the
 # larger. One rep per row — each is minutes, and the spread across repeats is under 1%.
 #
@@ -38,23 +41,39 @@ gridlen(n) = length((cld(CHIP_MAX, 2) + RADIUS + 2):SPACING:(n - cld(CHIP_MAX, 2
 # One row of the table, run in a fresh process. Written to a file rather than kept as a function
 # because each row must be its own process, for the peak-RSS reason above.
 #
-# `eager` and `lazy` differ in exactly one thing — whether the pixels are on disk or in memory when
-# correlation starts — since both go through `autorift(::AbstractRaster, ...)`. `raw` is the
-# plain-array path on bare `Float32` planes, which is what the binary reads and what every other
-# benchmark in this repository measures.
+# Four modes. `prepped` is the correlator comparison: the uint8 planes `bench_scene.py` wrote after the
+# reference's own filtering, correlated with `preprocess = :none`, so both sides start from the same
+# bytes at the same entry point and neither timing contains a filter. `eager` and `lazy` differ in
+# exactly one thing — whether the pixels are on disk or in memory when correlation starts — since both
+# go through `autorift(::AbstractRaster, ...)`. `raw` is the plain-array path on bare `Float32` planes,
+# which is what the binary reads and what every other benchmark in this repository measures.
+#
+# `Phase.measure` brackets the `autorift` call alone. Reading the planes is setup and sits outside it,
+# except on `lazy`, where reading *is* part of the call and is the point of the row.
 const ROW_SCRIPT = """
     using AutoRIFT, Printf
+    include("$HERE/phase.jl")
     mode, block = ARGS[1], parse(Int, ARGS[2])
     work = ARGS[3]
     kw = (; chip_size = $CHIP, chip_size_max = $CHIP_MAX, grid_spacing = $SPACING,
           search_radius = $RADIUS, preprocess = :highpass, filter_width = 5,
           upsampling = $UPSAMPLING, threaded = Threads.nthreads() > 1,
           process_block_size = block == 0 ? nothing : (block, block))
-    if mode == "raw"
-        nr, nc = Tuple(parse.(Int, split(read(joinpath(work, "dims.txt"), String))))
-        ref = Matrix{Float32}(undef, nr, nc); read!(joinpath(work, "ref.bin"), ref)
-        sec = Matrix{Float32}(undef, nr, nc); read!(joinpath(work, "sec.bin"), sec)
-        out = autorift(ref, sec; kw...)
+    dims() = Tuple(parse.(Int, split(read(joinpath(work, "dims.txt"), String))))
+    function plane(name, T, nr, nc)
+        a = Matrix{T}(undef, nr, nc)
+        read!(joinpath(work, name), a)
+        return a
+    end
+    if mode == "prepped"
+        nr, nc = dims()
+        ref, sec = plane("prep_ref.u8", UInt8, nr, nc), plane("prep_sec.u8", UInt8, nr, nc)
+        out, m = Phase.measure(() -> autorift(ref, sec; kw..., preprocess = :none))
+        measured = count(!isnan, out.dx)
+    elseif mode == "raw"
+        nr, nc = dims()
+        ref, sec = plane("ref.bin", Float32, nr, nc), plane("sec.bin", Float32, nr, nc)
+        out, m = Phase.measure(() -> autorift(ref, sec; kw...))
         measured = count(!isnan, out.dx)
     else
         using Rasters, ArchGDAL, Extents
@@ -65,9 +84,11 @@ const ROW_SCRIPT = """
         # would make every mode eager.
         ex = Extents.intersection(Extents.extent(a), Extents.extent(b))
         va, vb = view(a, ex), view(b, ex)
-        out = mode == "lazy" ? autorift(va, vb; kw...) : autorift(read(va), read(vb); kw...)
+        ra, rb = mode == "lazy" ? (va, vb) : (read(va), read(vb))
+        out, m = Phase.measure(() -> autorift(ra, rb; kw...))
         measured = count(!isnan, parent(out.vx))
     end
+    Phase.report("autorift", m)
     @printf("MEASURED %d\\n", measured)
 """
 
@@ -106,13 +127,26 @@ end
 
 # Runtime and peak RSS of one child process. `/usr/bin/time -l` reports peak in bytes on macOS, and is
 # the only way to get it for a process this one did not itself build.
+#
+# A row that brackets its own correlation prints the `PHASE` line `phase.jl`/`phase.py` define, and
+# that is the figure the reference is compared against: whole-process wall clock charges AutoRIFT.jl for
+# loading a runtime and the reference for filtering 290 Mpixel, neither of which is correlation. The
+# binary rows print no such line — instrumenting them means a rebuild, and `--trim=safe` rejects the
+# formatting the report needs — so `phase` is `nothing` there and the table says so.
 function timed(cmd::Cmd, tag::AbstractString)
     log = joinpath(WORK, "$tag.log")
     open(log, "w") do io
         run(pipeline(`/usr/bin/time -l $cmd`; stdout = io, stderr = io))
     end
-    seconds = peak = cpu = nothing
+    seconds = peak = cpu = phase = nothing
     for line in eachline(log)
+        if startswith(line, "PHASE autorift ")
+            kv = Dict(k => parse(Float64, v) for (k, v) in
+                      (split(f, '=') for f in split(line)[3:end]))
+            phase = (; wall = kv["wall"], cpu = kv["cpu"],
+                     peak_res = kv["peak_res"], peak_foot = kv["peak_foot"],
+                     start_res = kv["start_res"], start_foot = kv["start_foot"])
+        end
         # `/usr/bin/time -l` opens with "<real> real <user> user <sys> sys". Summing user and system
         # over elapsed gives mean cores used — which is measured rather than assumed, and for
         # autoRIFT.py is far below the core count.
@@ -127,10 +161,13 @@ function timed(cmd::Cmd, tag::AbstractString)
     seconds === nothing && error("no timing for $tag; see $log")
     cputime = something(cpu, 0.0)
     cores = cputime / seconds
-    @printf("  %-32s %7.1f s  %8.1f s cpu  %6.0f MiB  %5.2f cores\n",
-            tag, seconds, cputime, something(peak, 0.0), cores)
+    @printf("  %-32s %7.1f s  %8.1f s cpu  %6.0f MiB  %5.2f cores", tag, seconds, cputime,
+            something(peak, 0.0), cores)
+    phase === nothing ? println() :
+        @printf("   | correlate %7.1f s  %8.1f s cpu  %6.0f MiB\n",
+                phase.wall, phase.cpu, phase.peak_foot / 2^20)
     flush(stdout)
-    return seconds, something(peak, 0.0), cores, cputime
+    return (; seconds, peak = something(peak, 0.0), cores, cpu = cputime, phase)
 end
 
 function measure()
@@ -144,36 +181,51 @@ function measure()
 
     rows = Any[]
     # `group` orders the rendered table; `threads` stays in the JSON as data even though the label
-    # carries it, so a later reader can filter on it without parsing prose.
+    # carries it, so a later reader can filter on it without parsing prose. `phase` is the correlation
+    # alone and is `nothing` for a row that could not report it.
     add!(group, label, threads, lazy, blocks, r) =
-        push!(rows, (; group, label, threads, lazy, blocks, seconds = r[1], peak = r[2],
-                     cores = r[3], cpu = r[4]))
+        push!(rows, (; group, label, threads, lazy, blocks, seconds = r.seconds, peak = r.peak,
+                     cores = r.cores, cpu = r.cpu, phase = r.phase))
+    # `-t $th,1`: the phase sampler needs an interactive thread, or it queues behind the correlation's
+    # own tasks and misses the peak. It sleeps between 50 ms samples, so it does not compete for a core.
     julia(th, mode, bs, tag) = timed(
-        `$(Base.julia_cmd()) --startup-file=no --project=$HERE -t $th $rowfile $mode $bs $WORK`, tag)
+        `$(Base.julia_cmd()) --startup-file=no --project=$HERE -t $th,1 $rowfile $mode $bs $WORK`, tag)
 
     # The reference gets no thread count to set: its correlation loop is serial, so what it uses is
     # whatever OpenCV's filter calls take. Reported as the measured mean rather than a requested count.
     # `AUTORIFT_BENCH_DIR` is passed explicitly rather than left to inheritance, since `WORK` defaults to
     # a fresh temp dir that the caller never set — the child would then look somewhere else and exit
     # immediately, recording its startup as the run.
+    #
+    # First, because it writes the filtered uint8 planes the `prepped` rows below read.
     r = timed(`micromamba run -n arift-ref env AUTORIFT_BENCH_DIR=$WORK python $(joinpath(HERE, "bench_scene.py"))`,
               "python")
-    add!("reference", "python autoRIFT v2.1.2†", @sprintf("%.1f", r[3]), "no", 1, r)
+    add!("reference", "python autoRIFT v2.1.2†", @sprintf("%.1f", r.cores), "no", 1, r)
+
+    # The correlator comparison: the reference's own filtered planes, `preprocess = :none`, so the
+    # `correlate` columns on these rows and on the reference's measure the same work on the same bytes.
+    for th in (12, 1)
+        add!("library", "AutoRIFT.jl, reference's filtered planes, $th thread$(th == 1 ? "" : "s")",
+             string(th), "no", 1, julia(th, "prepped", 0, "prepped_$th"))
+    end
 
     for th in (12, 1)
         add!("library", "AutoRIFT.jl, eager, no blocks, $th thread$(th == 1 ? "" : "s")",
              string(th), "no", 1, julia(th, "raw", 0, "eager_$th"))
     end
 
-    # Two block sizes on the threaded library path, so the peak-memory/runtime trade has more than one
-    # point on it. The scene's grid is 2127x2107, so 4096 and 2048 partition it into 25 and 81 blocks.
+    # A block-size sweep on the threaded library path, so the peak-memory/runtime trade is a curve
+    # rather than a pair of points. The scene is 17121x16961 pixels, so these partition it into 1122,
+    # 289, 81 and 25 blocks — every size gives more blocks than the machine has threads, which is what
+    # keeps the reported peak a property of the block size rather than of how many happen to be in
+    # flight.
     #
     # 8192 is excluded, at 9 blocks. It is a genuine partition, but fewer blocks than the machine has
     # threads, so every block is in flight at once and the run holds nine 8341x8341 working sets — 2.2x
     # the scene area, for a measured 16772 MiB against 3947 at 2048. That is the cost of the block size
     # being large relative to the scene rather than anything the blocking does, and reporting it beside
     # sizes that do bound memory invites reading it as the latter.
-    for bs in (2048, 4096)
+    for bs in (512, 1024, 2048, 4096)
         add!("library", "AutoRIFT.jl, lazy, block $bs, 12 threads", "12", "yes", nblocks(bs),
              julia(12, "lazy", bs, "lazy_$bs"))
     end
@@ -216,6 +268,29 @@ function ranked_rows(r)
                 by = t -> (get(order, get(t, :group, "library"), 9), t.seconds))
 end
 
+# The correlation's own wall clock, CPU time and peak footprint, as three cells.
+#
+# A row with no phase measurement renders as an em dash rather than a zero: a binary row prints no
+# `PHASE` line, and a results file written before this existed has no field at all, so both must read
+# as "not measured" instead of as a fast row.
+function phase_cells(t)
+    p = get(t, :phase, nothing)
+    p === nothing && return ("—", "—", "—")
+    return (@sprintf("%.1f s", p.wall), @sprintf("%.1f s", p.cpu),
+            @sprintf("%.0f MiB", p.peak_foot / 2^20))
+end
+
+# One `<tr>` of the performance table: the correlation's own cost, then the whole process's.
+function row_html(t)
+    c = phase_cells(t)
+    return """<tr><td class="l">$(t.label)</td>""" *
+           """<td>$(t.lazy)</td><td>$(t.blocks)</td>""" *
+           """<td>$(c[1])</td><td>$(c[2])</td><td>$(c[3])</td>""" *
+           """<td>$(@sprintf("%.1f s", t.seconds))</td>""" *
+           """<td>$(@sprintf("%.1f s", get(t, :cpu, 0.0)))</td>""" *
+           """<td>$(@sprintf("%.0f MiB", t.peak))</td></tr>"""
+end
+
 # A PNG inlined as a data URI. Chrome resolves `file://` subresources inconsistently in headless
 # `--print-to-pdf`; embedding the bytes removes the question.
 data_uri(path) = "data:image/png;base64," * base64encode(read(path))
@@ -242,11 +317,7 @@ function render(r)
     # achieved. A row whose wall clock rose while its CPU time held did not get more expensive, it
     # got less parallel — and on a shared machine that is the difference between a regression and a
     # busy afternoon. Older rows of this table were misread exactly that way.
-    body = join(("""<tr><td class="l">$(t.label)</td>""" *
-                 """<td>$(t.lazy)</td>""" *
-                 """<td>$(t.blocks)</td><td>$(@sprintf("%.1f s", t.seconds))</td>""" *
-                 """<td>$(@sprintf("%.1f s", get(t, :cpu, 0.0)))</td>""" *
-                 """<td>$(@sprintf("%.0f MiB", t.peak))</td></tr>""" for t in ranked), "\n")
+    body = join((row_html(t) for t in ranked), "\n")
     html = """
     <!DOCTYPE html><html><head><meta charset="utf-8"><style>
       @page { size: letter landscape; margin: 0.8in; }
@@ -281,8 +352,9 @@ function render(r)
         Julia $(r.provenance.julia) &middot;
         AutoRIFT.jl $(r.provenance.autorift_jl) ($(r.provenance.commit)) &middot;
         autoRIFT $(r.provenance.autorift_py)</p>
-      <table><thead><tr><th>configuration</th><th>lazy</th>
-        <th>blocks</th><th>runtime</th><th>CPU time&Dagger;</th><th>peak RSS</th></tr></thead>
+      <table><thead><tr><th>configuration</th><th>lazy</th><th>blocks</th>
+        <th>correlate&sect;</th><th>correlate CPU</th><th>correlate peak</th>
+        <th>whole process</th><th>process CPU&Dagger;</th><th>peak RSS</th></tr></thead>
       <tbody>
     $body
       </tbody></table>
@@ -294,7 +366,14 @@ function render(r)
         <code>OMP_WAIT_POLICY=passive</code> moves it 0.3%.<br>
         &Dagger; User + system, all threads. <b>Compare runs by CPU time; choose a configuration by
         runtime.</b> Runtime is CPU time divided by the parallelism achieved, so a row that got slower
-        at unchanged CPU time lost parallelism rather than gaining work.</p>
+        at unchanged CPU time lost parallelism rather than gaining work.<br>
+        &sect; The correlator from its own entry point: <code>runAutorift</code> on the reference's
+        side, <code>autorift</code> on AutoRIFT.jl's, with reading and filtering outside the bracket on
+        both. <b>This is the column the two implementations are compared on</b> &mdash; the reference
+        filters in separate calls while AutoRIFT.jl filters inside <code>autorift</code>, so a
+        whole-process figure charges them differently. Peak is the physical footprint high-water reached
+        during the call, sampled at 50&thinsp;ms. The lazy rows read their imagery inside the call, so
+        theirs includes that; the binary reports no phase.</p>
 
       <div class="page">
         <h1>Agreement with autoRIFT.py: displacement</h1>
@@ -338,11 +417,14 @@ end
 function main()
     r = "--replot" in ARGS ? JSON3.read(read(RESULTS, String)) : measure()
     println()
-    println("| configuration | lazy | blocks | runtime | CPU time | peak RSS |")
-    println("|---|:---:|---:|---:|---:|---:|")
+    println("| configuration | lazy | blocks | correlate | correlate CPU | correlate peak | " *
+            "whole process | process CPU | peak RSS |")
+    println("|---|:---:|---:|---:|---:|---:|---:|---:|---:|")
     for t in ranked_rows(r)
-        @printf("| %s | %s | %d | %.1f s | %.1f s | %.0f MiB |\n",
-                t.label, t.lazy, t.blocks, t.seconds, get(t, :cpu, 0.0), t.peak)
+        c = phase_cells(t)
+        @printf("| %s | %s | %d | %s | %s | %s | %.1f s | %.1f s | %.0f MiB |\n",
+                t.label, t.lazy, t.blocks, c[1], c[2], c[3],
+                t.seconds, get(t, :cpu, 0.0), t.peak)
     end
     @printf("\nwrote %s\n      %s\n", RESULTS, render(r))
 end
