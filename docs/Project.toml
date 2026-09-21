@@ -1,0 +1,26 @@
+[deps]
+ArchGDAL = "c9ce4bd3-c3d5-55b8-8973-c0e20141b8c3"
+AutoRIFT = "52cb0ed0-aa80-430c-bd04-c52888a79add"
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
+DiskArrays = "3c3547ce-8d99-4f5e-a174-61eb10b00ae3"
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+DocumenterVitepress = "4710194d-e776-4893-9690-8d956a29c365"
+Rasters = "a3a2b9e3-a471-40c9-b274-f788e487c689"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+
+[sources]
+AutoRIFT = {path = ".."}
+
+[compat]
+ArchGDAL = "0.10"
+CairoMakie = "0.15"
+Dates = "1"
+DimensionalData = "0.29, 0.30"
+DiskArrays = "0.4"
+Documenter = "1.19"
+DocumenterVitepress = "0.3"
+Rasters = "0.14, 0.15"
+Statistics = "1"
+julia = "1.11"

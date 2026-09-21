@@ -7,6 +7,7 @@
 /docs/node_modules/
 /docs/src/.vitepress/cache/
 /docs/package-lock.json
+/docs/Manifest.toml
 
 # A library does not commit its Manifest: it pins exact versions resolved by one
 # Julia version, and CI tests against several. The root one *was* committed, which

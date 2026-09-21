@@ -1,0 +1,58 @@
+name: Documentation
+
+# Separate from `CI.yml` for three reasons. `CI.yml` cancels in-progress runs on every branch but
+# main, and a cancelled deploy leaves `gh-pages` half-written where a cancelled test run costs
+# nothing. `CI.yml` also has an LTS step that rewrites `Project.toml` in the working tree, which must
+# not be in effect when a docs build resolves the docs environment against it. And this is the only
+# job that needs node.
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  statuses: write
+
+concurrency:
+  # Not keyed on the ref, and never cancelled: two jobs pushing `gh-pages` at once interleave their
+  # writes to the version index, which leaves the site serving a version list that does not match
+  # the directories present.
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  docs:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    # Dominated by precompiling Rasters and CairoMakie and by npm, not by the examples: the whole
+    # figure set is a few seconds of correlation.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # `'1'`, never `'lts'`. `docs/make.jl` gates `checkdocs = :public`, which resolves public
+      # names through `Base.ispublic` — added in Julia 1.11. On the LTS the check would see only the
+      # exported names and pass while covering a third of the API, so `make.jl` errors there rather
+      # than building.
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-docdeploy@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
+      # A build that fails after precompiling Rasters and CairoMakie has done the expensive part;
+      # saving the cache anyway means the next attempt starts from it.
+      - uses: julia-actions/cache@v2
+        if: failure()
+        with:
+          delete-old-caches: false
