@@ -496,3 +496,24 @@ end
     @test_throws "may widen a pass but never narrow it" track(
         pair, pts, params(); geometry = AutoRIFT.PassGeometry(extent(32), extent(4)))
 end
+
+@testset "a padded scene's border is independent of how it is split" begin
+    # Two shapes, each large enough on a different axis that `_zeropad` splits the corresponding
+    # border loop over tasks: the first the top and bottom bands, the second the left and right
+    # margins. A slice that lost or duplicated a line would leave `undef` memory in the output.
+    for (nr, nc, px, py) in ((100, 1000, 8, 300), (2000, 200, 214, 10))
+        A = Float32[i + j / 3 for i in 1:nr, j in 1:nc]
+        out = AutoRIFT._zeropad(A, extent((px, py)))
+        @test size(out) == (nr + 2py, nc + 2px)
+        @test out[(py + 1):(py + nr), (px + 1):(px + nc)] == A
+        @test all(iszero, out[1:py, :])
+        @test all(iszero, out[(py + nr + 1):end, :])
+        @test all(iszero, out[:, 1:px])
+        @test all(iszero, out[:, (px + nc + 1):end])
+    end
+
+    # The border is `zero(T)` and not a missing marker: for the validity mask it is the `false`
+    # that separates "outside the image" from a dark pixel.
+    m = AutoRIFT._zeropad(trues(100, 1000), extent((8, 300)))
+    @test !any(m[1:300, :]) && all(m[301:400, 9:1008])
+end

@@ -332,8 +332,8 @@ end
 
 # The border is zero and the interior is a copy, so every element is written exactly once here:
 # `zeros` would write the interior a second time, and on a whole scene that is the larger half of
-# the cost. The border loops and the copy between them cover the output exactly, which is what
-# makes `undef` safe.
+# the cost. The border loops and the interior copy cover the output exactly, which is what makes
+# `undef` safe.
 #
 # `zero(T)` for the border is what distinguishes "outside the image" from a dark pixel, and for the
 # validity mask it is the `false` the correlator tests against.
@@ -343,14 +343,17 @@ function _zeropad(A::AbstractMatrix{T}, pad::Extent) where {T}
     nr, nc = size(A)
     out = Matrix{T}(undef, nr + 2py, nc + 2px)
     z = zero(T)
-    @inbounds begin
-        # Top and bottom bands, full width.
-        for j in 1:(nc + 2px), i in 1:py
+    # Top and bottom bands, full width. Split over columns, each slice owning whole columns of both.
+    _parallel_slices(1:(nc + 2px), (nc + 2px) * py) do cols
+        @inbounds for j in cols, i in 1:py
             out[i, j] = z
             out[nr + py + i, j] = z
         end
-        # Left and right margins, over the rows the copy covers.
-        for j in 1:px, i in (py + 1):(py + nr)
+    end
+    # Left and right margins, over the rows the copy covers. Split over rows rather than over the
+    # margin's own columns, which number as few as one.
+    _parallel_slices((py + 1):(py + nr), px * nr) do rows
+        @inbounds for j in 1:px, i in rows
             out[i, j] = z
             out[i, nc + px + j] = z
         end
