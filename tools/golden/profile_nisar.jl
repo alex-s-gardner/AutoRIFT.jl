@@ -1,6 +1,11 @@
 # Where a threaded whole-granule run spends its time and its memory, attributed over the whole run.
 #
 #   julia --project=tools/golden -t 10,1 tools/golden/profile_nisar.jl NISAR_L2_PR_GSLC --blocks 8192
+#   julia --project=tools/golden -t 10,1 tools/golden/profile_nisar.jl S2B_MSIL1C --blocks 0 --run 200
+#
+# The case is a fragment of any golden product name, not only a NISAR one: nothing below reads the
+# platform. `--stride S` searches a scattered `1/S^2` of the grid (`_thin`), which is what puts a
+# granule whose whole-grid untiled peak does not fit the machine within reach of one run.
 #
 # `mem_nisar.jl` answers "what is the peak and what set it". This answers the two questions that one
 # leaves open on a granule that runs for minutes on ten threads:
@@ -187,10 +192,32 @@ profiler flagged asleep, and `span` the seconds between the first and last sampl
 
 `stacks` is keyed the way [`_stack_label`](@ref) labels a sample — the innermost frames belonging to
 this package — so a row names a pipeline stage rather than an FFTW codelet.
+
+The parallelism figures come from grouping samples into the sampling intervals that produced them. The
+profiler writes one block per thread per interval, so the running samples sharing an interval are **the
+threads that were working at that instant**: `hist[k + 1]` is the number of intervals with exactly `k`
+of them, and `nticks` the intervals in the run. That histogram is the answer a sample count cannot give
+— a stage holding 5% of the CPU on ten threads is 0.5% of the wall clock, and the same 5% on one thread
+is 5% of it — and it is a distribution rather than a mean, so a run that alternates between ten threads
+and one is distinguishable from one that uses five throughout.
+
+`ticks` counts, per stage, the intervals that stage appeared in at all, so `ticks / nticks` is its share
+of the wall clock. `serial` counts, per stage, only its samples in intervals at or below
+[`SERIAL_THREADS`](@ref) working threads: the stages that hold the machine to one core, which is the
+ranking a parallelisation effort is chosen from.
+
+Two cross-checks the caller should read rather than assume. `(samples + idle) / nticks` recovers the
+thread count, confirming that intervals group by thread and not by anything else; and `samples / nticks`
+is an independent estimate of the occupancy that CPU time measures, so the two disagreeing means one of
+them is wrong.
 """
 struct ProfileScan
     samples::Int
     stacks::Vector{Pair{String,Int}}
+    ticks::Dict{String,Int}
+    serial::Dict{String,Int}
+    hist::Vector{Int}
+    nticks::Int
     by_thread::Dict{Int,Int}
     idle::Int
     sleeping::Int
@@ -198,8 +225,14 @@ struct ProfileScan
     span::Float64
 end
 
+# The working-thread count at or below which an interval counts as serial.
+#
+# Two rather than one: a pipeline stage that runs on the main thread while a single straggler finishes
+# the previous stage's last chunk is serial for every purpose this measurement serves, and reads as two.
+const SERIAL_THREADS = 2
+
 """
-    scan_profile(data, hz; nframes = 6) -> ProfileScan
+    scan_profile(data, hz; delay, nframes = 6) -> ProfileScan
 
 Attribute every sample in `data` rather than only those inside a time window.
 
@@ -207,14 +240,39 @@ Reads the same block layout [`peak_stacks`](@ref) documents. Kept separate from 
 answer different questions and mixing them hides a truncated buffer: a window query over a truncated
 profile still returns a plausible answer, whereas this reports a `span` that a caller can compare
 against the run's wall clock.
+
+`delay` is the interval the profiler sampled at, and it is what makes the per-stage thread counts
+possible: a sample's `clock` is stamped on its own thread, so the blocks written for one tick carry
+close but unequal timestamps and cannot be grouped by equality. Binning at `delay` groups them.
 """
-function scan_profile(data::Vector{UInt64}, hz::Float64; nframes::Int = 6)
+function scan_profile(data::Vector{UInt64}, hz::Float64; delay::Real, nframes::Int = 6)
     counts = Dict{String,Int}()
     by_thread = Dict{Int,Int}()
+    # One bin per sampling interval, per stage. `Int32` because a bin index is the tick number and a
+    # run long enough to overflow it would need six weeks at 2 ms.
+    bins = Dict{String,Set{Int32}}()
+    allbins = Set{Int32}()
+    # Every attributed sample as (interval, stage), so a second aggregation can ask how many threads
+    # shared the interval a sample was taken in. Kept rather than streamed because that count is not
+    # known until the interval is complete, and the intervals interleave across threads.
+    attributed = Tuple{Int32,String}[]
+    running = Dict{Int32,Int}()
+    period = max(round(UInt64, delay * hz), one(UInt64))
     block_end = 0
     samples = idle = sleeping = gc = 0
     lo = typemax(UInt64)
     hi = zero(UInt64)
+    # The first pass fixes the origin the bins are measured from; `lo` is not known until every sample
+    # has been read, and a bin index has to be stable across the run.
+    for i in 6:length(data)
+        (data[i] == 0 && data[i - 1] == 0 && data[i - 2] in 1:3) || continue
+        clock = data[i - 3]
+        lo = min(lo, clock)
+        hi = max(hi, clock)
+    end
+    lo == typemax(UInt64) && return ProfileScan(0, Pair{String,Int}[], Dict{String,Int}(),
+                                                Dict{String,Int}(), Int[], 0,
+                                                Dict{Int,Int}(), 0, 0, 0, 0.0)
     for i in 6:length(data)
         (data[i] == 0 && data[i - 1] == 0 && data[i - 2] in 1:3) || continue
         state = data[i - 2]
@@ -222,8 +280,8 @@ function scan_profile(data::Vector{UInt64}, hz::Float64; nframes::Int = 6)
         tid = Int(data[i - 5])
         stack_hi = block_end + 1
         block_end = i
-        lo = min(lo, clock)
-        hi = max(hi, clock)
+        bin = Int32((clock - lo) ÷ period)
+        push!(allbins, bin)
         if state != 1
             sleeping += 1
             continue
@@ -241,10 +299,26 @@ function scan_profile(data::Vector{UInt64}, hz::Float64; nframes::Int = 6)
         samples += 1
         key == "(garbage collection)" && (gc += 1)
         counts[key] = get(counts, key, 0) + 1
+        push!(get!(bins, key, Set{Int32}()), bin)
         by_thread[tid] = get(by_thread, tid, 0) + 1
+        push!(attributed, (bin, key))
+        running[bin] = get(running, bin, 0) + 1
     end
+
+    # An interval that produced samples but none of them running is a real observation — every thread
+    # asleep or parked — so the histogram is over `allbins`, not over the intervals that did work.
+    hist = zeros(Int, isempty(running) ? 1 : maximum(values(running)) + 1)
+    for bin in allbins
+        hist[get(running, bin, 0) + 1] += 1
+    end
+    serial = Dict{String,Int}()
+    for (bin, key) in attributed
+        running[bin] <= SERIAL_THREADS && (serial[key] = get(serial, key, 0) + 1)
+    end
+
     span = hi > lo ? (hi - lo) / hz : 0.0
     return ProfileScan(samples, sort!(collect(counts); by = last, rev = true),
+                       Dict(k => length(v) for (k, v) in bins), serial, hist, length(allbins),
                        by_thread, idle, sleeping, gc, span)
 end
 
@@ -360,7 +434,7 @@ function run_config(a, b, grid, kw; bs::Tuple{Int,Int}, profile::Bool,
     scan = if profile
         data = Profile.fetch(include_meta = true)
         (; fill = Profile.len_data() / Profile.maxlen_data(), delay,
-         result = scan_profile(data, trace.tick_hz))
+         result = scan_profile(data, trace.tick_hz; delay))
     else
         nothing
     end
@@ -377,18 +451,25 @@ function run_config(a, b, grid, kw; bs::Tuple{Int,Int}, profile::Bool,
             trace, scan, dx = out.dx, dy = out.dy)
 end
 
-# Occupancy comes from CPU time, and the profiler's sample counts cannot substitute for it.
+# The reported occupancy is `cpu_seconds / wall_seconds` from [`cpu_seconds!`](@ref) — validated to
+# 1.00 / 1.99 / 3.99 / 9.77 on 1, 2, 4 and 10 spin loops. Two sample-derived figures sit beside it and
+# neither replaces it.
 #
-# The tempting figure is `running samples / (ticks x nthreads)`, on the reasoning that the profiler
-# writes one block per running thread per tick. It does not measure what it appears to: on a load
-# verified by CPU time to be using 1.02 threads of ten, that ratio reads **5.26**, and on a genuinely
-# saturating ten-thread load it reads 8.55. The profiler samples parked threads too and flags them
-# only coarsely, so the numerator counts threads that are doing nothing while the denominator assumes
-# they would not have been counted. The bias is large, load-dependent, and in the direction that
-# flatters an idle run.
+# `running samples / (span / delay x nthreads)` is the tempting one and it is wrong: on a load verified
+# by CPU time to be using 1.02 threads of ten it reads **5.26**, and on a genuinely saturating ten-thread
+# load 8.55. Two separate biases, both flattering an idle run. The denominator assumes the profiler kept
+# up, and it does not — 20% of intervals produce no block at all — while the numerator counts threads
+# parked on a condition variable as running, because the profiler flags thread state only coarsely.
 #
-# So the sample counts below are counts, not a rate, and occupancy is `cpu_seconds / wall_seconds`
-# from [`cpu_seconds!`](@ref) — validated to 1.00 / 1.99 / 3.99 / 9.77 on 1, 2, 4 and 10 spin loops.
+# `samples / nticks` corrects both and is the `mean working` figure `report` prints: `nticks` counts the
+# intervals that actually produced blocks, and a parked thread is separated into `idle` by the
+# `__psynch_cvwait` test in [`_stack_label`](@ref). What confirms the correction rather than assuming it
+# is the companion ratio `(samples + idle) / nticks`, which recovers the thread count — 9.99 of 10 — so
+# an interval holds one block per thread and nothing else.
+#
+# It still reads below the CPU occupancy, and legitimately: 3.16 against 4.87 on a ten-thread optical
+# case. The gap is the worker spin before parking, which burns CPU while doing no work. So CPU time
+# bounds how much of the machine was *held* and the samples say how much was *working*.
 function report(r, figs, nthreads)
     @printf("  %-14s %6d blocks  %7.1f s  peak %8.2f GiB (%.2f above floor)  readamp %5.2fx  measured %d\n",
             block_label(r.block), figs.nblocks, r.seconds,
@@ -412,20 +493,59 @@ function report(r, figs, nthreads)
     @printf("      profile: %d running samples at %.0f ms, span %.0f s of %.0f s wall, buffer %.0f%% full%s\n",
             s.samples, 1000 * r.scan.delay, s.span, r.seconds, 100 * r.scan.fill,
             r.scan.fill > 0.98 ? "  ** TRUNCATED **" : "")
-    # Occupancy: samples per thread against what a saturated run would give. The profiler writes one
-    # block per running thread per tick, so `samples / (ticks x nthreads)` is the fraction of the
-    # machine the run kept busy.
-    # Sample *counts*, not an occupancy: see the note above `report` on why a ratio of profile samples
-    # to ticks cannot measure how busy a run was.
+    # Sample *counts*, not a rate: see the note above `report` for which ratios of them mean something.
     @printf("      samples: %d attributed, %d idle-on-cvwait, %d flagged sleeping\n",
             s.samples, s.idle, s.sleeping)
     @printf("      GC samples %.1f%% of running\n", 100 * s.gc / max(1, s.samples))
+
+    # How many threads were working at once, over the run's sampling intervals. Read the two
+    # cross-checks first: `threads seen` should recover the thread count, and `mean working` should
+    # agree with the occupancy CPU time measured. Where they do, the distribution below is the Amdahl
+    # shape of the run, measured rather than inferred from a mean.
+    @printf("      interval check: %.2f threads seen per interval of %d, mean working %.2f (cpu %.2f)\n",
+            (s.samples + s.idle) / max(1, s.nticks), nthreads,
+            s.samples / max(1, s.nticks), r.occupancy)
+    println("      working threads per interval:")
+    for k in 0:(length(s.hist) - 1)
+        s.hist[k + 1] == 0 && continue
+        share = s.hist[k + 1] / max(1, s.nticks)
+        @printf("        %2d %5.1f%% %s\n", k, 100 * share, '#'^ceil(Int, 60 * share))
+    end
+    ser = sum(s.hist[1:min(SERIAL_THREADS + 1, end)])
+    @printf("      at or below %d working threads: %.1f%% of the run, %.1f s of %.1f s\n",
+            SERIAL_THREADS, 100 * ser / max(1, s.nticks),
+            s.span * ser / max(1, s.nticks), s.span)
     # Shares of *working* samples. Dividing by running-plus-idle instead would fold the occupancy
     # question into every stage's share and make each one look smaller on a less busy configuration,
     # which is two findings tangled into one column — occupancy is the line above.
+    #
+    # `wall` is the column to read together with it: a stage at 30% of the CPU over 3% of the intervals
+    # costs a tenth of what a stage at 5% of the CPU over 5% of the intervals costs.
+    #
+    # `thr` is the mean threads inside the stage while it appeared, and it is only meaningful for a stage
+    # coarse enough that every thread in it shares a label. These labels are six frames deep and carry
+    # line numbers, so a saturated run has its ten threads on ten different lines and every row reads
+    # near 1.0 regardless of how busy the machine was. The table below, and the histogram above, are what
+    # answer that; `thr` distinguishes only the stages that genuinely run one thread wide, like GC.
     println("      where the run spends its time (share of working samples):")
+    @printf("        %6s %5s %6s  %s\n", "cpu", "thr", "wall", "stage")
     for (lbl, cnt) in first(s.stacks, 14)
-        @printf("        %5.1f%%  %s\n", 100 * cnt / max(1, s.samples), lbl)
+        tk = get(s.ticks, lbl, 0)
+        @printf("        %5.1f%% %5.2f %5.1f%%  %s\n", 100 * cnt / max(1, s.samples),
+                tk == 0 ? NaN : cnt / tk, 100 * tk / max(1, s.nticks), lbl)
+    end
+
+    # The same stages restricted to the serial intervals, which is a different ordering and the one a
+    # parallelisation effort is chosen from: the stage with the most CPU is usually the stage that is
+    # already spread across every thread.
+    ranked = sort!(collect(s.serial); by = last, rev = true)
+    if !isempty(ranked)
+        nser = sum(values(s.serial))
+        @printf("      what holds it there (share of the %d samples in those intervals):\n", nser)
+        for (lbl, cnt) in first(ranked, 10)
+            @printf("        %5.1f%% %5.1f s  %s\n", 100 * cnt / nser,
+                    s.span * cnt / max(1, s.nticks), lbl)
+        end
     end
     return nothing
 end
@@ -441,9 +561,13 @@ configuration's peak is reported against the trace's own settled floor before it
 what makes one process sufficient.
 """
 function measure_case(c::GoldenCase; blocks::Vector{Tuple{Int,Int}}, n::Integer = 100,
-                      profile::Bool = true)
+                      profile::Bool = true, stride::Integer = 1, thin_block::Integer = 128)
     k = read_capture(c; n)
     grid = pointset_from_capture(k)
+    # Thinning cuts the points searched and not the resident imagery, so a thinned row's peak is not a
+    # fraction of the whole-grid one and the two are not comparable. `stride` travels into the record
+    # below for that reason: a row has to say which grid it measured.
+    stride > 1 && (grid = _thin(grid, stride; block = thin_block))
     kw = kwargs_from_capture(k)
     # `arImgDisp_s(a, b)` cuts its chip from `b`, and the reference calls it with `I1` second, so
     # `I1` binds to `secondary` — the same binding `compare_correlator` documents and uses.
@@ -494,7 +618,8 @@ function measure_case(c::GoldenCase; blocks::Vector{Tuple{Int,Int}}, n::Integer 
         rec = (; r..., clean_seconds = clean.seconds, clean_peak = clean.peak,
                clean_cpu = clean.cpu, clean_occupancy = clean.occupancy,
                nblocks = figs.nblocks, readamp = figs.readamp, window = figs.window,
-               scene, grid = size(grid), halo = (h.X, h.Y), nthreads)
+               scene, grid = size(grid), halo = (h.X, h.Y), nthreads, stride,
+               searchable = nsearchable(grid), case = c.product, run = n)
         push!(results, rec)
         report(rec, figs, nthreads)
         flush(stdout)
@@ -562,7 +687,15 @@ function save_results(c::GoldenCase, results)
                (; fill = r.scan.fill, delay = r.scan.delay,
                 samples = r.scan.result.samples, idle = r.scan.result.idle,
                 sleeping = r.scan.result.sleeping, gc = r.scan.result.gc,
-                span = r.scan.result.span, stacks = r.scan.result.stacks)
+                span = r.scan.result.span, stacks = r.scan.result.stacks,
+                # Vectors of pairs rather than `Dict`s, so a reader can zip them against `stacks` and
+                # needs no lookup to pair a stage with the intervals it was spread over.
+                ticks = [lbl => get(r.scan.result.ticks, lbl, 0)
+                         for (lbl, _) in r.scan.result.stacks],
+                serial = [lbl => get(r.scan.result.serial, lbl, 0)
+                          for (lbl, _) in r.scan.result.stacks],
+                hist = r.scan.result.hist, serial_threads = SERIAL_THREADS,
+                nticks = r.scan.result.nticks)
         return (; base..., scan, stamp, commit)
     end
     # Read-then-write rather than opening in append mode: `Serialization` writes one value per stream,
@@ -586,24 +719,31 @@ are printed in the units they are budgeted in, with the ratio beside them rather
 """
 function render_history(rows)
     isempty(rows) && return nothing
-    # Newest row per block size, by position: `vcat` appends, so the last occurrence is the newest.
+    # Newest row per block size *and* grid, by position: `vcat` appends, so the last occurrence is the
+    # newest. The grid is part of the key because a thinned row measures a different computation, not a
+    # sample of the same one — see `measure_case`. Rows predating `stride` are whole-grid.
     latest = Dict{Any,Any}()
     for r in rows
-        latest[r.block] = r
+        latest[(r.block, get(r, :stride, 1))] = r
     end
-    keep = sort!(collect(values(latest)); by = r -> (r.block == (0, 0) ? 0 : -prod(r.block)))
-    base = get(latest, (0, 0), nothing)
-    println("\nevery configuration measured for this case (newest per block size):")
-    @printf("  %-14s %7s %9s %9s %9s %7s %8s %9s  %s\n",
-            "block", "blocks", "runtime", "vs untiled", "peak GiB", "vs unt", "occ/thr", "read amp",
-            "measured")
+    keep = sort!(collect(values(latest));
+                 by = r -> (get(r, :stride, 1), r.block == (0, 0) ? 0 : -prod(r.block)))
+    # Ratios are against the whole-grid untiled run, so a thinned row has none and prints "—" rather
+    # than a ratio against a run that searched sixteen times as many points.
+    base = get(latest, ((0, 0), 1), nothing)
+    println("\nevery configuration measured for this case (newest per block size and grid):")
+    @printf("  %-14s %6s %7s %9s %9s %9s %7s %8s %9s  %s\n",
+            "block", "stride", "blocks", "runtime", "vs untiled", "peak GiB", "vs unt", "occ/thr",
+            "read amp", "measured")
     for r in keep
         rt = r.clean_seconds
         pk = r.peak / 2^30
-        @printf("  %-14s %7d %7.1f s %9s %9.2f %7s %5.2f/%-2d %8.2fx  %d\n",
-                block_label(r.block), r.nblocks, rt,
-                isnothing(base) ? "—" : @sprintf("%.2fx", rt / base.clean_seconds),
-                pk, isnothing(base) ? "—" : @sprintf("%.2fx", pk / (base.peak / 2^30)),
+        s = get(r, :stride, 1)
+        comparable = !isnothing(base) && s == 1
+        @printf("  %-14s %6d %7d %7.1f s %9s %9.2f %7s %5.2f/%-2d %8.2fx  %d\n",
+                block_label(r.block), s, r.nblocks, rt,
+                comparable ? @sprintf("%.2fx", rt / base.clean_seconds) : "—",
+                pk, comparable ? @sprintf("%.2fx", pk / (base.peak / 2^30)) : "—",
                 r.clean_occupancy, r.nthreads, r.readamp, r.measured)
     end
     n = length(rows) - length(keep)
@@ -613,11 +753,14 @@ end
 
 function main()
     isempty(ARGS) && error("usage: profile_nisar.jl <product-fragment> " *
-                          "[--blocks 0,3072,2304x1152] [--run N] [--no-profile]")
+                          "[--blocks 0,3072,2304x1152] [--run N] [--stride S] " *
+                          "[--thin-block B] [--no-profile]")
     c = only(cases(ARGS[1]))
     n = parse(Int, argvalue("--run", "100"))
     blocks = parse_block.(split(argvalue("--blocks", "3072"), ','))
-    results = measure_case(c; blocks, n, profile = !("--no-profile" in ARGS))
+    stride = parse(Int, argvalue("--stride", "1"))
+    thin_block = parse(Int, argvalue("--thin-block", "128"))
+    results = measure_case(c; blocks, n, profile = !("--no-profile" in ARGS), stride, thin_block)
     report_agreement(results)
     save_results(c, results)
     return nothing
