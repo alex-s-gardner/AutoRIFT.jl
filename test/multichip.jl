@@ -1,7 +1,7 @@
 using AutoRIFT: ImagePair, gridpoints, params, correlate_multichip, chipsize_level,
                 MultichipResult, nmeasured, resample, resample!, Nearest, Area, Bicubic,
                 dilate_within, small_components, windowmax,
-                DisplacementField, _fill_holes!
+                DisplacementField, _fill_holes!, _open_after_count
 
 # Same convention as track.jl's tests: the correlator returns secondary-to-reference, so the
 # feature motion is its negative.
@@ -151,6 +151,32 @@ end
     @test !any(small_components(falses(5, 5), 5))     # empty stays empty
     @test !any(small_components(trues(4, 4), 5))      # one component of 16
     @test !any(small_components(trues(3, 3), 0))      # a threshold of 0 selects nothing
+end
+
+@testset "the open-hole scan is independent of how it is split" begin
+    # Large enough that `_open_after_count` splits its columns over tasks, and with a row count
+    # that is not a multiple of 64, so a slice boundary falls inside the result's last row.
+    nr, nc = 513, 513
+    dx = Float32[(i * 7 + j * 3) % 11 < 4 ? NaN32 : Float32(i - j) for i in 1:nr, j in 1:nc]
+
+    # The same criterion, written as one pass over the whole grid.
+    function whole(dx, w, needed)
+        lo = (w - 1) ÷ 2
+        out = falses(size(dx))
+        for j in axes(dx, 2), i in axes(dx, 1)
+            isnan(dx[i, j]) || continue
+            n = count(!isnan, @view dx[max(i - lo, 1):min(i + lo, nr),
+                                      max(j - lo, 1):min(j + lo, nc)])
+            out[i, j] = n < needed
+        end
+        return out
+    end
+
+    for (w, needed) in ((3, 6), (5, 12))
+        @test _open_after_count(dx, w, needed) == whole(dx, w, needed)
+    end
+    @test all(_open_after_count(fill(NaN32, nr, nc), 3, 6))      # nothing measured anywhere
+    @test !any(_open_after_count(zeros(Float32, nr, nc), 3, 6))  # no hole to leave open
 end
 
 @testset "hole size fills what neighbour count cannot" begin
