@@ -617,9 +617,10 @@ function _cell_means(sub::PointSet{2}, full::PointSet{2}, rows, cols, stride::In
     # `round(x + 0.5) - 0.5` (`autoRIFT.py:120-122`) snaps to half-integers, which is right for *its* grid
     # because `runAutorift` has already set `xGrid = round(xGrid) + 0.5` and averaging an even number of
     # half-integers lands back on a whole one. A `PointSet` carries no such guarantee — `gridpoints`
-    # produces integer coordinates and a captured grid half-integer ones — so the reference's literal form
-    # would move every node of an integer grid by half a pixel. Reading the phase from the grid reproduces
-    # the reference exactly on a captured grid and is a no-op on an integer one.
+    # produces integer coordinates and a captured grid half-integer ones — so a hardcoded half would move
+    # every node of an integer grid by half a pixel. Reading the phase from the grid reproduces the
+    # reference exactly on a captured grid and is a no-op on an integer one.
+    #
     #
     # `phase` is that lattice when a caller has already read it off `full`, which is a scan of the whole
     # grid and the same answer for every level over it.
@@ -652,7 +653,31 @@ end
 # `offset` names.
 #
 # `INTER_AREA` at an integer scale — what the reference resizes a level's coordinate arrays with — is exactly
-# this block mean, and the snap is its `round(x + 0.5) - 0.5` generalized to an arbitrary sub-pixel phase.
+# this block mean, and the snap puts the result back on the lattice `offset` names.
+#
+# **The offset is subtracted before rounding, and the opposite order is not equivalent.** Both reach the
+# same lattice and agree everywhere except where `s / n` falls midway between two of its points — but
+# `round` breaks such a tie to even, so there the two orders land a *whole step* apart: at an integral `x`
+# with `offset = 0.5`, this form gives `x + 0.5` for even `x` where `round(x + 0.5) - 0.5` gives `x - 0.5`.
+# Neither is rare nor self-cancelling in effect: 11.1% of the `x` cells of a stride-2 level over
+# `S1B_IW_SLC__1SDH_20180809T204617`'s grid sit exactly on a tie, 15.6% over NISAR L1's, and the direction
+# follows the parity of the cell rather than the data, so the population mean of the difference is zero and
+# only the exact-match rate shows it.
+#
+# This order is the one that reproduces the reference's own resized coordinate arrays — MAD 0.0000 and
+# 100.00% within 1 px against the captured chip-768 lattice, which `tools/golden/level_replay.jl` measures.
+# Swapping it costs 8.3 points of exact `dx` agreement on the golden `S1B_IW_SLC__1SDH_20180809T204617`
+# case (76.40% to 68.06%) and doubles the median residual, so `round(x + 0.5) - 0.5` read off
+# `autoRIFT.py:120-122` does not describe what the reference does to a *decimated* level.
+#
+# **The cell is averaged whole, nodata fill included, and that is matched rather than endorsed.** `cv2.resize`
+# has no concept of nodata, and the fill is an in-band constant — `0.5` on a coordinate array after the
+# half-sample snap — so a cell straddling the swath edge averages real coordinates against it and the node
+# lands somewhere the grid does not describe: outside its own cell's real coordinate range for 94.2% of
+# straddling cells at chip 768 on NISAR L1, where the reference searches 3,967 of them. This is the single
+# place that decision is made; `CORRECTNESS.md` item 2 carries the measurement and the masked-mean fix, which
+# item 1 there largely subsumes and which must not land while golden cases are red.
+#
 # Clipped at the grid's far edge, so a grid whose extent is not a multiple of `stride` has a short last cell
 # rather than one reaching past the end: `cv2.resize` cannot produce such a cell, since a level's shape is
 # `floor(n * Scale)`, but a caller-supplied grid can.
