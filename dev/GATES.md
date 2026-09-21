@@ -5,7 +5,7 @@ this list only while it still passes: `regate.jl` re-runs all of them, and a row
 a regression to fix rather than a number to update.
 
 **Deferred correctness work is not here.** A gate records what is *verified*; a defect this project
-reproduces on purpose is in [`CORRECTNESS.md`](../../CORRECTNESS.md) at the repository root, with
+reproduces on purpose is in [`CORRECTNESS.md`](CORRECTNESS.md), with
 `tools/golden/README.md` holding the per-item evidence. When every gate below is green, that file is the
 work list.
 
@@ -2454,7 +2454,7 @@ Measured after both fixes, on the captured L1 grid:
 So blocking *is* available on a NISAR grid, at a block size scaled to the halo. The amplification is set
 by the 2684x1448 px halo rather than by the layout: even a 16384 px block pays 2.9x, which is what a
 fixed-width halo costs when it is a large fraction of the block. Axis-aligned grids are unaffected — the
-Landsat sweep in `docs/memory.md` reproduces its previous block counts and amplification, a full-width
+Landsat sweep in `docs/src/explanation/memory.md` reproduces its previous block counts and amplification, a full-width
 band stays a band, and `dx`/`dy`/`correlation` stay bit-identical to an untiled run at every block size.
 
 ## Step: what the 44 GiB peak is, and it is not the imagery
@@ -2543,14 +2543,14 @@ bit-identical); per-point radius variety, `preprocess = :none`, a clustered unse
 reproduce bit-identically in isolation); and the chip ladder or the fine rejection themselves, since one
 point still differs with a single chip size.
 
-**What it means for the bit-identity promise.** `docs/memory.md` states bit-identity as one of two things
+**What it means for the bit-identity promise.** `docs/src/explanation/memory.md` states bit-identity as one of two things
 `process_block_size` guarantees. That holds for the correlation and fails for the *rejection decision* on
 a grid with a skewed radius field, because the decision is a threshold on a quantity only reproducible to
 ~1e-7. Two honest resolutions, neither applied: hand every block the whole grid's pass geometry for the
 quality metrics as well as the transform — which `_run_blocked` already does for `geometry`, so the
 remaining difference is that a bucket's workspace is sized to the bucket — or state the promise as
 bit-identical `dx`/`dy` *given the same keep mask*, and treat the mask as reproducible only where no point
-sits within ~1e-6 of a threshold. The Landsat sweep in `docs/memory.md` is unaffected either way: uniform
+sits within ~1e-6 of a threshold. The Landsat sweep in `docs/src/explanation/memory.md` is unaffected either way: uniform
 radii mean a block's geometry equals the grid's, and those runs are bit-identical at every block size.
 
 ## Step: what a whole NISAR scene costs, and a GC deadlock under contention
@@ -2850,7 +2850,7 @@ coarsely. `cpu_seconds / wall_seconds` from `proc_pid_rusage` measures 1.00 / 1.
 4 and 10 spin loops, so that is the figure quoted above. Its fields are **mach ticks**: read as
 nanoseconds they give 0.02 threads for a one-thread load.
 
-**The buffer rule was written as a 9x overcount.** `docs/memory.md` and this file both said
+**The buffer rule was written as a 9x overcount.** `docs/src/explanation/memory.md` and this file both said
 `9 x 18 bytes x (block + 2*halo)^2 x nthreads` while their prose said "18 bytes per pixel" — the nine
 arrays *total* 18 B/px for a `UInt8` pair (two `UInt8`, three `Float32`, four `Bool`), measured at exactly
 18.0 off the struct's fields. The derived figures in those sections (4.56 GiB per set, 45.6 across ten

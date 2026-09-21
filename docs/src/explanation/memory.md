@@ -60,7 +60,8 @@ skips the correlation.
 **97% of the floor is the runtime.** AutoRIFT itself is ~7 MiB. There is no optimization inside
 this package that reaches the other 397; `--compile=min` recovers 18 MiB, which is not the right
 order of magnitude. That is what makes a trimmed binary the only real lever — see
-[`app/`](../app/README.md), which runs the same correlation at **27.2 MiB peak against 424.2 MiB**.
+[`app/`](https://github.com/alex-s-gardner/AutoRIFT.jl/tree/main/app), which runs the same
+correlation at **27.2 MiB peak against 424.2 MiB**.
 
 ## Per-pair peak
 
@@ -322,13 +323,13 @@ differently in kind, not only in degree. On the whole NISAR L1 grid `halo(grid, 
 spacing — because a Geogrid search-radius field is extremely skewed: over the searchable points the
 median x radius is **34** against a maximum of **1905**, a 56× spread, and the halo takes the maximum.
 Only 35% of the grid is searchable at all, so a median over every point is 0 and says nothing.
-`tools/golden/GATES.md` records a per-block halo that was implemented and reverted at a measured
+`dev/GATES.md` records a per-block halo that was implemented and reverted at a measured
 1.03–1.11× gain, since `chip_size_max/2` alone floors it at 561 px whatever the block.
 
 A 2736 px halo still permits blocks on a 57760×50511 scene, and it now produces them. Two properties
 of a rotated grid had to be handled first, and both used to fail silently rather than loudly.
 
-**A grid's coordinates need not be separable.** [`AutoRIFT.block_layout`](@ref) used to derive its
+**A grid's coordinates need not be separable.** `AutoRIFT.block_layout` used to derive its
 block boundaries from `grid.y[:, 1]` and `grid.x[1, :]`, assuming a gridded `PointSet` repeats each
 coordinate down every row and across every column. A NISAR geogrid is a **rotated radar footprint**
 sampled onto a map grid, so `x` varies by 50502 px down a single column and `y` by 43164 px across a
@@ -346,11 +347,11 @@ constraints decouple, and this reduces to the separable answer, so a Landsat lay
 full-width band included.
 
 **A block's read window must span only the points it will search.** The window came from
-[`AutoRIFT._pixel_span`](@ref) over every point in the block, and on a rotated grid the points outside
+`AutoRIFT._pixel_span` over every point in the block, and on a rotated grid the points outside
 the footprint carry a *fill* coordinate — zero here, not `NaN`, so a finiteness test does not find
 them. A block straddling the footprint edge therefore spanned from 0 to the real coordinates and read
 `1:57760`, the whole scene. Measured at an 8192 px block: 28 of 209 blocks each read half the scene or
-more, 99× the scene in total. [`AutoRIFT._searchable_span`](@ref) reduces over searchable points only,
+more, 99× the scene in total. `AutoRIFT._searchable_span` reduces over searchable points only,
 which is sound because `_run_one_block!` returns before any I/O for a block with nothing to search.
 
 **And an index rate has to be measured over the points a block must cover.** The rates above came from
@@ -492,7 +493,7 @@ with the lock held, and blocks on the same lock before it reaches its own resume
 thread only it can restart. Every other thread queues at `jl_safepoint_start_gc` behind a collection that
 has begun and can never end, with **no** thread marking or sweeping. It is a Julia runtime bug in `src/signals-mach.c`, present in every release through 1.13.0
 and fixed on master by `ca49fc2e2` (not backported). `tools/golden/profiler_gc_deadlock.jl` reproduces it
-in ~2 runs of 5 with no AutoRIFT code involved, and `tools/golden/GATES.md` holds the traces.
+in ~2 runs of 5 with no AutoRIFT code involved, and `dev/GATES.md` holds the traces.
 
 None of the figures here are affected — they come from unprofiled runs — and an unprofiled production
 worker cannot reach the path at all.
@@ -589,7 +590,7 @@ collapse a threaded read to one slab.
 
 The count of distinct FFT sizes a NISAR pass plans looks alarming until it is measured properly. Distinct
 *raw* `(radius_x, radius_y)` pairs on the L1 grid number **29,761** — but that is not what gets planned.
-[`AutoRIFT._radius_bucket`](@ref) rounds every radius up to a power of two and caps it at the pass radius,
+`AutoRIFT._radius_bucket` rounds every radius up to a power of two and caps it at the pass radius,
 so the ladder actually reached is **37 sizes** on L1 and 44 on L2, each reused by tens of thousands of
 points. Nine rungs per axis: 8, 16, 32 … 1024, cap.
 

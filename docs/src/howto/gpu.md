@@ -19,7 +19,7 @@ out = autorift(image1, image2; chip_size = 32, search_radius = 25, backend = :me
 
 `backend` selects where the correlation kernels run. `:cpu` is the default; `:metal` needs
 `using Metal` and `:cuda` needs `using CUDA`. Everything else about the call is unchanged, and
-`dx`/`dy` are the same values the CPU produces — see [What agrees, and what does not](#what-agrees-and-what-does-not).
+`dx`/`dy` are the same values the CPU produces — see [What agrees, and what does not](@ref).
 
 Measured on an Apple M2 Max (38 GPU cores) against this package's own CPU path, Julia 1.12.5,
 Metal.jl 1.10.3.
@@ -223,7 +223,7 @@ Per point at 1024², chip 32, radius 25, a batch of 1024:
 
 `gather` and `peak` are the two remaining one-workitem-per-point kernels, and are the obvious next
 targets — together 18 µs of 78. The cascade is still the largest single stage even after the
-rewrite, which is the same conclusion the CPU profile reached: `docs/gpu-feasibility.md` measures
+rewrite, which is the same conclusion the CPU profile reached: `gpu-feasibility.md` measures
 it at 78 µs of a 97 µs CPU point at chip 16, fixed in chip size because it upsamples a 5×5 patch to
 320×320 whatever the surface was.
 

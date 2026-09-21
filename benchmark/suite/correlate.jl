@@ -24,7 +24,7 @@
 #     upsampled surface is never materialised at all. Prototyped on the device: **5.4x** on the
 #     refinement stage and scratch from 1048 MB to 0.109 MB per 1024-point tile, at 4.2e-7 from
 #     `pyrup!` with identical displacements over 400 real surfaces. Not yet implemented on either
-#     path; `docs/gpu.md` records the measurement.
+#     path; `gpu.md` records the measurement.
 #
 #   * Baselining the integral images, against a global table per pass. **Measured and rejected** —
 #     5.42 ms against 5.28 ms, i.e. slightly slower, because a global table costs one pass per

@@ -107,7 +107,7 @@ Two sections at the end carry the rest of the record: **Measured and rejected** 
 and abandoned, and **Measured, not yet implemented** for ones the numbers favour that nobody has
 landed. A performance claim in a source comment should trace to one of the three.
 
-GPU offload is a separate axis, in [`docs/gpu.md`](../docs/gpu.md): 2.7–3.2x a CPU *core* on the
+GPU offload is a separate axis, in [`docs/src/howto/gpu.md`](../docs/src/howto/gpu.md): 2.7–3.2x a CPU *core* on the
 correlation pass, and 0.5x eight threads, for reasons that are structural rather than a tuning
 gap.
 
@@ -191,8 +191,8 @@ are recorded here so the next reader neither re-derives them nor mistakes them f
 
 | change | measured | where it stands |
 |---|---|---|
-| **Composite subpixel interpolant, on the GPU.** `pyrup!` is a separable linear map, so `log2(up)` doublings compose into one fixed `(patch*up) x patch` matrix `K` and the cascade is `K·P·K'`. Each output column is then a 5-vector in registers, so the upsampled surface is never materialised. | **5.4x** on the refinement stage; device scratch 1048 MB → **0.109 MB** per 1024-point tile; 4.2e-7 from `pyrup!` with **identical displacements** over 400 real surfaces and peak values to 2e-7 | Prototyped, not landed. **GPU only** — see the rejected table for why it does not transfer to the CPU. `docs/gpu.md` |
-| **A per-element `gather`.** The device gather is one workitem per point, reading an 81x81 window serially. | 12.6 us/pt, the largest device stage once the refinement above lands | The same one-workitem-per-point mistake that cost 973 us/pt in the cascade and 113 in its argmax; both were fixed by widening, and this is the third instance. `docs/gpu.md` |
+| **Composite subpixel interpolant, on the GPU.** `pyrup!` is a separable linear map, so `log2(up)` doublings compose into one fixed `(patch*up) x patch` matrix `K` and the cascade is `K·P·K'`. Each output column is then a 5-vector in registers, so the upsampled surface is never materialised. | **5.4x** on the refinement stage; device scratch 1048 MB → **0.109 MB** per 1024-point tile; 4.2e-7 from `pyrup!` with **identical displacements** over 400 real surfaces and peak values to 2e-7 | Prototyped, not landed. **GPU only** — see the rejected table for why it does not transfer to the CPU. `docs/src/howto/gpu.md` |
+| **A per-element `gather`.** The device gather is one workitem per point, reading an 81x81 window serially. | 12.6 us/pt, the largest device stage once the refinement above lands | The same one-workitem-per-point mistake that cost 973 us/pt in the cascade and 113 in its argmax; both were fixed by widening, and this is the third instance. `docs/src/howto/gpu.md` |
 
 Neither closes the gap to a **threaded** CPU on a single pair, and that is not a tuning matter:
 this workload is thousands of independent problems with an 820 kB working set each, so the CPU

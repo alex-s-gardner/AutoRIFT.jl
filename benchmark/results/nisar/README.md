@@ -5,7 +5,7 @@ serialized histories live outside the repository (`$AUTORIFT_GOLDEN_CACHE/mem/`)
 an hour of machine time per case, so the record has to survive a clean checkout.
 
 Each log carries what the serialized row does not: the per-stack profile attribution, the layout figures
-printed before each run, and the progress of the run itself. `docs/memory.md` quotes these; a figure there
+printed before each run, and the progress of the run itself. `docs/src/explanation/memory.md` quotes these; a figure there
 should be traceable to a line here.
 
 ### L1 RSLC (re-measured on an idle machine)
@@ -52,7 +52,7 @@ Two of the four runs deadlocked, both while profiling. The cause is a **Julia ru
 profiler suspends threads while holding the profile lock, and `jl_mach_gc_end` resumes them through the same
 libpthread `os_unfair_lock`, in the opposite order — present in every release through 1.13.0 and fixed on
 master by `ca49fc2e2`. `tools/golden/profiler_gc_deadlock.jl` reproduces it without AutoRIFT;
-`tools/golden/GATES.md` has the traces and the analysis.
+`dev/GATES.md` has the traces and the analysis.
 
 Two consequences for reading these logs. **A run that stops writing has not necessarily died** — check for a
 0%-CPU survivor with `ps` before assuming it did. And **the runtimes and peaks are unaffected**, because

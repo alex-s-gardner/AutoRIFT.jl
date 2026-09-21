@@ -40,7 +40,7 @@ timestamp identifies `img1`.
 | 6 | 2 | NISAR L1 RSLC, L2 GSLC | as phase 5 |
 
 All twelve optical pairs pass the stage ladder with every stage exact or reported-as-designed;
-`tools/golden/GATES.md` holds the per-case table and the measurements behind each gate. What remains for them
+`dev/GATES.md` holds the per-case table and the measurements behind each gate. What remains for them
 is a *product* comparison, which needs the chain downstream of `correlate` — displacement to velocity,
 stable-shift correction, error estimation, cropping and netCDF packaging — none of which exists in Julia.
 
@@ -504,7 +504,7 @@ produced it.
 ### The stage ladder, and what it localized
 
 `tools/golden/stages.jl` compares one intermediate of `autorift()` at a time, feeding AutoRIFT.jl the
-reference's own dumped input and diffing against that stage's dumped output. `tools/golden/GATES.md`
+reference's own dumped input and diffing against that stage's dumped output. `dev/GATES.md`
 holds the measurements; what they change about the list below is worth stating first, because two of
 its entries were framed against endpoint statistics that the ladder now decomposes.
 
@@ -774,7 +774,7 @@ Two cases need the gate stated differently, and both for reasons that are proper
 
 ## Matched for agreement, not endorsed
 
-> **The work list lives in [`CORRECTNESS.md`](../../CORRECTNESS.md)**, at the repository root, ordered by
+> **The work list lives in [`CORRECTNESS.md`](../../dev/CORRECTNESS.md)**, ordered by
 > what to do first. This section is the evidence behind it: each row's measurement and the condition under
 > which it should be revisited. Neither is to be implemented while golden cases are red.
 
