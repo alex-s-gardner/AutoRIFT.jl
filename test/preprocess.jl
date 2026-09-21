@@ -32,6 +32,28 @@ using AutoRIFT: ImagePair, preprocess, replace_nonfinite, highpass, wallis, vali
     @test_throws DimensionMismatch ImagePair(a, b; reference_valid = trues(4, 4))
 end
 
+@testset "the mask intersection is independent of how it is split" begin
+    # `valid` returns a `BitMatrix`, which packs 64 pixels into each word, and it fills those words
+    # from several tasks on a scene this size. 513 x 513 is both above that threshold and not a
+    # multiple of 64, so the last word is partly outside the image.
+    nr, nc = 513, 513
+    a = Float32[(i * 5 + j) % 13 == 0 ? NaN32 : Float32(i) for i in 1:nr, j in 1:nc]
+    b = Float32[(i + j * 3) % 7 == 0 ? Inf32 : Float32(j) for i in 1:nr, j in 1:nc]
+    want = [isfinite(a[i, j]) & isfinite(b[i, j]) for i in 1:nr, j in 1:nc]
+
+    v = valid(ImagePair(a, b))
+    @test v == want
+    # A word beyond the last pixel has to stay clear, or a later `count` reads pixels that are not
+    # there.
+    @test count(v) == count(want)
+
+    # Masks given as arrays take the same route, packed or not.
+    @test valid(ImagePair(a, b; reference_valid = BitMatrix(want),
+                          secondary_valid = trues(nr, nc))) == want
+    @test valid(ImagePair(a, b; reference_valid = want,
+                          secondary_valid = trues(nr, nc))) == want
+end
+
 @testset "highpass removes a gradient" begin
     # What the filter is for: an illumination ramp is exactly the low-frequency content
     # that differs between two acquisitions and must not drive the correlation.
