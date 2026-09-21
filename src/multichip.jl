@@ -1210,16 +1210,25 @@ end
 # remains rather than what the count is about to close. The reference's equivalent is
 # `!foo1 = !((filter2D(foo, ones(3,3)) >= 6) | foo)` (`autoRIFT.py:798-803`).
 function _open_after_count(dx::AbstractMatrix, w::Integer, needed::Integer)
+    Base.require_one_based_indexing(dx)
     lo, _, hi, _ = _window_margins(w, w)
     nr, nc = size(dx)
-    open = falses(nr, nc)
-    @inbounds for j in 1:nc, i in 1:nr
-        isnan(dx[i, j]) || continue
-        n = 0
-        for jj in max(j - lo, 1):min(j + hi, nc), ii in max(i - lo, 1):min(i + hi, nr)
-            isnan(dx[ii, jj]) || (n += 1)
+    # One byte per point rather than `falses`: a `BitArray` packs 64 elements into each word, so the
+    # column slices below would share the words straddling their boundaries. 7.4 MB on a
+    # 3000 x 2480 grid, and `small_components` takes any `AbstractMatrix{Bool}`. Zero-filled because a
+    # measured point is skipped rather than written.
+    open = zeros(Bool, nr, nc)
+    # Each slice writes its own columns and reads a window's worth either side, so the slices share
+    # only the read-only `dx`.
+    _parallel_slices(1:nc, nr * nc) do cols
+        @inbounds for j in cols, i in 1:nr
+            isnan(dx[i, j]) || continue
+            n = 0
+            for jj in max(j - lo, 1):min(j + hi, nc), ii in max(i - lo, 1):min(i + hi, nr)
+                isnan(dx[ii, jj]) || (n += 1)
+            end
+            open[i, j] = n < needed
         end
-        open[i, j] = n < needed
     end
     return open
 end
