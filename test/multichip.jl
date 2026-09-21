@@ -820,6 +820,38 @@ end
     @test 0.0 < sub.grid.x[3, 4] < 54.0
 end
 
+@testset "the snap subtracts the phase before rounding, and the other order differs" begin
+    # `_cell_mean` snaps with `round(x - offset) + offset`. Reading `autoRIFT.py:120-122` literally gives
+    # `round(x + 0.5) - 0.5`, which reaches the same lattice and agrees everywhere except where the cell
+    # mean falls midway between two of its points — and there `round` breaks the tie to even, which is a
+    # *different* point on each side, a whole grid step away.
+    #
+    # Ties are the common case rather than a pathology, since averaging an even number of half-integers
+    # always lands on a whole one: every cell below is on one, as are 11.1% of the `x` cells of a stride-2
+    # level over the golden `S1B_IW_SLC__1SDH_20180809T204617` grid and 15.6% over NISAR L1's.
+    x = Float64[1.5 + (c - 1) for _ in 1:8, c in 1:8]
+    @test AutoRIFT._grid_phase(x) == 0.5
+    nr, nc = size(x)
+    for c in 1:(nc - 1), r in 1:(nr - 1)
+        raw = (x[r, c] + x[r, c + 1]) / 2
+        @test raw == round(raw)                         # the trap: every one of these cells is a tie
+        @test AutoRIFT._cell_mean(x, r, c, 2, nr, nc, 0.5) == round(raw - 0.5) + 0.5
+    end
+
+    # Stated as values, because the difference runs both ways and a mean over a level hides it: columns 1-2
+    # average to 2.0 and columns 2-3 to 3.0, and the other order would put them at 1.5 and 3.5 — one step
+    # below and one step above what this one gives.
+    @test AutoRIFT._cell_mean(x, 1, 1, 2, nr, nc, 0.5) == 2.5
+    @test AutoRIFT._cell_mean(x, 1, 2, 2, nr, nc, 0.5) == 2.5
+
+    # An integer grid is on the one phase where the two orders cannot differ, so reading the phase off the
+    # grid leaves `gridpoints` coordinates wherever the rounding alone puts them.
+    xi = Float64[Float64(c) for _ in 1:8, c in 1:8]
+    @test AutoRIFT._grid_phase(xi) == 0.0
+    @test AutoRIFT._cell_mean(xi, 1, 1, 2, 8, 8, 0.0) == 2.0     # mean 1.5, tie to even
+    @test AutoRIFT._cell_mean(xi, 1, 2, 2, 8, 8, 0.0) == 2.0     # mean 2.5, tie to even
+end
+
 @testset "an even sparse stride reduces over an odd window" begin
     # `filtWidth = stride + 1` when the stride is even and `stride` when it is odd
     # (`autoRIFT.py:618-626`), so the coarse radius reduction is symmetric about the node it is
