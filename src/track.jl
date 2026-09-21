@@ -330,12 +330,35 @@ function _shift_points(pts::PointSet, pad::Extent)
     return rebuild(pts; x = pts.x .+ (px + 0.5), y = pts.y .+ (py + 0.5))
 end
 
+# The border is zero and the interior is a copy, so every element is written exactly once here:
+# `zeros` would write the interior a second time, and on a whole scene that is the larger half of
+# the cost. The border loops and the copy between them cover the output exactly, which is what
+# makes `undef` safe.
+#
+# `zero(T)` for the border is what distinguishes "outside the image" from a dark pixel, and for the
+# validity mask it is the `false` the correlator tests against.
 function _zeropad(A::AbstractMatrix{T}, pad::Extent) where {T}
+    Base.require_one_based_indexing(A)
     px, py = pad.X, pad.Y
     nr, nc = size(A)
-    out = zeros(T, nr + 2py, nc + 2px)
-    @inbounds for j in 1:nc, i in 1:nr
-        out[i + py, j + px] = A[i, j]
+    out = Matrix{T}(undef, nr + 2py, nc + 2px)
+    z = zero(T)
+    @inbounds begin
+        # Top and bottom bands, full width.
+        for j in 1:(nc + 2px), i in 1:py
+            out[i, j] = z
+            out[nr + py + i, j] = z
+        end
+        # Left and right margins, over the rows the copy covers.
+        for j in 1:px, i in (py + 1):(py + nr)
+            out[i, j] = z
+            out[i, nc + px + j] = z
+        end
+    end
+    _parallel_slices(1:nc, nr * nc) do cols
+        @inbounds for j in cols, i in 1:nr
+            out[i + py, j + px] = A[i, j]
+        end
     end
     return out
 end

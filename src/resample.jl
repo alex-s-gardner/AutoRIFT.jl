@@ -74,6 +74,8 @@ end
 resample(A::AbstractMatrix, dstsize, method; kw...) =
     resample(A, (Int(dstsize[1]), Int(dstsize[2])), method; kw...)
 
+# Every interpolant below reads only the source and writes one output sample per iteration, so the
+# split over output columns changes nothing about the result.
 """
     resample!(out, A, method; scale) -> out
 
@@ -85,13 +87,15 @@ function resample!(out::AbstractMatrix, A::AbstractMatrix, ::Nearest;
     sr, sc = size(A)
     dr, dc = size(out)
     ys, xs = Float64(scale[1]), Float64(scale[2])
-    @inbounds for j in 1:dc
-        # `(j - 0.5) * scale` is the destination sample's centre in 0-based source
-        # coordinates; flooring and adding one gives the source sample containing it.
-        sj = clamp(floor(Int, (j - 0.5) * xs) + 1, 1, sc)
-        for i in 1:dr
-            si = clamp(floor(Int, (i - 0.5) * ys) + 1, 1, sr)
-            out[i, j] = Float32(A[si, sj])
+    _parallel_slices(1:dc, dr * dc) do cols
+        @inbounds for j in cols
+            # `(j - 0.5) * scale` is the destination sample's centre in 0-based source
+            # coordinates; flooring and adding one gives the source sample containing it.
+            sj = clamp(floor(Int, (j - 0.5) * xs) + 1, 1, sc)
+            for i in 1:dr
+                si = clamp(floor(Int, (i - 0.5) * ys) + 1, 1, sr)
+                out[i, j] = Float32(A[si, sj])
+            end
         end
     end
     return out
@@ -108,34 +112,36 @@ function resample!(out::AbstractMatrix, A::AbstractMatrix, ::Area;
     sr, sc = size(A)
     dr, dc = size(out)
     ys, xs = Float64(scale[1]), Float64(scale[2])
-    @inbounds for j in 1:dc
-        # Source interval this destination column covers, in continuous coordinates.
-        x0 = (j - 1) * xs
-        x1 = j * xs
-        j0 = max(floor(Int, x0) + 1, 1)
-        j1 = min(ceil(Int, x1), sc)
-        for i in 1:dr
-            y0 = (i - 1) * ys
-            y1 = i * ys
-            i0 = max(floor(Int, y0) + 1, 1)
-            i1 = min(ceil(Int, y1), sr)
-            acc = 0.0
-            wsum = 0.0
-            for jj in j0:j1
-                # Overlap of source column `jj` with the destination footprint.
-                wj = min(x1, Float64(jj)) - max(x0, Float64(jj - 1))
-                wj <= 0 && continue
-                for ii in i0:i1
-                    wi = min(y1, Float64(ii)) - max(y0, Float64(ii - 1))
-                    wi <= 0 && continue
-                    v = Float64(A[ii, jj])
-                    isnan(v) && continue
-                    w = wi * wj
-                    acc += w * v
-                    wsum += w
+    _parallel_slices(1:dc, dr * dc * (ys + 1) * (xs + 1)) do cols
+        @inbounds for j in cols
+            # Source interval this destination column covers, in continuous coordinates.
+            x0 = (j - 1) * xs
+            x1 = j * xs
+            j0 = max(floor(Int, x0) + 1, 1)
+            j1 = min(ceil(Int, x1), sc)
+            for i in 1:dr
+                y0 = (i - 1) * ys
+                y1 = i * ys
+                i0 = max(floor(Int, y0) + 1, 1)
+                i1 = min(ceil(Int, y1), sr)
+                acc = 0.0
+                wsum = 0.0
+                for jj in j0:j1
+                    # Overlap of source column `jj` with the destination footprint.
+                    wj = min(x1, Float64(jj)) - max(x0, Float64(jj - 1))
+                    wj <= 0 && continue
+                    for ii in i0:i1
+                        wi = min(y1, Float64(ii)) - max(y0, Float64(ii - 1))
+                        wi <= 0 && continue
+                        v = Float64(A[ii, jj])
+                        isnan(v) && continue
+                        w = wi * wj
+                        acc += w * v
+                        wsum += w
+                    end
                 end
+                out[i, j] = wsum > 0 ? Float32(acc / wsum) : NaN32
             end
-            out[i, j] = wsum > 0 ? Float32(acc / wsum) : NaN32
         end
     end
     return out
@@ -164,33 +170,35 @@ function resample!(out::AbstractMatrix, A::AbstractMatrix, ::Bicubic;
     sr, sc = size(A)
     dr, dc = size(out)
     ys, xs = Float64(scale[1]), Float64(scale[2])
-    wx = MVector4()
-    wy = MVector4()
-    @inbounds for j in 1:dc
-        x = (j - 0.5) * xs - 0.5
-        j0 = floor(Int, x)
-        _cubic_weights!(wx, x - j0)
-        for i in 1:dr
-            y = (i - 0.5) * ys - 0.5
-            i0 = floor(Int, y)
-            _cubic_weights!(wy, y - i0)
-            acc = 0.0
-            wsum = 0.0
-            for dj in 0:3
-                sj = clamp(j0 + dj, 1, sc)
-                for di in 0:3
-                    si = clamp(i0 + di, 1, sr)
-                    v = Float64(A[si, sj])
-                    isnan(v) && continue
-                    w = wy[di + 1] * wx[dj + 1]
-                    acc += w * v
-                    wsum += w
+    _parallel_slices(1:dc, 16 * dr * dc) do cols
+        wx = MVector4()
+        wy = MVector4()
+        @inbounds for j in cols
+            x = (j - 0.5) * xs - 0.5
+            j0 = floor(Int, x)
+            _cubic_weights!(wx, x - j0)
+            for i in 1:dr
+                y = (i - 0.5) * ys - 0.5
+                i0 = floor(Int, y)
+                _cubic_weights!(wy, y - i0)
+                acc = 0.0
+                wsum = 0.0
+                for dj in 0:3
+                    sj = clamp(j0 + dj, 1, sc)
+                    for di in 0:3
+                        si = clamp(i0 + di, 1, sr)
+                        v = Float64(A[si, sj])
+                        isnan(v) && continue
+                        w = wy[di + 1] * wx[dj + 1]
+                        acc += w * v
+                        wsum += w
+                    end
                 end
+                # The weights sum to 1 when all sixteen taps are present. Requiring at least
+                # half the weight keeps a mostly-missing neighbourhood from producing a
+                # confident-looking value.
+                out[i, j] = wsum >= 0.5 ? Float32(acc / wsum) : NaN32
             end
-            # The weights sum to 1 when all sixteen taps are present. Requiring at least
-            # half the weight keeps a mostly-missing neighbourhood from producing a
-            # confident-looking value.
-            out[i, j] = wsum >= 0.5 ? Float32(acc / wsum) : NaN32
         end
     end
     return out
