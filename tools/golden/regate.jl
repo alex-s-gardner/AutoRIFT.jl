@@ -76,7 +76,13 @@ end
 # as red; a thinned run has no meaningful tail to bound, so `3.nisar` ignores it.
 function parse_endpoint(text)
     occursin("no call1.json", text) && return (:skipped, "no capture on disk")
-    rows = collect(eachmatch(r"^(dx|dy)\s+([+-])\s+(\d+)\s+\d+\s+\d+\s+[\d.]+%\s+\d+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+([+-][\d.]+)"m, text))
+    # The median, p99 and max columns are `%g`, which switches to exponent form below 1e-4. A
+    # fixed-point pattern there reds a case for agreeing *too well*: a median of `6.896e-05` fails to
+    # match and the row count falls short.
+    num = raw"[\d.]+(?:[eE][+-]?\d+)?"
+    row = Regex(raw"^(dx|dy)\s+([+-])\s+(\d+)\s+\d+\s+\d+\s+[\d.]+%\s+\d+\s+" *
+                num * raw"\s+" * num * raw"\s+" * num * raw"\s+([+-][\d.]+)", "m")
+    rows = collect(eachmatch(row, text))
     length(rows) == 2 || return (:red, "could not read both axes: " * last_line(text))
     # **The core bias, not the mean over everything.** A pair correlating at a median of 0.148 — SAR
     # speckle over a 24-day repeat — puts a few hundred of its points on the other side of a nearly flat
