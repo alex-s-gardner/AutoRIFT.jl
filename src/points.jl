@@ -93,8 +93,8 @@ filtering steps are neighbourhood operations.
 - `x`, `y`: center coordinates in image pixels, as `Float64`. Fractional
   coordinates are meaningful: a center at `x = 10.5` sits between columns.
 - `radius_x`, `radius_y`: search half-extent per axis, in pixels. The search
-  window spans `2 * radius`. Independent per axis and per point — a glacier
-  flowing along x warrants a wide `radius_x` and a narrow `radius_y`. A point
+  window spans `2 * radius`. Independent per axis and per point — a surface
+  moving along x warrants a wide `radius_x` and a narrow `radius_y`. A point
   with either radius zero is skipped.
 - `dx_prior`, `dy_prior`: a-priori displacement in pixels. The search window is
   centred on the prior rather than on zero, so a modest radius suffices even
@@ -106,7 +106,7 @@ filtering steps are neighbourhood operations.
   fine chips while smooth ice admits coarse ones. Default to zero, which means unbounded — every
   level runs everywhere, and a caller who supplies neither sees no change.
 
-Every field carries its own type parameter, because a field is an [`AutoRIFT.Uniform`](@ref) exactly
+Every field carries its own type parameter, because a field is an `AutoRIFT.Uniform` exactly
 when the caller gave *that* field as a scalar, and callers mix freely: `chip_size_x` as a per-point
 array beside a scalar `chip_size_y` is ordinary use. One parameter shared across two fields would make
 such a pair a `MethodError`.
@@ -285,7 +285,7 @@ _tofield(::Type{T}, v::Real, like::AbstractArray, ::Symbol) where {T} =
 
 # A scalar for a field nothing writes, kept as one value rather than materialized. Separate from
 # `_tofield` rather than a keyword on it, because which fields may take it is a property of the
-# *field*, not of the call: see [`AutoRIFT.Uniform`](@ref) for why `radius_x` cannot.
+# *field*, not of the call: see `AutoRIFT.Uniform` for why `radius_x` cannot.
 _toconstfield(::Type{T}, v::Real, like::AbstractArray, ::Symbol) where {T} =
     Uniform(_exactly(T, v), size(like))
 _toconstfield(::Type{T}, v, like::AbstractArray, name) where {T} = _tofield(T, v, like, name)
@@ -318,7 +318,7 @@ search window fit. The second takes explicit coordinate vectors.
 julia> pts = AutoRIFT.gridpoints((512, 512), 32; chip_size = 32, search_radius = 25);
 
 julia> ndims(pts), size(pts)
-(2, (13, 13))
+(2, (14, 14))
 ```
 
 Accepts the same geometry keywords as [`pointset`](@ref).

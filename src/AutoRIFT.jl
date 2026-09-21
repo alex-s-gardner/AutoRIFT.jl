@@ -1,24 +1,28 @@
 """
     AutoRIFT
 
-Dense feature tracking by normalized cross-correlation: a pure-Julia
-reimplementation of NASA JPL's [autoRIFT](https://github.com/nasa-jpl/autoRIFT),
-the correlator behind the ITS_LIVE glacier velocity products.
-
-Given two images of the same scene acquired at different times, `autorift`
-estimates the displacement of surface features between them on a regular grid,
-to sub-pixel precision.
+Fast dense image motion tracking by normalized cross-correlation. Two images of
+the same scene that differ by motion go in; a grid of sub-pixel displacements
+comes out.
 
 ```julia
 out = autorift(image1, image2; chip_size = 32, search_radius = 25)
 out.dx, out.dy, out.correlation
 ```
 
-The core operates on plain `AbstractMatrix` in pixel coordinates, so it is
-agnostic to whether the images are map-projected or in radar slant-range
-geometry. Load `Rasters` or `DimensionalData` to accept dimensional arrays and
-receive a stack with coordinates and CRS attached; those methods live in package
+Applications include glacier and ice-sheet velocity, sea-ice drift, particle
+image velocimetry, digital image correlation and strain mapping, cell and tissue
+motion, and video motion estimation.
+
+The core operates on plain `AbstractMatrix` in pixel coordinates and knows
+nothing about coordinates or projections. Load `Rasters` or `DimensionalData` to
+accept dimensional arrays and receive a stack with coordinates, CRS and — given
+an acquisition interval — velocity attached; those methods live in package
 extensions, so the core stays cheap to load.
+
+The algorithm descends from NASA JPL's
+[autoRIFT](https://github.com/nasa-jpl/autoRIFT) and produces the ITS_LIVE
+velocity products, its largest deployment.
 """
 module AutoRIFT
 

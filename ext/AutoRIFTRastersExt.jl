@@ -52,6 +52,11 @@ const DDExt = Base.get_extension(AutoRIFT, :AutoRIFTDimensionalDataExt)
 # Seconds in a Julian year, the convention ITS_LIVE publishes velocities in.
 const MS_PER_YEAR = 365.25 * 24 * 60 * 60 * 1000
 
+# `cache_budget` is named rather than left in `kwargs`: what remains is forwarded to
+# `AutoRIFT.params`, which takes correlation parameters only and rejects anything else.
+#
+# A comment between a docstring and the definition it documents discards the docstring silently, so
+# this one stays above it.
 """
     autorift(reference::AbstractRaster, secondary::AbstractRaster; dt = nothing, kwargs...)
 
@@ -83,34 +88,10 @@ out.vx, out.vy, out.correlation
 `ArchGDAL` has to be loaded to open a file: it is what carries GDAL, through `RastersArchGDALExt`,
 and this extension requires it for that reason.
 
-# Reading a raster that is still on disk
-
-`lazy = true` correlates from the file, and this is the case the defaults are tuned for:
-
-```julia
-a = Raster("early.tif"; lazy = true)
-b = Raster("late.tif"; lazy = true)
-out = autorift(a, b; grid_spacing = 8, threaded = true)
-```
-
-Two things happen automatically, and both matter on a scene large enough to care about. The run is
-**blocked**, so the filtered scene — `Float32`, and what an unblocked run holds resident — is never
-formed; a block filters its own read window and nothing else. And **nodata becomes mask rather than
-number**: a GDAL raster's `missingval` marks pixels that are excluded from correlation instead of being
-read as a dark measurement, which is what reading a `-9999` fill would amount to.
-
-The *raw* pair is read into memory once when doing so reads less than windowing it would — a block's
-window is otherwise read once per pass, and a three-level run makes six of those. Both volumes follow
-from the scene and the block layout, so the decision is taken before anything is read; `cache_budget`
-overrides it either way. See `AutoRIFT.autorift`'s `cache_budget` and `docs/memory.md`.
-
-The answer is **bit-identical** to the same pair materialized, at any block size; the tests assert
-that on all five layers, since a windowed read that computed something subtly different would be
-worse than one that was merely slow. Measured on a Landsat 8/9 pair over Jakobshavn — 17121x16961
-`Float32`, 4.48 M grid points, 10 threads — reading from the two GeoTIFFs peaks at **5.4 GiB against
-9.0 GiB** for the same run from memory, in 41.3 s against 39.4 s. Both measure the same 915,488 points.
-The gap is smaller than the raw pair, because the lazy run holds that pair too; a `UInt16` or `UInt8`
-scene, which is what Landsat level-1 imagery ships as, holds a half or a quarter as much.
+`lazy = true` correlates from the file rather than materializing it, and is the case the defaults are
+tuned for. Such a run is **blocked**, so the filtered `Float32` scene is never formed, and a GDAL
+raster's `missingval` becomes mask rather than number. The answer is bit-identical to the same pair
+in memory. [Correlating scenes larger than memory](@ref) has the memory and the knobs.
 
 !!! note "Sign convention"
     `vx` and `vy` are **feature motion in map orientation**: `+vx` points east, `+vy` north. Both
@@ -124,8 +105,6 @@ scene, which is what Landsat level-1 imagery ships as, holds a half or a quarter
     geometry, where the conversion needs Geogrid's per-pixel matrices — not yet implemented, so
     pass `dt = nothing` and convert externally in that case.
 """
-# `cache_budget` is named rather than left in `kwargs`: what remains is forwarded to
-# `AutoRIFT.params`, which takes correlation parameters only and rejects anything else.
 function AutoRIFT.autorift(reference::AbstractRaster, secondary::AbstractRaster;
                            dt = nothing, reference_valid = nothing, secondary_valid = nothing,
                            process_block_size = nothing, cache_budget = :auto, kwargs...)

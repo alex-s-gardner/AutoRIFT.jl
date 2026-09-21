@@ -27,7 +27,7 @@
 # differently. Measured, the device is the more accurate of the two — 3.91e-5 against the CPU's
 # 6.05e-5, relative to exact arithmetic — because the gather subtracts the window mean and so keeps
 # a large DC term out of a `Float32` transform. `correlation` therefore agrees to 1e-5 rather than
-# exactly. See `docs/gpu-feasibility.md`.
+# exactly. See `gpu-feasibility.md`.
 
 using KernelAbstractions: @kernel, @index, @Const, get_backend, synchronize, allocate
 

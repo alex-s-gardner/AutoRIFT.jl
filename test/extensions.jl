@@ -613,7 +613,7 @@ end
     @test AutoRIFT._slab_read(AutoRIFT.FiniteMask(a), p_thr) == map(isfinite, want)
 
     # A threaded read splits on a boundary the storage shares, so no chunk is decoded by two slabs —
-    # unaligned, that decode is paid twice, which `docs/memory.md` measures. The height is a whole
+    # unaligned, that decode is paid twice, which `memory.md` measures. The height is a whole
     # number of chunk rows and at least one chunk, whatever the thread count asks for.
     @test AutoRIFT._chunk_rows(a) == 256                      # the extension reads the backend
     @test AutoRIFT._chunk_rows(AutoRIFT.FiniteMask(a)) == 256 # and a mask follows its parent

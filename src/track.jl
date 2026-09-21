@@ -30,7 +30,7 @@
 Per-point results of a correlation pass.
 
 `dx` and `dy` are displacements in pixels, `correlation` the peak similarity, `peak_ratio` how far that
-peak stood above the best rival peak elsewhere on the surface (see [`AutoRIFT.peak_ratio`](@ref)), and
+peak stood above the best rival peak elsewhere on the surface (see `AutoRIFT.peak_ratio`), and
 `searched` marks the points that were actually correlated. Non-searched and failed points are `NaN` in
 `dx`/`dy` and `false` in `searched` — distinguishing "no measurement" from a measurement of zero, which
 the reference conflates.
@@ -89,7 +89,7 @@ Correlate `pair` at every searchable point of `pts`, writing into `out`.
 
 The chip is cut from the secondary image and the search window from the reference, so the
 returned displacement is the offset from secondary back to reference — see
-[`peak_offset`](@ref) for why that is the negative of the feature motion, and note it is
+`peak_offset` for why that is the negative of the feature motion, and note it is
 *not* negated here. The single flip to a physical convention happens at the output
 boundary.
 

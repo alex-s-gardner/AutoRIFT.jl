@@ -93,8 +93,8 @@ places as it does in the reference.
     With the chip cut from the secondary (later) image and the window from the
     reference (earlier) one — the arrangement the reference implementation uses —
     the returned offset points from secondary back to reference, so it is the
-    **negative** of the feature displacement. A glacier that flowed `+10` pixels
-    east between acquisitions gives `dx = -10` here.
+    **negative** of the feature displacement. A surface that moved `+10` pixels
+    in x between acquisitions gives `dx = -10` here.
 
     The negation is applied once, at the output boundary, so that everything below
     it works in one consistent convention.
@@ -178,44 +178,18 @@ would return a number near 1 at every point regardless of how clean the surface 
 The result is `>= 1` by construction, since the primary is the surface maximum. A ratio near 1 means
 some other displacement matched nearly as well, so the reported one is a coin flip between them; a
 large ratio means the chosen displacement was the only candidate. This is the measure of an
-*ambiguous* surface, and ambiguity is the failure mode that a peak height cannot see: periodic
-texture — crevasse fields, dune trains, sea ice floes — produces rival peaks one wavelength apart,
-each as tall as the true one.
+*ambiguous* surface, and ambiguity is the failure mode a peak height cannot see: periodic texture —
+crevasse fields, dune trains, crop rows — produces rival peaks one wavelength apart, each as tall as
+the true one.
 
 `Inf32` when no rival is positive at all, meaning the primary is the only candidate the surface
 offers. `NaN32` when the surface is too small to have anything outside the exclusion box, which says
 "no ratio could be computed" rather than a low ratio. The two are distinct and a caller testing
 `isfinite` separates both from a real value.
 
-# Which measure to gate on
-
-**Use `correlation`, not this, to predict whether a displacement is reliable.** The two answer
-different questions — how *strong* the match was against whether it was *unique* — and a gate wants
-the first. Measured over the 80,648 directly measured points of a Jakobshavn pair that both this
-package and `autoRIFT.py` resolved, against the independent label "the two disagree by more than
-0.25 px", which 0.34% of them carry:
-
-| measure | AUC | rate in worst decile | rate in best decile |
-|---|---:|---:|---:|
-| `correlation` | **0.791** | 1.2% | 0.0% |
-| this | 0.544 | 0.5% | 0.6% |
-
-`correlation` falls monotonically across its deciles, from 1.2% to zero. This ratio is flat at
-0.1–0.6% and *not* monotonic — its highest decile is its worst — so **as a reliability gate on its
-own it has essentially no skill.** Nor is the flatness an artifact of pooling points of differing
-correlation: within a band of fixed `correlation` the ranking mildly *inverts*, at an AUC of 0.43
-over 0.2–0.4 and 0.50 over 0.4–0.6. The two measures are nearly independent, at a Spearman rank
-correlation of 0.242. `tools/ab/peak_ratio_skill.jl` computes all of it.
-
-That is not a defect in the quantity, it is what the quantity measures. Ambiguity and unreliability
-are different failures, and on this scene — a fast outlet glacier whose flow the search radius covers
-— the reference and this package disagree where the match is *weak*, not where it is contested. A
-ratio near 1 does mean two displacements matched nearly equally well; it just does not follow that
-the one chosen was the wrong one.
-
-So use this to *diagnose* rather than to threshold. A region of low ratios at otherwise healthy
-correlation is periodic texture matching at more than one offset — crevasse fields, dunes, sea ice —
-and the fix is a chip size that spans more than one wavelength, not a tighter gate.
+**Gate on `correlation`, not on this.** The two answer different questions and only peak height
+predicts reliability; this ratio has essentially no skill as a threshold, measured. Use it to
+diagnose ambiguity instead — see [Judging a result](@ref).
 
 `exclusion` is `PEAK_EXCLUSION` by default; see that constant for why it is fixed rather than
 tunable.
@@ -368,7 +342,7 @@ end
 #     `n² · patch`. At 64x that is 520,000 multiplies against 614,250 — a 15% saving, paid back in
 #     access pattern. The same change *does* pay 5.4x on a GPU, and the difference is not the
 #     arithmetic but the traffic: there the cascade writes every level through device memory, where
-#     here 820 kB stays in L2. `docs/gpu.md` records both halves.
+#     here 820 kB stays in L2. `gpu.md` records both halves.
 #
 #   * Cropping the cascade around the running peak at each level. The large win in
 #     principle. But the peak's deviation from its own rescaled position was measured at up
@@ -401,6 +375,8 @@ end
 # than the table lookup costs. Recorded because the symmetry is inviting and the answer is
 # counter-intuitive.
 
+# The standalone form allocates its own intermediate, which is the right trade for a function whose
+# standalone use is tests and one-off calls; the cascade passes `scratch` and allocates nothing.
 """
     pyrup!(dst, src, [scratch])
 
@@ -417,9 +393,6 @@ because the patch is only 5x5 — the border is most of it.
 `(2 * size(src, 1), size(src, 2))` for the intermediate of the two-pass form; the
 refinement cascade supplies one from its workspace so the hot path allocates nothing.
 """
-# Standalone form: allocates its own intermediate. The right trade for a function whose
-# standalone use is tests and one-off calls; the cascade passes scratch and allocates
-# nothing.
 pyrup!(dst::AbstractMatrix{Float32}, src::AbstractMatrix{Float32}) =
     pyrup!(dst, src, Matrix{Float32}(undef, 2 * size(src, 1), size(src, 2)))
 
@@ -695,7 +668,7 @@ peak at the search-window edge means the true displacement may be outside the
 search range, which the outlier filter is better placed to judge than this
 function.
 
-With `upsampling == 1` this is exactly [`peak_offset`](@ref).
+With `upsampling == 1` this is exactly `peak_offset`.
 """
 subpixel_peak(rw::RefinementWorkspace, surface::AbstractMatrix{Float32},
               radius::Tuple{Int,Int}, upsampling::Integer) =

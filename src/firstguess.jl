@@ -79,38 +79,9 @@ abstract type FirstGuess end
 
 Sparse first guess from ORB features. Needs `ImageFeatures` loaded to do anything.
 
-ORB is the measured choice rather than a default of convenience. Muckenhuber et al. (2016) compared
-three detectors on Sentinel-1 sea ice over Fram Strait and north-east Greenland:
-
-| detector | vectors | time |
-|---|---:|---:|
-| **ORB** | **177,513** | **66 s** |
-| SIFT | 43,260 | 182 s |
-| SURF | 25,113 | 99 s |
-
-Four times the vectors of SIFT in a third of the time. ORB is also unencumbered, where SIFT and SURF
-were patented when that paper was written — which is why its title says *open-source*.
-
-!!! note "A-KAZE is more precise under rotation, and costs 5x"
-    Demchev et al. (2017) report A-KAZE outperforming ORB "up to an order of magnitude" on ice drift:
-    Gaussian scale space blurs speckle and signal alike, while A-KAZE's nonlinear diffusion preserves
-    edges. Measured here against synthetic speckle with known ground truth, at matched keypoint
-    counts on 512²:
-
-    | rotation | ORB matches (correct) | A-KAZE matches (correct) |
-    |---:|---:|---:|
-    | 0° | 9000 (78.4%) | 8406 (**99.3%**) |
-    | 3° | 6434 (33.5%) | 6257 (**96.0%**) |
-    | 8° | 5666 (19.4%) | 5937 (**95.8%**) |
-
-    ORB's precision collapses as the field rotates; A-KAZE's does not. In *usable* vectors that is
-    1.2x at 0° rising to **5.2x at 8°** — against 5x the detection time (0.49 s vs 0.10 s at ~9000
-    keypoints). So the two roughly break even on cost per usable vector once there is rotation, and
-    A-KAZE wins outright on the precision that determines whether the consistency filter has
-    anything to keep.
-
-    Available as [`AKAZEGuess`](@ref) when `AkazeFeatures` is loaded. Not the default, because it is
-    unregistered — see that docstring.
+Fast and unencumbered, and the default first-guess detector. [`AKAZEGuess`](@ref) costs about 5× as
+much and is far more precise once the scene rotates; [Giving the search a first guess](@ref) compares
+them.
 
 Keywords are forwarded to `ImageFeatures.ORB`.
 """
@@ -377,58 +348,20 @@ out = autorift(a, b, guess; rotation = RotationSearch(; about = scene_rotation(g
     caller passes explicitly rather than something the pipeline fits for itself: passing it is the
     assertion that these particular priors came from matching these particular images.
 
-# Why this rather than the reference's version
-
-`sea_ice_drift` computes `alpha0` in `get_initial_rotation` from **geolocation**: the bearing between
-two corners of the secondary scene reprojected into the reference's grid. For a co-registered pair —
-which is what [`first_guess`](@ref) requires and checks — that is identically zero, so porting it
-would have produced a function that always returns 0.0. The rotation that is actually nonzero here is
-the *ice*'s, and the sparse vectors already measure it.
-
-# What it is
-
-An orthogonal Procrustes fit, which for 2D reduces to one `atan2` over two sums — the same shape as
-[`Deramp`](@ref)'s estimator and for the same reason: summing the cross and dot products before
-taking the angle makes the estimate a least-squares fit over all points at once, with no wrapping and
-no per-point angle to average.
-
-Given reference positions `p` and displacements `d` (reference minus secondary, so the secondary
-position is `p - d`), the returned angle is the rotation carrying **secondary orientation onto
-reference**:
-
-```
-θ = atan2(Σ (sx·ty - sy·tx), Σ (sx·tx + sy·ty))
-```
-
-with `s` the centred `p - d` and `t` the centred `p`.
-
-That direction, rather than reference-onto-secondary, for the same reason `dx`/`dy` are reference
-minus secondary: it is the negative of the imaged features' own motion. So the sign is consistent
-with the rest of the package, and `about` takes this value directly with no negation at the call
-site — [`angles`](@ref) is where the subtraction that follows from it is justified, and it is
-justified there rather than restated here so the two cannot drift apart on the one point the
-measurement actually pinned.
-
-Pinned by test in both directions, since a sign error would centre the search on the wrong side of
-the truth and be twice as wrong as not centring it at all.
-
 # Limitations, stated because they are the reason this is a separate opt-in step
 
 - **Translation is removed, scale is not fitted.** A rigid rotation plus translation is the model;
   divergence and shear are residuals. That is the same model `RotationSearch` itself assumes.
-- **One rotation for the whole scene.** A field with two floes rotating opposite ways fits to
+- **One rotation for the whole scene.** A field with two regions rotating opposite ways fits to
   something near their average, which describes neither. The per-chip search is what handles that,
   and `about` only moves where it starts looking.
-- **Returns `nothing`** when there is nothing to fit: fewer than two points, or a degenerate
-  configuration (all points coincident, or a field with no rotational component, where both sums
-  vanish and `atan(0, 0)` would report a confident zero).
+- **Returns `nothing`**, not `NaN`, when there is nothing to fit: fewer than two points, or a
+  degenerate configuration — all points coincident, or a field with no rotational component, where
+  both sums vanish and `atan(0, 0)` would report a confident zero. `nothing` fails at first use, so a
+  mistake surfaces at the line that made it.
 
-  `nothing` rather than `NaN`, and the distinction is deliberate. NaN is this package's "no
-  measurement" marker in a *field* — see [`track!`](@ref) — where every downstream reduction is
-  written to skip it. A scalar NaN has no such consumer: it survives `α / 2`, `round(α)` and
-  `min(α, 10)` unremarked and only surfaces much later, at whatever finally checks. `nothing` fails
-  at first use instead, so `RotationSearch(; about = scene_rotation(pts))` on an unfittable field is
-  an immediate `MethodError` at the line that made the mistake.
+The angle carries secondary orientation onto reference, so `about` takes it with no negation at the
+call site. [Giving the search a first guess](@ref) has the fit itself and the sign argument.
 """
 function scene_rotation(x::AbstractVector, y::AbstractVector, dx::AbstractVector,
                         dy::AbstractVector)

@@ -186,42 +186,24 @@ and the subpixel cascade are the same code the real measures use.
 Requires complex input; a real image has no phase to exploit and [`ZNCC`](@ref) is the measure
 for it.
 
-# Why bother, and when not to
-
-Complex matching buys **resolution**, not accuracy. Joughin (2002) found the complex
-cross-correlation function "more strongly peaked" in low-correlation regions, so a match that
-amplitude needs 64x64 to achieve is available at 24x24 — and on ice, where speckle decorrelates
-fast, that difference decides whether a shear margin is resolved or smoothed over.
-
-The cost is that it fails where amplitude does not:
+Coherence resolves finer detail than amplitude, following Joughin (2002), but it fails where
+amplitude does not.
 
 !!! warning "Phase variation destroys the peak"
-    Interferometric phase across the chip can *reduce or eliminate* the correlation peak, which
-    is worst exactly where the science is most interesting — high shear and steep topography.
-    Amplitude matching is unaffected there.
+    Interferometric phase across the chip can *reduce or eliminate* the correlation peak, worst
+    exactly where the deformation is largest. Amplitude matching is unaffected there.
 
-    Two consequences. First, run [`Deramp`](@ref) as the preprocessing step: it removes the
-    linear component of that phase variation, which is the part that is both dominant and
-    cheap to estimate. Second, expect to fall back. Passing a *tuple* to `similarity` runs
-    coherence at the finest chip size and a real measure above it, so a point coherence cannot
-    resolve is left for a larger amplitude chip:
+    Two consequences. Run [`Deramp`](@ref) as the preprocessing step, and expect to fall back:
+    passing a *tuple* to `similarity` runs coherence at the finest chip size and a real measure
+    above it, so a point coherence cannot resolve is left for a larger amplitude chip.
 
     ```julia
     autorift(z1, z2; similarity = (:coherence, :zncc), preprocess = :deramp,
              chip_size = 32, chip_size_max = 128)
     ```
 
-# Provenance
-
-There is no reference implementation of this to match, which is worth stating plainly.
-autoRIFT v2.1.2 has no complex path at all — its core exposes only real and `UInt8` entry
-points — and ISCE2's `cuAmpcor` takes `abs` of complex input before correlating, so both
-reduce to amplitude matching. The estimator above and the escalation strategy follow Joughin
-(2002); the implementation is verified against analytic cases (γ(T,T) = 1, a known shift, a
-known phase ramp) rather than against another program's output.
-
-Joughin, I. (2002). Ice-sheet velocity mapping: a combined interferometric and speckle-tracking
-approach. *Annals of Glaciology* 34, 195-201.
+What the escalation buys, and what it is verified against, is
+[How feature tracking works](@ref).
 """
 struct Coherence <: SimilarityMeasure end
 
@@ -515,89 +497,19 @@ end
 Deramp(; axis = :both) = Deramp(axis)
 
 """
-    RotationSearch(angles = (-3.0, 0.0, 3.0); about = 0.0)
-    NoRotationSearch()
+    RotationMethod
 
 Whether the dense stage tries several chip rotations and keeps the best.
 
-Opt-in, and off by default, because it multiplies the correlation cost by `length(angles)` — the
-whole point of `nansencenter/sea_ice_drift`'s `rotate_and_match` is that you pay 3x to recover the
-matches a rotating field would otherwise lose. Its own default is `angles=[-3, 0, 3]`, which is
-where this default comes from.
-
-```julia
-autorift(a, b, guess; rotation = RotationSearch())              # ±3°, 3x cost
-autorift(a, b, guess; rotation = RotationSearch((-6, -3, 0, 3, 6)))
-```
-
-# When this earns its cost
-
-Sea ice rotates, and a rotated chip decorrelates against an unrotated window — the peak weakens even
-though the ice is perfectly trackable. Measured on synthetic speckle, median peak correlation with
-five angles (±3°, ±6°, 0°) against none:
-
-| scene rotation | chip 32 | chip 64 |
-|---:|---:|---:|
-| 0° | 0.571 → 0.571 (0%) | 0.571 → 0.571 (0%) |
-| 3° | 0.113 → 0.146 (**+29%**) | 0.112 → 0.279 (**+149%**) |
-| 6° | 0.085 → 0.103 (+21%) | 0.043 → 0.052 (+21%) |
-| 10° | 0.082 → 0.101 (+23%) | 0.042 → 0.053 (+25%) |
-
-Two things worth reading off that. **The gain grows with chip size** — a 64-px chip's corners travel
-twice as far as a 32-px chip's under the same rotation, so it has more to lose and more to recover.
-And **the benefit is real but modest against decorrelation**: at 6° and beyond the correlation is
-weak with or without the search, because rotating a square chip pulls in padding that was never part
-of it. That is why `sea_ice_drift`'s own default is only ±3°.
-
-Cost measured at **1.7x** for five angles, not 5x, because the surrounding per-point work — window
-extraction, integral images, the peak search — is shared across angles.
-
-Also measured through the first-guess path: usable vectors fall from 2327 at 0° rotation to 29 at
-10°. Most of that loss is in the *sparse* stage's descriptor matching rather than the dense
-correlation, so chip rotation alone does not recover it — see [`AKAZEGuess`](@ref), which holds
-95-99% match precision where ORB falls to 19%.
-
-It is *not* a substitute for [`Deramp`](@ref) or for the consistency filter, and it does not handle
-**shear** — no published sea-ice tracker does. Both references tolerate shear instead by keeping the
-filtering neighbourhood small enough that shear looks locally like rotation; deformation is then
-computed *from* the vector field afterwards rather than corrected for during matching.
-
-The best-fitting angle is available per point, which makes it a measurement rather than only a
-correction — `sea_ice_drift` returns it as `best_a`.
-
-# `about`: centring the search on a scene-level rotation
-
-`about` is the **scene's** rotation, in the same sense [`scene_rotation`](@ref) reports it, and the
-chip rotations actually tried are `angles .- about`. This is `rotate_and_match`'s `alpha0`, which
-appears in its template call as exactly `angle - alpha0`.
-
-The subtraction is not a convention to be chosen: the chip comes from the *secondary* and is
-correlated against an *unrotated* reference window, so it has to be turned **back** to the
-reference's orientation. Measured on speckle rotated 8°, peak correlation of a chip rotated by each
-candidate — the counter-rotation is the only one that recovers anything, and by more the larger the
-chip:
-
-| chip | no rotation | +8° | −8° |
-|---:|---:|---:|---:|
-| 32 | 0.723 | 0.345 | 0.597 |
-| 64 | 0.328 | 0.132 | **0.641** |
-| 128 | 0.142 | 0.025 | **0.670** |
-
-At chip 128 that is 0.14 → 0.67, a **4.7x** recovery. At chip 32 counter-rotation still loses to no
-rotation at all, because a 32-px chip's corners travel only ~2 px at 8° while resampling and corner
-padding cost more than that — which is the same "the gain grows with chip size" effect as the table
-above, seen from the other end.
-
-It matters because the search window is narrow on purpose. A scene rotated 8° is outside `±3°`
-entirely — every angle tried is wrong by at least 5°, and widening the tuple to reach it costs a
-correlation per angle for angles that can only ever lose. One scene-level estimate moves the whole
-window instead, so `±3°` around 8° searches 5-11° at the same 3x cost.
-
-[`scene_rotation`](@ref) is where that estimate comes from, and where the choice to fit it from the
-sparse vectors rather than from geolocation is argued.
+Subtypes: [`RotationSearch`](@ref), [`NoRotationSearch`](@ref). Pass one as `params`' `rotation`.
 """
 abstract type RotationMethod end
 
+"""
+    NoRotationSearch()
+
+Correlate each chip at its own orientation only. The default `rotation`.
+"""
 struct NoRotationSearch <: RotationMethod end
 
 # The angles are a *tuple* type parameter, and the reason is `isbits` rather than speed.
@@ -618,6 +530,35 @@ struct NoRotationSearch <: RotationMethod end
 # dispatch and is load-bearing for the `--trim`ed binary in `app/`. Trading that for a one-time
 # ~600 ms of recompile is the wrong direction, so the tuple stays. `test/params.jl` asserts
 # `isbitstype` and not merely `isconcretetype` for exactly this reason.
+#
+# A comment between a docstring and the definition it documents discards the docstring silently, so
+# this one stays above it.
+"""
+    RotationSearch(angles = (-3.0, 0.0, 3.0); about = 0.0)
+
+Correlate each chip at every angle in `angles`, in degrees, and keep the strongest peak. `about` is
+the scene's own rotation, in the sense [`scene_rotation`](@ref) reports it, so the rotations actually
+applied to the chip are `angles .- about`.
+
+Opt-in because it multiplies the correlation cost by `length(angles)`, and worth that cost when the
+scene itself rotates — a rotated chip decorrelates against an unrotated window even where the surface
+is perfectly trackable. `angles` must be distinct and finite.
+
+```julia
+autorift(a, b, guess; rotation = RotationSearch())              # ±3°, 3x cost
+autorift(a, b, guess; rotation = RotationSearch((-6, -3, 0, 3, 6)))
+autorift(a, b, guess; rotation = RotationSearch(; about = 8.0)) # searches 5-11°
+```
+
+Five angles cost 1.7×, not 5×, since the per-point work around the correlation is shared across
+them. [`AutoRIFT.angles`](@ref) reports the rotations a pass will try, and the best-fitting angle is
+available per point — a measurement, not only a correction.
+
+Not a substitute for [`Deramp`](@ref) or for the consistency filter, and it does not correct
+**shear**: deformation is computed from the vector field afterwards.
+[Giving the search a first guess](@ref) measures what the search recovers, why `about` subtracts, and
+where the estimate comes from.
+"""
 struct RotationSearch{A<:Tuple} <: RotationMethod
     angles::A
     about::Float64
@@ -795,7 +736,8 @@ instance. `CPU()` is the default and the only one that needs no additional packa
 
 The GPU backends are **experimental and do not currently outperform the CPU**: a device pass is
 2.7-3.2x one CPU core, but slower than a threaded CPU run on a single image pair. They are worth
-selecting where the cores are already committed and the device is idle. See `docs/gpu.md`.
+selecting where the cores are already committed and the device is idle. See
+[Correlating on a GPU](@ref).
 
 A singleton per backend, carried as a `Params` **type parameter** rather than a field value, so the
 grid loop's choice is resolved at compile time and the unused paths are eliminated — the same
@@ -872,7 +814,7 @@ The largest chip and search radius any point in a pass uses.
 Two [`AutoRIFT.Extent`](@ref)s: the largest `chip` and the largest `radius`.
 
 These **bound** the pass rather than describing every point in it. A point is correlated at its own
-radius rounded up to a power of two and clamped to `radius` ([`AutoRIFT._radius_bucket`](@ref)), and
+radius rounded up to a power of two and clamped to `radius` (`AutoRIFT._radius_bucket`), and
 that bucket sizes the workspace it runs through — so a pass executes one transform length per bucket
 its points reach, not one for the whole pass. The `chip` extent is the transform's other dimension and
 is uniform within a level.
@@ -909,7 +851,7 @@ Abstract supertype for how implausible displacements are identified and dropped.
 Correlation returns a displacement at every searched point, including points where the peak
 was noise. Those false matches are not small errors — they are arbitrary vectors, and one can
 dominate any downstream fit. What separates them from real motion is spatial coherence:
-neighbouring points on the same glacier move similarly, while a false match agrees with
+neighbouring points on one moving surface move similarly, while a false match agrees with
 nothing around it. Every method here is some way of asking that question.
 
 Concrete subtypes: [`GardnerFilter`](@ref), [`NoOutlierFilter`](@ref).
@@ -1094,7 +1036,7 @@ of one measure everywhere is the 1-tuple and costs nothing. See [`chip_measures`
 
 `subpixel` is a tuple for the same reason and with the same rule: the reference's subpixel
 denominator is a function of chip size rather than of the run, so a level's displacement may be
-quantized to 1/16 px at the base chip and 1/32 or 1/64 above it. See [`chip_subpixels`](@ref).
+quantized to 1/16 px at the base chip and 1/32 or 1/64 above it. See `chip_subpixels`.
 """
 struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:PreprocessMethod,
               R<:Tuple{SubpixelMethod,Vararg{SubpixelMethod}},O<:OutlierMethod,T<:BoolAsType,
@@ -1282,7 +1224,7 @@ The subpixel method each chip-size level will use, finest first, with the last t
 repeating.
 
 The counterpart of [`chip_measures`](@ref), and for inspecting a configuration rather than running
-one — the chip-size loop calls [`subpixel_at`](@ref), which allocates nothing.
+one — the chip-size loop calls `subpixel_at`, which allocates nothing.
 """
 function chip_subpixels(p::Params, nlevels::Integer = length(chip_sizes(p)))
     _check_subpixels(p, nlevels)

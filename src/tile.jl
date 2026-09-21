@@ -25,7 +25,7 @@
 # iterations, and on the strided coarse grid `dilate_within(keep, coarse_buffer)` alone reaches
 # `coarse_buffer * coarse_stride * oversample * grid_spacing` — 2048 px at defaults, more than every
 # other term together. A halo covering that would be mostly overlap at any block size worth asking
-# for, so rejection runs once on the assembled field instead. See `docs/plan-tiling.md`.
+# for, so rejection runs once on the assembled field instead. See `plan-tiling.md`.
 
 """
     AutoRIFT.Block
@@ -73,7 +73,7 @@ filter's reach. Both apply to every point, so both are taken at their maximum ov
 
 Measured against the *coarsest level*, not against `grid` as supplied. A level overwrites the
 chip size and floors the radii, so a grid's own `chip_size_x` and `radius_x` are not what any
-pass runs — see [`AutoRIFT._worst_level_points`](@ref).
+pass runs — see `AutoRIFT._worst_level_points`.
 
 The filter term comes from [`AutoRIFT.filter_reach`](@ref) rather than from `filter_width ÷ 2`,
 because the two differ: `Wallis` applies two chained window passes and so reaches twice its
@@ -398,7 +398,7 @@ end
 # no point to search.
 #
 # Reduced over the block's **searchable** points rather than all of them, which is what
-# [`AutoRIFT._pixel_span`](@ref) would do. A point with a zero radius is never correlated
+# `AutoRIFT._pixel_span` would do. A point with a zero radius is never correlated
 # (`issearchable`), so no imagery has to be read for it — and on a grid whose footprint is rotated
 # within its bounding box, those points carry a *fill* coordinate rather than a plausible one. Spanning
 # them is not merely wasteful, it is wrong by the width of the scene: a block straddling the footprint
@@ -645,14 +645,14 @@ end
 """
     AutoRIFT.Blocked(raw, layout, blocks, buffers, cache_budget)
 
-Correlate each pass a block at a time. See [`AutoRIFT.PassRunner`](@ref).
+Correlate each pass a block at a time. See `AutoRIFT.PassRunner`.
 
 `raw` is the **unfiltered** pair, and that is what makes blocking bound memory rather than merely
 reorganize it: each block is filtered from its own read window, so the filtered scene the whole-scene
 runner holds is never formed.
 
 `blocks` is the partition this runner correlates over — `layout.blocks` for a fine pass, and the
-strided subset [`AutoRIFT._coarse_block_layout`](@ref) derives for a coarse one. `layout` is kept
+strided subset `AutoRIFT._coarse_block_layout` derives for a coarse one. `layout` is kept
 alongside it because `block_buffers` sizes from the whole layout's largest read window, which no pass
 changes. `buffers` is `nothing` for a threaded run, where each task takes its own set.
 

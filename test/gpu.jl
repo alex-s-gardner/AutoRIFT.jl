@@ -25,7 +25,7 @@
 #   2. **Points where the CPU surface is not a correlation coefficient.** On a window that is partly
 #      constant the CPU's denominator cancels to near zero while its `Float32` numerator carries the
 #      window's DC magnitude, so the ratio escapes `[-1, 1]` — measured up to **3.94**, on 2% of a
-#      scene with an interior constant patch. `docs/gpu-feasibility.md` records the mechanism. The
+#      scene with an interior constant patch. `gpu-feasibility.md` records the mechanism. The
 #      device does not have this failure, because it removes the window mean before transforming, so
 #      the two genuinely disagree there and the CPU is the wrong one. Those points are excluded by
 #      the `[-1, 1]` test rather than papered over with a loose tolerance.
@@ -143,7 +143,7 @@ function check_pass(pair, pts, pc, pg, chip, radius; label = "")
     @test count(i -> a.dy[i] == b.dy[i], cmp) >= 0.99 * length(cmp)
 
     # `correlation` to 1e-5: the transform-library difference, and the tolerance
-    # `docs/gpu-feasibility.md` justifies. Relative, since a correlation near zero has no absolute
+    # `gpu-feasibility.md` justifies. Relative, since a correlation near zero has no absolute
     # scale worth comparing against.
     for i in cmp
         (isnan(a.correlation[i]) || isnan(b.correlation[i])) && continue
