@@ -14,7 +14,7 @@ implementations. This records what has been *verified at a commit*, which is a d
 one that decays. A gate whose command cannot be re-run is not a gate.
 
 Machine: Apple M2 Max, 12 cores, macOS 26.5.2. Julia 1.12.5 for every row recorded below; the
-toolchain has since moved to **1.13.0**, on which the suite passes 704,363/704,363 and the untiled
+toolchain has since moved to **1.13.0**, on which the suite passes 704,596/704,596 and the untiled
 point count on the S2B case is unchanged at 612,607. Re-measure before quoting a *runtime* against the
 new toolchain. Reference: autoRIFT 2.1.1 in
 `micromamba -n arift-ref`, whose `autoRIFT.py` is byte-identical to the pinned v2.1.2; container
@@ -25,15 +25,17 @@ new toolchain. Reference: autoRIFT 2.1.1 in
 > twenty cases have since been re-measured, so no row is awaiting a measurement — but a row's *original*
 > section still carries the superseded figure, because these are re-measured rather than edited.
 >
-> | defect | what it broke | re-measured in |
+> | change | what it broke | re-measured in |
 > |---|---|---|
 > | `pointset_from_capture` handed AutoRIFT.jl a wrong-sign `Dy0`, the prior *before* `arImgDisp_*` flips it | every `exact`, `bias` and coverage number on all twenty cases | "Re-measurement after the Dy0 sign fix" |
 > | `_level_decimation` consulted the y extent, so a level's stride was half the reference's — on three radar pairs no level coarsened at all | every anisotropic chip: eight radar, both NISAR | the NISAR and radar steps below |
 > | `_grid_step` read a spacing of zero past a majority nonzero nodata fill | nine of twelve optical, all eight radar, both NISAR | the optical and radar steps below |
+> | `_cell_means` places a coarse node at its cell's block mean rather than shifting the cell's first point — deliberate, and it averages the nodata fill in | the core `dx` bias on five of eight radar cases and both NISAR cases; every other gated statistic improved | "the radar and NISAR gates after the cell-mean change" |
 >
-> Gate 0 (`tools/ab`) is unaffected by all three: it passes a zero prior on an unrotated synthetic grid,
-> so neither the sign convention nor the nodata fill crosses it. **`3.rdr` is 6 of 8** — cases 6 and 7
-> exceed its core-bias threshold, which is the one open red gate.
+> Gate 0 (`tools/ab`) is unaffected by any of them: it passes a zero prior on an unrotated synthetic grid,
+> so neither the sign convention nor the nodata fill crosses it. **`3.rdr` is 3 of 8 and `3.nisar` 0 of 2**,
+> both on core-bias bounds calibrated before the cell-mean placement; they are the open red gates, and the
+> final section records why the bounds are not simply widened.
 
 **`regate.jl` covers all 22 cases: `3.opt` twelve optical, `3.rdr` eight radar, `3.nisar` both NISAR.**
 `3.nisar` runs a sixteenth of each NISAR grid (`--stride 4 --block 128`, ~1 minute a case), because a
@@ -3915,3 +3917,73 @@ matched-not-endorsed register, and both have the same fix as item 0: **mask the 
 footprint is not sufficiently inside the valid region is never correlated. That removes the straddling cells
 from the problem rather than arguing about how to average them, and it is a correctness improvement neither
 implementation currently has.
+
+## Step: the radar and NISAR gates after the cell-mean change
+
+`_cell_means` (`src/multichip.jl`) places a coarse node at its cell's block mean. The eight radar rows and
+both NISAR rows above predate it. Re-measured at the gates' own commands — `correlator.jl <case> --run 200`
+for radar, `--run 100 --stride 4 --block 128` for NISAR — against "Step: the eight radar pairs, re-measured
+after the stride and grid-step fixes" and "The gate: `3.nisar`, on a thinned grid":
+
+| # | case | both | Δ both | exact dx | core bias dx | core bias dy | corr dx | corr dy | tail dx |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | `S1A_..._20150828T162412` | 1,365,687 | +55,123 | 29.41% → **62.29%** | −0.00000 → −0.00019 | −0.00029 → +0.00037 | +0.903 → **+0.9886** | +0.906 → +0.9895 | 0 → 0 |
+| 2 | `S1A_..._20151120T080202` | 66,792 | +6,720 | 0.00% † → **32.19%** | −0.00428 → +0.00111 | +0.00408 → +0.00019 | +0.968 → +0.9979 | +0.930 → +0.9949 | 167 → 4 |
+| 3 | `S1A_..._20170221T204710` | 1,678,471 | +11,840 | 69.08% → **81.58%** | +0.00715 → **−0.02370** | +0.00239 → −0.00275 | +0.996 → +0.9984 | +0.985 → +0.9952 | 35 → 10 |
+| 4 | `S1B_..._20180809T204617` | 501,820 | +11,874 | 69.26% → **76.39%** | +0.00479 → **−0.03830** | +0.00475 → −0.00051 | +0.987 → +0.9915 | +0.971 → +0.9946 | 0 → 0 |
+| 5 | `S1C_..._20250416T010214` | 501,072 | +16,601 | 46.54% → **63.06%** | +0.00560 → **−0.01781** | −0.00155 → −0.00083 | +0.983 → +0.9951 | +0.896 → +0.9880 | 0 → 0 |
+| 6 | `S1C_..._20250416T010159` | 38,028 | +2,042 | 36.17% → **42.89%** | −0.04313 → **−0.07607** | −0.01656 → −0.01372 | +0.941 → +0.9797 | +0.850 → +0.9481 | 0 → 0 |
+| 7 | `S1A_..._20240618T025533` | 575,180 | +28,281 | 63.24% → **72.56%** | +0.01181 → **−0.02253** | +0.00556 → −0.00530 | +0.992 → +0.9985 | +0.982 → +0.9973 | 14 → 4 |
+| 8 | `S1A_..._20240618T025528` | 1,558,493 | +52,720 | 54.77% → **72.79%** | −0.00107 → +0.00025 | +0.00010 → −0.00008 | +0.988 → +0.9986 | +0.961 → +0.9984 | 12 → 4 |
+
+**Every case improves on coverage, exact match and both correlations. The core `dx` bias is the only
+statistic that gets worse, and it does so on five of the eight.** `both` rises on all eight (+185,201 in
+total), `exact` rises as a *fraction* on all eight where it previously fell against a growing population,
+and the `dx` tail falls on every case that had one. Cases 3, 4, 5 and 7 flip their `dx` bias from positive
+to negative and grow it 3-5x; case 6 was already negative and doubles. Cases 1, 2 and 8 stay within
+0.0012 px.
+
+**Gate `3.rdr` is 3 of 8**, red on cases 3, 4, 5, 6 and 7 against its `0.010 px` core-bias threshold. The
+three newly red are 3, 4 and 5; 6 and 7 were already over it.
+
+† The `0.00%` was recorded as being 0 "by construction" — `20151120`'s base level running a coarse pass and
+a `filtDisp` but no fine pass, so every reported point is bicubic-resized rather than quantized. It is now
+32.19%, so that no longer describes this case and the `3.rdr` closure's note that `exact` cannot be
+asserted on it is stale.
+
+### NISAR, on the thinned grid the gate uses
+
+| case | exact dx | core bias dx | core bias dy | corr dx | corr dy |
+|---|---:|---:|---:|---:|---:|
+| L1 `--stride 4 --block 128` | 16.81% → 17.71% | +0.0975 → **−0.7279** | −0.1411 → −0.1731 | +0.99853 → +0.99684 | +0.98765 → +0.99378 |
+| L2 `--stride 4 --block 128` | 68.70% → **30.53%** | +0.1758 → **−0.4359** | +0.2343 → **−0.5787** | +0.99962 → +0.99188 | +0.99637 → +0.96092 |
+
+**Gate `3.nisar` is 0 of 2.** Both `dx` biases exceed their bounds by roughly 6x and 2x, and unlike the
+radar cases **L2 is worse on every statistic**, not only on bias.
+
+**The thinned run is no longer a proxy for the whole grid.** Placement now depends on the *point grid's own*
+cell means, so a grid thinned by `--stride 4` puts its coarse nodes where a whole-grid reference never put
+any — and the two sides resolve different pyramid levels to begin with, which is why this gate was already
+calibrated to the thinned run rather than to whole-grid figures. The whole-grid L1 measurement moved the
+other way over the same change, 73.91% → 76.9% exact on `dx` ("Step: the cell-mean fix, and whether the
+reference is right"), so the thinned degradation is the proxy breaking rather than the correlator.
+
+### Why the thresholds are not simply widened
+
+The `dx` bias carries the fill averaging on `CORRECTNESS.md`'s item 2 list: a cell straddling the swath edge
+averages real coordinates against the in-band nodata constant, which pulls its node one way only. That is
+matched deliberately, and it is measured directly on NISAR L1 — the node lands outside its own cell's real
+coordinate range for 94.2% of straddling cells at chip 768. So the statistic these two gates fail on is
+dominated by a difference the project is currently choosing to keep, while every statistic that reflects
+agreement more broadly improved.
+
+Two ways to make the gates informative again, neither taken here because widening a bound to admit a
+measurement is what this ledger exists to prevent:
+
+- **Re-calibrate both gates at this placement**, recording cases 3, 4, 5, 6 and 7 as expected red with
+  these figures, so a *new* regression is again the only thing that reds them.
+- **Gate something the fill averaging does not dominate** — coverage, exact count, correlation and the tail
+  all moved the right way on all eight radar cases and would have caught nothing spuriously.
+
+Either is a calibration decision. What is established here is the attribution: the reds are this change,
+they are the `dx` core bias alone on radar, and no other gated statistic regressed.
