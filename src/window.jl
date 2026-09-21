@@ -100,36 +100,46 @@ end
 # Separable monotone-deque extremum. `better(a, b)` is `>` for a maximum and `<` for
 # a minimum, so one implementation serves both without a runtime branch — it
 # specializes on the function type.
+#
+# Each pass is split over the lines it traverses, and a line's result depends on nothing but that
+# line: `_deque_pass!` starts from an empty deque every call, so no state crosses a column
+# boundary in pass 1 or a row boundary in pass 2. `tmp` carries the first pass into the second,
+# and they are separate calls so every column is written before any row reads it. Scratch is
+# allocated per slice and sized to that pass's own axis.
 function _window_extremum!(out, A::AbstractMatrix, w, better::F) where {F}
     wx, wy = _window_size(w, A)
     nr, nc = size(A)
-    # Scratch for one axis pass, plus the deque itself. Sized once for the larger
-    # axis so a single allocation serves both passes.
-    n = max(nr, nc)
-    buf = Vector{Float32}(undef, n)
     tmp = Matrix{Float32}(undef, nr, nc)
-    dq = Vector{Int}(undef, n)
-    vals = Vector{Float32}(undef, n)
 
     # Pass 1: along columns (contiguous in memory).
-    @inbounds for j in 1:nc
-        for i in 1:nr
-            vals[i] = Float32(A[i, j])
-        end
-        _deque_pass!(buf, vals, nr, wy, dq, better)
-        for i in 1:nr
-            tmp[i, j] = buf[i]
+    _parallel_slices(1:nc, nr * nc) do cols
+        buf = Vector{Float32}(undef, nr)
+        dq = Vector{Int}(undef, nr)
+        vals = Vector{Float32}(undef, nr)
+        @inbounds for j in cols
+            for i in 1:nr
+                vals[i] = Float32(A[i, j])
+            end
+            _deque_pass!(buf, vals, nr, wy, dq, better)
+            for i in 1:nr
+                tmp[i, j] = buf[i]
+            end
         end
     end
 
     # Pass 2: along rows.
-    @inbounds for i in 1:nr
-        for j in 1:nc
-            vals[j] = tmp[i, j]
-        end
-        _deque_pass!(buf, vals, nc, wx, dq, better)
-        for j in 1:nc
-            out[i, j] = buf[j]
+    _parallel_slices(1:nr, nr * nc) do rows
+        buf = Vector{Float32}(undef, nc)
+        dq = Vector{Int}(undef, nc)
+        vals = Vector{Float32}(undef, nc)
+        @inbounds for i in rows
+            for j in 1:nc
+                vals[j] = tmp[i, j]
+            end
+            _deque_pass!(buf, vals, nc, wx, dq, better)
+            for j in 1:nc
+                out[i, j] = buf[j]
+            end
         end
     end
     return out
@@ -267,6 +277,10 @@ end
 # `windowmean`'s only in-package callers are the preprocessing filters at `filter_width` (default 5).
 # The 48-wide windows mentioned at the top of this file belong to the deque reductions, which carry
 # no scratch and are untouched by this. A wider default would want a larger band.
+#
+# That reseeding is also what makes a band independent of every other, so both paths below hand
+# bands out across threads. The scratch is allocated per slice rather than per call, so the cache
+# figures above are per task.
 const _BAND_ROWS = 16
 
 # The masked path, in the same row bands as the dense one below.
@@ -288,15 +302,25 @@ const _BAND_ROWS = 16
 # more than the copy costs. Keeping the buffer.
 function _windowmean_masked!(out, A::AbstractMatrix, wx::Int, wy::Int)
     nr, nc = size(A)
-    lx, ly, rx, ry = _window_margins(wx, wy)
     nb = min(_BAND_ROWS, nr)
+    _parallel_slices(1:cld(nr, nb), nr * nc) do bands
+        _windowmean_masked_bands!(out, A, wx, wy, nb, bands)
+    end
+    return out
+end
+
+# One task's share of the bands, with that task's own scratch.
+function _windowmean_masked_bands!(out, A::AbstractMatrix, wx::Int, wy::Int, nb::Int,
+                                   bands::AbstractUnitRange)
+    nr, nc = size(A)
+    lx, ly, rx, ry = _window_margins(wx, wy)
     sums = Matrix{Float64}(undef, nb, nc)
     counts = Matrix{Int32}(undef, nb, nc)
     rowbuf = Vector{Float64}(undef, nc)
     cntbuf = Vector{Int32}(undef, nc)
 
-    i0 = 1
-    @inbounds while i0 <= nr
+    @inbounds for b in bands
+        i0 = (b - 1) * nb + 1
         i1 = min(i0 + nb - 1, nr)
 
         # Column pass over rows i0:i1, seeded with exactly the window row `i0` sees so the result
@@ -360,7 +384,6 @@ function _windowmean_masked!(out, A::AbstractMatrix, wx::Int, wy::Int)
                 end
             end
         end
-        i0 = i1 + 1
     end
     return out
 end
@@ -387,13 +410,23 @@ end
 # pooling would have been the obvious move; the cheaper change removed the reason for it.
 function _windowmean_dense!(out, A::AbstractMatrix, wx::Int, wy::Int)
     nr, nc = size(A)
-    lx, ly, rx, ry = _window_margins(wx, wy)
     nb = min(_BAND_ROWS, nr)
+    _parallel_slices(1:cld(nr, nb), nr * nc) do bands
+        _windowmean_dense_bands!(out, A, wx, wy, nb, bands)
+    end
+    return out
+end
+
+# One task's share of the bands, with that task's own scratch.
+function _windowmean_dense_bands!(out, A::AbstractMatrix, wx::Int, wy::Int, nb::Int,
+                                  bands::AbstractUnitRange)
+    nr, nc = size(A)
+    lx, ly, rx, ry = _window_margins(wx, wy)
     sums = Matrix{Float64}(undef, nb, nc)
     rowbuf = Vector{Float64}(undef, nc)
 
-    i0 = 1
-    @inbounds while i0 <= nr
+    @inbounds for b in bands
+        i0 = (b - 1) * nb + 1
         i1 = min(i0 + nb - 1, nr)
 
         # Column sums for rows i0:i1. The recurrence restarts here rather than carrying across
@@ -433,7 +466,6 @@ function _windowmean_dense!(out, A::AbstractMatrix, wx::Int, wy::Int)
                 jj <= nc && (s += rowbuf[jj])
             end
         end
-        i0 = i1 + 1
     end
     return out
 end
@@ -510,28 +542,34 @@ windowmedmad(A::AbstractMatrix, w) = _window_sorted(A, w, _medmad_of!, Val(2))
 # exist once. The window convention in particular is the thing this file's header warns
 # is easy to get backwards, so having one transcription of it matters more than the
 # handful of lines saved.
+#
+# Split over column bands. Nothing is carried from one window to the next, so a band
+# computes the same values wherever it runs, and each band writes only its own columns
+# of `outs`. The gather buffer is allocated inside the band so each has its own.
 function _window_sorted(A::AbstractMatrix, w, reduce!::F, ::Val{N} = Val(1)) where {F,N}
     wx, wy = _window_size(w, A)
     nr, nc = size(A)
     outs = ntuple(_ -> fill(NaN32, nr, nc), Val(N))
     lx, ly, rx, ry = _window_margins(wx, wy)
-    buf = Vector{Float32}(undef, wx * wy)
 
-    @inbounds for j in 1:nc, i in 1:nr
-        n = 0
-        for jj in max(j - lx, 1):min(j + rx, nc)
-            for ii in max(i - ly, 1):min(i + ry, nr)
-                v = Float32(A[ii, jj])
-                isnan(v) && continue
-                n += 1
-                buf[n] = v
+    _parallel_slices(1:nc, nr * nc * wx * wy) do cols
+        buf = Vector{Float32}(undef, wx * wy)
+        @inbounds for j in cols, i in 1:nr
+            n = 0
+            for jj in max(j - lx, 1):min(j + rx, nc)
+                for ii in max(i - ly, 1):min(i + ry, nr)
+                    v = Float32(A[ii, jj])
+                    isnan(v) && continue
+                    n += 1
+                    buf[n] = v
+                end
             end
+            n == 0 && continue         # every neighbour missing; leave NaN
+            vals = reduce!(buf, n)
+            # `N` is a compile-time constant, so this unrolls and the tuple never
+            # materialises — a one-output reducer costs exactly what it did before.
+            ntuple(k -> (outs[k][i, j] = vals[k]), Val(N))
         end
-        n == 0 && continue         # every neighbour missing; leave NaN
-        vals = reduce!(buf, n)
-        # `N` is a compile-time constant, so this unrolls and the tuple never
-        # materialises — a one-output reducer costs exactly what it did before.
-        ntuple(k -> (outs[k][i, j] = vals[k]), Val(N))
     end
     return N == 1 ? only(outs) : outs
 end
@@ -668,22 +706,26 @@ function count_agreeing(A::AbstractMatrix, w, tol::Real)
     t = Float32(tol)
     lx, ly, rx, ry = _window_margins(wx, wy)
 
-    @inbounds for j in 1:nc, i in 1:nr
-        centre = Float32(A[i, j])
-        if isnan(centre)
-            out[i, j] = 0.0f0
-            continue
-        end
-        n = 0
-        for jj in max(j - lx, 1):min(j + rx, nc)
-            for ii in max(i - ly, 1):min(i + ry, nr)
-                v = Float32(A[ii, jj])
-                # NaN fails this comparison, so missing neighbours simply do not
-                # count -- no separate check needed.
-                abs(v - centre) < t && (n += 1)
+    # Column bands, for the reason `_window_sorted` gives: each window stands alone and each
+    # band writes only its own columns of `out`. No scratch to divide here.
+    _parallel_slices(1:nc, nr * nc * wx * wy) do cols
+        @inbounds for j in cols, i in 1:nr
+            centre = Float32(A[i, j])
+            if isnan(centre)
+                out[i, j] = 0.0f0
+                continue
             end
+            n = 0
+            for jj in max(j - lx, 1):min(j + rx, nc)
+                for ii in max(i - ly, 1):min(i + ry, nr)
+                    v = Float32(A[ii, jj])
+                    # NaN fails this comparison, so missing neighbours simply do not
+                    # count -- no separate check needed.
+                    abs(v - centre) < t && (n += 1)
+                end
+            end
+            out[i, j] = Float32(n)
         end
-        out[i, j] = Float32(n)
     end
     return out
 end

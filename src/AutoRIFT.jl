@@ -86,6 +86,7 @@ end
 """
 function autorift! end
 
+include("parallel.jl")
 include("types.jl")
 include("params.jl")
 include("points.jl")
