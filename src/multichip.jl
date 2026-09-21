@@ -226,6 +226,9 @@ correlate_multichip(pair::ImagePair, grid::PointSet{2}, p::Params) =
 function _multichip(runner::PassRunner, grid::PointSet{2}, p::Params)
     sizes = _level_sizes(p)
     result = _empty_result(size(grid))
+    # Every level decimates the same `grid`, so its sub-pixel phase is read once here rather than
+    # once per level. `nothing` where no level decimates and nothing reads it.
+    phase = any(cs -> _level_decimation(p, cs) > 1, sizes) ? _grid_phases(grid) : nothing
 
     # `eachindex` and two index reads rather than `zip` over a `Vector` and a tuple: `zip` of a
     # `Vector` with anything is `Iterators.Zip{<:Tuple{Vector,Vararg}}`, which `--trim` cannot
@@ -240,7 +243,7 @@ function _multichip(runner::PassRunner, grid::PointSet{2}, p::Params)
         # `result.dx`/`result.dy` are passed in as the finer levels' standing answer, which a
         # decimated level fills its holes from before interpolating — see `_undecimate_level`.
         level = chipsize_level(runner, grid, p, cs, wanted, measure_at(p, k),
-                               subpixel_at(p, k), result.dx, result.dy)
+                               subpixel_at(p, k), result.dx, result.dy, phase)
         isnothing(level) && continue              # level found nothing coherent
         _merge_level!(result, level.field, level.filled, cs)
     end
@@ -273,6 +276,11 @@ fills its own holes from before interpolating back up — see [`AutoRIFT.correla
 Omitting them fills from the level's own neighbours alone, which is right for a level run in
 isolation and wrong inside the loop, where a finer answer at that very point is available.
 
+`phase` is `grid`'s sub-pixel phase as `(x, y)`, which a decimated level snaps its coarse nodes to —
+see `AutoRIFT._cell_means`. It depends on `grid` alone, so a caller running several levels over one
+grid can read it once with `AutoRIFT._grid_phases` and pass it to each. `nothing` reads it from
+`grid` here.
+
 Separately callable so a caller can run one chip size without the loop.
 
 `chip_size` is an [`AutoRIFT.Extent`](@ref); a scalar is accepted and means square.
@@ -285,9 +293,10 @@ chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size,
                measure::SimilarityMeasure = first(p.similarity),
                subpixel::SubpixelMethod = first(p.subpixel),
                prior_dx::Union{Nothing,AbstractMatrix} = nothing,
-               prior_dy::Union{Nothing,AbstractMatrix} = nothing) =
+               prior_dy::Union{Nothing,AbstractMatrix} = nothing,
+               phase::Union{Nothing,Tuple{Float64,Float64}} = nothing) =
     chipsize_level(WholeScene(pair), grid, p, extent(chip_size), wanted, measure, subpixel,
-                   prior_dx, prior_dy)
+                   prior_dx, prior_dy, phase)
 
 # One chip-size level, however its passes are executed.
 #
@@ -306,13 +315,14 @@ function chipsize_level(runner::PassRunner, grid::PointSet{2}, p::Params,
                         measure::SimilarityMeasure,
                         subpixel::SubpixelMethod = first(p.subpixel),
                         prior_dx::Union{Nothing,AbstractMatrix} = nothing,
-                        prior_dy::Union{Nothing,AbstractMatrix} = nothing)
+                        prior_dy::Union{Nothing,AbstractMatrix} = nothing,
+                        phase::Union{Nothing,Tuple{Float64,Float64}} = nothing)
     # The grid this level runs on. A chip wider than the finest one gets a proportionally coarser
     # grid, so every level posts one estimate per chip rather than several per chip.
     decim = _level_decimation(p, chip_size)
     decim == 1 && return _level_on_grid(runner, grid, p, chip_size, wanted, measure, subpixel)
 
-    sub = _decimate_level(grid, wanted, decim)
+    sub = _decimate_level(grid, wanted, decim, phase)
     isnothing(sub) && return nothing
     # `restrict` before the pass: `sub.grid` is a different shape from `grid`, and a `PassRunner` may
     # hold state indexed by grid shape — `Blocked` holds a partition of grid index ranges, which
@@ -396,7 +406,8 @@ end
 # be resolved.
 #
 # `nothing` when the result is too small to filter, the same condition `_coarse_points` applies.
-function _decimate_level(grid::PointSet{2}, wanted::AbstractMatrix{Bool}, stride::Int)
+function _decimate_level(grid::PointSet{2}, wanted::AbstractMatrix{Bool}, stride::Int,
+                         phase::Union{Nothing,Tuple{Float64,Float64}} = nothing)
     nr, nc = size(grid)
     rows = 1:stride:nr
     cols = 1:stride:nc
@@ -437,7 +448,7 @@ function _decimate_level(grid::PointSet{2}, wanted::AbstractMatrix{Bool}, stride
                   dx_prior = [Float64(mx[i, j]) for i in rows, j in cols],
                   dy_prior = [Float64(my[i, j]) for i in rows, j in cols])
 
-    return (; grid = _cell_means(sub, grid, rows, cols, stride),
+    return (; grid = _cell_means(sub, grid, rows, cols, stride, phase),
             wanted = keep, rows, cols)
 end
 
@@ -473,6 +484,89 @@ end
 # longer fits the unpadded image and the pass silently switches to the zero-padded path. The
 # displacements come out the same, but the surface is computed by a different transform and its peak
 # height differs in the last bits — enough that a blocked run stops matching an untiled one exactly.
+# Distinct values a `ModeCounter` holds inline before spilling. A grid carries one coordinate phase and
+# one spacing, plus whatever its nodata fill contributes, so a handful of slots covers every stream this
+# package takes a mode over; the scan stays a few compares wide.
+const MODE_SCAN_CAPACITY = 8
+
+# A mode over a stream of `Float64`s that is expected to hold very few distinct values.
+#
+# A linear scan rather than a `Dict`, because that expectation is what the mode is *for*: a grid's
+# coordinates are one sub-pixel phase and its steps one spacing, so the scan matches on the first slot
+# for nearly every element, where a `Dict` pays a hash and a probe per element to rediscover a key it
+# already holds. Over a 7.4 M-point grid that is the whole cost of reading the phase.
+#
+# Past `MODE_SCAN_CAPACITY` distinct values the stream spills into a `Dict`, so a grid whose coordinates
+# genuinely land on many fractions — a rotated footprint — costs what it costs today rather than turning
+# the scan quadratic.
+#
+# Matching is `isequal`, which is `Dict`'s own key comparison, so where a value falls decides nothing
+# about whether it is counted.
+mutable struct ModeCounter
+    key::Vector{Float64}
+    count::Vector{Int}
+    spill::Union{Nothing,Dict{Float64,Int}}
+end
+
+ModeCounter() = ModeCounter(Float64[], Int[], nothing)
+
+@inline function _tally!(m::ModeCounter, v::Float64)
+    spill = m.spill
+    if isnothing(spill)
+        key = m.key
+        for i in eachindex(key)
+            if isequal(key[i], v)
+                m.count[i] += 1
+                return m
+            end
+        end
+        if length(key) < MODE_SCAN_CAPACITY
+            push!(key, v)
+            push!(m.count, 1)
+            return m
+        end
+        spill = _spill!(m)
+    end
+    spill[v] = get(spill, v, 0) + 1
+    return m
+end
+
+# Move the inline slots into a `Dict` and count there from then on. Counting in both would make a spilled
+# stream pay the full scan *and* a probe per element, which is worse than the `Dict` alone this is meant
+# to fall back to.
+@noinline function _spill!(m::ModeCounter)
+    spill = Dict{Float64,Int}()
+    for i in eachindex(m.key)
+        spill[m.key[i]] = m.count[i]
+    end
+    empty!(m.key)
+    empty!(m.count)
+    m.spill = spill
+    return spill
+end
+
+# The most frequent value tallied, or `empty` if none was.
+#
+# A tie goes to the smaller value, which makes the result a function of the stream's contents rather than
+# of the order they arrived in or of where they landed. A mode that depends on either shifts a whole
+# chip-size level by a sub-pixel phase between two runs over the same grid.
+function _mode(m::ModeCounter, empty::Float64)
+    best = empty
+    bestn = 0
+    key, count = m.key, m.count
+    for i in eachindex(key)
+        c = count[i]
+        (c > bestn || (c == bestn && key[i] < best)) && (best = key[i]; bestn = c)
+    end
+    spill = m.spill
+    if !isnothing(spill)
+        for (v, c) in spill
+            (c > bestn || (c == bestn && v < best)) && (best = v; bestn = c)
+        end
+    end
+    return best
+end
+
 # How far one step along `dim` moves this coordinate, as the modal signed step between adjacent points
 # that both carry a coordinate.
 #
@@ -500,7 +594,7 @@ end
 function _grid_step(x::AbstractMatrix, dim::Int)
     n = size(x, dim)
     n > 1 || return 0.0
-    counts = Dict{Float64,Int}()
+    counts = ModeCounter()
     @inbounds for j in axes(x, 3 - dim), i in 1:(n - 1)
         a, b = dim == 2 ? (x[j, i], x[j, i + 1]) : (x[i, j], x[i + 1, j])
         # Both endpoints must be on the grid. A zero is the nodata marker, not a coordinate, so a step
@@ -510,18 +604,13 @@ function _grid_step(x::AbstractMatrix, dim::Int)
         # A zero step is a constant region, not a spacing. That is the nodata fill wherever it survived
         # the snap as a nonzero constant, and it can be the majority of the array — see above.
         iszero(d) && continue
-        counts[d] = get(counts, d, 0) + 1
+        _tally!(counts, d)
     end
-    isempty(counts) && return 0.0
-    best = 0.0
-    bestn = 0
-    for (d, c) in counts
-        c > bestn && (best = d; bestn = c)
-    end
-    return best
+    return _mode(counts, 0.0)
 end
 
-function _cell_means(sub::PointSet{2}, full::PointSet{2}, rows, cols, stride::Int)
+function _cell_means(sub::PointSet{2}, full::PointSet{2}, rows, cols, stride::Int,
+                     phase::Union{Nothing,Tuple{Float64,Float64}} = nothing)
     stride == 1 && return sub
     nr, nc = size(full)
     # **Snapped onto the grid's own sub-pixel lattice, not onto a hardcoded half integer.** The reference's
@@ -531,12 +620,17 @@ function _cell_means(sub::PointSet{2}, full::PointSet{2}, rows, cols, stride::In
     # produces integer coordinates and a captured grid half-integer ones — so the reference's literal form
     # would move every node of an integer grid by half a pixel. Reading the phase from the grid reproduces
     # the reference exactly on a captured grid and is a no-op on an integer one.
-    offx = _grid_phase(full.x)
-    offy = _grid_phase(full.y)
+    #
+    # `phase` is that lattice when a caller has already read it off `full`, which is a scan of the whole
+    # grid and the same answer for every level over it.
+    offx, offy = isnothing(phase) ? _grid_phases(full) : phase
     return rebuild(sub;
                    x = [_cell_mean(full.x, r, c, stride, nr, nc, offx) for r in rows, c in cols],
                    y = [_cell_mean(full.y, r, c, stride, nr, nc, offy) for r in rows, c in cols])
 end
+
+# A grid's sub-pixel phase on both axes, as `(x, y)`. See `_grid_phase`.
+_grid_phases(grid::PointSet{2}) = (_grid_phase(grid.x), _grid_phase(grid.y))
 
 # The sub-pixel offset a grid's coordinates sit on, as the modal fractional part.
 #
@@ -546,18 +640,12 @@ end
 # majority of the array — but it is one value against many, so a mode over the whole grid finds the
 # convention the real coordinates use.
 function _grid_phase(x::AbstractMatrix)
-    counts = Dict{Float64,Int}()
-    @inbounds for v in x
+    counts = ModeCounter()
+    for v in x
         d = Float64(v)
-        f = d - floor(d)
-        counts[f] = get(counts, f, 0) + 1
+        _tally!(counts, d - floor(d))
     end
-    best = 0.0
-    bestn = 0
-    for (f, c) in counts
-        c > bestn && (best = f; bestn = c)
-    end
-    return best
+    return _mode(counts, 0.0)
 end
 
 # The mean of `x` over the `stride`-by-`stride` cell whose first point is `(r, c)`, snapped to the lattice
