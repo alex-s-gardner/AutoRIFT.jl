@@ -21,7 +21,7 @@
 using Printf
 
 const ROOT = normpath(joinpath(@__DIR__, "..", ".."))
-const LEDGER = joinpath(@__DIR__, "GATES.md")
+const LEDGER = joinpath(ROOT, "dev", "GATES.md")
 
 struct Gate
     id::String

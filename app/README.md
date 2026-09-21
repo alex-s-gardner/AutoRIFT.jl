@@ -4,7 +4,7 @@ A trimmed, statically-compiled `autorift` executable: **27.2 MiB peak RSS agains
 the equivalent Julia process, 0.06 s to run a 512² pair, and no Julia installation needed at run time.
 
 This exists for one reason. 97% of an ordinary AutoRIFT process's 408 MiB memory floor is the Julia
-runtime itself — AutoRIFT is ~7 MiB of it (see [`docs/memory.md`](../docs/memory.md)). No
+runtime itself — AutoRIFT is ~7 MiB of it (see [`docs/src/explanation/memory.md`](../docs/src/explanation/memory.md)). No
 optimization inside the package reaches the rest, and `--compile=min` recovers only 18 MiB. On a
 `t3.micro` the difference is 43% of the instance against 3.1%.
 

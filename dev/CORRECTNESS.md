@@ -13,7 +13,7 @@ there is measured reason to think is wrong.
 - **Do not implement these while golden cases are still red.** Each one *reduces* agreement with current
   production output by construction, because each changes which points are measured or where. Fixing one
   early makes every other comparison unreadable.
-- **The gate is `tools/golden/GATES.md`.** When every case there is green, this file becomes the work
+- **The gate is `GATES.md`.** When every case there is green, this file becomes the work
   list.
 - **Each item names its own evidence.** The measurement that establishes the defect is in `GATES.md` or
   `tools/golden/README.md`; none of these is a suspicion.

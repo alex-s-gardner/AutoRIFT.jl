@@ -353,7 +353,7 @@ Three things it measures that a single `maxrss` cannot:
   `memtrace.jl`, which additionally drops threads parked in `__psynch_cvwait` — 1399 of 1650 otherwise
   unattributable samples on this scene.
 
-The findings are in `docs/memory.md`: peak tracks a block's area rather than the block count, runtime
+The findings are in `docs/src/explanation/memory.md`: peak tracks a block's area rather than the block count, runtime
 tracks the halo, and both ends of the sweep are misconfigurations for opposite reasons.
 
 ## The full scene: every configuration, end to end

@@ -8,7 +8,7 @@ from the probe scripts described at the end.
 
 A GPU correlation path is viable. "Viable" here means the kernels are correct and the device is
 fast enough to be worth the bus traffic — **not** that it beats the CPU: the shipped path is slower
-than a threaded CPU run on one image pair, and `docs/gpu.md` records that comparison and the
+than a threaded CPU run on one image pair, and `docs/src/howto/gpu.md` records that comparison and the
 batch-driver case where the device does pay. This document is the feasibility record behind the
 implementation, so what follows is about what the hardware can do, not about which backend to
 choose.

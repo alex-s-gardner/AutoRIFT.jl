@@ -9,7 +9,7 @@ through the core's generic windowed read, with no dependency in `src/`.
 
 `process_block_size` is in **pixels**; 1024 by 1024 is the measured best default at a narrow halo, and
 has to grow with the halo. Blocking cuts total peak memory 2.3× on a full Landsat scene for a 10%
-runtime cost, and peak tracks a block's *area* rather than the number of blocks — `docs/memory.md`
+runtime cost, and peak tracks a block's *area* rather than the number of blocks — `docs/src/explanation/memory.md`
 holds the sweep, the halo arithmetic that bounds how small a block can usefully be, and the two
 misconfigurations at either end.
 
@@ -250,7 +250,7 @@ halo it saves is a fixed width. Halo overhead at these sizes is 1–13% extra re
 The 512-against-1024 ordering here is within the run-to-run spread and does not survive a larger
 scene. On the full 17121×16961 Landsat overlap at 10 threads, 1024 px is the cheapest and 512 px is
 marginally worse — 2140 against 2248 MiB — and the whole range 256–1024 px is flat within 10%, because
-peak is set by a block's *area* times the task count rather than by the block count. `docs/memory.md`
+peak is set by a block's *area* times the task count rather than by the block count. `docs/src/explanation/memory.md`
 holds that sweep, and it is the one to size a production run from: these two scenes are small enough
 that few of their block sizes give more blocks than a wide machine has threads.
 
@@ -277,7 +277,7 @@ prepare 15.36 MiB → 0.23 MiB. And per *task* rather than per block, at 144 blo
 for every configuration measured here, tiled or not. The 300–430 MiB figures an earlier round of this
 work reported were allocator slack from per-block churn, not a requirement — and reading them as a
 requirement produced a wrong conclusion ("tiling makes memory worse") that took several rounds to
-correct. `docs/memory.md` documents the same trap.
+correct. `docs/src/explanation/memory.md` documents the same trap.
 
 ### One algorithm, one implementation
 

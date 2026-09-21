@@ -239,7 +239,7 @@ function run_memory()
     # scatters 6.2-9.7 MiB at 512² with no ordering. An earlier reading of one sample per
     # configuration showed peak apparently falling 14.3 -> 5.1 MiB with more threads, which
     # repetition did not reproduce. One subprocess sample is enough to detect a regression against a
-    # stored baseline; it is not enough to assert a trend. See `docs/memory.md`.
+    # stored baseline; it is not enough to assert a trend. See `memory.md`.
     for up in (8, 128)
         record!("memory/pair 1024x1024 upsampling $up",
                 pair_peak(1024; threads = "auto", kw = ", upsampling = $up"))

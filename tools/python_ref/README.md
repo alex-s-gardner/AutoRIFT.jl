@@ -37,7 +37,7 @@ pyramid upsampling, peak tie-breaking, the distance transform.
 
 They are **not** a golden copy of Python autoRIFT's output. That distinction
 matters, because AutoRIFT.jl deliberately does not reproduce several defects in
-the reference (see `../../REFERENCE.md`). Correctness of the whole pipeline is
+the reference (see `../../dev/REFERENCE.md`). Correctness of the whole pipeline is
 established against synthetic ground truth — a texture displaced by a known amount
 has an exactly known answer — and agreement with production is assessed
 statistically, with a tracked divergence budget.
