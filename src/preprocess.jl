@@ -204,7 +204,50 @@ determines which grid points are searched at all, which makes it consequential w
 beyond the filtering: a mask that is wrong here produces a scene-wide error that no
 later stage can detect.
 """
-valid(p::ImagePair) = p.reference_valid .& p.secondary_valid
+valid(p::ImagePair) = _and_masks(p.reference_valid, p.secondary_valid)
+
+# Two validity masks intersected, as the `BitMatrix` broadcasting would have produced.
+#
+# A `BitArray` packs 64 elements into each `UInt64`, so a range of *elements* cannot be handed to a
+# task: two tasks writing distinct elements of one word read-modify-write the same memory and lose
+# each other's bits. The split is therefore over the result's `chunks`, where each task owns whole
+# `UInt64`s of a plain `Vector` and nothing is shared.
+#
+# Each slice broadcasts over its own elements and copies the words that come back, rather than
+# packing them a bit at a time: `Base` packs through a cache of 1024 `Bool`s and beats a hand-written
+# `|=` loop by 2x even before threading. The slice starts on a word boundary, so its words land in
+# `out` unshifted and the final one keeps the zero tail a `BitArray` requires.
+#
+# A whole scene is one element per pixel, and the mask is read twice per element, so this is
+# bandwidth-bound rather than compute-bound — it scales well short of the thread count.
+function _and_masks(a::AbstractMatrix{Bool}, b::AbstractMatrix{Bool})
+    axes(a) == axes(b) ||
+        throw(DimensionMismatch("validity masks must match: $(axes(a)) vs $(axes(b))"))
+    Base.require_one_based_indexing(a, b)
+    out = BitMatrix(undef, size(a))
+    chunks = out.chunks
+    n = length(a)
+    _parallel_slices(eachindex(chunks), n) do words
+        lo = (first(words) - 1) * 64 + 1
+        hi = min(last(words) * 64, n)
+        slice = @views a[lo:hi] .& b[lo:hi]
+        copyto!(chunks, first(words), slice.chunks, 1, length(slice.chunks))
+    end
+    return out
+end
+
+# Both masks already packed: the intersection is one `&` per 64 pixels, on words that line up with
+# the result's. The cost is the word count, not the pixel count.
+function _and_masks(a::BitMatrix, b::BitMatrix)
+    axes(a) == axes(b) ||
+        throw(DimensionMismatch("validity masks must match: $(axes(a)) vs $(axes(b))"))
+    out = BitMatrix(undef, size(a))
+    oc, ac, bc = out.chunks, a.chunks, b.chunks
+    _parallel_slices(eachindex(oc), length(oc)) do words
+        @views oc[words] .= ac[words] .& bc[words]
+    end
+    return out
+end
 
 # ---------------------------------------------------------------------------
 # Filters
