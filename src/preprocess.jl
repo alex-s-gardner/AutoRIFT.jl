@@ -276,6 +276,11 @@ preprocess(pair::ImagePair, m::PreprocessMethod) = ImagePair(
     preprocess(pair.reference, pair.reference_valid, m),
     preprocess(pair.secondary, pair.secondary_valid, m))
 
+# No filter means no conversion: the image passes through with its own element type, so `Int16`
+# imagery stays 2 bytes per pixel rather than becoming 4. The correlator handles any `T<:Real`,
+# and this stage is memory-bandwidth-bound, so widening for no numerical gain would be the
+# expensive kind of harmless. A copy is still made, because the caller's array must not be
+# aliased by a pipeline that may write to it.
 """
     preprocess(img, mask, method) -> (filtered, mask)
 
@@ -285,11 +290,6 @@ The pair form is this applied twice. Exposed separately because a filtered image
 in a time series each acquisition is the secondary of one pair and the reference of the next,
 so filtering per image rather than per pair halves the work.
 """
-# No filter means no conversion: the image passes through with its own element type, so `Int16`
-# imagery stays 2 bytes per pixel rather than becoming 4. The correlator handles any `T<:Real`,
-# and this stage is memory-bandwidth-bound, so widening for no numerical gain would be the
-# expensive kind of harmless. A copy is still made, because the caller's array must not be
-# aliased by a pipeline that may write to it.
 preprocess(img::AbstractMatrix, mask::AbstractMatrix{Bool}, ::NoPreprocess) =
     (copy(img), copy(mask))
 
@@ -1062,13 +1062,13 @@ replace_nonfinite(pair::ImagePair) = ImagePair(
     replace_nonfinite(pair.reference, pair.reference_valid),
     replace_nonfinite(pair.secondary, pair.secondary_valid))
 
+# An integer image cannot hold a non-finite value, so there is nothing to replace and the
+# copy is the whole operation.
 """
     replace_nonfinite(img, mask) -> (replaced, mask)
 
 Per-image form, for the same reason [`preprocess`](@ref) has one.
 """
-# An integer image cannot hold a non-finite value, so there is nothing to replace and the
-# copy is the whole operation.
 replace_nonfinite(img::AbstractMatrix{<:Integer}, mask::AbstractMatrix{Bool}) =
     (copy(img), copy(mask))
 
@@ -1265,7 +1265,7 @@ end
 """
     preprocess(img, mask, m::Destripe) -> (Matrix{Float32}, Matrix{Bool})
 
-[`destripe`](@ref), with the mask passed through.
+`destripe`, with the mask passed through.
 
 The mask is unchanged because a frequency-domain filter has no window to erode: every output cell draws on
 the whole image, so no border ring is less trustworthy than the interior. That is the opposite of the local

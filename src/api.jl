@@ -267,7 +267,7 @@ _reinit_runner(old_runner::Blocked, raw::ImagePair, ::ImagePair, p::Params) =
 #
 # The gain is the smallest block's, which is the one that reads most, and it is gone by 2048 px. What
 # the prefetch costs is its own bytes. A block large enough to amortize its halo is the cheaper way to
-# the same place, and `cache_budget = nothing` is how a run declines the trade. `docs/memory.md` has
+# the same place, and `cache_budget = nothing` is how a run declines the trade. `memory.md` has
 # the runtime and peak for each block size, per arm.
 #
 # What this does *not* change is the property `process_block_size` exists for: the filtered scene is
@@ -342,7 +342,7 @@ _check_cache_budget(x) = throw(ArgumentError(
 # partial cache. A blocked run is a cyclic scan: it sweeps every block once per pass, so a chunk's next
 # use is a whole sweep away and a cache below the touched set has evicted it by then. The step is the
 # access order rather than the eviction policy, and the touched set is too sparse to narrow the cache
-# to — `docs/memory.md` replays the actual chunk requests through LRU and random replacement.
+# to — `memory.md` replays the actual chunk requests through LRU and random replacement.
 #
 # `Threads.nthreads()` concurrent pairs for a serial run, one for a threaded one: `threaded = false` is
 # the batch shape [`autorift!`](@ref) documents — one pair per task, up to `nthreads` at once — and each
@@ -425,7 +425,7 @@ _chunk_rows(m::FiniteMask) = _chunk_rows(m.parent)
 # No chunk then spans two slabs. A chunk is the smallest unit the backend can read, so a boundary
 # inside one makes both neighbouring slabs decode it — and for a compressed file that decode *is* the
 # read: on a DEFLATE GeoTIFF whose chunks are 256 rows, an even division into 209-row slabs reads the
-# same pixels in 987 ms against 278 ms aligned. See `docs/memory.md`.
+# same pixels in 987 ms against 278 ms aligned. See `memory.md`.
 #
 # Rounding up rather than down, and never below one chunk, so alignment costs slabs rather than
 # adding them: a thread count asking for more slabs than there are chunk rows gets the chunk row.
@@ -481,8 +481,10 @@ All of [`AutoRIFT.params`](@ref)'s, plus:
   these for sensors with a fill value, or to apply a cloud or shadow mask — an invalid pixel
   never contributes to a correlation.
 - `process_block_size`: `(X, Y)` **pixels** per block, or `nothing` (the default) for one block over
-  the whole scene. Filters the images a block at a time, so the filtered scene is never formed.
-  **1024 by 1024 is a good default at a narrow halo**, and needs to grow with the halo — see below.
+  the whole scene. Filters the images a block at a time, so the filtered scene is never formed, which
+  bounds peak memory by the block rather than the scene. `(1024, 1024)` is a good default at a narrow
+  halo and must grow with the halo; a tuple and only a tuple, since the shape is the caller's to
+  choose. See [Correlating scenes larger than memory](@ref) for sizing.
 
   Two things are promised under semantic versioning, and only these two: the result is
   **bit-identical** to the untiled run, and the *filtered* pair — `Float32` whatever the input type,
@@ -490,74 +492,19 @@ All of [`AutoRIFT.params`](@ref)'s, plus:
   number and shape of the blocks, buffer reuse, the threading shape and where the raw imagery is read
   from are all free to change.
 
-  For input already in memory — including a memory-mapped array, which the table below measures —
-  nothing scene-sized is formed at all. **Input still on disk is read into memory once** when doing so
-  reads less than windowing it would, which `cache_budget` decides and documents. A block's window is
-  otherwise read once per pass — three chip sizes, coarse and fine — which is 3.4-4.4× the scene over a
-  run on a 15901×13435 GeoTIFF pair against 0.66-0.96× for a single pass, and no block size removes it.
-  Either way the answer is the same: where the raw pixels are read from does not reach the correlation.
-
-  Worth it whenever peak memory matters, not only when the scene cannot fit. Measured total process
-  peak on a 17121×16961 Landsat overlap at 10 threads, from a memory-mapped input, against an untiled
-  run of the same scene:
-
-  | block | blocks | peak | runtime | read amplification |
-  |---|---:|---:|---:|---:|
-  | untiled | 1 | 4958 MiB | 20.5 s | 1.00× |
-  | 2048 px | 81 | 3116 MiB | 24.4 s | 1.13× |
-  | 1024 px | 289 | **2140 MiB** | 22.6 s | 1.26× |
-  | 512 px | 1089 | 2248 MiB | 22.3 s | 1.55× |
-  | 256 px | 4160 | 2042 MiB | 24.0 s | 2.21× |
-
-  **Peak is set by a block's area, not by the number of blocks** — 2140, 2248 and 2042 MiB across a
-  14× range of block counts. Nine arrays sized to the largest read window are held per task, and the
-  task count is capped at `min(nblocks, nthreads)`, so the footprint is area × threads however finely
-  the scene is cut. Combine this with an input that reads a window cheaply — a lazy `Raster`, or any
-  disk-backed array — and the scene is never resident at all.
-
-  **Runtime is set by the halo, which is why the block size cannot simply be minimized.** The halo is
-  a fixed width for every block, so the imagery a run reads grows as `((block + 2·halo) / block)²` —
-  the fourth column above, at a 69-pixel halo. Below 1024 px the memory curve has flattened while that
-  redundancy keeps climbing, and pushed far enough it stops being merely wasteful: each block read
-  allocates a block-sized temporary, so read amplification is also allocation rate, and a 128-pixel
-  block on this scene becomes GC-bound rather than compute-bound. **A wide halo therefore needs a
-  proportionally larger block**, and a block only a few halos across is mostly overlap.
-
-  Keep the block count above the thread count. Fewer blocks than threads puts every block in flight at
-  once, which on this scene at 8192 px held nine 8331² working sets for a peak of 14856 MiB — 3× the
-  untiled run.
-
-  A block is a whole number of grid points, so the size is a target that snaps outward: at
-  `grid_spacing = 32` a request of 500 becomes 512. A tuple and only a tuple, since a full-width band
-  costs halo on two sides where a square block pays it on four — pass the scene width as `X` for a
-  band rather than leaving the shape to be inferred from a scalar.
-
-  Each block reads its own extent grown by a halo, so it reads more than it writes — see
-  [`AutoRIFT.halo`](@ref). A block smaller than that halo would be almost entirely overlap and is
-  rejected. A preprocessing filter that estimates from the whole image cannot be reproduced block by
-  block, and is rejected rather than approximated — see [`AutoRIFT.filter_reach`](@ref).
+  A block reads its own extent grown by a halo, so it reads more than it writes — see
+  [`AutoRIFT.halo`](@ref). A block smaller than that halo is rejected, as is a preprocessing filter
+  that estimates from the whole image: it cannot be reproduced block by block, and is rejected rather
+  than approximated — see [`AutoRIFT.filter_reach`](@ref).
 - `cache_budget`: how many bytes of disk-backed input a blocked run may hold in memory, as `:auto`
   (the default), a byte count, or `nothing`.
 
-  `:auto` compares two volumes computable before anything is read: the pair's own bytes against the
-  sum of every block's read window, once per pass. It caches when the first is smaller, and is capped
-  at an eighth of free memory — divided by the thread count for `threaded = false`, the batch shape
-  where each task decides for itself — so a run competes for a share of what is free rather than the
-  last of it. A count caps it explicitly, and `nothing` caches nothing and reads a window per block per
-  pass. The budget is compared against the pair's own bytes, so either the whole pair is cached or none
-  of it is — a count between the two reads windows. Input already in memory is never copied whatever
-  this says, and the result does not depend on it.
-
-  There is no partial cache to size, because a blocked run sweeps every block once per pass: a chunk's
-  next use is a whole sweep away, so a cache below the whole working set has evicted it by then.
-  Simulated on the 15901×13435 pair at blocks of 1024, the read volume is 3.4× the scene at half the
-  working set and 5.7× at a twentieth, falling below 1× only at the whole of it.
-
-  Set a count on a machine whose free memory is a poor guide to what this process may take — a
-  container with a cgroup limit, or a host shared with work Julia cannot see. Set `nothing` to hold
-  peak memory to the blocks alone: caching a 0.398 GiB pair raised peak from 3.6 to 4.2 GiB at blocks
-  of 512 px, for 15.2 s against 13.5 s at 10 threads. The gain narrows as the block grows — 14.1 s
-  either way at 2048 px — since a larger block reads less to begin with.
+  `:auto` compares the pair's own bytes against the sum of every block's read window, once per pass,
+  and caches when the first is smaller — capped at an eighth of free memory, divided by the thread
+  count for `threaded = false`. A count caps it explicitly; `nothing` caches nothing and reads a
+  window per block per pass. Either the whole pair is cached or none of it is, so a count between the
+  two reads windows. Input already in memory is never copied whatever this says, and the result does
+  not depend on it. [Correlating scenes larger than memory](@ref) measures what it costs and buys.
 
 ```julia
 out = autorift(image1, image2; chip_size = 32, search_radius = 25)
@@ -568,14 +515,13 @@ For many pairs, [`AutoRIFT.init`](@ref) and [`autorift!`](@ref) reuse buffers an
 plans across calls.
 
 !!! note "Sign convention"
-    `dx` and `dy` are the offset from `secondary` back to `reference`, which is the *negative*
-    of the motion of the imaged features — a glacier flowing east gives a negative `dx`. This
-    matches the reference implementation. `dy` increases downward, matching array indexing.
+    `dx` and `dy` are the offset from `secondary` back to `reference`, which is the *negative* of the
+    motion of the imaged features — a feature moving east gives a negative `dx`. `dy` increases
+    downward, matching array indexing.
 
-    This is the *array* convention, and it is deliberately not what the `Raster` method returns.
-    An array has no orientation to be north-up about, so the raw offsets are the honest output
-    here; given a CRS, `autorift` instead returns map-oriented `vx`/`vy` for feature motion. The
-    flip happens once, in the extension, where the y direction is actually known.
+    This is the *array* convention, and deliberately not what the `Raster` method returns: given a
+    CRS, `autorift` returns map-oriented `vx`/`vy` for feature motion instead. See
+    [Conventions](@ref).
 """
 autorift(reference::AbstractMatrix, secondary::AbstractMatrix; kwargs...) =
     autorift!(init(reference, secondary; kwargs...))
@@ -597,23 +543,19 @@ once reuse it across pairs without re-validating keywords — though [`AutoRIFT.
 the better tool for that, since it also reuses buffers.
 
 ```julia
-p = AutoRIFT.Params((ZNCC(),), Highpass(), PyramidRefine(), GardnerFilter(),
+p = AutoRIFT.Params((ZNCC(),), Highpass(), (PyramidRefine(),), GardnerFilter(),
                     AutoRIFT.False(), AutoRIFT.NoRotationSearch(),
-                    (X = 32, Y = 32),    # chip_size_min
-                    (X = 128, Y = 128),  # chip_size_max
-                    (X = 32, Y = 32),    # grid_spacing
-                    (X = 25, Y = 25),    # search_radius
-                    6, 4, 8, 0.01, 0.0, 0.0, 3, UInt64(0), false)
+                    #= then the four geometry extents and the ten scalars, in field order =#)
 out = autorift(image1, image2, p)
 ```
 
 `Params` has no keyword constructor deliberately: `params()` is the documented way to build one
 with defaults, and a second spelling of the defaults would be a second place for them to drift.
-The positional form is stable API — the field order is `Params`'s own, in declaration order.
+The positional form is stable API — the field order is `Params`'s own, in declaration order, and
+`app/src/AutoRIFTApp.jl`'s `app_params` is a complete call.
 
-The call above omits the trailing `backend` field, which then defaults to `AutoRIFT.CPU()`. Pass
-`AutoRIFT.MetalGPU()` or `AutoRIFT.CUDAGPU()` as a twentieth argument to select a device; see
-[`AutoRIFT.Backend`](@ref).
+Omitting the trailing `backend` field defaults it to `AutoRIFT.CPU()`. Pass `AutoRIFT.MetalGPU()` or
+`AutoRIFT.CUDAGPU()` as a twentieth argument to select a device; see [`AutoRIFT.Backend`](@ref).
 
 Validity masks are not accepted here. They are per-image data rather than configuration, and the
 keyword form or [`ImagePair`](@ref) is where they belong; this overload exists for the case where

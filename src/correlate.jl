@@ -727,7 +727,7 @@ Correlate `chip` against `search`, returning a view of the workspace's surface
 buffer holding the similarity at every candidate shift.
 
 The returned surface is `(2 * radius_y, 2 * radius_x)`, with zero displacement at
-its centre — see [`AutoRIFT.peak_offset`](@ref) for converting an index to a
+its centre — see `AutoRIFT.peak_offset` for converting an index to a
 displacement. `search` must be `(chip + 2 * radius - 1)` in each dimension, the
 asymmetric extent that makes the surface an even size.
 

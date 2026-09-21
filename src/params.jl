@@ -312,8 +312,8 @@ Called once per `autorift` invocation. Every `Symbol` is mapped to a method
 object and every number range-checked here, so failures surface at the API
 boundary naming the offending keyword rather than deep inside a chip-size level.
 
-Defaults match the autoRIFT reference driver, except where the reference's
-choice is a known defect — see the package documentation for the list.
+Defaults match the autoRIFT reference driver, except for a few of its choices that are defects;
+`dev/REFERENCE.md` lists them.
 
 # Keywords
 
@@ -322,9 +322,7 @@ choice is a known defect — see the package documentation for the list.
 
   A **tuple** assigns measures to chip-size levels in order, with the last repeated for any
   remaining levels — so `(:coherence, :zncc)` tries complex coherence at the finest chip and
-  falls back to amplitude at every coarser one. That is the escalation of Joughin (2002):
-  coherence resolves finer detail but is destroyed by phase variation, so points it cannot
-  resolve are left to a larger amplitude chip. Requires complex input; see [`Coherence`](@ref).
+  falls back to amplitude at every coarser one. Requires complex input; see [`Coherence`](@ref).
 - `preprocess = :highpass`: pre-correlation filter; see [`PreprocessMethod`](@ref).
 - `subpixel = :pyramid`: peak refinement; see [`SubpixelMethod`](@ref).
 
@@ -364,11 +362,10 @@ chip_size = (X = 16, Y = 32)   # taller than wide
 ## Outlier rejection and filling
 - `rotation = nothing`: try several chip rotations and keep the best, per
   [`RotationSearch`](@ref). `nothing` or `false` disables it, which is the default because it
-  multiplies correlation cost by the number of angles. `true` uses ±3°, following
-  `nansencenter/sea_ice_drift`; a tuple names the angles. Only useful where the ice rotates —
-  see [`RotationSearch`](@ref) for the measurement. To centre a narrow angle window on a scene
-  that is already rotated, build the method with `about`: `RotationSearch(; about =
-  scene_rotation(guess))`. See [`scene_rotation`](@ref).
+  multiplies correlation cost by the number of angles. `true` uses ±3°; a tuple names the angles.
+  Only useful where the surface itself rotates — see [`RotationSearch`](@ref), and
+  [Giving the search a first guess](@ref) for centring a narrow angle window on a scene that is
+  already rotated.
 - `outliers = :gardner`: which implausible displacements to drop. `:gardner` is the
   two-stage filter of Gardner et al. (2018) that autoRIFT uses; `:none` keeps everything,
   which is useful for telling the correlator's failures from the filter's rejections. An
@@ -391,19 +388,17 @@ already carries its own — that is an error rather than a silent override.
 ## Misc
 - `threaded = false`: parallelise over grid points within one image pair. For
   batch processing, leaving this `false` and running one pair per worker is
-  usually faster; see the documentation on throughput.
+  usually faster — see [Correlating many pairs](@ref).
 - `backend = :cpu`: where the correlation kernels run. `:metal` needs `using Metal`, `:cuda`
   needs `using CUDA`; both correlate every point of a pass in batches on the device. Cannot be
   combined with `threaded = true`, which parallelises the same loop. The GPU path reports
-  `dx`/`dy` identical to the CPU's and `correlation` to within 1e-5 — see
-  `docs/gpu-feasibility.md` for why that asymmetry is a property of Float32 transforms rather
-  than of the device. There is no `:gpu`: a machine may have more than one kind of device, and
-  naming the vendor is the whole content of the keyword.
+  `dx`/`dy` identical to the CPU's and `correlation` to within 1e-5, an asymmetry that is a
+  property of Float32 transforms rather than of the device. There is no `:gpu`: a machine may
+  have more than one kind of device, and naming the vendor is the whole content of the keyword.
 
-  **The GPU backends are experimental and do not currently outperform the CPU.** A device pass is
-  2.7-3.2x one CPU core but *slower* than `threaded = true` on a single pair — 0.65 s against
-  0.26 s at 1024², chip 32, radius 25 on 8 threads. Prefer `threaded = true` unless the cores are
-  already committed and the device is idle, which is the batch-driver case `docs/gpu.md` describes.
+  **The GPU backends are experimental and do not currently outperform the CPU.** Prefer
+  `threaded = true` unless the cores are already committed and the device is idle, which is the
+  batch-driver case [Correlating on a GPU](@ref) describes and measures.
 - `progress = false`: show a progress meter.
 - `rng_seed = 0`: seed for the noise [`WallisGapfill`](@ref) fills gaps with, so a run is
   reproducible. Read by that filter alone; every other `preprocess` choice ignores it.

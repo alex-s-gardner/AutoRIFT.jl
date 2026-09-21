@@ -30,7 +30,7 @@
 # as that file predicts — centered ones by 3.6e-6, and centered with a double-single accumulator by
 # 3.9e-8, which matches `Float64`. Centering the window also makes the *numerator* more accurate
 # than the CPU's, since a raw window puts a large DC term into the transform whose magnitude sets
-# the rounding at every frequency. See `docs/gpu-feasibility.md`.
+# the rounding at every frequency. See `gpu-feasibility.md`.
 
 # Sum tables carried as an unevaluated pair of `Float32`, which is what buys back the mantissa
 # `Float64` would have given. `hi + lo` is the value; `lo` holds the bits `hi` dropped.

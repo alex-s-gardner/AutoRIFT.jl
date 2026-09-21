@@ -30,9 +30,9 @@
 # ---------------------------------------------------------------------------
 #
 # Chip size trades resolution against reliability. A small chip resolves fine detail and
-# follows a shear margin, but carries little texture, so on a smooth snowfield it correlates
-# with nothing. A large chip is reliable there and blind to detail. Neither choice is right
-# everywhere in one scene.
+# follows a sharp velocity gradient, but carries little texture, so on a smooth surface it
+# correlates with nothing. A large chip is reliable there and blind to detail. Neither choice
+# is right everywhere in one scene.
 #
 # So each level is tried in turn, finest first, and a level only writes where no finer level
 # already produced a value. The smallest chip that works wins, per point. Levels are
@@ -65,30 +65,22 @@ Displacement over the full grid, assembled from all chip-size levels.
 which level produced each point — `0` where none did — and `interpolated` marks points
 filled from their neighbours rather than measured.
 
-`peak_ratio` is the correlation peak divided by the best rival peak elsewhere on the same surface, so it
-measures whether the displacement was *unique* where `correlation` measures how strong it was. **To gate
-on reliability use `correlation`**: against disagreement with the Python reference it reaches an AUC of
-0.791 where `peak_ratio` reaches 0.544, and [`AutoRIFT.peak_ratio`](@ref) records both measurements and
-the population they were taken over. `peak_ratio` is the diagnostic for an
-*ambiguous* surface — periodic texture matching at more than one offset — and for the search-boundary
-condition below.
+`peak_ratio` measures whether the displacement was *unique* where `correlation` measures how strong it
+was. **Gate on `correlation`** and use this to diagnose an ambiguous surface; [Judging a result](@ref)
+has the measurements behind that.
 
-At an `interpolated` point it is the median of the neighbourhood the displacement itself was taken from,
-since that is what stands behind the value; `correlation` is `NaN` there instead, having no surface of its
-own to report.
+At an `interpolated` point `peak_ratio` is the median of the neighbourhood the displacement was taken
+from, since that is what stands behind the value; `correlation` is `NaN` there instead, having no
+surface of its own to report.
 
-`peak_ratio` is **zero** where the correlation peak lay against the search boundary: the displacement is a
-lower bound and its sub-pixel part is quantized to whole pixels, so any positive threshold excludes those
-points without the caller needing to know about them, zero being below the 1 a real ratio cannot go under.
-Select them with `peak_ratio .== 0` to find where `search_radius` is too small — `AutoRIFT.peak_ratio`
-documents the measurements.
+`peak_ratio` is **zero** where the correlation peak lay against the search boundary: the displacement is
+a lower bound and its sub-pixel part is quantized to whole pixels, so any positive threshold excludes
+those points without the caller needing to know about them, zero being below the 1 a real ratio cannot go
+under. Select them with `peak_ratio .== 0` to find where `search_radius` is too small.
 
-`chip_size` holds the level's **x** extent. That identifies the level on its own, since the aspect
-is constant across levels, so the y extent is this times a fixed ratio.
-
-The chip size is worth keeping rather than discarding: it says how much spatial averaging is
-behind each estimate, so a downstream consumer can tell a sharply-resolved velocity from a
-smoothed one.
+`chip_size` holds the level's **x** extent, which identifies the level on its own since the aspect is
+constant across levels. It says how much spatial averaging is behind each estimate, so a consumer can
+tell a sharply-resolved displacement from a smoothed one.
 
 `interpolated` is a `BitMatrix` here, unlike `searched` on [`DisplacementField`](@ref), which
 is a `Matrix{Bool}`. The difference is deliberate and is about concurrency, not taste: this
@@ -159,7 +151,7 @@ end
 """
     AutoRIFT.WholeScene(prepared)
 
-Correlate each pass in one call, over a whole filtered scene. See [`AutoRIFT.PassRunner`](@ref).
+Correlate each pass in one call, over a whole filtered scene. See `AutoRIFT.PassRunner`.
 
 `prepared` is the **filtered** pair — the pair `_prepare` produced. The blocked runner takes an
 unfiltered one instead, and holding the pair here is what keeps the two from being confused.
@@ -214,7 +206,7 @@ ignored: the level sets it.
 Each level runs [`chipsize_level`](@ref) and contributes only where no finer level already
 succeeded, so the smallest chip that yields a coherent estimate wins at every point.
 
-`pair` is the **filtered** pair. [`AutoRIFT.correlate_tiled`](@ref) runs the same loop over an
+`pair` is the **filtered** pair. `AutoRIFT.correlate_tiled` runs the same loop over an
 unfiltered one, filtering per block; both go through `_multichip` so the level sequence exists once.
 """
 correlate_multichip(pair::ImagePair, grid::PointSet{2}, p::Params) =
@@ -262,7 +254,7 @@ continuing.
 
 `measure` is the similarity measure for this level, and `subpixel` its refinement method. Positional
 rather than keywords because `p.similarity` and `p.subpixel` are tuples and a keyword carrying an
-abstract type is unresolvable under `--trim` — see [`measure_at`](@ref) and [`subpixel_at`](@ref).
+abstract type is unresolvable under `--trim` — see [`measure_at`](@ref) and `subpixel_at`.
 
 `subpixel` is per level because the reference's subpixel denominator is a function of chip size: a
 coarse level locates its peak to a finer fraction of a pixel than the base level does.
@@ -285,8 +277,8 @@ Separately callable so a caller can run one chip size without the loop.
 
 `chip_size` is an [`AutoRIFT.Extent`](@ref); a scalar is accepted and means square.
 
-`pair` is the **filtered** pair, which this wraps in an [`AutoRIFT.WholeScene`](@ref) runner. The
-[`AutoRIFT.PassRunner`](@ref) form below is what a blocked run uses, with the same body.
+`pair` is the **filtered** pair, which this wraps in an `AutoRIFT.WholeScene` runner. The
+`AutoRIFT.PassRunner` form below is what a blocked run uses, with the same body.
 """
 chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size,
                wanted::AbstractMatrix{Bool},
@@ -992,7 +984,7 @@ end
 #
 # Splitting them is what lets the halo be the correlation reach alone. The alternative — a halo
 # covering the filter and the dilation — reaches 1792 px at defaults, which is more overlap than
-# data at any block size worth asking for. See `docs/plan-tiling.md`.
+# data at any block size worth asking for. See `plan-tiling.md`.
 #
 # The coarse grid is affordable to hold whole even when the imagery is not: at the default spacing
 # and stride it is about 1/1024 the size of the scene.

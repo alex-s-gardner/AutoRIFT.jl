@@ -10,7 +10,7 @@
 # ---------------------------------------------------------------------------
 #
 # Measured on an M2 Max (38 GPU cores) against this package's CPU path — see
-# `docs/gpu-feasibility.md` for the full tables:
+# `gpu-feasibility.md` for the full tables:
 #
 #   * The batched transform is 8-17x FFTW's throughput at batch 1024 and above, and *slower* below
 #     batch 256. So a pass with few searchable points falls back to the CPU, which is a routine

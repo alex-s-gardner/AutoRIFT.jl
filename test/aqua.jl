@@ -21,19 +21,23 @@ Aqua.test_all(AutoRIFT;
     # have to agree about it — the declaration, the documentation, and this test — and the failure
     # mode it exists to prevent is a name drifting out of one of them silently.
     meta = Base.Docs.meta(AutoRIFT)
-    for name in AutoRIFT.PUBLIC_NAMES
+    # `names` includes public names from 1.11, so the exports are taken by their defining property.
+    exported = Set(n for n in names(AutoRIFT) if Base.isexported(AutoRIFT, n))
+    # Both halves of the public surface, checked identically: `checkdocs = :public` in the docs build
+    # demands a docstring for each, and a name documented in neither list nor export is one a user
+    # cannot learn to use.
+    for name in union(Set(AutoRIFT.PUBLIC_NAMES), exported)
         # Declared but absent would make the `public` declaration a lie and the docs unbuildable.
         @test isdefined(AutoRIFT, name)
-        # A public name without a docstring is a name a user cannot learn to use. Read from the
-        # module's own docs metadata rather than through `Base.Docs.doc`, which needs the REPL's
-        # docsystem loaded and is unavailable in a bare test process.
+        # Read from the module's own docs metadata rather than through `Base.Docs.doc`, which needs
+        # the REPL's docsystem loaded and is unavailable in a bare test process. A comment placed
+        # between a docstring and the definition it documents registers nothing, silently, and this
+        # is what catches that.
         @test haskey(meta, Base.Docs.Binding(AutoRIFT, name))
     end
 
     # No name is both exported and listed: exports are what a user needs in scope, these are what
     # they reach for deliberately, and a name in both lists would leave which one it is ambiguous.
-    # `names` includes public names from 1.11, so the exports are taken by their defining property.
-    exported = Set(n for n in names(AutoRIFT) if Base.isexported(AutoRIFT, n))
     for name in AutoRIFT.PUBLIC_NAMES
         @test !(name in exported)
     end
