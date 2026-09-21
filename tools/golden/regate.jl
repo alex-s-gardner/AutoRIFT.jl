@@ -230,9 +230,8 @@ const GATES = Gate[
         #
         # Gated on the core bias, correlation, the measured `dy` sign and coverage rather than on rungs.
         # The ladder needs `CAPTURE_STAGES=1` and a radar capture costs 12-50 minutes, so no stage trace
-        # is on disk. And `exact` is 0 on `20151120` by construction — its base level runs a coarse pass
-        # and a `filtDisp` but no fine pass, so every reported point is bicubic-resized rather than
-        # quantized — which is why the gate cannot assert it.
+        # is on disk. `exact` is not asserted: it spans 32% to 82% across the eight with no expected
+        # value to hold any of them to.
         #
         # The `dy` sign is part of the assertion. `optflag == 0` pre-flips `Dy0`
         # (`testautoRIFT.py:402`), and `correlator.jl` picks the sign by correlation rather than
@@ -255,24 +254,26 @@ const GATES = Gate[
                 tailx === nothing && return (:red, "no tail line: " * last_line(t))
                 fails = String[]
                 # A systematic offset over the agreeing population is held an order of magnitude
-                # tighter than the optical 0.035 px. Six of the eight sit within 0.0072 px on both
-                # axes, which is what the bound is drawn from.
+                # tighter than the optical 0.035 px. The bound is drawn from a placement rule
+                # `_cell_means` has since replaced, under which six of the eight sat within 0.0072 px on
+                # both axes.
                 #
-                # **Two cases exceed it and are expected red**: the burst pairs `20250416T010159` at
-                # -0.0431/-0.0166 and `20240618T025533` at +0.0118. `GATES.md` records the measurement
-                # and why the bound is not the thing to widen — the same two cases gained coverage and
-                # correlation while their bias grew, which is a behaviour change wanting an
-                # explanation rather than a threshold set too tight.
+                # **Five cases exceed it and are expected red**: `20170221T204710` at -0.0237,
+                # `20180809T204617` at -0.0383, `20250416T010214` at -0.0178, `20250416T010159` at
+                # -0.0761/-0.0137 and `20240618T025533` at -0.0225. `GATES.md` records the measurement
+                # and why the bound is not the thing to widen — all eight gained coverage, exact match
+                # and correlation over the same change, so the `dx` bias is the one statistic the
+                # deliberate nodata-fill averaging of `CORRECTNESS.md` item 2 dominates.
                 bx <= 0.010 || push!(fails, "dx core bias $bx > 0.010")
                 by <= 0.010 || push!(fails, "dy core bias $by > 0.010")
-                # The floor is the weakest measured case less a margin. `20150828` is the lowest of the
-                # eight at 0.903 and 0.906, where the rest reach 0.94-0.99.
+                # The floor is the weakest measured case less a margin. `20250416T010159` is the lowest
+                # of the eight at 0.980 and 0.948, where the rest reach 0.988-0.999.
                 corr["dx"] >= 0.78 || push!(fails, "dx corr $(corr["dx"]) < 0.78")
                 corr["dy"] >= 0.78 || push!(fails, "dy corr $(corr["dy"]) < 0.78")
                 sgn["dy"] == "-" || push!(fails, "dy sign $(sgn["dy"]), expected -")
                 # The tail is bounded rather than ignored: it cancels today, and a tail that grew would
-                # otherwise hide behind a core bias that stayed small. Four of the eight report zero and
-                # `20151120` is the largest at 167, on the pair whose base level runs no fine pass.
+                # otherwise hide behind a core bias that stayed small. Three of the eight report zero and
+                # `20170221T204710` is the largest at 10, two orders inside the bound.
                 tailx <= 400 || push!(fails, "dx tail $tailx > 400 beyond 10 px")
                 isempty(fails) || return (:red, join(fails, "; "))
                 return (:green, @sprintf("core %.4f/%.4f corr %+.3f/%+.3f both %d tail %d",
@@ -307,14 +308,19 @@ const GATES = Gate[
         # while the reference's `Dx`/`Dy` come from a capture taken over the full one, so the two resolve
         # different pyramid levels: a level's coarse grid is the point grid decimated by 1, 2, 4, 8, and a
         # thinned one can fall below the width its filter needs, at which point the level silently produces
-        # nothing (`tools/golden/README.md`). L1's `exact` is the statistic this destroys — 73.90% on the
-        # whole grid against 16.81% here, and 0.00% at a 512-px tile — so it is *not* asserted. L2's
-        # survives (72.20% whole against 68.70%) because its levels still clear the filter at this tiling.
+        # nothing (`tools/golden/README.md`). `exact` is the statistic this destroys — L1 reaches 73.90% on
+        # the whole grid against 17.71% here and 0.00% at a 512-px tile, and L2 72.20% whole against 30.53%
+        # here — so it is *not* asserted on either case.
         #
         # What is asserted is what proved stable across three tilings: correlation and `bias_core`. Both
-        # are reproducible bit-for-bit at a given tiling, so a threshold is meaningful; both sit above the
-        # whole-grid bias by a consistent tiling offset, so the bound is drawn from the thinned
-        # measurement and is not comparable to the 0.010 px `3.rdr` holds Sentinel-1 to.
+        # are reproducible bit-for-bit at a given tiling, so a threshold is meaningful; the bound is drawn
+        # from the thinned measurement and is not comparable to the 0.010 px `3.rdr` holds Sentinel-1 to.
+        #
+        # **Both cases exceed their `dx` bound and are expected red**, L1 at -0.7279 and L2 at
+        # -0.4359/-0.5787. `_cell_means` places a coarse node at its cell's own mean, so a thinned grid
+        # places nodes the whole-grid reference never placed and this run is no longer a proxy for the
+        # whole one — over the same change whole-grid L1 `exact` improved. `GATES.md` records the
+        # measurement and both ways of making these bounds informative again.
         # Named rather than positional: each bound is the case's own measured value plus a margin, and the
         # two cases differ by more than a factor of two on bias, so a reader at the assertion needs to know
         # which number they are looking at.
@@ -329,7 +335,7 @@ const GATES = Gate[
             # Run 100 holds the capture on both cases; L1's run 200 directory exists but is empty, so
             # naming the run explicitly is what keeps this from skipping.
             # `--block` is stated rather than defaulted: the tile size *is* the calibration. At a 512-px
-            # tile L1's `dx` correlation is 0.923 against 0.9985 here, so a threshold inherited by one
+            # tile L1's `dx` correlation is 0.923 against 0.9968 here, so a threshold inherited by one
             # tiling and measured at another reports a regression that is only a changed default.
             cmd = `julia --project=$(@__DIR__) -t 8 $(joinpath(@__DIR__, "correlator.jl"))
                    $c --run 100 --stride 4 --block 128`
@@ -340,8 +346,8 @@ const GATES = Gate[
                 fails = String[]
                 corr["dx"] >= g.corr_x || push!(fails, "dx corr $(corr["dx"]) < $(g.corr_x)")
                 corr["dy"] >= g.corr_y || push!(fails, "dy corr $(corr["dy"]) < $(g.corr_y)")
-                # L2's core bias is the larger of the two on both axes, which is the whole-grid finding as
-                # well and is unexplained there.
+                # L2 carries the larger `dy` core bias of the two, which is the whole-grid finding as well
+                # and is unexplained there.
                 bx <= g.bias_x || push!(fails, "dx core bias $bx > $(g.bias_x)")
                 by <= g.bias_y || push!(fails, "dy core bias $by > $(g.bias_y)")
                 # The `dy` sign, for the same reason `3.rdr` asserts it: a reintroduced flip shows up here
