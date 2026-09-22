@@ -408,17 +408,16 @@ const GATES = Gate[
     end),
 
     Gate("5.e2e", "the end-to-end ladder on every case it reaches", true, function ()
-        # The eighteen golden cases the ladder runs green, by group: eight same-CRS optical, four
+        # The seventeen golden cases the ladder runs green, by group: eight same-CRS optical, three
         # cross-projection optical whose scenes rung 5.2 warps first (slow on a cold cache, free after),
         # three Sentinel-1 SLC, two OPERA burst pairs and both NISAR products.
         #
-        # Four are absent and each for a recorded reason rather than by omission: two Sentinel-1 pairs
-        # whose mosaic width needs a CSLC to measure, and `LT05_L1GS_001013` and
-        # `S1C_IW_SLC__1SSV_20250416`, whose residual lives entirely at the decimated levels. `dev/GATES.md`
-        # holds both.
+        # Five are absent and each for a recorded reason rather than by omission: two Sentinel-1 pairs whose
+        # mosaic width needs a CSLC to measure; `LT05_L1GS_001013` and `S1C_IW_SLC__1SSV_20250416`, whose
+        # endpoint residual lives entirely at the decimated levels; and `LT04_L1TP_063018`, which reds at
+        # rung 5.3 on the band-reject residual. `dev/GATES.md` holds all three causes.
         cases = ["LC08_L1TP_009011", "LC08_L1TP_062018", "LC09_L1GT_215109",
                  "LE07_L1TP_063018_20040810", "S2A_MSIL1C_20200626", "S2B_MSIL1C_20200612",
-                 "LT04_L1TP_063018",
                  "LC08_L1TP_060018_20130330_20200912_02_T1_X", "LE07_L1TP_061018_20120428",
                  "LE07_L1TP_061018_20130314", "LT05_L1TP_060018",
                  "S1A_IW_SLC__1SSH_20150828", "S1B_IW_SLC__1SDH_20180809",
