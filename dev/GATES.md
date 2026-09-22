@@ -4338,6 +4338,40 @@ external state and was pruned from the run directory.
 That makes every remaining Sentinel-1 blocker the same one: the two SLC pairs' mosaic *width* and these
 two burst pairs' mosaic *values* both need the COMPASS CSLC raster.
 
+### The secondary's coregistration: range exact, azimuth off by exactly one line
+
+`secondary.tif` is the secondary resampled onto the reference grid, so reaching `in_I2` needs the
+coregistration itself. `coregistration_offset` is the orbit-driven solve — `rdr2geo` on the reference to
+reach the ground, `geo2rdr` on the secondary to come back — with the terrain as an outer fixed point,
+since `rdr2geo` takes a constant height and every geogrid caller supplies one. The offsets come from the
+solved time and range rather than through `azimuth_index`, which rounds to a whole line for the geogrid's
+benefit and so discards exactly the sub-pixel part a resampler needs.
+
+**Validated against COMPASS's own coregistration, not against another prediction.** `secondary.tif` and
+the *raw* secondary burst are the same acquisition, so correlating them locates the offset COMPASS
+actually used. The peak is sharp — correlation 0.61 to 0.78 across bursts 1, 3 and 5 at two range
+positions each — and the result is uniform:
+
+| axis | residual against COMPASS |
+|---|---|
+| range | **exact**, 0 samples at every point tested |
+| azimuth | a systematic **−1.00 line** |
+
+**The one line is the geometry's, and a control proves it.** The same correlation with the *reference* on
+both sides — `reference.tif` against the raw reference burst — peaks at `(0, 0)` with correlation
+**1.000**, so the mosaic row mapping is exact and the residual is not the comparison's.
+
+A convention shared by both acquisitions cancels in the difference, so the cause is an asymmetry rather
+than an off-by-one in the index formula. The next thing to check is each burst's `sensing_start` against
+the annotation's own `azimuthTime`: `s1reader` and `SLCDatasets` need not place a burst's first line
+identically, and one line is what that would cost.
+
+**What remains after the geometry closes** is the resampling itself, and it is three things rather than
+one: ISCE3's eight-point sinc kernel with its own table, the TOPS deramp-and-reramp that a resample has
+to bracket or the azimuth ramp aliases, and the coarse lattice COMPASS interpolates the offsets on.
+`ImagePairGeometry` supplies `rdr2geo`, `geo2rdr` and the lattice interpolation; the kernel and the
+deramp have no implementation yet.
+
 ### What rung 5.4 now reaches on radar
 
 | case | `in_I1` | `in_I2` |
