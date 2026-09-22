@@ -4387,10 +4387,18 @@ edges need not land identically; `gen_warpaffine`'s fixtures cover that rotation
 
 ### The gap-fill branch matches its decisions exactly and cannot match its values
 
-On `LE07_L1TP_063018` the zero mask is **exact — 0 of 261,488,361 either way**. The values are not, at a
-median of 0.119 and a p99.9 of 4.14, and the causes are the same Wallis variance plus the fills
-themselves: the reference draws them from NumPy's *unseeded* global generator, so no run reproduces
-another, including its own.
+**The zero mask is exact on all eight scenes of the four `wallis_fill` cases** — 0 discrepancies in
+either direction, over 252 to 271 million pixels each. That is the whole of the filter's decision logic
+reproduced: both distance transforms, the 30-pixel reach that makes a missing scan line valid, the
+`sqrt(2((w-1)/2)²) + 0.01` buffer radius, and the low-standard-deviation dilation.
+
+The values are not matched, at a median of 0.19 to 0.37 and a p99.9 near 4.2, and both causes are already
+established elsewhere: the median is the Wallis variance choice, isolated at 0.113 on the `fft` branch
+where nothing else intervenes, and the tail is the fills themselves, drawn from NumPy's *unseeded* global
+generator so that no run reproduces another including the reference's own. **Reported rather than gated**,
+for the same reason rung 5.4 skips these cases — a bound neither implementation can meet is not a test.
+Separating the two causes here would need the gap fill's distance transforms reimplemented in the harness,
+which the `fft` branch's isolation makes unnecessary.
 
 ## Rung 5.4 on the Landsat cases
 
@@ -4764,15 +4772,24 @@ reference to a median of exactly zero. A geometry error does not spare the base 
 
 | group | cases | on the ladder |
 |---|---:|---|
-| optical (Landsat 4/5/7/8/9, Sentinel-2) | 12 | **11 green**, 1 red |
+| optical (Landsat 4/5/7/8/9, Sentinel-2) | 12 | **10 green**, 2 red |
 | Sentinel-1 SLC | 5 | **3 green**, 2 blocked at rung 5.0 |
 | Sentinel-1 OPERA burst | 3 | **2 green**, 1 red |
 | NISAR L1 RSLC | 1 | **green** |
 | NISAR L2 GSLC | 1 | **green** |
 
-**Eighteen of the twenty-two are green on every rung the ladder runs**, and the remaining four are two
-causes rather than four: two Sentinel-1 SLC pairs whose merged mosaic width needs a COMPASS CSLC to
-measure, and two pairs whose residual is entirely the deliberately-matched coarse-level position gap.
+**Seventeen of the twenty-two are green on every rung the ladder runs.** That is one fewer than before
+rungs 5.3 and 5.4 existed, and the case that moved — `LT04_L1TP_063018` — did not regress: the ladder now
+tests a boundary it did not test before, and that case reds at it. Comparing the count across the two
+states means comparing different questions.
+
+The five reds are three causes:
+
+| cases | cause | what it needs |
+|---|---|---|
+| `S1A ... 20151120`, `S1A ... 20170221` | the merged mosaic width, taken from a COMPASS CSLC raster rather than any annotation | a CSLC to measure |
+| `LT05_L1GS_001013`, `S1C ... 20250416` | the coarse-node position gap, deliberately matched | `dev/CORRECTNESS.md` items 2 and 3 |
+| `LT04_L1TP_063018`, and `LT05_L1GS_001013` again | the band-reject residual at rung 5.3, ~0.005 median where both fire against 5e-5 where both decline | the frequency band mask's boundary cells |
 
 ### NISAR L1 is the simplest radar case, not the hardest
 
