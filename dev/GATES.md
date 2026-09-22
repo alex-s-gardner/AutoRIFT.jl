@@ -4005,17 +4005,22 @@ directory: the nine `window_*.tif`, `autoRIFT_intermediate.nc`, the `capture/` a
 | rung | Julia produces | reference truth | gate |
 |---|---|---|---|
 | 5.0 | the output `MapGrid` — geotransform and size | `window_location.tif`'s own | exact |
+| 5.1 | the overlap window and each scene's offset into it | `capture/in_I1`'s shape | exact |
+| 5.4 | the bytes the correlator is handed, from the granule | `capture/in_I1`, `in_I2` | exact ≥ 99%, within one level ≥ 99.99% |
 | 5.5 | the geogrid, all 17 bands | the nine `window_*.tif` | integer bands exact, `Float64` bands ≤ 1e-7 relative |
 | 5.6 | the driver's scene-wide parameters | `capture/call1.json` scalars | exact |
+| 5.7 | the endpoint, and its bias split by level | `capture/out_Dx`, `out_Dy` | structure; see below |
 
 The two-tier gate on 5.5 is `ImagePairGeometry`'s own standard and the tiers split where they do for a
 reason: `window_location`, `window_offset`, `window_search_range`, the two chip-size files and the
 stable-surface mask all pass through a rounding or truncating conversion that absorbs a last-bit
 difference, while the off2vel and scale-factor bands do not.
 
-Rungs 5.1 through 5.4 — the granule read, the secondary onto the reference's grid, the filter on
-Julia's own read, and the byte rescale — are not yet wired into the ladder. `bytescale` (rung 5.4's
-Julia side) exists and is pinned against the reference by fixtures; see below.
+Rungs 5.2 and 5.3 — the secondary onto the reference's grid, and the pre-geogrid filter on Julia's own
+read — are not yet wired in. Rung 5.2's optical half runs inside `setup` as the warp that
+`aligned_scenes` performs; its radar half, the coregistration, does not exist. Rung 5.3 is what the
+seven Landsat 4/5/7 cases need before rung 5.4 can reach them, since those are filtered twice on two
+different grids.
 
 ## Result: all twelve optical cases, every rung green
 
@@ -4270,6 +4275,42 @@ accurate sum is both nearer the truth and nearer the reference.
 The residual one level on a rounding boundary is what a last-bit difference in `m` or `s` produces,
 and is not matched — reproducing `np.mean`'s block structure is brittle for one pixel in fifty
 thousand.
+
+## Rung 5.4 — the bytes, and the one deliberate deviation that reaches all of them
+
+The first rung on the *imagery* side. Rung 5.7 is fed `capture/in_I1`, so before this nothing upstream
+of the reference's own quantized pair had ever run in Julia on a golden case: read the granule, crop to
+the overlap, apply the filter `runAutorift` applies, quantize.
+
+Green on all five `hps` optical pairs, and the interior kernel is **bitwise identical** — over the
+Sentinel-2 scene the largest difference between `AutoRIFT.highpass` and the reference's own form, away
+from the image frame, is exactly 0.
+
+| case | ours | with the reference's border rule |
+|---|---|---|
+| `S2B_MSIL1C_20200612` | 65.24 / 68.47% exact | **99.9984 / 99.9972%**, max 1 level |
+| `S2A_MSIL1C_20200626` | 79.31 / 81.53% | **99.9985 / 99.9998%**, max 1 |
+| `LC08_L1TP_009011` | 99.9977 / 99.9960% | 99.9977 / 99.9960%, max 1 |
+| `LC08_L1TP_062018` | 99.9813 / 99.9907% | 99.9974 / 99.9975%, max 1 |
+| `LC09_L1GT_215109` | 99.9925 / 99.9954% | 99.9950 / 99.9985%, max 1 |
+
+**One deviation explains every gap, and it is `highpass`'s documented one.** `AutoRIFT.highpass`
+excludes out-of-image neighbours from the local mean where the reference zero-pads
+(`cv2.filter2D(..., BORDER_CONSTANT)`). The disagreement is confined to a `width ÷ 2` frame — 0.07% of
+a 10980² scene — but `uniform_data_type` takes its mean and standard deviation over the **whole
+array**, so that frame moves the quantization window and rescales every pixel. Splicing the
+reference's frame into an otherwise-Julia field closes it completely, which is what identifies it.
+
+**It bites only where the data reaches the raster edge.** That is the difference between the two
+groups above: a Landsat scene is rotated inside its raster and so already carries a wide zero border,
+where both rules agree because the box mean of zeros is zero either way. A Sentinel-2 tile fills its
+raster, so the frame is real data and its zero-padded mean is badly wrong. So the deviation costs
+essentially nothing on Landsat and ~30 points of exact agreement on Sentinel-2 — worth knowing before
+reading either number as a general figure.
+
+The rung reports both and gates the better, since the worse is a recorded deviation rather than a
+disagreement this rung is asking about. The floor is one level everywhere, which is `np.mean`'s
+summation order moving whatever sits nearest a rounding boundary.
 
 ## What Gate 5 does not yet establish
 

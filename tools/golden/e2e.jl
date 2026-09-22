@@ -767,6 +767,128 @@ function rung_endpoint(s::Setup)
 end
 
 """
+    rung_bytes(s::Setup) -> Vector{StageResult}
+
+Rung 5.4 — the bytes the correlator is handed, from Julia's own read of the granule.
+
+The last boundary before the correlation, and the first one on the imagery side that this ladder
+reaches: rung 5.7 is fed `capture/in_I1`, so until here nothing upstream of the reference's own
+quantized pair had ever run in Julia on a golden case. The chain is read the granule, crop to the
+overlap `coregister` computed, apply the filter `runAutorift` applies ([`correlator_filter`](@ref)),
+and quantize with [`AutoRIFT.bytescale`](@ref).
+
+**Two border rules are reported, and the difference between them is the whole story.**
+`AutoRIFT.highpass` excludes out-of-image neighbours from the local mean where the reference
+zero-pads (`cv2.filter2D(..., BORDER_CONSTANT)`), a deliberate deviation its docstring records. That
+disagreement is confined to a `width ÷ 2` frame — 0.07% of a 10980² scene — but `uniform_data_type`
+takes its mean and standard deviation over the **whole array**, so the frame moves the quantization of
+every pixel in the image. Measured on the golden Sentinel-2 pair, the frame alone is the difference
+between **65.24%** of bytes exact and **99.9984%**. Reporting both separates "the border rule differs"
+from "something else differs", which one number cannot.
+
+The interior kernel is bitwise identical, checked directly: over that scene the largest difference
+between `AutoRIFT.highpass` and the reference's own form, away from the frame, is exactly 0.
+"""
+function rung_bytes(s::Setup)
+    call = joinpath(s.run, "capture", "call1.json")
+    isfile(call) || return [StageResult("5.4 correlator bytes", "capture/in_I1", "exact", true, 0,
+                                       "skipped: no capture at $call")]
+    # The radar scenes in a run directory are ISCE3's own products rather than anything this ladder
+    # built, so quantizing them would compare the reference against itself. Rung 5.2's radar half —
+    # the coregistration — is what has to exist first.
+    (startswith(s.case.platform, "S1") || startswith(s.case.platform, "NISAR")) &&
+        return [StageResult("5.4 correlator bytes", "capture/in_I1", "exact", true, 0,
+                            "skipped: the radar pair reaching the correlator is ISCE3's raster, so \
+                             this needs rung 5.2's coregistration rather than a read and a filter")]
+    # **A Landsat 4/5/7 pair is filtered twice, on two different grids**, and this rung reads the
+    # granule rather than `filtered/`, so it reproduces only the second application. `process.py`
+    # filters the *native* scene and writes `filtered/`; `runAutorift` then filters the *cropped*
+    # overlap again ([`correlator_filter`](@ref)). Declined with what it needs rather than run on the
+    # wrong input, which would report a filter difference as a quantization one.
+    native = native_filter(s.case, first(s.case.reference))
+    native === nothing || return [StageResult("5.4 correlator bytes", "capture/in_I1", "exact", true,
+                                              0, "skipped: a $(native) pair is filtered on its \
+                                               native scene before geogrid, so this rung needs rung \
+                                               5.3's output as its input rather than the granule")]
+    k = read_capture(s.case; n = parse(Int, basename(s.run)))
+    m = correlator_filter(s.case)
+    out = StageResult[]
+    for (nm, path, off, truth) in (("in_I1", s.reference_path, s.pair.reference_offset,
+                                    k.arrays["in_I1"]),
+                                   ("in_I2", s.secondary_path, s.pair.secondary_offset,
+                                    k.arrays["in_I2"]))
+        win = _cropped_scene(path, off, size(truth))
+        push!(out, _bytes_stage(nm, win, truth, m, native))
+    end
+    return out
+end
+
+# The overlap `coregister` computed, read out of the native scene. ArchGDAL hands back `(x, y)`; every
+# captured array is the reference's `(row, col)`, so the window transposes once here rather than at
+# each comparison.
+function _cropped_scene(path::AbstractString, off::NTuple{2,Int}, want::Tuple{Int,Int})
+    full = ArchGDAL.read(ArchGDAL.getband(ArchGDAL.read(path), 1))
+    nr, nc = want
+    ox, oy = off
+    size(full, 1) >= ox + nc && size(full, 2) >= oy + nr || throw(DimensionMismatch(
+        "the overlap at offset $off does not fit in a $(size(full)) scene; the crop and the \
+         geotransform disagree"))
+    return permutedims(full[(ox + 1):(ox + nc), (oy + 1):(oy + nr)])
+end
+
+# The reference's zero-padded value on the frame the two border rules disagree on, spliced into an
+# otherwise-Julia field. Only the frame: the interior is bitwise identical, so this isolates the
+# deviation instead of reimplementing the filter.
+function _zeropad_frame!(out, img, width::Integer)
+    h = Int(width) ÷ 2
+    n, m = size(img)
+    for j in 1:m, i in 1:n
+        (i <= h || i > n - h || j <= h || j > m - h) || continue
+        acc = 0.0f0
+        for dj in (-h):h, di in (-h):h
+            a, b = i + di, j + dj
+            (1 <= a <= n && 1 <= b <= m) || continue
+            acc += Float32(img[a, b])
+        end
+        out[i, j] = Float32(img[i, j]) - acc / Float32(width * width)
+    end
+    return out
+end
+
+function _bytes_stage(nm, win, truth, m, native)
+    mask = trues(size(win))
+    if m === nothing
+        field = Float32.(win)
+        variants = (("as read", field),)
+    else
+        f, _ = AutoRIFT.preprocess(Float32.(win), mask, m)
+        # The frame patch applies to the plain high-pass alone. `WallisGapfill` divides by a local
+        # standard deviation and fills its gaps from a random draw, so its frame is not one term the
+        # reference's padding rule maps onto.
+        variants = m isa AutoRIFT.Highpass ?
+                   (("ours", f), ("reference border", _zeropad_frame!(copy(f), win, m.width))) :
+                   (("ours", f),)
+    end
+    best = nothing
+    parts = String[]
+    for (label, field) in variants
+        d = Int.(AutoRIFT.bytescale(field, mask)) .- Int.(truth)
+        ad = abs.(d)
+        eq = count(iszero, d) / length(d)
+        w1 = count(<=(1), ad) / length(d)
+        push!(parts, @sprintf("%s exact %.4f%% within one level %.4f%% max %d", label, 100eq, 100w1,
+                              maximum(ad)))
+        best = best === nothing ? (eq, w1) : (max(best[1], eq), max(best[2], w1))
+    end
+    # Gated on the better border rule, since the worse one is a recorded deviation rather than a
+    # disagreement this rung is asking about. One level everywhere is the floor `bytescale`'s own
+    # docstring sets — `np.mean`'s summation order moves whatever sits nearest a rounding boundary.
+    gate = "exact>=99% within one level>=99.99%"
+    passed = best[1] >= 0.99 && best[2] >= 0.9999
+    return StageResult("5.4 $nm", "capture/$nm", gate, passed, length(truth), join(parts, "; "))
+end
+
+"""
     _by_level(axis, jl, ref, chip) -> StageResult
 
 The residual's bias split by the chip size each point resolved at. Reported, never gating.
@@ -883,7 +1005,7 @@ function e2e(c::GoldenCase; n::Union{Integer,Nothing} = nothing, stop_on_red::Bo
     @info "e2e setup" product=c.product region=s.info.name epsg=s.info.epsg window=size(s.window) dt_days=s.pair.dt / 86400
 
     out = StageResult[]
-    for rung in (rung_grid, rung_window, rung_geogrid, rung_params, rung_endpoint)
+    for rung in (rung_grid, rung_window, rung_bytes, rung_geogrid, rung_params, rung_endpoint)
         rs = rung(s)
         append!(out, rs)
         stop_on_red && !all(r -> r.passed, rs) && break
