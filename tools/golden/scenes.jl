@@ -326,3 +326,75 @@ end
 The footprint's EPSG code, as an integer.
 """
 footprint_epsg(fp) = GeoFormatTypes.val(fp.crs)
+
+"""
+    correlator_filter(c::GoldenCase) -> Union{Nothing,PreprocessMethod}
+
+The filter `runAutorift` applies to the cropped pair before quantizing it, or `nothing`.
+
+`testautoRIFT.py:533-540` picks a method **per scene** from the granule name and then
+`:293-308` applies **one** of them to both images, most stringent first. So the dispatch is a
+reduction over the pair rather than a per-image choice:
+
+  * an `L[EO]07_` scene acquired on or after 2003-05-31 — after the Scan Line Corrector failed —
+    contributes `wallis_fill`, and if either scene does, both are filtered with it;
+  * an `LT0[45]_` scene contributes `fft`, whose branch is **commented out** and applies no filter
+    at all (`:297-306` warns instead, because the band-reject has to run on the native scene before
+    geogrid rounds the corners off);
+  * anything else contributes `hps`, the plain high-pass.
+
+The width is 5 everywhere except Sentinel-1, which uses 21 (`:526-528`). `StandardDeviationCutoff`
+is `0.25` and never overridden (`autoRIFT.py:864`).
+
+Returning `nothing` for an L4/L5 pair is the reference's behaviour, not an omission: those scenes
+reach the correlator carrying only the filter [`native_filter`](@ref) already applied.
+"""
+function correlator_filter(c::GoldenCase)
+    width = startswith(c.platform, "S1") ? 21 : 5
+    methods = [_scene_method(n) for n in vcat(c.reference, c.secondary)]
+    :wallis_fill in methods && return AutoRIFT.WallisGapfill(width, 0.25)
+    :fft in methods && return nothing
+    return AutoRIFT.Highpass(width)
+end
+
+# One scene's contribution to that reduction, by the name tests `testautoRIFT.py:535-540` applies.
+function _scene_method(name::AbstractString)
+    if occursin(r"^L[EO]07_", name)
+        acquired = DateTime(split(name, '_')[4], dateformat"yyyymmdd")
+        return acquired >= DateTime(2003, 5, 31) ? :wallis_fill : :hps
+    end
+    occursin(r"^LT0[45]_", name) && return :fft
+    return :hps
+end
+
+"""
+    native_filter(c::GoldenCase, name) -> Union{Nothing,Symbol}
+
+The filter `process.py` applies to `name`'s **native** scene, writing `filtered/`, or `nothing`.
+
+Gated on the *pair* and then chosen per scene, which is two separate tests and both matter
+(`process.py:471-479`, `apply_landsat_filtering`). The pair is filtered only when
+`min(reference_platform, secondary_platform)` is `L4`, `L5` or `L7` — so an L8 scene paired with an
+L7 one is filtered and the same scene paired with an L9 one is not. Given that, each scene takes the
+filter its own platform names: `:fft` for L4 and L5, `:wallis_fill` for L7 and L8.
+
+`:fft` is Wallis at width 5 followed by the band-reject `AutoRIFT.Destripe` reproduces; `:wallis_fill`
+is `AutoRIFT.WallisGapfill(5, 0.25)`.
+"""
+function native_filter(c::GoldenCase, name::AbstractString)
+    platforms = [_landsat_platform(n) for n in vcat(c.reference, c.secondary)]
+    any(isnothing, platforms) && return nothing
+    minimum(platforms) in ("L4", "L5", "L7") || return nothing
+    own = _landsat_platform(name)
+    own in ("L4", "L5") && return :fft
+    own in ("L7", "L8") && return :wallis_fill
+    throw(ArgumentError("no native filter rule for \"$name\"; apply_landsat_filtering dispatches " *
+                        "on L4, L5, L7 and L8 only"))
+end
+
+# `LT05_...` gives "L5": the platform code `get_platform` returns, which drops the leading zero so
+# the string comparison `min` relies on orders L4 < L5 < L7 < L8 < L9.
+function _landsat_platform(name::AbstractString)
+    m = match(r"^L([TEOC])0?(\d)_", name)
+    return m === nothing ? nothing : string('L', m.captures[2])
+end
