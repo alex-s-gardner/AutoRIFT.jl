@@ -473,6 +473,85 @@ function decibel(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool})
 end
 
 """
+    bytescale(img, mask) -> Matrix{UInt8}
+
+Rescale `img` to 256 levels by its own mean and standard deviation: `±3σ` about the mean maps onto
+`0:255`, and a masked or non-finite pixel becomes zero.
+
+This is the last step the ITS_LIVE production driver applies before correlating
+(`autoRIFT.py:345-379`, reached because the driver sets `DataType = 0`), so reproducing a production
+run means reproducing it. The arithmetic is the reference's, including three details that each move
+the result:
+
+  * The statistics are the **sample** standard deviation — `np.std` is the population form, and the
+    reference multiplies it by `sqrt(n / (n - 1))` to correct it.
+  * The multiplier is **256**, not 255 (`2**8 - 0`), so the window's top end lands one level past
+    the representable range and is clipped there.
+  * Clipping happens **before** rounding, so a value above the window becomes exactly `255` rather
+    than wrapping.
+
+`mask` selects the pixels the statistics are taken over, and every pixel outside it is written as
+zero. The reference takes the population from `isfinite(I1)` and zeroes its own no-data mask
+afterwards; both are expressed here as one mask, because a filtered field records its no-data as
+either `NaN` or zero-with-the-mask-cleared depending on which path produced it, and the statistics
+must not depend on which.
+
+The arithmetic runs in the image's own precision, `T = float(eltype(img))`. That is the reference's
+behaviour — `loadProduct` casts to `float32` (`testautoRIFT.py:120-124`) and every statistic and
+per-pixel expression after it is `float32` — and it is what a caller handing this a `Float32` field
+should expect. Computing in `Float64` instead is more accurate and disagrees with the reference by
+one level on about 1e-4 of pixels, which is enough to matter when the whole point is to hand the
+correlator the same bytes.
+
+**One level of residual disagreement remains and is `numpy`'s summation order.** With the precision
+matched, the pinned fixtures agree on all but 1 pixel of 33,218, by one level; that pixel sits on a
+rounding boundary, and closing it would mean reproducing `np.mean`/`np.std`'s pairwise-summation
+block structure over the reduction. The mean and standard deviation are sums over the whole image, so
+any difference in accumulation order moves them in the last bits and moves whatever is nearest a
+boundary. Not matched, and recorded rather than tolerated silently.
+
+Quantizing before correlating costs accuracy at every point — see the register in
+`dev/CORRECTNESS.md` — and is reproduced because the reference's byte and float correlators are
+separate entry points that disagree, so a production comparison has to take the byte one.
+"""
+function bytescale(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool})
+    axes(img) == axes(mask) || throw(DimensionMismatch(
+        "image and mask must share axes: $(axes(img)) vs $(axes(mask))"))
+    T = float(eltype(img))
+    n = 0
+    total = zero(T)
+    for i in eachindex(img, mask)
+        (mask[i] && isfinite(img[i])) || continue
+        n += 1
+        total += T(img[i])
+    end
+    n > 1 || throw(ArgumentError(
+        "bytescale needs at least two valid pixels to estimate a standard deviation, got $n"))
+    m = total / T(n)
+    sq = zero(T)
+    for i in eachindex(img, mask)
+        (mask[i] && isfinite(img[i])) || continue
+        sq += (T(img[i]) - m)^2
+    end
+    # `np.std` divides by `n` and the reference corrects to the sample form by `sqrt(n / (n - 1))`.
+    # Written as the corrected sum directly, which is the same value.
+    s = sqrt(sq / T(n - 1))
+    s > 0 || throw(ArgumentError(
+        "bytescale needs a non-zero standard deviation; all $n valid pixels are equal, so the " *
+        "image carries no texture to correlate"))
+
+    lo = m - T(3) * s
+    width = T(6) * s
+    out = Matrix{UInt8}(undef, size(img))
+    for i in eachindex(out, img, mask)
+        # `256`, and clamped before rounding — both the reference's, and both change the answer.
+        v = mask[i] ? (T(img[i]) - lo) / width * T(256) : zero(T)
+        out[i] = isfinite(v) ? round(UInt8, clamp(v, zero(T), T(255))) : 0x00
+    end
+    return out
+end
+
+"""
     sobel(img, mask, width) -> Matrix{Float32}
 
 Sum of the x and y Sobel derivative kernels of side `width`, applied as one kernel.

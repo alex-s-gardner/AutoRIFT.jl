@@ -191,7 +191,7 @@ const PUBLIC_NAMES = (
     :correlate_multichip, :chipsize_level, :PassGeometry, :pass_geometry,
     # Preprocessing, standalone as well as inside a run.
     :ImageElement, :preprocess, :valid, :replace_nonfinite, :highpass, :highpass!, :wallis,
-    :wallis_gapfill, :decibel, :sobel, :laplacian, :deramp, :ramp_phase,
+    :wallis_gapfill, :decibel, :sobel, :laplacian, :deramp, :ramp_phase, :bytescale,
     :FiniteMask, :resident,
     # Whether a read costs I/O. Public because it is an extension point: a disk-backed array type
     # neither `AutoRIFTDiskArraysExt` nor `AutoRIFTRastersExt` recognizes needs a method here to be

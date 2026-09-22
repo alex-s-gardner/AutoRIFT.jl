@@ -704,6 +704,90 @@ def gen_wallisfill() -> int:
     return n
 
 
+def gen_bytescale() -> int:
+    """`uniform_data_type` (`autoRIFT.py:345-379`), the 256-level rescale the driver applies before
+    correlating.
+
+    The production driver sets ``DataType = 0``, so this is what the correlator actually sees: each
+    filtered scene mapped from its own mean plus-or-minus three standard deviations onto ``0:255``.
+    Nothing downstream can recover the precision it discards, so the mapping has to be exact rather
+    than close.
+
+    Three details each move the result by a level and each is easy to transcribe wrongly:
+
+      * The standard deviation is the **sample** form. ``np.std`` is the population form and the
+        reference multiplies it by ``sqrt(n / (n - 1))`` to correct it, so a transcription using
+        ``np.std`` alone is off by ``sqrt(n / (n-1))`` in the scale.
+      * The multiplier is **256**, written ``2**8 - 0``. A reading of 255 puts every level half a
+        step off and moves the top of the window inside the representable range instead of one level
+        past it.
+      * ``np.clip`` runs **before** ``np.round``, so a value above the window becomes exactly 255.
+        Rounding first can produce 256, which ``astype(np.uint8)`` wraps to 0 — a bright pixel
+        reported as no data.
+
+    The population is ``isfinite(I1)`` and is *not* the same set as ``zeroMask``: the statistics are
+    taken over the finite pixels and the zeroing is applied afterwards, so a filter that writes zero
+    rather than ``NaN`` over its no-data would change the statistics. Both cases are covered.
+    """
+    count = 0
+    for name, shape, seed in (("texture_64", (64, 64), 0), ("texture_129", (129, 97), 1)):
+        img = (texture(shape, seed=seed, dtype=np.float32) * 400.0 - 100.0).astype(np.float32)
+
+        # No mask: the population is every pixel, which is the `zeroMask is None` branch.
+        write_case(f"bytescale/{name}_nomask",
+                   {"image": img,
+                    "mask": np.ones(shape, dtype=bool),
+                    "scaled": _uniform_data_type(img, None)},
+                   {"masked": False})
+        count += 1
+
+        # A NaN region plus a zero mask over it, which is the production shape: `hps` writes `NaN`
+        # where it declines a pixel and the driver zeroes the same set afterwards.
+        mask = np.ones(shape, dtype=bool)
+        mask[: shape[0] // 4, : shape[1] // 3] = False
+        holed = img.copy()
+        holed[~mask] = np.nan
+        write_case(f"bytescale/{name}_masked",
+                   {"image": holed,
+                    "mask": mask,
+                    "scaled": _uniform_data_type(holed, ~mask)},
+                   {"masked": True})
+        count += 1
+
+        # Heavy tails, so a real population of pixels falls outside the plus-or-minus-three-sigma
+        # window and the clip is exercised on both ends rather than being inert.
+        # Just past the window rather than far past it. A large spike would dominate the standard
+        # deviation and collapse everything else into a handful of levels, which tests the clip and
+        # nothing else; this keeps the full range populated *and* puts pixels outside the window.
+        sd = float(np.std(img))
+        spiky = img.copy()
+        spiky[:: 37, :: 41] += 3.4 * sd
+        spiky[13 :: 43, 7 :: 47] -= 3.4 * sd
+        write_case(f"bytescale/{name}_clipped",
+                   {"image": spiky,
+                    "mask": np.ones(shape, dtype=bool),
+                    "scaled": _uniform_data_type(spiky, None)},
+                   {"masked": False, "clipped": True})
+        count += 1
+    return count
+
+
+def _uniform_data_type(img: np.ndarray, zero_mask) -> np.ndarray:
+    """`autoRIFT.py:349-361` transcribed for one image, statement for statement."""
+    I1 = img.astype(np.float32).copy()
+    if zero_mask is not None:
+        temp = I1[np.isfinite(I1)]
+    else:
+        temp = I1
+    S1 = np.std(temp) * np.sqrt(temp.size / (temp.size - 1.0))
+    M1 = np.mean(temp)
+    I1 = (I1 - (M1 - 3 * S1)) / (6 * S1) * (2 ** 8 - 0)
+    I1 = np.round(np.clip(I1, 0, 255)).astype(np.uint8)
+    if zero_mask is not None:
+        I1[zero_mask] = 0
+    return I1
+
+
 def gen_warpaffine() -> int:
     """`warpAffine` of a `getRotationMatrix2D`, which is the only OpenCV call the destripe filter keeps.
 
@@ -889,6 +973,7 @@ GENERATORS = (
     ("colfilt", gen_colfilt),
     ("bwareaopen", gen_bwareaopen),
     ("wallisfill", gen_wallisfill),
+    ("bytescale", gen_bytescale),
     ("warpaffine", gen_warpaffine),
     ("scenegeometry", gen_scenegeometry),
 )

@@ -1,0 +1,28 @@
+{
+  "arrays": {
+    "image": {
+      "dtype": "float32",
+      "shape": [
+        64,
+        64
+      ]
+    },
+    "mask": {
+      "dtype": "bool",
+      "shape": [
+        64,
+        64
+      ]
+    },
+    "scaled": {
+      "dtype": "uint8",
+      "shape": [
+        64,
+        64
+      ]
+    }
+  },
+  "params": {
+    "masked": false
+  }
+}

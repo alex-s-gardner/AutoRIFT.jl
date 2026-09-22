@@ -6,6 +6,11 @@
       "opencv_version": "4.13.0",
       "python_version": "3.10.20"
     },
+    "bytescale": {
+      "numpy_version": "1.26.4",
+      "opencv_version": "4.13.0",
+      "python_version": "3.10.20"
+    },
     "colfilt": {
       "numpy_version": "1.26.4",
       "opencv_version": "4.13.0",
@@ -29,6 +34,7 @@
   },
   "groups": {
     "bwareaopen": 15,
+    "bytescale": 6,
     "colfilt": 120,
     "derivkernels": 14,
     "disttransform": 4,
@@ -44,5 +50,5 @@
   "numpy_version": "1.26.4",
   "opencv_version": "4.13.0",
   "python_version": "3.10.20",
-  "total_cases": 471
+  "total_cases": 477
 }
