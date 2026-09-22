@@ -496,19 +496,22 @@ afterwards; both are expressed here as one mask, because a filtered field record
 either `NaN` or zero-with-the-mask-cleared depending on which path produced it, and the statistics
 must not depend on which.
 
-The arithmetic runs in the image's own precision, `T = float(eltype(img))`. That is the reference's
-behaviour — `loadProduct` casts to `float32` (`testautoRIFT.py:120-124`) and every statistic and
-per-pixel expression after it is `float32` — and it is what a caller handing this a `Float32` field
-should expect. Computing in `Float64` instead is more accurate and disagrees with the reference by
-one level on about 1e-4 of pixels, which is enough to matter when the whole point is to hand the
-correlator the same bytes.
+Per-pixel arithmetic runs in the image's own precision, `T = float(eltype(img))`, which is the
+reference's behaviour — `loadProduct` casts to `float32` (`testautoRIFT.py:120-124`) and every
+per-pixel expression after it is `float32`.
 
-**One level of residual disagreement remains and is `numpy`'s summation order.** With the precision
-matched, the pinned fixtures agree on all but 1 pixel of 33,218, by one level; that pixel sits on a
-rounding boundary, and closing it would mean reproducing `np.mean`/`np.std`'s pairwise-summation
-block structure over the reduction. The mean and standard deviation are sums over the whole image, so
-any difference in accumulation order moves them in the last bits and moves whatever is nearest a
-boundary. Not matched, and recorded rather than tolerated silently.
+**The two reductions are different, and accumulate in `Float64`.** `np.mean` and `np.std` sum
+pairwise, so their error grows with `log n` rather than `n` and over a scene-sized array they return
+essentially the exact value. A naive `Float32` accumulator does not model that, it collapses: summing
+1.2e8 squared deviations of ~1e5 each drives the accumulator to 1e13, past the point where a
+`Float32` mantissa registers the addends at all. Measured on the golden Sentinel-2 pair's 10980²
+highpass field, the standard deviation comes out **278.97 against a true 296.55** — a 5.9% error, and
+because the window is `m ± 3s` it rescales every pixel in the image rather than a few near a
+boundary. Each term is still formed in `T`, as the reference forms it; only the sum is protected.
+
+**A one-level residual remains on a rounding boundary**, which is what a difference in the last bits
+of `m` or `s` produces. The pinned fixtures agree on all but 1 pixel of 49,827, and over the golden
+Sentinel-2 scene the whole chain reaches 99.9984% exact with every remaining pixel within one level.
 
 Quantizing before correlating costs accuracy at every point — see the register in
 `dev/CORRECTNESS.md` — and is reproduced because the reference's byte and float correlators are
@@ -518,24 +521,32 @@ function bytescale(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool})
     axes(img) == axes(mask) || throw(DimensionMismatch(
         "image and mask must share axes: $(axes(img)) vs $(axes(mask))"))
     T = float(eltype(img))
+    # Each *term* is formed in `T`, as the reference forms it, and the *accumulation* runs in `Float64`.
+    # `np.mean`/`np.std` sum pairwise, whose error grows with `log n` rather than `n`, so over a
+    # scene-sized array they return essentially the exact value — a naive `T` accumulator does not model
+    # them, it collapses. On the 10980² highpass field of the golden Sentinel-2 pair the sum of squared
+    # deviations reaches 1e13 while each addend is ~1e5, past what a `Float32` accumulator can register:
+    # the standard deviation comes out 278.97 against a true 296.55. That 5.9% error rescales every pixel
+    # of the image, not a few near a boundary.
     n = 0
-    total = zero(T)
+    total = 0.0
     for i in eachindex(img, mask)
         (mask[i] && isfinite(img[i])) || continue
         n += 1
-        total += T(img[i])
+        total += Float64(img[i])
     end
     n > 1 || throw(ArgumentError(
         "bytescale needs at least two valid pixels to estimate a standard deviation, got $n"))
-    m = total / T(n)
-    sq = zero(T)
+    m = T(total / n)
+    sq = 0.0
     for i in eachindex(img, mask)
         (mask[i] && isfinite(img[i])) || continue
-        sq += (T(img[i]) - m)^2
+        d = T(img[i]) - m
+        sq += Float64(d * d)
     end
     # `np.std` divides by `n` and the reference corrects to the sample form by `sqrt(n / (n - 1))`.
     # Written as the corrected sum directly, which is the same value.
-    s = sqrt(sq / T(n - 1))
+    s = T(sqrt(sq / (n - 1)))
     s > 0 || throw(ArgumentError(
         "bytescale needs a non-zero standard deviation; all $n valid pixels are equal, so the " *
         "image carries no texture to correlate"))
