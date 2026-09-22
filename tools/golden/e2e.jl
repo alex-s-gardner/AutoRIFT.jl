@@ -1025,10 +1025,24 @@ function rung_bytes(s::Setup)
     # The radar scenes in a run directory are ISCE3's own products rather than anything this ladder
     # built, so quantizing them would compare the reference against itself. Rung 5.2's radar half —
     # the coregistration — is what has to exist first.
-    (startswith(s.case.platform, "S1") || startswith(s.case.platform, "NISAR")) &&
+    # **A NISAR L2 GSLC needs neither rung 5.2 nor a filter this rung can reproduce.** It is geocoded, so
+    # the correlator's input is `convert_slc_to_uint8_amplitude`'s two rasters on one map grid — a read and
+    # a crop, which is what this rung does. What stops it is the *filter*: `loadProduct` hard-casts NISAR
+    # to `uint8`, and `cv2.filter2D(..., ddepth=-1)` returns the input's depth, so the reference's
+    # high-pass output is `uint8` too and its entire negative half saturates to zero. Measured in the
+    # reference's own bytes: **~30% of `in_I1` sits at exactly 128**, which is where a field value of zero
+    # quantizes to, against a smooth ~1.8% per level elsewhere. Reproducing that means truncating the
+    # filter to `UInt8` before quantizing; see `tools/golden/README.md`, since discarding half the
+    # high-pass response is a defect rather than a convention.
+    s.case.platform == "NISAR-L2" &&
         return [StageResult("5.4 correlator bytes", "capture/in_I1", "exact", true, 0,
-                            "skipped: the radar pair reaching the correlator is ISCE3's raster, so \
-                             this needs rung 5.2's coregistration rather than a read and a filter")]
+                            "skipped: the reference's high-pass output is truncated to `UInt8` here, \
+                             clipping every negative response to zero — ~30% of `in_I1` is the single \
+                             value 128. Untruncated this rung reaches 57.2% exact")]
+    (startswith(s.case.platform, "S1") || s.case.platform == "NISAR-L1") &&
+        return [StageResult("5.4 correlator bytes", "capture/in_I1", "exact", true, 0,
+                            "skipped: the pair reaching the correlator is a radar-grid mosaic, so this \
+                             needs rung 5.2's coregistration rather than a read and a filter")]
     # **A Landsat 4/5/7 pair is filtered twice, on two different grids**, so the granule is the wrong
     # input for it. `process.py` filters the *native* scene and, for a cross-projection pair, warps the
     # result; `runAutorift` then filters the *cropped* overlap again ([`correlator_filter`](@ref)). Rung
