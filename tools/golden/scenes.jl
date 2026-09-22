@@ -264,6 +264,8 @@ function _scene_date(platform::AbstractString, name::AbstractString)
     parts = split(name, '_')
     startswith(platform, "L") && return String(parts[4])
     platform == "S2" && return String(parts[3][1:8])
+    # Sentinel-1 names the acquisition start as field 6, `20150828T162412`.
+    startswith(platform, "S1") && return String(parts[6][1:8])
     throw(ArgumentError("no date rule for platform \"$platform\""))
 end
 

@@ -4263,3 +4263,68 @@ and recorded rather than absorbed into a wider tolerance.
   parameters, which is the premise the endpoint comparison needs and did not have.
 - **The ten radar and NISAR cases.** `coregister` needs the orbit-driven resample for those, which is
   the `ImagePairGeometry` coregistration path.
+
+## Rung 5.2 — Sentinel-1, and what the radar geometry needs
+
+The coregistration turns out not to be on the critical path for the geogrid at all.
+`s1_isce3.process_slc` builds `meta_r = loadMetadataSlc(safe_ref, orbit_ref, swaths, slc_shape)` and then
+`meta_s = copy.copy(meta_r)` with **only** `sensingStart` and `sensingStop` replaced. So every number
+geogrid consumes, and therefore every `window_*.tif` band, comes from the *reference* acquisition's burst
+annotations and its orbit. What COMPASS's per-burst resample and hyp3's `merge_swaths` produce is
+`secondary.tif`'s pixel values, which the geometry rungs never read.
+
+That makes the geometry reachable without moving a granule. ASF's burst extractor serves a subswath's
+annotation — `SLCDatasets.asf_bursts` — and one fetch per subswath carries the burst list, the valid-line
+ranges and the range geometry. `tools/golden/radar.jl` reproduces `loadMetadataSlc` from those.
+
+### Three of five Sentinel-1 SLC pairs reproduce the merged grid exactly
+
+| case | julia | `reference.tif` | |
+|---|---|---|---|
+| `S1A_IW_SLC__1SSH_20150828` | 64751 x 15858 | 64751 x 15858 | **exact** |
+| `S1A_IW_SLC__1SSH_20151120` | 66172 x 23856 | 65978 x 23857 | 194 wide, 1 short |
+| `S1A_IW_SLC__1SSH_20170221` | 67945 x 23862 | 67860 x 24043 | 85 wide, 181 short |
+| `S1B_IW_SLC__1SDH_20180809` | 67945 x 23860 | 67945 x 23860 | **exact** |
+| `S1C_IW_SLC__1SDV_20250416` | 65643 x 23852 | 65643 x 23852 | **exact** |
+
+The reference's own `window_location.tif` confirms which extents geogrid was told: on the first case its
+range index runs 0..64750 and its azimuth index 0..15857, against 3,828,446 in-image points of 6,733,887.
+
+### Two quirks of the merge, reproduced
+
+**The azimuth extent overshoots the acquisition by about 1.7x.** `merge_swaths:437-439` sets
+`burst_sensing_stop = ref_bursts[-1].sensing_start + burst_length` where `burst_length` spans
+`burst_az_samples` — the *merged subswath's* height, not one burst's. Added to the **last** burst's start,
+that double-counts the swath: on the first case the acquisition is 9145 lines and the mosaic 15858. The
+reference's own two `SIZE` log lines show both, 9145 from `bounding_box`'s metadata-only call and 15858
+from the one given the merged shape.
+
+**The width formula and the merge disagree, and the merge wins.** `loadMetadataSlc:197-200`'s closed form
+uses `round` and the annotation's sample count; `merge_swaths:463` uses `floor` and the CSLC's. On
+`20151120` the first gives 66173 and the second 65978, and 65978 is what geogrid got.
+
+### The genuine block
+
+`total_rng_samples = last_rng_samples + floor((far.starting_range - near.starting_range) / dr)`, and
+`last_rng_samples` is read off the **COMPASS CSLC raster** of the far subswath's first burst
+(`s1_isce3.py:562`) rather than off any annotation. It equals `samples_per_burst` on the three exact cases
+and is 194 and 85 narrower on the other two, and leading-invalid-sample trimming does not explain that —
+`first_valid_sample` is 45, 592, 580, 524 and 164 across the five, against needed deltas of 0, 194, 85, 0
+and 0. The azimuth extent inherits the same dependency through the per-swath merged length.
+
+So closing the last two cases needs either COMPASS's width rule or a CSLC to measure. The derivation is
+left deriving rather than reading `reference.tif`, so the rung that compares them stays a test rather than
+a restatement.
+
+### Still open on the radar side
+
+- The three OPERA burst pairs, which take `process_burst` rather than `process_slc` and get their geometry
+  from the single-burst branch (`testGeogrid.py:141-154`) instead.
+- The precise coregistration itself, for the rungs that read pixels: `ResampledSLC(secondary, field;
+  amplitude_only = true)` puts the secondary's samples on the reference's grid, which is what COMPASS does
+  per burst. The post-tracking alternative — the offset as an a-priori shift, removed afterwards with
+  `AutoRIFT.remove_misregistration` — stays available and needs the field negated exactly once.
+- `SLCDatasets.merge_bursts` refuses a burst list spanning subswaths, deliberately: "Subswaths lie at
+  different slant ranges, so merging them would need one range origin for two". hyp3 does it anyway. A
+  pure-Julia mosaic wants that to become a supported construction rather than a relaxed check, since what
+  it produces is a mosaic whose phase is not on one grid.
