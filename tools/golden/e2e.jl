@@ -93,6 +93,72 @@ function relative_stage(name, ref_name, jl, ref; atol = 1e-3)
 end
 
 """
+    endpoint_stage(name, ref_name, jl, ref, step; max_median = step, max_bias = 0.01,
+                   max_p99 = 1.0) -> StageResult
+
+Compare two quantized displacement fields, gating on the *shape* of the residual and reporting its size.
+
+`quantized_stage` gates on `exact >= 77.4%` and `within one step >= 97.3%`, the figures the pre-existing
+L8/L9 benchmark reaches on a 3072² window. Those are the right numbers for that window and the wrong ones
+for a gate over twenty-two different scenes, and `tools/golden/README.md` says so in as many words: the
+gate is *similar* statistics, not identical ones, because the fraction of interpolated points, the spread
+of chip sizes and the amount of fast flow all vary — "a pair that misses 77.4% by a few points with a
+structureless residual passes; one that hits it with a dipole along the flow margin does not."
+
+So this gates the three statistics that answer *structureless*, and reports `exact` and
+`within one step` beside them:
+
+  * the **median** residual, which a grid offset or a convention error moves off zero;
+  * the **bias**, which a systematic difference moves and tie-breaking does not;
+  * the **p99**, which bounds the tail a gradient-correlated residual produces.
+
+Thresholds from the twelve optical cases rather than chosen: every one has a median of exactly 0, a
+|bias| no larger than 0.0075 px and a p99 no larger than 0.75 px, while `exact` spans 62.8% to 79.7%.
+The bounds here are one upsampling step, 0.01 px and 1.0 px — modest headroom on each, and each one a
+quantity the README names as what a structured residual would move.
+
+`dev/GATES.md` records the per-case `exact` and `within` figures, which is where a regression that
+preserves the shape while losing agreement would show up.
+"""
+function endpoint_stage(name, ref_name, jl, ref, step; max_median = step, max_bias = 0.01,
+                        max_p99 = 1.0)
+    if size(jl) != size(ref)
+        return StageResult(name, ref_name, "structure", false, 0,
+                           "shape $(size(jl)) against reference $(size(ref))")
+    end
+    both = 0; only_j = 0; only_r = 0; exact = 0; within = 0
+    d = Float64[]
+    for i in eachindex(jl, ref)
+        mj = isnan(jl[i]); mr = isnan(ref[i])
+        mj && mr && continue
+        if mr
+            only_j += 1
+        elseif mj
+            only_r += 1
+        else
+            both += 1
+            δ = Float64(jl[i]) - Float64(ref[i])
+            push!(d, δ)
+            δ == 0 && (exact += 1)
+            abs(δ) <= step && (within += 1)
+        end
+    end
+    both == 0 && return StageResult(name, ref_name, "structure", false, 0,
+                                    "no point measured on both sides")
+    ad = abs.(d)
+    med = median(ad)
+    bias = mean(d)
+    p99 = quantile(ad, 0.99)
+    passed = med <= max_median && abs(bias) <= max_bias && p99 <= max_p99
+    detail = @sprintf("both %d, only jl %d, only ref %d; median %.4g, bias %+.5f, p99 %.4g \
+                       (exact %.2f%%, within one step %.2f%%)",
+                      both, only_j, only_r, med, bias, p99,
+                      100exact / both, 100within / both)
+    gate = @sprintf("median<=%.4g |bias|<=%.3g p99<=%.3g", max_median, max_bias, max_p99)
+    return StageResult(name, ref_name, gate, passed, both, detail)
+end
+
+"""
     rounded_stage(name, ref_name, jl, ref; budget = 2) -> StageResult
 
 Compare two integer geogrid bands, allowing at most `budget` points to differ by one.
@@ -220,7 +286,10 @@ function setup(c::GoldenCase; n::Union{Integer,Nothing} = nothing, proj_only::Bo
 
     # Reprojection first, because the footprints geogrid intersects — and the pixel grid its indices
     # count in — are the warped ones. A pair already in one projection comes back untouched.
-    rpath, spath = aligned_scenes(c)
+    #
+    # A NISAR L2 GSLC is geocoded and its two amplitude rasters are already on one map grid, so the pair
+    # is read from the run directory instead — see `gslc_amplitude_paths` on why they are not rebuilt.
+    rpath, spath = c.platform == "NISAR-L2" ? gslc_amplitude_paths(c, run) : aligned_scenes(c)
     rfp = scene_footprint(rpath)
     sfp = scene_footprint(spath)
     pair = coregister(rfp, sfp; dt = geogrid_seconds(c))
@@ -554,7 +623,7 @@ function rung_endpoint(s::Setup)
         for sgn in (1, -1)
             nm = "5.7 $axis (sign $(sgn > 0 ? '+' : '-'))"
             rn = "out_$(uppercase(String(axis)))"
-            st = quantized ? quantized_stage(nm, rn, jl, sgn .* rf, step) :
+            st = quantized ? endpoint_stage(nm, rn, jl, sgn .* rf, step) :
                  unquantized_stage(nm, rn, jl, sgn .* rf)
             best === nothing && (best = (sgn, st))
             best = _better_endpoint(best, (sgn, st))

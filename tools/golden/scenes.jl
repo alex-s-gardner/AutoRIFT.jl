@@ -76,6 +76,30 @@ function scene_path(c::GoldenCase, which::Symbol)
     throw(ArgumentError("scene_path has no route for platform \"$(c.platform)\""))
 end
 
+"""
+    gslc_amplitude_paths(c::GoldenCase, run) -> (reference, secondary)
+
+The two byte-amplitude rasters a NISAR L2 GSLC pair is correlated from.
+
+A GSLC is geocoded, so `nisar_isce3.process_gslc` runs the **projected** geogrid over it
+(`optical_flag = 1`) and the imagery reaching the correlator is `reference_adjusted.tif` and
+`secondary_adjusted.tif` — `convert_slc_to_uint8_amplitude` of the cropped products, already on one map
+grid at 2.5 x 5.0 m. So there is no reprojection, no filter and no byte rescale on this path: the
+amplitude rasters *are* the correlator's input, which is why rungs 5.2, 5.3 and 5.4 do not apply to it.
+
+Taken from the cached run rather than rebuilt. Producing them means cropping two 11 GB products and
+converting 6 GB of complex samples per side; the outputs are 6 GB each and already on disk.
+"""
+function gslc_amplitude_paths(c::GoldenCase, run::AbstractString)
+    paths = (joinpath(run, "reference_adjusted.tif"), joinpath(run, "secondary_adjusted.tif"))
+    for p in paths
+        isfile(p) || error("$(basename(p)) is not in $run. A NISAR GSLC pair is correlated from the " *
+                           "byte-amplitude rasters the driver writes there, and rebuilding them " *
+                           "means cropping two 11 GB products.")
+    end
+    return paths
+end
+
 function _landsat_path(name::AbstractString, band::Symbol)
     url = "https://landsatlook.usgs.gov/stac-server/collections/landsat-c2l1/items/$name"
     item = JSON3.read(String(take!(Downloads.download(url, IOBuffer(); timeout = 60))))
@@ -266,6 +290,8 @@ function _scene_date(platform::AbstractString, name::AbstractString)
     platform == "S2" && return String(parts[3][1:8])
     # Sentinel-1 names the acquisition start as field 6, `20150828T162412`.
     startswith(platform, "S1") && return String(parts[6][1:8])
+    # NISAR names it as field 12, `20251028T235201`.
+    startswith(platform, "NISAR") && return String(parts[12][1:8])
     throw(ArgumentError("no date rule for platform \"$platform\""))
 end
 
