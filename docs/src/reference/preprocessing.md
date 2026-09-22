@@ -24,4 +24,5 @@ sobel
 deramp
 ramp_phase
 decibel
+bytescale
 ```

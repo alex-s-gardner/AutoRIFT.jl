@@ -1,5 +1,5 @@
 using AutoRIFT: ImagePair, preprocess, replace_nonfinite, highpass, wallis, valid, Destripe, destripe,
-                workspace, correlate!, peak_offset
+                workspace, correlate!, peak_offset, bytescale
 
 @testset "ImagePair construction" begin
     a = rand(Float32, 8, 8)
@@ -709,4 +709,68 @@ end
     out, outmask = preprocess(synthetic_texture((64, 64); seed = 4), trues(64, 64), m)
     @test size(out) == (64, 64)
     @test all(outmask)
+end
+
+@testset "bytescale reproduces uniform_data_type" begin
+    if !has_fixtures()
+        @info "Fixture corpus absent; skipping the bytescale comparison."
+    else
+        # One level on a handful of pixels, not exact, and the reason is `numpy`'s summation order:
+        # the mean and standard deviation are reductions over the whole image, so a different
+        # accumulation order moves them in the last bits and moves whichever pixels sit nearest a
+        # rounding boundary. Measured with the precision already matched — 1 pixel of 33,218 across
+        # these six cases — so the budget below is the measurement plus room for one more, not a
+        # tolerance chosen to make the test pass.
+        differing = 0
+        total = 0
+        for shape in ("texture_64", "texture_129"),
+            kind in ("nomask", "masked", "clipped")
+
+            f = fixture("bytescale/$(shape)_$(kind)")
+            a = f.arrays
+            mine = bytescale(a.image, a.mask .!= 0)
+            d = Int.(mine) .- Int.(a.scaled)
+            # No pixel may be off by more than one level. A two-level difference would mean the
+            # scale itself is wrong rather than a boundary being crossed, which is the failure this
+            # is here to catch.
+            @test maximum(abs, d) <= 1
+            differing += count(!=(0), d)
+            total += length(d)
+
+            # Every case spans most of the range, so the agreement above is a statement about the
+            # whole transform rather than about a narrow band of it.
+            @test length(unique(mine)) > 180
+        end
+        @test differing <= 4
+        @test differing / total < 1e-3
+
+        # The clip runs before the round, so the top of the plus-or-minus-three-sigma window lands
+        # on 255 rather than wrapping through 256 to 0. A pixel far above the window is the
+        # discriminating case: rounding first would report it as no data.
+        img = fill(0.0f0, 8, 8)
+        img[1, 1] = 1.0f0
+        img[2, 2] = 1.0f6
+        b = bytescale(img, trues(8, 8))
+        @test b[2, 2] == 0xff
+    end
+
+    # A masked pixel is zero whatever it held, and the statistics ignore it — so a wild value
+    # under the mask cannot move the scale of everything else.
+    img = Float32.(reshape(1:100, 10, 10))
+    mask = trues(10, 10)
+    mask[1, 1] = false
+    wild = copy(img)
+    wild[1, 1] = 1.0f9
+    @test bytescale(wild, mask) == bytescale(img, mask)
+    @test bytescale(wild, mask)[1, 1] == 0x00
+
+    # A `NaN` under the mask is the production shape — `highpass!` writes one where it declines a
+    # pixel — and must be treated the same as any other masked value rather than poisoning the mean.
+    holed = copy(img)
+    holed[1, 1] = NaN32
+    @test bytescale(holed, mask) == bytescale(img, mask)
+
+    @test_throws "must share axes" bytescale(img, trues(10, 9))
+    @test_throws "at least two valid pixels" bytescale(img, falses(10, 10))
+    @test_throws "carries no texture" bytescale(fill(3.0f0, 8, 8), trues(8, 8))
 end
