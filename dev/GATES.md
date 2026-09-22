@@ -4298,6 +4298,58 @@ The residual one level on a rounding boundary is what a last-bit difference in `
 and is not matched — reproducing `np.mean`'s block structure is brittle for one pixel in fifty
 thousand.
 
+## Rung 5.2 — the merged radar mosaic
+
+`merge_swaths` and `merge_bursts_in_swath` (`s1_isce3.py:393-577`) are index arithmetic, not signal
+processing: `read_slc_gdal` takes `np.abs` on the way in, so every array is `Float32` amplitude and hyp3
+resamples nothing. Two nested layouts — bursts into a subswath with the azimuth seam halfway through each
+overlap, then subswaths onto the near-range origin with a **first-come** writer. `radar_mosaic` and
+`swath_amplitude` reproduce both.
+
+**The reference burst needs no coregistration**, which is what makes this reachable at all: COMPASS writes
+the reference burst on its own grid and deramping is phase-only, so `abs` of the CSLC is `abs` of the raw
+burst. Measured on `S1C_IW_SLC__1SSV_20250416`'s first burst: a median difference of 0.0057 on amplitudes
+near 200, or 3e-5 relative.
+
+### The layout is exact, and one case proves it
+
+| case | swaths | filled on both | only ours | only the reference | median \|d\| |
+|---|---|---:|---:|---:|---:|
+| `S1C ... 20250416T010159` | 1 | 158,556,780 | **0** | 27,860 (peak 0.106) | 0.0032 of a 4009 peak |
+| `S1A ... 20240618T025533` | 1, 2 | 235,824,727 | 443,425 | 244,072 (peak 3529) | 45.0 |
+
+On the single-swath case the shape is exact and **not one pixel is filled by us and not by the
+reference** — which is the strong statement, since every offset, valid window and the 64-sample
+far-range buffer would move that set. The 27,860 the reference fills and we do not are all below **0.106**
+against amplitudes near 200, with a median of 0.008: COMPASS's resample tapers into samples whose raw
+value is exactly zero. So the gate bounds the *peak* value at a disagreeing pixel rather than the count —
+a magnitude says the difference is the taper, where a count cannot.
+
+### The two-swath cases need a CSLC, which is the blocker already on record
+
+`S1A ... 20240618T025533` disagrees structurally: a peak of 3529 at pixels only the reference fills, and a
+median of 45. Its cause is visible in the values — at the near-range edge the reference ramps
+`0, 0.02, 0.42, 1.01, 3.58, 38.06` where the raw burst is already at full amplitude, which is an
+interpolation kernel running off the end of valid data. So **COMPASS resampled the reference burst on this
+pair and did not on `S1C`**, and its `s1_cslc.yaml` differs only in the burst-specific path — the
+discriminator is whether a cached static topographic correction existed for those bursts, which is
+external state and was pruned from the run directory.
+
+That makes every remaining Sentinel-1 blocker the same one: the two SLC pairs' mosaic *width* and these
+two burst pairs' mosaic *values* both need the COMPASS CSLC raster.
+
+### What rung 5.4 now reaches on radar
+
+| case | `in_I1` | `in_I2` |
+|---|---|---|
+| `S1C ... 20250416T010159` | **99.6333% exact, 100.0000% within one level, max 1** | skipped |
+
+That is the whole imagery chain in Julia for a radar case — SAFE bursts, the two-level mosaic, the
+high-pass at width 21, and the byte quantization — against the reference's own bytes, agreeing to within
+one level at every one of 363,775,172 pixels. `in_I2` is declined because it is the *coregistered* half:
+`secondary.tif` is COMPASS's resample of the secondary onto the reference grid, and that half of rung 5.2
+is not built.
+
 ## Rung 5.4 — the bytes, and the one deliberate deviation that reaches all of them
 
 The first rung on the *imagery* side. Rung 5.7 is fed `capture/in_I1`, so before this nothing upstream
