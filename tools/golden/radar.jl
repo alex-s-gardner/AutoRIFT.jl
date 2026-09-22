@@ -478,3 +478,86 @@ end
 # `bursts[-1].last_valid_line` of a subswath, 0-based. Named because the reference reaches it as a
 # negative Python index, `slice(first_valid_line, -last_valid_line)`, which counts from the end.
 lvl_last(a) = a.last_valid_line[end] - 1
+
+"""
+    dem_sampler(path) -> Function
+
+Bilinear terrain height from a geographic DEM, as `(lon_degrees, lat_degrees) -> height`.
+
+The DEM the container downloaded for the pair, which sits in the run directory as `dem.tif` on an
+EPSG:4326 grid. Read whole rather than windowed: it is a few thousand cells on a side, and the
+coregistration solve asks for scattered points rather than a block.
+"""
+function dem_sampler(path::AbstractString)
+    ds = ArchGDAL.read(path)
+    gt = ArchGDAL.getgeotransform(ds)
+    z = ArchGDAL.read(ArchGDAL.getband(ds, 1))
+    nx, ny = size(z)
+    return function (lon_d, lat_d)
+        px = (lon_d - gt[1]) / gt[2]
+        py = (lat_d - gt[4]) / gt[6]
+        i = clamp(floor(Int, px), 0, nx - 2)
+        j = clamp(floor(Int, py), 0, ny - 2)
+        fx, fy = px - i, py - j
+        at(p, q) = Float64(z[p + 1, q + 1])
+        return (1 - fx) * (1 - fy) * at(i, j) + fx * (1 - fy) * at(i + 1, j) +
+               (1 - fx) * fy * at(i, j + 1) + fx * fy * at(i + 1, j + 1)
+    end
+end
+
+"""
+    coregistration_offset(cr, cs, line, sample, height; iters = 4) -> (dline, dsample, h)
+
+Where the secondary images the ground point the reference images at `(line, sample)`, as an offset in
+the reference's own pixels.
+
+The orbit-driven coregistration, and the geometry half of rung 5.2's secondary side: `rdr2geo` on the
+reference to reach the ground, `geo2rdr` on the secondary to come back. `line` and `sample` are
+zero-based, as the reference's indices are.
+
+**The terrain enters as an outer fixed point.** `rdr2geo` takes a constant height — all its callers in
+the geogrid supply one — so the DEM is iterated: solve at the current height, look the DEM up at the
+resulting position, solve again. Four passes, which is past convergence for Sentinel-1 geometry.
+
+**The offsets are computed from the solved time and range, not through `azimuth_index`.** Those helpers
+round to a whole line and sample for the geogrid's benefit, which is exactly the sub-pixel part a
+resampler needs.
+
+# What this reproduces, and the one thing it does not
+
+Validated against COMPASS's own coregistration on `S1C_IW_SLC__1SSV_20250416`, by correlating
+`secondary.tif` — the secondary already resampled onto the reference grid — against the *raw* secondary
+burst. Those are the same acquisition, so the peak locates COMPASS's offset rather than any prediction,
+and it is sharp: correlation 0.61 to 0.78 across bursts 1, 3 and 5 at two range positions each.
+
+    range:   exact, 0 samples at every point tested
+    azimuth: a systematic  -1.00 line
+
+The azimuth residual is one line, the same at every point, and it is not the comparison's: the same
+correlation run with the *reference* on both sides — `reference.tif` against the raw reference burst —
+peaks at `(0, 0)` with correlation **1.000**, so the mosaic row mapping is exact and the one line
+belongs to the geometry. A convention shared by both acquisitions would cancel in the difference, so
+the cause is an asymmetry: the next thing to check is each burst's `sensing_start` against the
+annotation's own `azimuthTime`, since `s1reader` and `SLCDatasets` need not place a burst's first line
+identically.
+"""
+function coregistration_offset(cr, cs, line::Integer, sample::Integer, height;
+                               iters::Integer = 4)
+    el = Ellipsoid()
+    az = cr.sensing_start + line / cr.prf
+    rg = cr.starting_range + sample * cr.dr
+    h = 0.0
+    llh = ImagePairGeometry.SVector{3,Float64}(0.0, 0.0, 0.0)
+    for _ in 1:iters
+        llh = ImagePairGeometry.rdr2geo(cr.orbit, el, az, rg; height = h,
+                                       wavelength = cr.wavelength, side = cr.look_side)
+        h = height(llh[1] / ImagePairGeometry.DEG2RAD, llh[2] / ImagePairGeometry.DEG2RAD)
+    end
+    xyz = ImagePairGeometry.lonlat_to_xyz(el,
+              ImagePairGeometry.SVector{3,Float64}(llh[1], llh[2], h))
+    pm, vm = ImagePairGeometry.interpolate(cs.orbit, ImagePairGeometry.orbit_midtime(cs))
+    p = ImagePairGeometry.geo2rdr(cs.orbit, xyz, ImagePairGeometry.midtime(cs),
+                                 ImagePairGeometry.orbit_midtime(cs), pm, vm)
+    return ((p.aztime - cs.sensing_start) * cs.prf - line,
+            (p.range - cs.starting_range) / cs.dr - sample, h)
+end
