@@ -4361,10 +4361,30 @@ positions each — and the result is uniform:
 both sides — `reference.tif` against the raw reference burst — peaks at `(0, 0)` with correlation
 **1.000**, so the mosaic row mapping is exact and the residual is not the comparison's.
 
-A convention shared by both acquisitions cancels in the difference, so the cause is an asymmetry rather
-than an off-by-one in the index formula. The next thing to check is each burst's `sensing_start` against
-the annotation's own `azimuthTime`: `s1reader` and `SLCDatasets` need not place a burst's first line
-identically, and one line is what that would cost.
+**Pinned to sub-pixel precision, then narrowed by elimination.** Refining the correlation peak with a
+parabola over 15 points — five bursts at three range positions — gives a residual of
+**+1.0162 ± 0.0310 lines**, median +1.0250. Integer search alone could not have said this: the true offset
+is near a half-integer, where a one-line error and a rounding ambiguity look the same.
+
+Four candidate causes, each ruled out by measurement rather than by argument:
+
+| candidate | test | verdict |
+|---|---|---|
+| a parsing difference in `sensing_start` | `s1reader` against `SLCDatasets` against the annotation XML | **identical** to the microsecond on every burst, both products |
+| the reference grid is not the burst's own | `as_isce3_radargrid().sensing_start` + `ref_epoch` | resolves to the burst's `sensing_start` exactly |
+| a line spacing error | `prf * azimuth_time_interval` | **1.000000000000**; and `dl` varies 0.0036 over 1200 lines, so there is no drift |
+| the Sentinel-1 bistatic delay | `burst.bistatic_delay()` evaluated in lines | 0.234–0.264 lines, and **identical** for both acquisitions, so it cancels in the difference |
+
+A strongly line-varying term is excluded by the same line-invariance, which rules out the TOPS steering
+Doppler as well. What is left is a **constant one-line index convention inside COMPASS's resampling** —
+not in the metadata, not in the grid, not in the azimuth corrections. `s1reader` and `isce3` are installed
+locally and were used for the tests above; COMPASS itself is not, so reading `s1_cslc`'s offset convention
+needs the container.
+
+One structural detail confirms the solve is tracking the metadata correctly rather than by luck: the
+annotation places bursts 2, 6 and 7 one line differently from 1, 3, 4 and 5 (443.35 against 442.35 lines
+of inter-acquisition offset), and `coregistration_offset` reproduces that split — burst 2 predicts −2.48
+where the others predict −1.47.
 
 **What remains after the geometry closes** is the resampling itself, and it is three things rather than
 one: ISCE3's eight-point sinc kernel with its own table, the TOPS deramp-and-reramp that a resample has
