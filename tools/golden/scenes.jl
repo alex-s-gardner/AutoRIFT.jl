@@ -398,3 +398,45 @@ function _landsat_platform(name::AbstractString)
     m = match(r"^L([TEOC])0?(\d)_", name)
     return m === nothing ? nothing : string('L', m.captures[2])
 end
+
+"""
+    filtered_path(c::GoldenCase, run, name) -> Union{Nothing,String}
+
+The reference's own natively-filtered raster for `name`, or `nothing` if the pair is not filtered.
+
+`process.py` writes `apply_landsat_filtering`'s output into `filtered/` on the scene's **native** grid
+and, for a cross-projection pair, `ensure_same_projection` then writes the warped copies into
+`reprojected/`. The later directory is preferred when it exists, because that is what geogrid and the
+correlator actually read — `reference_path` is reassigned to it (`process.py:488`) before the bounding
+box is taken.
+
+Returns the path the reference would have handed downstream, which is what a rung wanting the
+*correlator's* input needs. Rung 5.3, which is testing the filter itself, wants `filtered/` on the
+native grid instead and asks for it by name.
+"""
+function filtered_path(c::GoldenCase, run::AbstractString, name::AbstractString)
+    native_filter(c, name) === nothing && return nothing
+    band = scene_band(c.platform) === :green ? "B2" : "B8"
+    for dir in ("reprojected", "filtered")
+        p = joinpath(run, dir, "$(name)_$(band).TIF")
+        isfile(p) && return p
+    end
+    error("no filtered raster for $name under $run; `filtered/` is what " *
+          "`apply_landsat_filtering` writes and a pruned run has neither it nor `reprojected/`")
+end
+
+"""
+    native_filtered_paths(c::GoldenCase, run, name) -> (image, zero_mask)
+
+The reference's native-grid filter outputs for `name`: the Float32 raster and its zero mask.
+
+The mask is `nothing` for an L4/L5 pair, which is `apply_fft_filter`'s own return — only the
+nodata-infill filter produces one (`process.py:275, 286`).
+"""
+function native_filtered_paths(c::GoldenCase, run::AbstractString, name::AbstractString)
+    band = scene_band(c.platform) === :green ? "B2" : "B8"
+    img = joinpath(run, "filtered", "$(name)_$(band).TIF")
+    isfile(img) || error("no $img; rung 5.3 compares against `filtered/` on the native grid")
+    zero = joinpath(run, "filtered", "$(name)_$(band)_zeroMask.TIF")
+    return (img, isfile(zero) ? zero : nothing)
+end

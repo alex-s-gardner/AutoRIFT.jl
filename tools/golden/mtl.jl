@@ -370,3 +370,34 @@ function orbit_angle_check(c::GoldenCase, run::AbstractString, cache::AbstractSt
     end
     return out
 end
+
+"""
+    reference_banding(log) -> Vector{Bool}
+
+Whether the reference's band-reject **fired**, one entry per filtered scene.
+
+`_fft_filter` prints its two band powers unconditionally and adds a "No banding filter applied" line
+only when it declines (`autoRIFT.py:211-226`), so the decision is readable from the log and does not
+have to be inferred from the output — which would be circular, since this is what a rung comparing that
+output needs to know.
+
+The decision is a **binary branch on a ratio**, and it can be marginal: on
+`LT05_L1GS_001013_19920425` the powers are 1588 and 3279, clearing the `>= 2` test by 3.2%. A scene
+that close can be decided differently by two implementations whose input fields differ slightly, and
+then its whole output differs — a declined reject returns the clamped input, a fired one returns the
+band-rejected field.
+"""
+function reference_banding(log::AbstractString)
+    out = Bool[]
+    pending = false
+    for line in eachline(log)
+        if occursin(r"Cross track power is", line)
+            pending && push!(out, true)
+            pending = true
+        elseif occursin("No banding filter applied", line)
+            pending && (push!(out, false); pending = false)
+        end
+    end
+    pending && push!(out, true)
+    return out
+end
