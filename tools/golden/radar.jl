@@ -45,8 +45,8 @@ using Dates, Printf
 using ImagePairGeometry
 using ImagePairGeometry: IdentityTransform, LookRight, incidence_angle
 using SLCDatasets
-using SLCDatasets: annotation, asf_bursts, bursts, merge_bursts, nbursts, open_slc, orbit,
-                   seconds_between, Sentinel1Product
+using SLCDatasets: annotation, asf_bursts, burst_raster, bursts, merge_bursts, nbursts,
+                   open_slc, orbit, seconds_between, Sentinel1Product
 
 # Sentinel-1 IW covers the swath with three subswaths, and a full-SLC job processes all three
 # (`s1_isce3.process_slc` defaults `swaths=(1, 2, 3)`).
@@ -335,3 +335,146 @@ function nisar_l1_pair(c::GoldenCase, run::AbstractString)
     end
     return CoregisteredPair(open_slc(path(early)), open_slc(path(late)))
 end
+
+# ---------------------------------------------------------------------------
+# Rung 5.2 — the merged radar mosaic the correlator is handed
+# ---------------------------------------------------------------------------
+#
+# `merge_swaths` (`s1_isce3.py:393-530`) is the whole specification, and it is index arithmetic rather
+# than signal processing: `read_slc_gdal` takes `np.abs` of each burst raster on the way in, so every
+# array downstream is `Float32` amplitude and nothing is resampled. Two nested layouts:
+#
+#   1. **Bursts into a subswath** (`merge_bursts_in_swath`). Bursts overlap in azimuth, and the seam is
+#      put *halfway through* each overlap so no burst contributes its resampling margin.
+#   2. **Subswaths into the mosaic** (`merge_swaths`). Each subswath is laid on the near-range one's
+#      range origin, and the writer is first-come: a pixel already non-zero is not overwritten.
+#
+# **The reference burst needs no coregistration.** COMPASS writes the reference burst on its own grid and
+# deramping is phase-only, so `abs` of the CSLC is `abs` of the raw burst — measured on
+# `S1C_IW_SLC__1SSV_20250416`'s first burst at a median difference of 0.0057 on amplitudes near 200, or
+# 3e-5 relative. So the reference side of rung 5.2 is reproducible from the SAFE with no COMPASS run.
+
+"""
+    swath_amplitude(p::Sentinel1Product, swath) -> (Matrix{Float32}, Int, Int)
+
+One subswath's bursts merged into a single amplitude raster, with its azimuth and range extents.
+
+Reproduces `merge_bursts_in_swath`. The azimuth seam between two bursts is placed halfway through their
+overlap, which is what keeps each burst's resampling margin out of the result, and the range window is
+the *first* burst's valid sample range applied to every burst.
+
+A single-burst subswath takes the early return: the burst is written whole, with no valid-region
+cropping at all, so its extents are the burst's own.
+"""
+function swath_amplitude(p::Sentinel1Product, swath::Integer)
+    a = annotation(p, swath)
+    b = collect(bursts(p, swath))
+    n = length(b)
+    lpb, spb = a.lines_per_burst, a.samples_per_burst
+    dt = a.azimuth_time_interval
+    # One handle for the whole subswath: a `.SAFE` stacks every burst of a subswath in one raster, so a
+    # burst is a row range of it. `read_pixels` on a single burst cannot be used — it is
+    # `first(burst_raster(b))` on a `BurstRaster`, which is not iterable.
+    raster = burst_raster(first(b).backend).raster
+    amp(i, rows, cols) = abs.(raster[((i - 1) * lpb) .+ rows, cols])
+
+    # The annotation's valid bounds are 1-based inclusive; every index below is the reference's 0-based.
+    fvl = a.first_valid_line .- 1
+    lvl = a.last_valid_line .- 1
+    fvs = a.first_valid_sample .- 1
+    lvs = a.last_valid_sample .- 1
+
+    n == 1 && return (Float32.(amp(1, 1:lpb, 1:spb)), lpb, spb)
+
+    # `get_azimuth_reference_offsets`: where each burst's valid region starts and ends in the merged
+    # subswath, from its own sensing time and first valid line.
+    lims = map(1:n) do i
+        s = round(Int, (seconds_between(first(a.burst_start), a.burst_start[i]) + fvl[i] * dt) / dt)
+        (s, s + (lvl[i] - fvl[i]) + 1)
+    end
+    nlines = 1 + round(Int, (seconds_between(first(a.burst_start), last(a.burst_start)) +
+                             (lpb - 1) * dt) / dt)
+    out = zeros(Float32, nlines, spb)
+    for i in 1:n
+        # `//` in the reference is floor division and these overlaps are positive, but `fld` says so.
+        prev = i > 1 ? fld(lims[i - 1][2] - lims[i][1], 2) : 0
+        nxt = i < n ? fld(lims[i][2] - lims[i + 1][1], 2) : 0
+        bstart, bend = fvl[i] + prev, 1 + lvl[i] - nxt
+        mstart, mend = lims[i][1] + prev, lims[i][2] - nxt
+        cols = (fvs[i] + 1):lvs[i]          # `slice(first_valid_sample, last_valid_sample)`
+        out[(mstart + 1):mend, cols] = amp(i, (bstart + 1):bend, cols)
+    end
+    return (out, nlines, spb)
+end
+
+"""
+    radar_mosaic(p::Sentinel1Product, swaths) -> Matrix{Float32}
+
+The merged amplitude raster `merge_swaths` writes as `reference.tif`.
+
+Each subswath is placed at its own azimuth offset from the earliest sensing start and at its range offset
+from the near subswath's origin, and only where the mosaic is still zero — the reference's writer is
+first-come, which matters because adjacent subswaths overlap in range.
+
+Two quirks of the extent are reproduced rather than corrected, both already established by
+[`s1_mosaic`](@ref): the azimuth span adds a whole merged subswath length to the *last* burst's start, so
+the mosaic reaches about 1.7 times a subswath's height; and the width is the **last** subswath's sample
+count plus the floored range offset to it, not a union of the three.
+
+A subswath other than the far one is trimmed by 64 samples at its far edge, which is the reference's
+`invalid_pixel_buffer` — the resampling margin at a subswath's far range.
+"""
+function radar_mosaic(p::Sentinel1Product, swaths)
+    sws = collect(swaths)
+    ann = [annotation(p, sw) for sw in sws]
+    merged = [swath_amplitude(p, sw) for sw in sws]
+
+    dr = first(ann).range_pixel_spacing
+    dt = first(ann).azimuth_time_interval
+    starts = [first(a.burst_start) for a in ann]
+    stops = [last(a.burst_start) for a in ann]
+    sensing_start = minimum(starts)
+    # `burst_sensing_stop` spans the *merged* subswath rather than one burst, which is the 1.7x quirk.
+    span = maximum(zip(ann, merged)) do (a, m)
+        seconds_between(sensing_start, last(a.burst_start)) + (m[2] - 1) * a.azimuth_time_interval
+    end
+    total_az = 1 + round(Int, span / dt)
+
+    # `rng_offsets` are measured from the *first* subswath in the list, and `last_rng_samples` ends as the
+    # last subswath's own width — not the widest.
+    rng_offsets = [sw == first(sws) ? 0 :
+                   floor(Int, (annotation(p, sw).starting_range - first(ann).starting_range) / dr)
+                   for sw in sws]
+    total_rng = last(merged)[3] +
+                floor(Int, (last(ann).starting_range - first(ann).starting_range) / dr)
+
+    out = zeros(Float32, total_az, total_rng)
+    for k in eachindex(sws)
+        a, (slc, nrows, _) = ann[k], merged[k]
+        fvl, lvl = a.first_valid_line[1] - 1, a.last_valid_line[1] - 1
+        fvs, lvs = a.first_valid_sample[1] - 1, a.last_valid_sample[1] - 1
+        az_offset = floor(Int, seconds_between(sensing_start, starts[k]) / dt)
+        rng_offset = rng_offsets[k] + fvs
+        rng_end = rng_offset + (lvs - fvs)
+        buffer = sws[k] == maximum(sws) ? 0 : 64
+        # A single-burst subswath was written whole, so its azimuth window is the first burst's valid
+        # region; a merged one runs to the *last* burst's last valid line counted from the end.
+        slc_az_end = nbursts(a) > 1 ? nrows - (lvl_last(a)) : lvl
+        merged_az_end = nbursts(a) > 1 ? az_offset + nrows - lvl_last(a) - fvl : az_offset + (lvl - fvl)
+        mrows = (az_offset + 1):merged_az_end
+        srows = (fvl + 1):slc_az_end
+        mcols = (rng_offset + 1):(rng_end - buffer)
+        scols = (fvs + 1):(lvs - buffer)
+        dst = view(out, mrows, mcols)
+        src = view(slc, srows, scols)
+        for i in eachindex(dst, src)
+            # First-come: `cond = merged == 0 & slc != 0`.
+            (dst[i] == 0 && src[i] != 0) && (dst[i] = src[i])
+        end
+    end
+    return out
+end
+
+# `bursts[-1].last_valid_line` of a subswath, 0-based. Named because the reference reaches it as a
+# negative Python index, `slice(first_valid_line, -last_valid_line)`, which counts from the end.
+lvl_last(a) = a.last_valid_line[end] - 1

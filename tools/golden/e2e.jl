@@ -768,6 +768,96 @@ function rung_endpoint(s::Setup)
 end
 
 """
+    rung_coregister(s::Setup) -> Vector{StageResult}
+
+Rung 5.2 — the merged radar mosaic the correlator is handed, against `reference.tif`.
+
+[`radar_mosaic`](@ref) reproduces `merge_swaths` and `merge_bursts_in_swath`: bursts into a subswath with
+the azimuth seam halfway through each overlap, then subswaths onto the near-range origin with a
+first-come writer. `read_slc_gdal` takes `np.abs` on the way in, so the whole layout is `Float32`
+amplitude and nothing is resampled by hyp3 itself.
+
+**Gated on the zero/non-zero set exactly and the values on tolerance.** Which pixels the mosaic fills is
+pure index arithmetic — every offset, valid window and the 64-sample far-range buffer — so a single index
+error moves the set and there is nothing to round. The values cannot be bitwise: they travel through a
+`Float32` GeoTIFF and COMPASS's own amplitude differs from the raw burst's in the last digits.
+
+**Only a burst job can be reached.** Its SAFE is on disk beside the outputs, where a full-SLC pair's
+granule is not — the run directory holds `reference.tif` and no source product, so that pair would need
+an 8 GiB transfer to read a pixel from.
+"""
+function rung_coregister(s::Setup)
+    s.case.platform == "S1-BURST" || return [StageResult("5.2 radar mosaic", "reference.tif", "set",
+                                                         true, 0,
+                                                         "skipped: only a burst job keeps its SAFE in \
+                                                          the run directory; a full-SLC pair would need \
+                                                          the granule transferred to read a pixel")]
+    path = joinpath(s.run, "reference.tif")
+    isfile(path) || return [StageResult("5.2 radar mosaic", "reference.tif", "set", true, 0,
+                                        "skipped: no $path")]
+    p = _reference_product(s.case, s.run)
+    got = radar_mosaic(p, burst_swaths(s.case))
+    return [_mosaic_stage("5.2 radar mosaic", path, got)]
+end
+
+# The reference acquisition's parsed SAFE, which is the earlier of the two `burst2safe` wrote.
+function _reference_product(c::GoldenCase, run::AbstractString)
+    early, _ = _burst_safes(run)
+    return Sentinel1Product(early; orbit = s1_orbit(run, basename(early)),
+                            polarization = lowercase(s1_polarization(basename(early))),
+                            swaths = burst_swaths(c))
+end
+
+# `got` against a reference raster, read in row strips so neither is held whole. The filled *set* is the
+# gate; the values are reported relative to the amplitudes they sit on.
+function _mosaic_stage(name, ref_path, got)
+    bd = ArchGDAL.getband(ArchGDAL.read(ref_path), 1)
+    if size(got) != (ArchGDAL.height(bd), ArchGDAL.width(bd))
+        return StageResult(name, basename(ref_path), "set", false, 0,
+                           "shape $(size(got)) against reference \
+                            $((ArchGDAL.height(bd), ArchGDAL.width(bd)))")
+    end
+    nr, nc = size(got)
+    only_j = 0; only_r = 0; both = 0
+    d = Float64[]
+    scale = 0.0
+    only_r_peak = 0.0
+    for r0 in 1:4096:nr
+        rows = r0:min(r0 + 4095, nr)
+        want = permutedims(ArchGDAL.read(bd, rows, 1:nc))
+        g = @view got[rows, :]
+        for i in eachindex(g, want)
+            a, b = Float64(g[i]), Float64(want[i])
+            if a != 0 && b == 0
+                only_j += 1
+            elseif a == 0 && b != 0
+                only_r += 1
+                only_r_peak = max(only_r_peak, b)
+            elseif a != 0
+                both += 1
+                scale = max(scale, b)
+                length(d) < 4_000_000 && push!(d, abs(a - b))
+            end
+        end
+    end
+    n = nr * nc
+    med = isempty(d) ? 0.0 : median(d)
+    p99 = isempty(d) ? 0.0 : quantile(d, 0.99)
+    # **Three conditions, and the third is a magnitude rather than a count.** We may never invent a filled
+    # pixel — that would be an index error. The reference may fill one we do not, because COMPASS's
+    # resample tapers into samples whose raw value is exactly zero, but only where its value there is
+    # negligible: measured on `S1C_IW_SLC__1SSV_20250416`, 27,860 such pixels of 363,775,172 with a
+    # *maximum* of 0.106 against amplitudes near 200. Bounding the peak rather than the count says that
+    # the disagreement is the taper and not a misplaced burst, which a count cannot.
+    passed = only_j == 0 && only_r_peak <= 1e-3 * max(scale, 1) && med <= 1e-4 * max(scale, 1)
+    return StageResult(name, basename(ref_path),
+                       "none only ours, their extras <= 1e-3 of scale, median <= 1e-4", passed, n,
+                       @sprintf("%d of %d filled on both; %d only ours, %d only the reference (peak \
+                                 %.4g there); median |d| %.5g, p99 %.5g against a peak amplitude of %.4g",
+                                both, n, only_j, only_r, only_r_peak, med, p99, scale))
+end
+
+"""
     rung_filter(s::Setup) -> Vector{StageResult}
 
 Rung 5.3 — `apply_landsat_filtering` on Julia's own read of the granule, on the native grid.
@@ -1039,6 +1129,19 @@ function rung_bytes(s::Setup)
                             "skipped: the reference's high-pass output is truncated to `UInt8` here, \
                              clipping every negative response to zero — ~30% of `in_I1` is the single \
                              value 128. Untruncated this rung reaches 57.2% exact")]
+    if s.case.platform == "S1-BURST"
+        # **The reference side only.** `radar_mosaic` builds what `merge_swaths` writes as
+        # `reference.tif`, which needs no coregistration — COMPASS writes the reference burst on its own
+        # grid. `secondary.tif` is the coregistered one, and that half of rung 5.2 does not exist yet, so
+        # `in_I2` is declined rather than compared against a mosaic built from the wrong grid.
+        k = read_capture(s.case; n = parse(Int, basename(s.run)))
+        got = radar_mosaic(_reference_product(s.case, s.run), burst_swaths(s.case))
+        out = StageResult[_bytes_stage("in_I1", got, k.arrays["in_I1"], correlator_filter(s.case))]
+        push!(out, StageResult("5.4 in_I2", "capture/in_I2", "exact", true, 0,
+                              "skipped: the secondary is the coregistered half of rung 5.2, which is \
+                               not built — an uncoregistered mosaic would compare two different grids"))
+        return out
+    end
     (startswith(s.case.platform, "S1") || s.case.platform == "NISAR-L1") &&
         return [StageResult("5.4 correlator bytes", "capture/in_I1", "exact", true, 0,
                             "skipped: the pair reaching the correlator is a radar-grid mosaic, so this \
@@ -1260,7 +1363,8 @@ function e2e(c::GoldenCase; n::Union{Integer,Nothing} = nothing, stop_on_red::Bo
     @info "e2e setup" product=c.product region=s.info.name epsg=s.info.epsg window=size(s.window) dt_days=s.pair.dt / 86400
 
     out = StageResult[]
-    for rung in (rung_grid, rung_window, rung_filter, rung_bytes, rung_geogrid, rung_params,
+    for rung in (rung_grid, rung_window, rung_coregister, rung_filter, rung_bytes,
+                 rung_geogrid, rung_params,
                  rung_endpoint)
         rs = rung(s)
         append!(out, rs)
