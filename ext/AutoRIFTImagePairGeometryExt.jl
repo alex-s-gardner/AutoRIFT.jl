@@ -32,7 +32,8 @@
 module AutoRIFTImagePairGeometryExt
 
 import AutoRIFT
-using ImagePairGeometry: PairGeometry, chip_size_pixels, y_displacement_sign
+using ImagePairGeometry: PairGeometry, ProjectedCoordinate, chip_size_pixels,
+                         y_displacement_sign
 
 """
     AutoRIFT.pointset(g::PairGeometry; chip_size = nothing, chip_size_0 = 240.0,
@@ -176,5 +177,90 @@ end
 
 AutoRIFT.remove_misregistration(r, offset) =
     AutoRIFT.remove_misregistration(r.dx, r.dy, offset)
+
+"""
+    AutoRIFT.params(g::PairGeometry; chip_size_0 = 240.0, optical, kwargs...) -> Params
+
+The correlator settings the ITS_LIVE driver derives from a geogrid result.
+
+Five keywords a caller would otherwise have to re-derive, each read out of `g` rather than configured
+(`testautoRIFT.py:245-250, 330-334`):
+
+  * `chip_size.X = ceil(chip_size_0 / pixel_size / 4) * 4` — the base chip is a fixed *distance*
+    divided by the image's pixel size, rounded up to a multiple of four.
+  * `chip_size.Y = round(chip_size.X * scale / 2) * 2`, where `scale` is the median of
+    `chip_min_y / chip_min_x` over the points where both bounds are present. The parameter chip sizes
+    are square on the ground, so that ratio is the y:x *pixel size* ratio — 1.0 wherever the pixel is
+    square and about 0.25 on a Sentinel-1 pair, varying per acquisition with the azimuth:range ratio.
+  * `chip_size_max` from the largest per-point bound `g` carries, with the same `scale` on Y. Both
+    bounds carry it, not just the minimum: the pyramid doubles the two axes together, so a maximum
+    scaled on one axis only is reached after a different number of doublings on each.
+  * `grid_spacing.X = chip_size.X * grid_spacing_m / chip_size_0`, in pixels — written this way
+    rather than as `grid_spacing_m / pixel_size`, which is the same number only when the first
+    division is exact.
+  * `subpixel`, as the reference's per-level ladder: `16, 32, 64, 64` for optical and
+    `32, 64, 128, 128` for radar. A single factor cannot express it, and the reference looks the
+    factor up per chip size.
+
+`optical` selects that last pair, matching the driver's `optflag`; it defaults from `g`'s coordinate
+system, which is what decides it in production.
+
+Every other keyword is forwarded to [`AutoRIFT.params`](@ref) unchanged, so a caller overrides any of
+the above by passing it.
+"""
+function AutoRIFT.params(g::PairGeometry; chip_size_0 = 240.0,
+                         optical::Bool = g.coordinate isa ProjectedCoordinate, kwargs...)
+    sentinel = Int32(g.nodata.output)
+    pixel_size = abs(g.coordinate.spacing[1])
+    chip_x = chip_size_pixels(chip_size_0, pixel_size)
+
+    # Over the points where *both* bounds are present, which is the reference's own condition. A
+    # point missing either would contribute a ratio of zero or a division by zero.
+    ratios = [Float64(y) / Float64(x)
+              for (x, y) in zip(g.chip_min_x, g.chip_min_y)
+              if x != sentinel && y != sentinel && x > 0 && y > 0]
+    isempty(ratios) && throw(ArgumentError(
+        "the geometry carries no point with both chip-size minima present, so the y:x chip ratio " *
+        "cannot be derived. It was computed without `csminx`/`csminy`."))
+    scale_y = _median!(ratios)
+
+    max_x = maximum(x -> x == sentinel ? Int32(0) : x, g.chip_max_x)
+    max_x > 0 || throw(ArgumentError(
+        "every chip-size maximum is missing or zero, so no pyramid level could run. The geometry " *
+        "was computed without `csmaxx`/`csmaxy`."))
+
+    grid_m = abs(g.geotransform[2])
+    spacing = trunc(Int, chip_x * grid_m / chip_size_0)
+
+    return AutoRIFT.params(;
+        chip_size = (X = chip_x, Y = _even(chip_x * scale_y)),
+        chip_size_max = (X = Int(max_x), Y = _even(Int(max_x) * scale_y)),
+        grid_spacing = (X = spacing, Y = spacing),
+        subpixel = _subpixel_ladder(optical),
+        kwargs...)
+end
+
+# `round(x / 2) * 2` — the reference's way of keeping a chip extent even, which the correlator's
+# centroid convention requires.
+_even(x::Real) = round(Int, x / 2) * 2
+
+# `np.median`: the middle element, or the mean of the two middle ones for an even count. Written here
+# rather than taken from `Statistics` because an extension may only load the package's own
+# dependencies, and one statistic does not justify making `Statistics` one of them. Sorts in place;
+# the caller's vector is a local built for this.
+function _median!(v::Vector{Float64})
+    sort!(v)
+    n = length(v)
+    return isodd(n) ? v[(n + 1) ÷ 2] : (v[n ÷ 2] + v[n ÷ 2 + 1]) / 2
+end
+
+# One refinement factor per pyramid level, coarsest last. The reference holds these as a dictionary
+# keyed by chip size (`testautoRIFT.py:330-334`) and looks the factor up per level; `Params` holds
+# the same ladder positionally, with the last entry applying to every remaining level.
+_subpixel_ladder(optical::Bool) =
+    optical ? (AutoRIFT.PyramidRefine(16), AutoRIFT.PyramidRefine(32), AutoRIFT.PyramidRefine(64),
+               AutoRIFT.PyramidRefine(64)) :
+    (AutoRIFT.PyramidRefine(32), AutoRIFT.PyramidRefine(64), AutoRIFT.PyramidRefine(128),
+     AutoRIFT.PyramidRefine(128))
 
 end # module
