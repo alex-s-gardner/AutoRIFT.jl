@@ -4017,11 +4017,10 @@ Rungs 5.1 through 5.4 — the granule read, the secondary onto the reference's g
 Julia's own read, and the byte rescale — are not yet wired into the ladder. `bytescale` (rung 5.4's
 Julia side) exists and is pinned against the reference by fixtures; see below.
 
-## Result: eight of twelve optical cases, every rung green
+## Result: all twelve optical cases, every rung green
 
-`FastGeoProjections`, the default, which is what production uses. Four cases are absent because their
-two scenes are in different UTM zones and `coregister` refuses them exactly as the reference does
-(`GeogridOptical.py:297-298`); reprojecting the secondary is rung 5.2 and does not exist.
+`FastGeoProjections`, the default, which is what production uses. The four cross-projection pairs need
+rung 5.2 below; the eight same-CRS ones are tabulated here.
 
 `worst float` is the largest absolute disagreement over all six `Float64` bands, in that band's own
 units — m/yr per pixel of displacement for the off2vel entries, dimensionless for the scale factors.
@@ -4036,14 +4035,16 @@ units — m/yr per pixel of displacement for the off2vel entries, dimensionless 
 | `S2B_MSIL1C_20200612` | S2 | 1,018,081 | **23/23** | 4.4e-7 |
 | `LT04_L1TP_063018` | L4 | 5,202,900 | **23/23** | 4.4e-6 |
 | `LT05_L1GS_001013` | L5 | 5,066,604 | **23/23** | 1.8e-7 |
-| `LC08_L1TP_060018_20130330` | L8×L7 | — | cross-zone, 32608 × 32607 | — |
-| `LE07_L1TP_061018_20120428` | L7 | — | cross-zone, 32607 × 32608 | — |
-| `LE07_L1TP_061018_20130314` | L7×L8 | — | cross-zone, 32607 × 32608 | — |
-| `LT05_L1TP_060018` | L5 | — | cross-zone, 32608 × 32607 | — |
+| `LC08_L1TP_060018_20130330` | L8×L7 | 2,079 x 1,761 | **24/24** | 4.5e-6 |
+| `LE07_L1TP_061018_20120428` | L7 | 2,097 x 1,658 | **24/24** | 7.8e-7 |
+| `LE07_L1TP_061018_20130314` | L7×L8 | — | **24/24** | 4.4e-6 |
+| `LT05_L1TP_060018` | L5 | — | **24/24** | — |
+
+The last four go through rung 5.2's warp; the rest are read where they lie.
 
 Every integer band is identical to the container's output over **33,822,848 grid points** across the
-eight, on four platforms and three projections (32622, 32607, 3413, 3031), bar the single `search_x`
-rounding tie below. The grid geotransform and size match exactly on all eight, so the two sides are
+eight same-CRS cases, on four platforms and three projections (32622, 32607, 3413, 3031), bar the
+single `search_x` rounding tie below. The grid geotransform and size match exactly on all eight, so the two sides are
 comparing the same points before any band is read.
 
 `LC09_L1GT_215109` is the case with no float disagreement at all: its scene is already in EPSG:3031
@@ -4157,6 +4158,80 @@ cases then read as red and the conclusion drawn — that PROJ was required — i
 `relative_stage` now reports both magnitudes and gates at 1e-6, six times the measured worst across
 the eight cases rather than a number borrowed from elsewhere.
 
+## Rung 5.2 — the cross-projection pairs
+
+Four of the twelve optical pairs have their two scenes in different UTM zones, and
+`GeogridOptical.coregister` refuses a pair in two coordinate systems outright
+(`GeogridOptical.py:297-298`) because its overlap is index arithmetic in a single system.
+`utils.ensure_same_projection` is what the pipeline does about it, and rung 5.2 reproduces it: warp
+**both** scenes to the reference's EPSG at the reference's own resolution, `lanczos`, with
+`targetAlignedPixels`.
+
+Three details are load-bearing. The reference scene is warped **too**, not just the secondary, because
+`-tap` snaps the output extent to a multiple of the resolution and so can move its origin — on
+`LE07_L1TP_063018` the native origin is 330292.5, which is not a multiple of 15. The warp must run
+**before** the footprints are read, since what geogrid intersects and what its pixel indices count in
+is the warped grid. And the filter runs before the warp for L4/5/7 (`process.py:474-488`), which does
+not matter to these rungs: the filtered scene carries the native geotransform and size exactly, checked
+directly against `filtered/` on the L7 case.
+
+The warped scenes go to `<cache>/reprojected/<product>/` and are kept — 2.1 GiB for the four pairs,
+against minutes of compute and requester-pays egress to rebuild.
+
+**Eleven of the twelve optical cases are now green on every rung.** The four cross-projection pairs:
+
+| case | grid | rungs |
+|---|---:|---|
+| `LE07_L1TP_061018_20120428` | 2,097 x 1,658 | **24/24** |
+| `LE07_L1TP_061018_20130314` | — | **24/24** |
+| `LT05_L1TP_060018` | — | **24/24** |
+| `LC08_L1TP_060018_20130330` | 2,079 x 1,761 | **24/24** after the gate below was corrected |
+
+### The float gate was measuring the kernel's conditioning, not either implementation
+
+`LC08_L1TP_060018_20130330` first reported `off2vy_dy` at 4.16e-6 relative against a 1e-6 bound, and
+widening the bound would have been the wrong response to it. What the measurement says:
+
+| quantity | S2A Malaspina | LC08 x LE07 cross-zone |
+|---|---:|---:|
+| fast against PROJ, position | 1.742e-7 m | 1.914e-7 m |
+| fast against PROJ, one-cell step | 7.278e-11 | 9.700e-11 |
+| resulting `off2vy_dy`, relative | 1.724e-7 | **4.162e-6** |
+| resulting `off2vy_dy`, absolute | 1.27e-5 | 4.46e-6 |
+
+The transform disagreement is the *same size* on both, and the output disagreement differs 25-fold. So
+the spread is the shared determinant's conditioning — a difference of products of nearly equal terms,
+whose amplification depends on the local slope and view geometry — and not on the projection library.
+The window also sits 69 to 274 km inside zone 32608, so it is not a zone-edge effect. Running the same
+case with `--proj-only` drops `off2vy_dy` to 1.836e-7 absolute, 24 times smaller, which is the same
+library matching itself rather than a better answer.
+
+`relative_stage` therefore gates on the **absolute** difference, which is the quantity with a
+consequence: every band here multiplies a displacement in pixels, so the off2vel entries are metres per
+year per pixel and the scale factors are dimensionless. The bound is 1e-3, which is 224 times the
+largest absolute difference across all twelve cases (4.46e-6) and small enough to be harmless — on a
+three-hundred-pixel displacement it is 0.3 m/yr, under a third of the 1 m/yr the product quantizes
+velocity to. The relative figure is still reported, because it is what a reader compares against
+`ImagePairGeometry`'s own fixture bound.
+
+### The driver reaches a coarser level than the geometry implies, and it is imagery that decides
+
+Rung 5.6 first reported the scene-wide maximum chip size as 128 against the capture's 64 on
+`LE07_L1TP_061018_20120428`. Both are right about different things. The geogrid band reaches 128 px at
+70,898 points, **all of them inside the image** — so it is not the out-of-image sentinel, and the
+one-row chop at `autoRIFT.py:832` is far too small to account for it. What removes them is
+`testautoRIFT.py:402`, `obj.ChipSizeMaxX[noDataMask] = 0`, where `noDataMask` is the *imagery's* zero
+mask sampled at each grid point (`:349`) rather than anything geometric. A cross-path pair whose
+overlap is largely scan-line gap or fill therefore loses its coarsest pyramid level entirely: 70,898
+points on that case, 162,117 on the L8 x L7 one.
+
+`AutoRIFT.params(::PairGeometry)` cannot reproduce that — a `PairGeometry` carries no imagery — so it
+derives the geometry's maximum and the rung gates against the geogrid band's own maximum over in-image
+points, reporting the driver's reduction beside it. A caller that needs the reference's level count
+passes `chip_size_max` explicitly. **This is an open item for rung 5.7**: given the geometry alone,
+AutoRIFT.jl would run a fourth pyramid level the reference never creates, and while its own validity
+mask should decline most of those points, `chip_sizes` would report four levels against three.
+
 ## `bytescale`, and the one level that does not close
 
 `uniform_data_type` (`autoRIFT.py:345-379`) had no Julia implementation, so rung 5.4 could not exist.
@@ -4180,9 +4255,6 @@ and recorded rather than absorbed into a wider tolerance.
 
 ## What Gate 5 does not yet establish
 
-- **The four cross-zone optical pairs**, which need the secondary reprojected onto the reference's
-  grid. `process.py` writes that to `reprojected/`, and `run_reference`'s `prune` default deletes it,
-  so rung 5.2 needs either a run with `prune = false` or a comparison that does not use it.
 - **Rungs 5.1, 5.3 and 5.4 in the ladder.** The granule read, the filter on Julia's own read, and the
   byte rescale are each implemented and separately tested; none is yet compared against the
   reference's own arrays *inside* the ladder.

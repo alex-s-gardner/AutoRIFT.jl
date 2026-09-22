@@ -192,9 +192,19 @@ Five keywords a caller would otherwise have to re-derive, each read out of `g` r
     `chip_min_y / chip_min_x` over the points where both bounds are present. The parameter chip sizes
     are square on the ground, so that ratio is the y:x *pixel size* ratio — 1.0 wherever the pixel is
     square and about 0.25 on a Sentinel-1 pair, varying per acquisition with the azimuth:range ratio.
-  * `chip_size_max` from the largest per-point bound `g` carries, with the same `scale` on Y. Both
-    bounds carry it, not just the minimum: the pyramid doubles the two axes together, so a maximum
-    scaled on one axis only is reached after a different number of doublings on each.
+  * `chip_size_max` from the largest per-point bound `g` carries over the points that fall inside the
+    image, with the same `scale` on Y. Both bounds carry it, not just the minimum: the pyramid doubles
+    the two axes together, so a maximum scaled on one axis only is reached after a different number of
+    doublings on each.
+
+    **The ITS_LIVE driver's effective maximum can be lower than this one.** It zeroes the bound
+    wherever its no-data mask is set (`testautoRIFT.py:402`), and that mask is the *imagery's* zero
+    mask sampled at each grid point (`:349`) rather than anything geometric — so a pair whose overlap
+    is largely scan-line gap or fill loses its coarsest level, and reaches three pyramid levels where
+    the geometry alone implies four. Measured on the golden cross-path Landsat 7 pair
+    `LE07_L1TP_061018_20120428`: the geometry reaches 128 px at 70,898 in-image points and the driver
+    hands the correlator 64. A `PairGeometry` carries no imagery, so pass `chip_size_max` explicitly to
+    reproduce a level count that depends on one.
   * `grid_spacing.X = chip_size.X * grid_spacing_m / chip_size_0`, in pixels — written this way
     rather than as `grid_spacing_m / pixel_size`, which is the same number only when the first
     division is exact.
