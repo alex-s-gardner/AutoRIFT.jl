@@ -303,6 +303,46 @@ function rung_grid(s::Setup)
 end
 
 # ---------------------------------------------------------------------------
+# Rung 5.1 — the coregistration window
+# ---------------------------------------------------------------------------
+
+"""
+    rung_window(s::Setup) -> Vector{StageResult}
+
+The overlap window the pipeline correlates, against the shape of the imagery it correlated.
+
+`GeogridOptical.coregister` intersects the two footprints and returns each image's offset into the
+overlap plus its size, and `loadProductOptical` then reads exactly that window out of each scene
+(`testautoRIFT.py:120-124`). So the shape of the reference's own `in_I1` *is* the overlap, and
+comparing against it checks the intersection arithmetic — the four bounds, the `nround` index
+conversion and the four failure conditions — without needing a pixel.
+
+Worth its own rung because the overlap is the full scene whenever the two share a grid, which is eight
+of the twelve optical pairs. On those the assertion is weak; on the four cross-projection pairs the
+overlap is a strict subset — 11338 x 15101 of a warped scene — and the arithmetic is exercised.
+
+The offsets are reported rather than gated: the reference does not record them, and they matter only
+once the imagery is Julia's own, which is rungs 5.3 and 5.4.
+"""
+function rung_window(s::Setup)
+    call = joinpath(s.run, "capture", "call1.json")
+    isfile(call) || return [StageResult("5.1 overlap window", "capture/in_I1", "exact", true, 0,
+                                       "skipped: no capture at $call")]
+    k = read_capture(s.case; n = parse(Int, basename(s.run)))
+
+    # The capture's arrays are in the reference's own `(row, col)` order, so the overlap's `(x, y)` size
+    # reverses to compare.
+    out = [exact_stage("5.1 overlap window", "in_I1",
+                       collect(reverse(s.pair.coordinate.size)),
+                       collect(size(k.arrays["in_I1"])))]
+    push!(out, StageResult("5.1 scene offsets", "coregister", "reported", true, 2,
+                           @sprintf("reference offset %s, secondary offset %s into the overlap",
+                                    string(s.pair.reference_offset),
+                                    string(s.pair.secondary_offset))))
+    return out
+end
+
+# ---------------------------------------------------------------------------
 # Rung 5.5 — the geogrid
 # ---------------------------------------------------------------------------
 
@@ -478,6 +518,11 @@ function rung_endpoint(s::Setup)
                            predicted, collect(size(k.arrays["in_xGrid"]))))
     predicted == collect(size(k.arrays["in_xGrid"])) || return out
 
+    # Truncated and masked to the points the reference actually correlated, so the two answer the same
+    # question. Both are the driver's own steps and neither is AutoRIFT.jl's: it keeps the points the chop
+    # discards, and it has no imagery mask to zero a radius from.
+    grid = _mask_from_capture(_chop_to(grid, predicted[1], predicted[2]), k)
+
     @info "5.7 correlating" scene=size(a) npoints=length(grid.x) chip=p.chip_size_min threads=Threads.nthreads()
     r = AutoRIFT.autorift(b, a, grid, p)
 
@@ -486,6 +531,20 @@ function rung_endpoint(s::Setup)
     nx = min(size(r.dx, 2), size(rdx, 2))
     step = 1 / AutoRIFT.subpixel_at(p, 1).upsampling
 
+    # **Which statistic carries the verdict depends on whether the base level was reached.** Its values
+    # are quantized to the upsampling step and `exact` is meaningful; above it both sides overwrite their
+    # measurements with a bicubic resize (`autoRIFT.py:856-866`) and neither field lands on any grid, so
+    # `exact` is near zero by construction. Decided from the reference's own values rather than assumed:
+    # the golden L7 pair resolves only chips 32 and 64, and gating it on `exact` would red a case whose
+    # residual is a median of zero and a p99 of 0.21 px.
+    on_grid = count(v -> !isnan(v) && abs(v / step - round(v / step)) < 1e-6, rdx) /
+              max(1, count(!isnan, rdx))
+    quantized = on_grid > 0.5
+    push!(out, StageResult("5.7 reference quantization", "out_DX", "reported", true, 1,
+                           @sprintf("%.2f%% of the reference's own dx lands on the 1/%d grid, so the \
+                                     gate is %s", 100on_grid, round(Int, 1 / step),
+                                    quantized ? "exact and within-one-step" : "bias and spread")))
+
     for (axis, ref) in ((:dx, rdx), (:dy, rdy))
         jl = getproperty(r, axis)[1:ny, 1:nx]
         rf = ref[1:ny, 1:nx]
@@ -493,15 +552,60 @@ function rung_endpoint(s::Setup)
         # rather than a comment asserting it.
         best = nothing
         for sgn in (1, -1)
-            st = quantized_stage("5.7 $axis (sign $(sgn > 0 ? '+' : '-'))", "out_$(uppercase(String(axis)))",
-                                 jl, sgn .* rf, step)
+            nm = "5.7 $axis (sign $(sgn > 0 ? '+' : '-'))"
+            rn = "out_$(uppercase(String(axis)))"
+            st = quantized ? quantized_stage(nm, rn, jl, sgn .* rf, step) :
+                 unquantized_stage(nm, rn, jl, sgn .* rf)
             best === nothing && (best = (sgn, st))
-            occursin("exact", st.detail) || continue
             best = _better_endpoint(best, (sgn, st))
         end
         push!(out, last(best))
     end
     return out
+end
+
+# `pts` truncated to `nr x nc`, which is what `autoRIFT.py:809-819` does to every per-point array before
+# correlating. AutoRIFT.jl keeps those points — `tools/ab/README.md` measures the truncation costing the
+# reference 1.6% of its grid — so this is applied to make the two comparable rather than because either
+# implementation should.
+function _chop_to(pts, nr::Integer, nc::Integer)
+    c(A) = A[1:nr, 1:nc]
+    # `chip_size_x`/`chip_size_y` are lazy uniform arrays carrying the grid's own axes, so they need
+    # chopping too or `PointSet` rejects the mismatch — which it does, by name, rather than broadcasting
+    # a stale shape into the correlation.
+    return AutoRIFT.rebuild(pts; x = c(pts.x), y = c(pts.y),
+                            radius_x = c(pts.radius_x), radius_y = c(pts.radius_y),
+                            dx_prior = c(pts.dx_prior), dy_prior = c(pts.dy_prior),
+                            chip_size_x = c(pts.chip_size_x), chip_size_y = c(pts.chip_size_y),
+                            chip_size_min_x = c(pts.chip_size_min_x),
+                            chip_size_max_x = c(pts.chip_size_max_x))
+end
+
+"""
+    _mask_from_capture(pts, k::Capture) -> PointSet
+
+`pts` with its search radius zeroed wherever the reference declined the point.
+
+The driver zeroes `xGrid`, `Dx0`, `SearchLimit*` and both chip bounds wherever `noDataMask` is set
+(`testautoRIFT.py:394-403`), and `noDataMask` is the *imagery's* zero mask sampled at each grid point
+(`:344-349`) — the filtered scene's no-data for Landsat 4/5/7, and simply the out-of-image sentinel for
+an `hps` pair, which `pointset` already handles.
+
+Fed rather than derived, and that is the ladder's discipline rather than a shortcut: rung 5.7 tests the
+geogrid handoff composed with the correlator, and the mask is an *imagery* input that rung 5.3 is what
+reproduces. Deriving it here would fold a filter difference into a grid measurement.
+
+It matters most where the imagery is gappy. On the cross-path Landsat 7 pair it moves the comparison from
+115,099 shared points with 621,986 measured only by AutoRIFT.jl to a set the two can be read against;
+on an `hps` pair it changes almost nothing, since there the mask is the sentinel.
+"""
+function _mask_from_capture(pts, k)
+    declined = k.arrays["in_SearchLimitX"] .== 0
+    size(declined) == size(pts.radius_x) || throw(DimensionMismatch(
+        "the reference declined-point mask is $(size(declined)) but the grid is " *
+        "$(size(pts.radius_x)); the chop should already have made them agree"))
+    keep = .!declined
+    return AutoRIFT.rebuild(pts; radius_x = pts.radius_x .* keep, radius_y = pts.radius_y .* keep)
 end
 
 # The better of two signed scorings, read off the `exact` fraction the detail line carries. Comparing on
@@ -512,8 +616,12 @@ function _better_endpoint(a, b)
     return eb > ea ? b : a
 end
 
+# `exact` where the quantized gate reported one, and the within-0.1-px fraction otherwise: both rise with
+# agreement, and the sign only has to be ranked rather than measured.
 function _exact_fraction(detail::AbstractString)
     m = match(r"exact ([\d.]+)%", detail)
+    m === nothing || return parse(Float64, m.captures[1])
+    m = match(r"within 0\.1 px ([\d.]+)%", detail)
     return m === nothing ? -1.0 : parse(Float64, m.captures[1])
 end
 
@@ -536,7 +644,7 @@ function e2e(c::GoldenCase; n::Union{Integer,Nothing} = nothing, stop_on_red::Bo
     @info "e2e setup" product=c.product region=s.info.name epsg=s.info.epsg window=size(s.window) dt_days=geogrid_seconds(c) / 86400
 
     out = StageResult[]
-    for rung in (rung_grid, rung_geogrid, rung_params, rung_endpoint)
+    for rung in (rung_grid, rung_window, rung_geogrid, rung_params, rung_endpoint)
         rs = rung(s)
         append!(out, rs)
         stop_on_red && !all(r -> r.passed, rs) && break
