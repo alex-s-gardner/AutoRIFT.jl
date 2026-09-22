@@ -4244,14 +4244,32 @@ Three details each move the result by a level: the standard deviation is the **s
 becomes exactly 255 rather than rounding to 256 and wrapping to 0 — a bright pixel reported as no
 data.
 
-The arithmetic runs in the image's own precision, because `loadProduct` casts to `float32`
-(`testautoRIFT.py:120-124`) and every statistic and per-pixel expression after it is `float32`.
-Computing in `Float64` is more accurate and disagrees with the reference on **3 pixels of 33,218**;
-matching the precision takes that to **1**. The last one is `numpy`'s pairwise-summation block
-structure: the mean and standard deviation are reductions over the whole image, so any difference in
-accumulation order moves them in the last bits and moves whatever sits nearest a rounding boundary.
-Not matched — reproducing `np.mean`'s block structure is brittle for one pixel in thirty thousand —
-and recorded rather than absorbed into a wider tolerance.
+Per-pixel arithmetic runs in the image's own precision, because `loadProduct` casts to `float32`
+(`testautoRIFT.py:120-124`) and every per-pixel expression after it is `float32`.
+
+**The two reductions are not, and a fixture-scale measurement got this backwards.** The original
+reading was that `Float32` throughout matches best: at fixture scale `Float64` statistics disagree on
+3 pixels of 49,827 against `Float32`'s 1, so the whole reduction was put in `Float32`. That does not
+scale, and rung 5.4 is what exposed it. `np.mean`/`np.std` sum **pairwise**, so their error grows with
+`log n` rather than `n`; a naive `Float32` accumulator over a scene collapses instead. On the golden
+Sentinel-2 pair's 10980² highpass field — 120,560,400 pixels — the sum of squared deviations reaches
+1e13 while each addend is ~1e5, past the point a `Float32` mantissa registers them:
+
+| | `Float32` accumulator | accurate |
+|---|---:|---:|
+| mean | −0.00027631 | −0.00027627 |
+| **standard deviation** | **278.965** | **296.553** |
+
+A 5.9% error in `s`, and because the window is `m ± 3s` it rescales **every pixel in the image**. The
+cost to the endpoint bytes was **36.06% exact and 71.48% within one level**; accumulating the
+reductions in `Float64` while still forming each term in `T` takes that to **65.24% and 95.37%**, and
+leaves the fixtures at 1 differing pixel of 49,827 — unchanged, since at fixture scale the two
+accumulations agree. So this was strictly a defect, with no matching-versus-correctness tension: the
+accurate sum is both nearer the truth and nearer the reference.
+
+The residual one level on a rounding boundary is what a last-bit difference in `m` or `s` produces,
+and is not matched — reproducing `np.mean`'s block structure is brittle for one pixel in fifty
+thousand.
 
 ## What Gate 5 does not yet establish
 
