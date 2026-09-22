@@ -394,8 +394,10 @@ Four things differ from the projected path and each is the reference's own choic
 """
 function _radar_setup(c::GoldenCase, run::AbstractString, proj_only::Bool)
     # A NISAR L1 RSLC is one acquisition on one radar grid, so its pair is read straight off the two
-    # products; a Sentinel-1 pair has to be assembled from burst annotations and mosaicked.
-    pair = c.platform == "NISAR-L1" ? nisar_l1_pair(c, run) : s1_pair(c, run)
+    # products; a Sentinel-1 pair has to be assembled from burst annotations and mosaicked, from ASF for
+    # a full granule and from the synthesized SAFE for a burst job.
+    pair = c.platform == "NISAR-L1" ? nisar_l1_pair(c, run) :
+           c.platform == "S1-BURST" ? s1_burst_pair(c, run) : s1_pair(c, run)
     coord = pair.coordinate
 
     # The footprint in geodetic degrees, which is what the region lookup takes — `bounding_box(..., 
@@ -747,6 +749,7 @@ function rung_endpoint(s::Setup)
     for (axis, ref) in ((:dx, rdx), (:dy, rdy))
         jl = getproperty(r, axis)[1:ny, 1:nx]
         rf = ref[1:ny, 1:nx]
+        push!(out, _by_level(axis, jl, axis === :dy ? -rf : rf, r.chip_size[1:ny, 1:nx]))
         # Both signs scored, the better kept: `dy` needs the flip and `dx` does not, and measuring says so
         # rather than a comment asserting it.
         best = nothing
@@ -761,6 +764,40 @@ function rung_endpoint(s::Setup)
         push!(out, last(best))
     end
     return out
+end
+
+"""
+    _by_level(axis, jl, ref, chip) -> StageResult
+
+The residual's bias split by the chip size each point resolved at. Reported, never gating.
+
+This is the cut that localizes an endpoint residual, and it is here rather than in a scratch script
+because it has now answered two reds that the whole-field statistics could not.
+
+**The base level is the one whose values are each side's own measurement.** Above it both sides place a
+coarse node at the cell's *mean* coordinate and read the answer back from the cell's geometric *centre*
+(`dev/CORRECTNESS.md` items 2 and 3), and those are the same point only for a cell with no nodata in it.
+So a decimated level's residual grows with how often its cells straddle the imagery's edge, which is a
+property of the scene's coverage rather than of the correlator — and splitting on the level says at once
+whether a bias is the kernel's or that position gap's.
+
+Measured across four cases, the whole-field `dx` bias tracks the share of points that reached the base
+level and nothing else: 62% base gives −0.006, 35% gives −0.039, 0% gives −0.089, while every one of the
+four has a base-level bias under 0.0004 and a base-level median of exactly 0.
+"""
+function _by_level(axis::Symbol, jl, ref, chip)
+    parts = String[]
+    for cs in sort(unique(vec(chip)))
+        cs == 0 && continue
+        d = [Float64(jl[i]) - Float64(ref[i])
+             for i in eachindex(jl, ref, chip)
+             if chip[i] == cs && !isnan(jl[i]) && !isnan(ref[i])]
+        isempty(d) && continue
+        push!(parts, @sprintf("chip %d n %d bias %+.5f median %.4g", cs, length(d), mean(d),
+                              median(abs.(d))))
+    end
+    return StageResult("5.7 $axis by level", "out_$(uppercase(String(axis)))", "reported", true, 0,
+                       isempty(parts) ? "no point measured on both sides" : join(parts, "; "))
 end
 
 # `pts` truncated to `nr x nc`, which is what `autoRIFT.py:809-819` does to every per-point array before
@@ -840,7 +877,10 @@ against a grid that does not match is comparing two different problems.
 function e2e(c::GoldenCase; n::Union{Integer,Nothing} = nothing, stop_on_red::Bool = true,
              proj_only::Bool = false)
     s = setup(c; n, proj_only)
-    @info "e2e setup" product=c.product region=s.info.name epsg=s.info.epsg window=size(s.window) dt_days=geogrid_seconds(c) / 86400
+    # The interval off the pair rather than recomputed: the two paths derive it by opposite conventions —
+    # whole calendar days for optical, full precision for radar — and the pair already holds the one that
+    # was used.
+    @info "e2e setup" product=c.product region=s.info.name epsg=s.info.epsg window=size(s.window) dt_days=s.pair.dt / 86400
 
     out = StageResult[]
     for rung in (rung_grid, rung_window, rung_geogrid, rung_params, rung_endpoint)

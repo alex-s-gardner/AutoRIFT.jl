@@ -4412,7 +4412,7 @@ imagery.
 | `S2B_MSIL1C_20200612` | **29/29** | exact 74.7 / 76.2%, median 0, p99 0.5 / 0.31 |
 | `LT04_L1TP_063018` | **29/29** | — |
 | `LT05_L1TP_060018` | **30/30** | — |
-| `LT05_L1GS_001013` | 27/29 | **red**: bias −0.126 px on `dy`, within 0.1 px 44.4% |
+| `LT05_L1GS_001013` | 29/31 | **red**: bias −0.126 px on `dx`, within 0.1 px 44.4% |
 | `NISAR_L2_PR_GSLC` | **26/26** | deferred, 11.5 GiB of imagery |
 
 The thirty-rung cases are the four cross-projection pairs, which run rung 5.2's warp as well.
@@ -4421,12 +4421,16 @@ The thirty-rung cases are the four cross-projection pairs, which run rung 5.2's 
 
 `LT05_L1GS_001013` is the `P000` case — the one golden product with no valid pixel in its ROI, and the
 one that exercises the uncropped path. Its endpoint shares only 17,968 points, its base chip level is
-never reached, and its `dy` carries a **−0.126 px bias** with 44.4% of points within a tenth of a pixel
-against the gate's 45%. `dx` is −0.028 px and 50.9%.
+**never reached**, and its `dx` carries a **−0.126 px bias** with 44.4% of points within a tenth of a pixel
+against the gate's 45%. `dy` is −0.028 px and 50.9%.
 
 A bias is what the gate exists to catch, and 0.126 px is two upsampling steps. It is not tie-breaking and
-it is not the interpolation regime, both of which are symmetric. Open, and the first thing to look at is
-whether the shared 17,968 points are all in one corner of a grid whose valid region is marginal.
+it is not the interpolation regime, both of which are symmetric.
+
+The base level never being reached is the whole of it, established later on this page: all 17,968 shared
+points resolve at chip 16, and the residual at a decimated level is the coarse-node position gap of
+`dev/CORRECTNESS.md` items 2 and 3 rather than anything the correlator does. See "the two remaining
+endpoint reds are one cause".
 
 ### What the NISAR L2 case adds
 
@@ -4503,18 +4507,107 @@ peak surface, two-sided and tens of pixels out, which drags the mean while the p
 sit near zero. Gating the mean sets a threshold around that tail's cancellation; the tail is bounded by
 the p99 instead.
 
+## The three OPERA burst pairs
+
+**A multi-burst job is the full-SLC path, not the single-burst one.** `process_sentinel1_burst_isce3`
+branches on `len(reference) > 1` and, when the list holds more than one burst, calls `process_slc`
+unchanged (`s1_isce3.py:55-73`). All three golden burst pairs hold 24, 10 and 7 bursts, so none of them
+reaches `process_burst` and none is described by the single-burst geometry. Two substitutions and no
+third:
+
+  * **The container is local and synthesized.** `burst2safe` assembles the requested bursts into a SAFE
+    and `process_slc` runs on that, so `merge_swaths` mosaics whatever bursts it holds and the merged
+    extents follow from *its* annotations by the same arithmetic as a full granule's. Its name is
+    `burst2safe`'s own — the checksum suffix does not match the one in the product name — so it names
+    nothing at ASF, and the annotations are read from the SAFE the run directory already holds.
+  * **The subswath set is the bursts'.** `swaths = sorted(set(int(g.split('_')[2][2]) for g in
+    reference))` (`:58`), off the reference list alone. A job over `IW1` bursts alone mosaics one
+    subswath, and the range origin, width and incidence angle are that subswath's rather than the
+    three-swath union's.
+
+`AsfSwaths` and `SafeSwaths` in `tools/golden/radar.jl` are the whole difference; `s1_mosaic` is shared.
+
+### All three reproduce the merged mosaic exactly
+
+| case | bursts | swaths | derived | `reference.tif` |
+|---|---:|---|---|---|
+| `S1A ... 20240618T025528` | 24 | 1, 2, 3 | 67686 x 21232 | 67686 x 21232 |
+| `S1A ... 20240618T025533` | 10 | 1, 2 | 44864 x 12707 | 44864 x 12707 |
+| `S1C ... 20250416T010159` | 7 | 1 | 20662 x 17606 | 20662 x 17606 |
+
+Exact on all three, where two of the five full-SLC pairs are not — and for a reason that is the same
+fact from the other side. The full-SLC outliers need `merge_bursts_in_swath`'s `num_rng_samples`, read off
+the COMPASS CSLC raster rather than off an annotation; a `burst2safe` SAFE's annotation is written to
+agree with the bursts it contains, so `samples_per_burst` *is* that width here.
+
+### Two are green outright; the third reds on the coarse levels
+
+| case | rungs | endpoint |
+|---|---|---|
+| `S1A ... 20240618T025528` | **31/31** | bias core −0.00007 / −0.00012, median 0, p99 0.234 / 0.126, exact 70.8% / 71.1%, both 1,555,971 |
+| `S1A ... 20240618T025533` | **31/31** | bias core −0.00603 / −0.00147, median 0, p99 0.539 / 0.250, exact 69.9% / 70.6%, both 573,804 |
+| `S1C ... 20250416T010159` | 29/31 | **red** on `dx`: bias −0.0446 (core −0.0394), within 0.1 px 84.1%, both 37,851 |
+
+## The two remaining endpoint reds are one cause, and it is the coarse level
+
+`LT05_L1GS_001013` and `S1C_IW_SLC__1SSV_20250416` were separate open questions — the first recorded here
+as needing a difference map. It does not: splitting the residual by the chip size each point resolved at
+localizes both completely, and `rung_endpoint` now reports that split (`_by_level`).
+
+| case | base level | share at base | stride-2 bias | whole-field `dx` core | verdict |
+|---|---|---:|---:|---:|---|
+| `S1A ... 20240618T025528` (3 swaths) | 68 | 51.5% on the grid | — | −0.00007 | green |
+| `S1A ... 20240618T025533` (2 swaths) | 64 | 62% | −0.019 | −0.00603 | green |
+| `S1C ... 20250416T010159` (1 swath) | 56 | 35% | −0.103 | −0.03937 | **red** |
+| `LT05_L1GS_001013` | 8 | **0%** | −0.126 | −0.08880 | **red** |
+
+**Every one of the four has a base-level bias under 0.0004 px and a base-level median of exactly zero.**
+The whole-field bias tracks the share of points that never reached the base level and nothing else — and
+`LT05_L1GS_001013` has *no* base-level measurement at all: all 17,968 of its shared points resolved at
+chip 16, and 0.00% of the reference's own `dx` lands on the quantization grid.
+
+So the previously recorded reading of that case — a gradient-correlated `dx` bias growing with
+displacement and concentrating in one quadrant — is the same observation seen without the level cut. Large
+displacements are exactly the points that fall to a coarser chip, so "grows with the reference's
+displacement" and "lives at the decimated level" are one fact.
+
+**The cause is on record and is matched deliberately.** `dev/CORRECTNESS.md` items 2 and 3: a coarse node
+is placed at its cell's *mean* coordinate and its answer read back from the cell's geometric *centre*, and
+those coincide only for a cell with no nodata in it, because the coordinate arrays encode nodata as an
+in-band fill value that the block mean averages in. So a decimated level's residual grows with how often
+its cells straddle the imagery's edge. That predicts the ordering above: `S1C ... 20250416` is an Antarctic
+coastal pair whose product carries `P022` — 2.2% valid — so nearly every coarse cell of it straddles, and
+its stride-2 bias is five times the two green pairs'.
+
+This is the same failure mode `3.rdr` and `3.nisar` carry, entered at `4141728` (#21, `_cell_centres` →
+`_cell_means`), where the bias bounds were calibrated on the placement rule that change replaced.
+
+### What was ruled out, by measurement
+
+**The tail is not the cause, so the core bias is not the fix.** `endpoint_stage` gates the core rather
+than the mean because a speckle pair's two-sided tail drags the mean; `unquantized_stage` gates the mean,
+and `S1C ... 20250416` is the first *radar* case to land in the unquantized regime, where that asymmetry
+could have mattered. It does not: −0.0394 core against −0.0446 mean. Gating the core would have moved a
+threshold without answering anything, so the mean is still what is gated and the core is now reported
+beside it.
+
+**The geometry is not the cause.** All of rungs 5.0 through 5.6 are green on `S1C ... 20250416`, including
+`location_x`, `offset_x`, `search_x` and both chip bounds exactly, and its base level agrees with the
+reference to a median of exactly zero. A geometry error does not spare the base level.
+
 ## Where the twenty-two stand
 
 | group | cases | on the ladder |
 |---|---:|---|
 | optical (Landsat 4/5/7/8/9, Sentinel-2) | 12 | **11 green**, 1 red |
 | Sentinel-1 SLC | 5 | **3 green**, 2 blocked at rung 5.0 |
-| Sentinel-1 OPERA burst | 3 | not attempted |
+| Sentinel-1 OPERA burst | 3 | **2 green**, 1 red |
 | NISAR L1 RSLC | 1 | **green** |
 | NISAR L2 GSLC | 1 | **green** |
 
-**Sixteen of the twenty-two are green on every rung the ladder runs.** Two are red for reasons that are
-measured and attributed, and one group of three has not been started.
+**Eighteen of the twenty-two are green on every rung the ladder runs**, and the remaining four are two
+causes rather than four: two Sentinel-1 SLC pairs whose merged mosaic width needs a COMPASS CSLC to
+measure, and two pairs whose residual is entirely the deliberately-matched coarse-level position gap.
 
 ### NISAR L1 is the simplest radar case, not the hardest
 
@@ -4527,14 +4620,14 @@ Its residual is the same azimuth offset the Sentinel-1 cases show, one step larg
 the three along-track float bands against Sentinel-1's 1.073e-4, and 0.251% of `search_y` indices off by
 one against 0.065%. One mechanism, and the radar bounds are set above the larger of the two.
 
-### The three remaining reds, and what each needs
+### The remaining reds, and what each needs
 
-**`LT05_L1GS_001013`**, the `P000` case: a −0.126 px `dy` bias over 17,968 shared points of 5,048,320, all
-inside a single 324x170 patch, at the smallest base chip in the set (8 px). `dx`'s bias grows with the
-reference's own displacement — −0.064 px in the smallest magnitude quartile to −0.227 in the largest — and
-concentrates in one quadrant at −0.405. That is the gradient-correlated shape, which this file records as
-the signature of a geometry error rather than of arithmetic; on 0.36% coverage it could equally be the
-case being marginal. Needs a difference map before anything else.
+**`LT05_L1GS_001013` and `S1C_IW_SLC__1SSV_20250416`** are the coarse-level position gap, attributed in
+full above. Neither needs a difference map and neither is a defect in `src/`: both have a base level that
+agrees to a median of exactly zero, and both draw most or all of their shared points from above it. What
+they need is `dev/CORRECTNESS.md` items 2 and 3 — which are deliberately *not* fixed while golden cases
+are red, per that file's own rule, since diverging from the reference's placement desynchronizes every
+downstream comparison.
 
 **`S1A_IW_SLC__1SSH_20151120` and `S1A_IW_SLC__1SSH_20170221`**: the merged mosaic width, which
 `merge_swaths` takes from the COMPASS CSLC raster of the far subswath's first burst rather than from any
@@ -4544,7 +4637,6 @@ burst extractor at 23894, so the input was never wrong), `last_valid_sample + 1`
 layer (none of the five cases used one). What remains is `burst.as_isce3_radargrid()`'s own width, which
 needs a CSLC to measure.
 
-**The three OPERA burst pairs** take `process_burst` rather than `process_slc` and get their geometry from
-the single-burst branch (`testGeogrid.py:141-154`), where `numberOfLines` is the burst's own shape. Their
-inputs are OPERA CSLC-S1 products from ASF rather than SAFE granules, so the route to them is
-`asf_bursts`' sibling rather than `open_slc`.
+A note on what that block is *not*: a burst job's SAFE is synthesized, and its annotation agrees with the
+bursts it contains, so all three burst pairs reproduce the merged width exactly. The two outliers are
+specific to a full granule, where the annotation and the CSLC raster can disagree.

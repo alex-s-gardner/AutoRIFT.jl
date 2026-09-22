@@ -45,7 +45,8 @@ using Dates, Printf
 using ImagePairGeometry
 using ImagePairGeometry: IdentityTransform, LookRight, incidence_angle
 using SLCDatasets
-using SLCDatasets: asf_bursts, merge_bursts, open_slc, orbit, seconds_between
+using SLCDatasets: annotation, asf_bursts, bursts, merge_bursts, nbursts, open_slc, orbit,
+                   seconds_between, Sentinel1Product
 
 # Sentinel-1 IW covers the swath with three subswaths, and a full-SLC job processes all three
 # (`s1_isce3.process_slc` defaults `swaths=(1, 2, 3)`).
@@ -93,25 +94,59 @@ function s1_orbit(dir::AbstractString, granule::AbstractString)
 end
 
 """
-    s1_subswath(granule, swath, polarization, orbit_path) -> SLC
+    AsfSwaths(granule, polarization, orbit_path)
 
-One subswath of `granule`, its bursts merged.
+An acquisition whose subswaths are read from ASF's burst extractor.
 
-Two fetches against ASF's burst extractor and no granule transfer: the first burst's metadata file
-carries the whole subswath's annotation, including how many bursts it has, and the second call is served
-from the same cached file. The rasters are fetched only when read, which the geometry never does.
+Two fetches per subswath and no granule transfer: the first burst's metadata file carries the whole
+subswath's annotation, including how many bursts it has, and the second call is served from the same
+cached file. The rasters are fetched only when read, which the geometry never does.
 """
-function s1_subswath(granule::AbstractString, swath::Integer, polarization::AbstractString,
-                     orbit_path::AbstractString)
-    probe = only(asf_bursts(granule, swath, polarization, 1:1; orbit = orbit_path))
-    n = length(probe.backend.annotation.burst_start)
-    return merge_bursts(asf_bursts(granule, swath, polarization, 1:n; orbit = orbit_path))
+struct AsfSwaths
+    granule::String
+    polarization::String
+    orbit::String
 end
 
 """
-    s1_mosaic(granule, polarization, orbit_path; swaths = S1_SWATHS) -> (RadarCoordinate, UtcTime)
+    SafeSwaths(product::Sentinel1Product)
 
-The merged radar grid geogrid is handed for `granule`.
+An acquisition whose subswaths are read from an already-parsed local SAFE.
+
+This is the route a burst job takes. Its granule name is `burst2safe`'s own — synthesized from the
+requested bursts, with a checksum suffix that is not the one the product name carries — so it names
+nothing at ASF and the annotations have to come off the container the container built.
+"""
+struct SafeSwaths
+    product::Sentinel1Product
+end
+
+"""
+    swath_annotation(src, swath) -> SubswathAnnotation
+
+`swath`'s annotation, which is every number the merged grid is derived from bar the orbit.
+"""
+swath_annotation(src::AsfSwaths, swath::Integer) =
+    only(asf_bursts(src.granule, swath, src.polarization, 1:1; orbit = src.orbit)).backend.annotation
+swath_annotation(src::SafeSwaths, swath::Integer) = annotation(src.product, swath)
+
+"""
+    merged_swath(src, swath) -> SLC
+
+One subswath of the acquisition, its bursts merged.
+
+Wanted for what an annotation does not carry: the orbit, its epoch and the look side.
+"""
+function merged_swath(src::AsfSwaths, swath::Integer)
+    n = nbursts(swath_annotation(src, swath))
+    return merge_bursts(asf_bursts(src.granule, swath, src.polarization, 1:n; orbit = src.orbit))
+end
+merged_swath(src::SafeSwaths, swath::Integer) = merge_bursts(collect(bursts(src.product, swath)))
+
+"""
+    s1_mosaic(src, swaths = S1_SWATHS) -> (RadarCoordinate, UtcTime)
+
+The merged radar grid geogrid is handed for the acquisition `src` reaches.
 
 Built from the near-range subswath and then widened to the mosaic, which is what `loadMetadataSlc`
 does: the range origin, sample spacing, PRF, wavelength and orbit are the near subswath's, the sample
@@ -125,10 +160,8 @@ and the centre moves when the range extent widens from one subswath to three.
 The absolute sensing start comes back alongside, because the pair's interval is the difference of two
 acquisitions' and each acquisition's own `sensing_start` is relative to its own orbit epoch.
 """
-function s1_mosaic(granule::AbstractString, polarization::AbstractString,
-                   orbit_path::AbstractString; swaths = S1_SWATHS)
-    ann = [only(asf_bursts(granule, sw, polarization, 1:1; orbit = orbit_path)).backend.annotation
-           for sw in swaths]
+function s1_mosaic(src::Union{AsfSwaths,SafeSwaths}, swaths = S1_SWATHS)
+    ann = [swath_annotation(src, sw) for sw in swaths]
 
     # **The mosaic's extents are `merge_swaths`'s, not a subswath's.** `loadMetadataSlc:210` takes both
     # `numberOfLines` and `numberOfSamples` straight from the merged shape when it is given one — the
@@ -167,7 +200,7 @@ function s1_mosaic(granule::AbstractString, polarization::AbstractString,
     # The near subswath's merged acquisition supplies what an annotation does not carry: the orbit, its
     # epoch, and the look side.
     near = argmin(i -> ann[i].starting_range, eachindex(ann))
-    base = s1_subswath(granule, swaths[near], polarization, orbit_path)
+    base = merged_swath(src, collect(swaths)[near])
     c = RadarCoordinate(base)
     base_start = first(_annotation_of(base).burst_start)
 
@@ -201,12 +234,79 @@ function s1_pair(c::GoldenCase, run::AbstractString)
     # `img1` even on the two jobs whose reference is the later acquisition, so the pipeline reorders the
     # pair before geogrid sees it exactly as it does on the optical path.
     rg, sg = acquisition_order(c)
-    ref, ref_start = s1_mosaic(rg, s1_polarization(rg), s1_orbit(run, rg))
+    src(g) = AsfSwaths(g, s1_polarization(g), s1_orbit(run, g))
+    return _s1_pair(src(rg), src(sg), S1_SWATHS)
+end
+
+"""
+    s1_burst_pair(c::GoldenCase, run) -> CoregisteredPair
+
+`c`'s pair for a burst job, which reaches `process_slc` over a synthesized SAFE.
+
+A burst job is the full-SLC path with two substitutions and no third
+(`s1_isce3.process_sentinel1_burst_isce3:55-73`). `burst2safe` assembles the requested bursts into a
+SAFE, and `process_slc` then runs on it unchanged — so `merge_swaths` mosaics whatever bursts that
+container holds, and the merged extents follow from its annotations by the same arithmetic as a full
+granule's. The substitutions are:
+
+  * **The container is local.** Its name is `burst2safe`'s, not a granule ASF would serve, so the
+    annotations are read from the SAFE the run directory holds rather than fetched.
+  * **The subswath set is the bursts'.** `swaths = sorted(set(int(g.split('_')[2][2]) for g in
+    reference))` (`:58`), so a job over `IW1` bursts alone mosaics one subswath and the range origin,
+    width and incidence angle are that subswath's rather than the three-swath union's.
+
+The two SAFEs are matched to the pair by acquisition time rather than by name: `burst2safe` stamps its
+own checksum suffix, which does not agree with the one in the product name.
+"""
+function s1_burst_pair(c::GoldenCase, run::AbstractString)
+    early, late = _burst_safes(run)
+    pol(safe) = s1_polarization(basename(safe))
+    src(safe) = SafeSwaths(Sentinel1Product(safe; orbit = s1_orbit(run, basename(safe)),
+                                            polarization = lowercase(pol(safe)),
+                                            swaths = burst_swaths(c)))
+    return _s1_pair(src(early), src(late), burst_swaths(c))
+end
+
+# Shared by both routes, because only the annotation source and the subswath set differ: the reference
+# acquisition's merged grid, and the interval between the two sensing starts.
+function _s1_pair(ref_src, sec_src, swaths)
+    ref, ref_start = s1_mosaic(ref_src, swaths)
 
     # Only the secondary's sensing start is wanted, so its geometry is built and its grid discarded.
-    _, sec_start = s1_mosaic(sg, s1_polarization(sg), s1_orbit(run, sg))
+    _, sec_start = s1_mosaic(sec_src, swaths)
 
     return CoregisteredPair(ref; dt = seconds_between(ref_start, sec_start))
+end
+
+"""
+    burst_swaths(c::GoldenCase) -> Vector{Int}
+
+The subswaths a burst job mosaics, from its reference burst list.
+
+`s1_isce3.py:58` reads them out of the burst names — `S1_105602_IW2_...` contributes 2 — and off the
+reference list alone, so a pair whose secondary reached a subswath the reference did not still
+processes only the reference's.
+"""
+function burst_swaths(c::GoldenCase)
+    sw = Int[]
+    for g in c.reference
+        m = match(r"_IW(\d)_", g)
+        m === nothing && throw(ArgumentError(
+            "\"$g\" does not name a Sentinel-1 IW subswath; a burst is named " *
+            "`S1_<id>_IW<n>_<time>_<pol>_<hash>-BURST`"))
+        push!(sw, parse(Int, m.captures[1]))
+    end
+    return sort!(unique!(sw))
+end
+
+# The pair's two SAFEs, earliest first. A burst run holds exactly two, both written by `burst2safe`.
+function _burst_safes(run::AbstractString)
+    safes = filter(n -> endswith(n, ".SAFE") && isdir(joinpath(run, n)), readdir(run))
+    length(safes) == 2 || error(
+        "expected the two SAFE products `burst2safe` assembles in $run, found $(length(safes)). " *
+        "A burst job's annotations are read from them; a pruned run has none.")
+    sort!(safes; by = n -> split(n, '_')[6])
+    return joinpath(run, safes[1]), joinpath(run, safes[2])
 end
 
 """
