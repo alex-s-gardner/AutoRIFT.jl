@@ -284,6 +284,43 @@ records as costing it 1.6% of the points on a different scene.
 That set is what makes Phase 1 possible without re-deriving anything: the same filtered inputs, the
 same geogrid, and the reference's own `Dx`/`Dy` to diff AutoRIFT.jl's against directly.
 
+## The end-to-end ladder: from the granule
+
+```bash
+julia --project=tools/golden tools/golden/e2e.jl S2B_MSIL1C_20200612 --all
+julia --project=tools/golden tools/golden/e2e.jl S2B_MSIL1C_20200612 --all --proj-only
+```
+
+Everything else in this directory is fed the reference's own arrays, which is what isolates the
+correlator and also means nothing upstream of `runAutorift` had ever run in Julia on a golden case.
+`e2e.jl` starts at the granule: it reads the scene pair where it lies, coregisters the two footprints,
+looks the parameter region up in the shapefile the product names, derives the output grid, runs the
+geogrid, and derives the driver's scene-wide parameters — diffing each against what the cached
+container run left on disk.
+
+| rung | Julia produces | reference truth |
+|---|---|---|
+| 5.0 | the output grid's geotransform and size | `window_location.tif`'s own |
+| 5.5 | the geogrid, all 17 bands | the nine `window_*.tif` |
+| 5.6 | the base and maximum chip size, the grid spacing, the upsampling ladder | `capture/call1.json` |
+
+**Eight of the twelve optical cases are green on every rung** — every integer band identical over 33.8
+million grid points on four platforms and three projections, bar a single `search_x` that sits within
+3.5e-8 of a pixel of a rounding boundary, and every `Float64` band within 1.3e-5 m/yr per pixel of
+displacement. The other four have their two scenes in different UTM zones, and `coregister` refuses
+them exactly as the reference does; reprojecting the secondary is the rung that does not exist yet.
+`dev/GATES.md` holds the per-case table, the four driver conventions this established, and the
+measurement behind each.
+
+The transform is `FastGeoProjections`, which is what production uses; `--proj-only` sets that package's
+own `proj_only` keyword to route the same pipeline through PROJ instead, taking the projection library
+out of the comparison. The two agree to 174 nm in position and 7e-11 in
+the one-cell step the kernel consumes, and produce the identical geogrid band for band — so this is an
+attribution knob, not a correctness one.
+
+No new container run is needed for any of it. The geogrid rasters, the intermediate and the capture are
+already cached for all 22 cases.
+
 ## The correlator, on production imagery
 
 ```bash

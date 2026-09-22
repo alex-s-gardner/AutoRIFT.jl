@@ -3987,3 +3987,207 @@ measurement is what this ledger exists to prevent:
 
 Either is a calibration decision. What is established here is the attribution: the reds are this change,
 they are the `dx` core bias alone on radar, and no other gated statistic regressed.
+
+# Gate 5 — the end-to-end ladder, granule to geogrid
+
+`tools/golden/e2e.jl` starts where the reference starts: at the granule. Every other comparison in
+`tools/golden/` is fed the reference's own arrays — `capture.py` dumps the filtered, byte-quantized
+pair and the snapped grid at the `runAutorift` boundary, and `pointset_from_capture` turns the
+reference's grid into the `PointSet` — so before this, nothing upstream of `runAutorift` had ever run
+in Julia on a golden case.
+
+The reference side needs no new compute. Every boundary's answer is already in the cached run
+directory: the nine `window_*.tif`, `autoRIFT_intermediate.nc`, the `capture/` arrays, and
+`filtered/` for the pairs the driver filters before geogrid.
+
+## The rungs that exist
+
+| rung | Julia produces | reference truth | gate |
+|---|---|---|---|
+| 5.0 | the output `MapGrid` — geotransform and size | `window_location.tif`'s own | exact |
+| 5.5 | the geogrid, all 17 bands | the nine `window_*.tif` | integer bands exact, `Float64` bands ≤ 1e-7 relative |
+| 5.6 | the driver's scene-wide parameters | `capture/call1.json` scalars | exact |
+
+The two-tier gate on 5.5 is `ImagePairGeometry`'s own standard and the tiers split where they do for a
+reason: `window_location`, `window_offset`, `window_search_range`, the two chip-size files and the
+stable-surface mask all pass through a rounding or truncating conversion that absorbs a last-bit
+difference, while the off2vel and scale-factor bands do not.
+
+Rungs 5.1 through 5.4 — the granule read, the secondary onto the reference's grid, the filter on
+Julia's own read, and the byte rescale — are not yet wired into the ladder. `bytescale` (rung 5.4's
+Julia side) exists and is pinned against the reference by fixtures; see below.
+
+## Result: eight of twelve optical cases, every rung green
+
+`FastGeoProjections`, the default, which is what production uses. Four cases are absent because their
+two scenes are in different UTM zones and `coregister` refuses them exactly as the reference does
+(`GeogridOptical.py:297-298`); reprojecting the secondary is rung 5.2 and does not exist.
+
+`worst float` is the largest absolute disagreement over all six `Float64` bands, in that band's own
+units — m/yr per pixel of displacement for the off2vel entries, dimensionless for the scale factors.
+
+| case | platform | grid | rungs | worst float |
+|---|---|---:|---|---:|
+| `LC08_L1TP_009011` | L8 | 5,503,691 | **23/23** | 1.4e-7 |
+| `LC08_L1TP_062018` | L8 | 5,352,100 | **23/23** | 1.5e-6 |
+| `LC09_L1GT_215109` | L9 | 5,262,435 | **23/23** | **0** |
+| `LE07_L1TP_063018_20040810` | L7 | 5,325,012 | **23/23** | 2.2e-6 |
+| `S2A_MSIL1C_20200626` | S2 | 1,092,025 | **23/23** | 1.3e-5 |
+| `S2B_MSIL1C_20200612` | S2 | 1,018,081 | **23/23** | 4.4e-7 |
+| `LT04_L1TP_063018` | L4 | 5,202,900 | **23/23** | 4.4e-6 |
+| `LT05_L1GS_001013` | L5 | 5,066,604 | **23/23** | 1.8e-7 |
+| `LC08_L1TP_060018_20130330` | L8×L7 | — | cross-zone, 32608 × 32607 | — |
+| `LE07_L1TP_061018_20120428` | L7 | — | cross-zone, 32607 × 32608 | — |
+| `LE07_L1TP_061018_20130314` | L7×L8 | — | cross-zone, 32607 × 32608 | — |
+| `LT05_L1TP_060018` | L5 | — | cross-zone, 32608 × 32607 | — |
+
+Every integer band is identical to the container's output over **33,822,848 grid points** across the
+eight, on four platforms and three projections (32622, 32607, 3413, 3031), bar the single `search_x`
+rounding tie below. The grid geotransform and size match exactly on all eight, so the two sides are
+comparing the same points before any band is read.
+
+`LC09_L1GT_215109` is the case with no float disagreement at all: its scene is already in EPSG:3031
+and the parameter region is the southern polar grid, so the transform is the identity and every band
+is bitwise. That is a useful control — it says the residual on the other seven is the reprojection and
+nothing else in the kernel.
+
+## Four driver conventions, each of which leaves the case looking two-thirds right
+
+None of these is visible to a comparison fed the reference's own arrays, and each one, when wrong,
+leaves `window_location`, both chip-size bands and the stable-surface mask **exact** while corrupting
+the bands that depend on the acquisition interval. A case at 11/17 bands reads as a subtle numerical
+problem and is a convention.
+
+**`dt` is a whole number of calendar days.** `testGeogridOptical.py:161-165` builds two
+`datetime.date` objects from the first eight characters of each scene name's date field, so the time
+of day is discarded. The product's `date_dt` is a *different* quantity, computed later in
+`netcdf_output.py` from the full timestamps. Measured on `S2B_MSIL1C_20200612`, feeding geogrid the
+product's 15.0009490740741 days instead of 15 moves **75 points of `window_offset` and 445 of
+`window_search_range`** by one pixel — 0.007% and 0.044% of the grid.
+
+That this was a rounding difference rather than a systematic one was ruled out before the cause was
+found, which is the part worth keeping. Perturbing `dt` by one ULP, and then by 1e-6 s, left the
+*same* 75 and 445 points differing, so it was not a tie. Recovering the pre-round float — by scaling
+the velocity raster by `2^20`, since the offset is linear in it, and dividing back — put every one of
+the 75 at a fractional part between 0.5000010 and 0.5024071, against a control median of 0.176 over
+the agreeing points and only 0.2% of them within 0.001 of a half. So the reference's float was
+systematically *smaller* in magnitude by about 3e-5 relative, which is 39 s on 1,296,082 — and the
+82 s of clock time between the two acquisitions is exactly that.
+
+**The pair is taken in acquisition order, not the job's.** Two of the twenty-two jobs name the later
+acquisition as the reference, and their products still report the earlier one as `id_img1` with a
+positive `date_dt`: on `LE07_L1TP_063018`, `img1` is 20040810 and `date_dt` is +32.000 while the job's
+reference is 20040911. Following the job order negated `window_offset` and all four `off2vel` bands —
+a velocity field pointing backwards — and *doubled* `window_search_range`, because the short-interval
+inflation `max(1, 5 - 4·dt/182)` grows as the interval falls below zero. 191,991 `offset_x` points and
+1,890,950 `search_x` points on that case, with every chip-size and mask band still exact.
+
+**`ArchGDAL.toEPSG` returns the base geographic code for a projected CRS.** `LC09_L1GT_215109` is a
+Landsat scene over the Antarctic peninsula carrying a custom `PROJCRS["PS         WGS84"]` with no
+authority code of its own; `toEPSG` walks down to the `BASEGEOGCRS` and answers **4326**, which is a
+real code for a different coordinate system. Nothing errors: the grid-to-scene transform becomes
+4326→4326, a no-op, and the pair's centroid stays in metres — so the parameter-region lookup is handed
+a point 2,000 km outside the Earth's coordinate range and the case fails on the lookup rather than on
+the CRS. The reference's own procedure works and is what `scene_epsg` now reproduces:
+`AutoIdentifyEPSG`, then the `PROJCS` authority code, falling back to `OSRFindMatches`
+(`GeogridOptical.py:93-123`). That resolves the same scene to **3031** at 100% confidence.
+
+**GDAL's window offsets are zero-based.** `ImagePairGeometry.grid_window` returns one-based
+`CartesianIndices`, so reading each parameter raster at `first(xs)` shifts all twelve of them by one
+pixel in both axes. The signature is unmistakable once seen and reads as arithmetic until then:
+`window_location` stays exact because it reads no parameter raster, while `chip_min` differs by
+±24/48/96 — whole steps of the chip-size quantization — the stable-surface mask by ±1, and `offset`
+and `search` by up to 39 and 61 pixels. 0.38% to 8.9% of points, all interior, none on the footprint
+ring.
+
+## FastGeoProjections against PROJ, measured
+
+The gate runs `FastGeoProjections`, because that is what a production run uses. PROJ is reached through
+that package's own `proj_only` keyword — `--proj-only` on the command line — rather than by constructing
+against a second library: `FastGeoProjections` already falls back to Proj for any CRS pair it has no
+native implementation for, so it is one interface with a backend flag. It is an attribution tool rather
+than a requirement: the reference builds its transforms with `osr.CoordinateTransformation`, so forcing
+Proj takes the projection library out of the comparison and leaves whatever remains belonging to the
+kernel arithmetic.
+
+**The choice is very nearly invisible, and an earlier reading in this file said otherwise.** What the
+two transforms do to the quantities the geogrid consumes, measured on `S2A_MSIL1C_20200626`
+(3413 → 32607, a 120 m grid over 10 m imagery):
+
+| quantity | fast against PROJ |
+|---|---:|
+| position | **1.742e-7 m** |
+| a one-grid-cell step, relative | **7.278e-11** |
+| every integer band | **0 of 1,092,025 differ** |
+
+So the two agree to 174 nanometres in position and to 7e-11 in the *difference* the kernel actually
+divides by — and produce the identical geogrid, band for band, at every point.
+
+Across all eight same-CRS optical cases the integer bands differ at **one point of 33.8 million**: on
+`LC08_L1TP_062018` a single `search_x` reads 34 against PROJ's 35. That point is a rounding tie, and
+this is a measurement rather than an inference — scaling its search range by a relative **1e-9** flips
+PROJ to 34 as well, so PROJ's own pre-round value sits within about 3.5e-8 of a pixel of the 34.5
+boundary. A 7e-11 step disagreement is enough to straddle it, neither answer is wrong, and PROJ lands
+on the container's side only because it is the same library. `rounded_stage` admits a tie and nothing
+else; a convention error moves tens of thousands of points.
+
+The `Float64` bands, same case, reported absolutely as well as relatively because the ratio alone
+misleads:
+
+| band | max absolute | max relative | median \|value\| |
+|---|---:|---:|---:|
+| `off2vx_dx` | 5.638e-7 | 7.731e-9 | 74.6 |
+| `off2vx_dy` | 1.320e-6 | 1.819e-9 | 726.2 |
+| `off2vy_dx` | 5.661e-8 | 7.794e-11 | 726.2 |
+| `off2vy_dy` | **1.265e-5** | **1.724e-7** | 74.6 |
+| `scale_x` | 7.887e-10 | 7.570e-10 | 1.04 |
+| `scale_y` | 1.813e-8 | 1.739e-8 | 1.04 |
+
+`off2vy_dy` is metres per year per pixel of displacement, so its worst disagreement is 1.3e-5 — a
+millimetre per year on a hundred-pixel displacement, against velocities of hundreds to thousands, and
+six orders below the 1 m/yr the product quantizes to. Its *relative* figure is the largest of the six
+only because the ratio is taken where the coefficient is near its own minimum.
+
+**What the earlier reading got wrong**, recorded because it is a method error rather than an
+arithmetic one. `ImagePairGeometry`'s `REFERENCE.md` bounds the `Float64` bands at 1e-7 relative, and
+that figure is calibrated for **PROJ against PROJ on a different platform**. Applying it to a
+comparison that also swaps the projection library gates on a threshold that was never about this
+question, and reporting a bare ratio hid the fact that the quantity behind it was 1.3e-5 m/yr. Three
+cases then read as red and the conclusion drawn — that PROJ was required — inverted the truth.
+`relative_stage` now reports both magnitudes and gates at 1e-6, six times the measured worst across
+the eight cases rather than a number borrowed from elsewhere.
+
+## `bytescale`, and the one level that does not close
+
+`uniform_data_type` (`autoRIFT.py:345-379`) had no Julia implementation, so rung 5.4 could not exist.
+`AutoRIFT.bytescale` is it, pinned by six fixtures in `test/fixtures/bytescale/` generated from the
+reference's own statements.
+
+Three details each move the result by a level: the standard deviation is the **sample** form
+(`np.std` is the population form and the reference corrects it by `sqrt(n/(n-1))`); the multiplier is
+**256**, written `2**8 - 0`; and `np.clip` runs **before** `np.round`, so a value above the window
+becomes exactly 255 rather than rounding to 256 and wrapping to 0 — a bright pixel reported as no
+data.
+
+The arithmetic runs in the image's own precision, because `loadProduct` casts to `float32`
+(`testautoRIFT.py:120-124`) and every statistic and per-pixel expression after it is `float32`.
+Computing in `Float64` is more accurate and disagrees with the reference on **3 pixels of 33,218**;
+matching the precision takes that to **1**. The last one is `numpy`'s pairwise-summation block
+structure: the mean and standard deviation are reductions over the whole image, so any difference in
+accumulation order moves them in the last bits and moves whatever sits nearest a rounding boundary.
+Not matched — reproducing `np.mean`'s block structure is brittle for one pixel in thirty thousand —
+and recorded rather than absorbed into a wider tolerance.
+
+## What Gate 5 does not yet establish
+
+- **The four cross-zone optical pairs**, which need the secondary reprojected onto the reference's
+  grid. `process.py` writes that to `reprojected/`, and `run_reference`'s `prune` default deletes it,
+  so rung 5.2 needs either a run with `prune = false` or a comparison that does not use it.
+- **Rungs 5.1, 5.3 and 5.4 in the ladder.** The granule read, the filter on Julia's own read, and the
+  byte rescale are each implemented and separately tested; none is yet compared against the
+  reference's own arrays *inside* the ladder.
+- **The endpoint.** Nothing here reaches `autoRIFT_intermediate.nc`; rungs 5.0, 5.5 and 5.6 establish
+  that both sides would be handed the same grid, priors, search limits, chip bounds and scene-wide
+  parameters, which is the premise the endpoint comparison needs and did not have.
+- **The ten radar and NISAR cases.** `coregister` needs the orbit-driven resample for those, which is
+  the `ImagePairGeometry` coregistration path.

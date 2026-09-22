@@ -1,0 +1,231 @@
+# Reading a golden case's scenes, as opposed to establishing that they exist.
+#
+# `fetch.jl::resolve_inputs` answers reachability and returns no path. This returns a path GDAL can
+# open and the footprint behind it, which is what the end-to-end ladder needs in order to start
+# where the reference starts: at the granule.
+#
+# Nothing is downloaded. Both routes read the object in place — `/vsicurl` for the anonymous
+# Sentinel-2 mirror, `/vsis3` for requester-pays Landsat — so a case costs the tiles its window
+# covers rather than a scene on disk.
+
+using ArchGDAL, Dates, Downloads, GeoFormatTypes, JSON3, ImagePairGeometry
+using GeoFormatTypes: EPSG
+
+include("parameters.jl")
+
+"""
+    scene_band(platform) -> Symbol
+
+Which band the reference correlates: `:pan` for Landsat 7/8/9, `:green` for Landsat 4/5, `:pan` for
+Sentinel-2.
+
+`process.py:77-89`. The STAC asset keys are used rather than band numbers because the number moves
+with the sensor — green is B2 on TM and B3 on OLI — while the key does not.
+"""
+function scene_band(platform::AbstractString)
+    platform in ("L4", "L5") && return :green
+    platform in ("L7", "L8", "L9", "S2") && return :pan
+    throw(ArgumentError("no band rule for platform \"$platform\"; the optical rule is " *
+                        "process.py:77-89 and the radar platforms carry no band"))
+end
+
+"""
+    acquisition_order(c::GoldenCase) -> (early, late)
+
+`c`'s two scene names ordered by acquisition date, which is the order the pipeline correlates them in
+whatever order the job listed them.
+
+**The job's `reference`/`secondary` is not that order.** Two of the twenty-two jobs name the later
+acquisition as the reference, and their products still report the earlier one as `id_img1` with a
+*positive* `date_dt` — on `LE07_L1TP_063018`, `img1` is 20040810 and `date_dt` is +32.000 while the
+job's reference is 20040911. So the pipeline sorts the pair before geogrid sees it, and a harness that
+follows the job order hands the geogrid a negative interval.
+
+The cost of getting it wrong is not a rejected run: `window_offset` and all four `off2vel` bands come
+back negated — a velocity field pointing backwards — and `window_search_range` doubles, because the
+short-interval search inflation `max(1, 5 - 4·dt/182)` grows as the interval falls below zero. Every
+integer band that does not depend on the interval stays exact, so the case looks two-thirds right.
+"""
+function acquisition_order(c::GoldenCase)
+    a, b = only(c.reference), only(c.secondary)
+    da, db = _scene_date(c.platform, a), _scene_date(c.platform, b)
+    return da <= db ? (a, b) : (b, a)
+end
+
+"""
+    scene_path(c::GoldenCase, which::Symbol) -> String
+
+A GDAL-openable path to `which` scene of `c`, at the band the reference correlates.
+
+`which` is `:reference` or `:secondary` in the pipeline's sense — see [`acquisition_order`](@ref),
+which is not the job's sense.
+
+Landsat resolves through the public landsatlook STAC catalogue, whose item names the requester-pays
+S3 object; reading it needs `AWS_PROFILE` to point at credentials that can pay, the same identity
+`reference.jl` passes to the container.
+
+Sentinel-2 resolves through the granule's `manifest.safe` on the anonymous Google Cloud mirror. The
+granule directory name inside a `.SAFE` is not derivable from the product name — it carries its own
+datatake identifier — so the manifest is read rather than guessed.
+"""
+function scene_path(c::GoldenCase, which::Symbol)
+    early, late = acquisition_order(c)
+    name = which === :reference ? early : late
+    c.platform == "S2" && return _s2_path(name)
+    startswith(c.platform, "L") && return _landsat_path(name, scene_band(c.platform))
+    throw(ArgumentError("scene_path has no route for platform \"$(c.platform)\""))
+end
+
+function _landsat_path(name::AbstractString, band::Symbol)
+    url = "https://landsatlook.usgs.gov/stac-server/collections/landsat-c2l1/items/$name"
+    item = JSON3.read(String(take!(Downloads.download(url, IOBuffer(); timeout = 60))))
+    asset = get(item.assets, band, nothing)
+    asset === nothing && error("STAC item $name has no `$band` asset")
+    href = asset.alternate.s3.href
+    startswith(href, "s3://") ||
+        error("expected an s3:// href for $name band $band, got $href")
+    # Requester pays, and GDAL wants it said explicitly; the account is whatever `AWS_PROFILE`
+    # names, matching `run_reference`.
+    ArchGDAL.setconfigoption("AWS_REQUEST_PAYER", "requester")
+    return "/vsis3/" * href[6:end]
+end
+
+const S2_MIRROR = "https://storage.googleapis.com/gcp-public-data-sentinel-2/tiles"
+
+function _s2_path(name::AbstractString)
+    # `S2B_MSIL1C_20200612T150759_N0209_R025_T22WEB_20200612T184700`: the tile id is field 6, as
+    # `T<zone><band><square>`, and the mirror splits it into three directory levels.
+    tile = split(name, '_')[6]
+    startswith(tile, "T") && length(tile) == 6 ||
+        error("cannot read an MGRS tile out of \"$name\"; expected field 6 like T22WEB")
+    safe = "$S2_MIRROR/$(tile[2:3])/$(tile[4:4])/$(tile[5:6])/$name.SAFE"
+    manifest = String(take!(Downloads.download("$safe/manifest.safe", IOBuffer(); timeout = 90)))
+    # The band the reference correlates is B08 at 10 m. One match is expected; more than one means
+    # the manifest layout changed and guessing which is wrong.
+    hits = unique(m.match for m in eachmatch(r"GRANULE/[^\"<>]*B08\.jp2", manifest))
+    length(hits) == 1 ||
+        error("expected one B08 entry in $name's manifest.safe, found $(length(hits))")
+    return "/vsicurl/$safe/$(only(hits))"
+end
+
+"""
+    scene_footprint(path) -> ImageFootprint
+
+The image's footprint: origin, signed spacing, size and CRS, read from its geotransform.
+
+`ImageFootprint` carries the CRS so [`coregister`](@ref) can refuse a pair in two projections, which
+is what the reference does (`GeogridOptical.py:297-298`) rather than reprojecting on the fly.
+"""
+function scene_footprint(path::AbstractString)
+    gdal_network_setup()
+    ds = ArchGDAL.read(path)
+    gt = ArchGDAL.getgeotransform(ds)
+    (gt[3] == 0 && gt[5] == 0) || error("$path has a rotated geotransform ($(gt[3]), $(gt[5])); " *
+                                       "the optical geogrid assumes an axis-aligned grid")
+    return ImageFootprint(origin = (gt[1], gt[4]), spacing = (gt[2], gt[6]),
+                          size = (ArchGDAL.width(ds), ArchGDAL.height(ds)),
+                          crs = EPSG(scene_epsg(ds)))
+end
+
+"""
+    scene_epsg(ds) -> Int
+
+The EPSG code of a dataset's *projected* CRS, by the reference's own procedure.
+
+`GeogridOptical.getProjectionSystem` (`GeogridOptical.py:93-123`) imports the WKT, calls
+`AutoIdentifyEPSG`, requires the result to be projected, and reads the authority code off `PROJCS` —
+falling back to a database match if that is empty.
+
+**`ArchGDAL.toEPSG` is not a substitute and fails silently here.** A Landsat scene over Antarctica
+carries a custom `PROJCRS["PS         WGS84"]` with no authority code of its own; `toEPSG` walks down
+to the `BASEGEOGCRS` and returns **4326**, which is a real code for a different coordinate system.
+Nothing then errors: the grid-to-scene transform becomes 4326→4326, a no-op, and the pair's centroid
+stays in metres — so the parameter-region lookup is handed a point 2,000 km outside the Earth's
+coordinate range. Auto-identification resolves the same scene to **3031** at 100% confidence.
+"""
+function scene_epsg(ds)
+    srs = ArchGDAL.importWKT(ArchGDAL.getproj(ds))
+    ArchGDAL.GDAL.osrisprojected(srs.ptr) == 1 || error(
+        "the scene's coordinate system is not projected; geogrid refuses a geographic or local " *
+        "one (GeogridOptical.py:110-115) because its pixel arithmetic is in metres")
+    ArchGDAL.GDAL.osrautoidentifyepsg(srs.ptr)
+    code = ArchGDAL.GDAL.osrgetauthoritycode(srs.ptr, "PROJCS")
+    isempty(code) || return parse(Int, code)
+
+    # The reference's last resort is `gdalsrsinfo -o epsg`, which is this match against the EPSG
+    # database. Done in process rather than by shelling out, and the confidence is reported so a
+    # weak match is visible rather than silently adopted.
+    n = Ref{Cint}(0)
+    conf = Ref{Ptr{Cint}}(C_NULL)
+    matches = ArchGDAL.GDAL.osrfindmatches(srs.ptr, C_NULL, n, conf)
+    n[] > 0 || error("could not identify an EPSG code for the scene's projected CRS; the " *
+                     "reference raises here too (GeogridOptical.py:123)")
+    best = unsafe_wrap(Array, matches, n[])[1]
+    @info "scene CRS identified by database match rather than by authority code" epsg=ArchGDAL.GDAL.osrgetauthoritycode(best, C_NULL) confidence=unsafe_wrap(Array, conf[], n[])[1]
+    return parse(Int, ArchGDAL.GDAL.osrgetauthoritycode(best, C_NULL))
+end
+
+"""
+    geogrid_seconds(c::GoldenCase) -> Float64
+
+The interval the geogrid is given, in seconds: positive, and a whole number of days.
+
+**Whole calendar days, not the pair's actual separation.** `testGeogridOptical.py:161-165` builds
+two `datetime.date` objects from the first eight characters of each scene name's date field and
+differences them, so the time of day is discarded. The product's `date_dt` is a different quantity,
+computed later from the full timestamps (`netcdf_output.py`), and the two differ by up to half a
+day.
+
+Using `date_dt` here is not a rounding nicety: on the golden S2B case it moves 75 points of
+`window_offset` and 445 of `window_search_range` by one pixel, because the offset is linear in the
+interval and a 6e-5 relative change tips whatever sits nearest a rounding boundary.
+
+Positive because the pair is taken in acquisition order — see [`acquisition_order`](@ref).
+"""
+function geogrid_seconds(c::GoldenCase)
+    early, late = acquisition_order(c)
+    d(name) = Date(_scene_date(c.platform, name), dateformat"yyyymmdd")
+    return Float64(Dates.value(d(late) - d(early))) * 86400.0
+end
+
+# Where the acquisition date sits in a scene name, per platform. Landsat names it as field 4
+# (`LC08_L1TP_009011_20200703_...`) and Sentinel-2 as the first eight characters of field 3
+# (`S2B_MSIL1C_20200612T150759_...`), which is how the reference reads each.
+function _scene_date(platform::AbstractString, name::AbstractString)
+    parts = split(name, '_')
+    startswith(platform, "L") && return String(parts[4])
+    platform == "S2" && return String(parts[3][1:8])
+    throw(ArgumentError("no date rule for platform \"$platform\""))
+end
+
+"""
+    pair_centroid(coord, epsg) -> (lon, lat)
+
+Centre of `coord` in WGS84 degrees, which is what the parameter-region lookup takes.
+
+The centre of the *coregistered* coordinate rather than of either scene: the region has to be the one
+covering the overlap, since that is the only ground the pair reports.
+
+`epsg` is passed rather than read off `coord`, because a `ProjectedCoordinate` carries origin,
+spacing and size but no CRS — only the `ImageFootprint` it was built from does. The two scenes share
+one CRS by construction, since `coregister` refuses a pair that does not.
+"""
+function pair_centroid(coord, epsg::Integer)
+    cx = coord.origin[1] + (coord.size[1] - 1) * coord.spacing[1] / 2
+    cy = coord.origin[2] + (coord.size[2] - 1) * coord.spacing[2] / 2
+    lon = lat = 0.0
+    # `order = :trad` gives (lon, lat); EPSG:4326's authority order is (lat, lon).
+    ArchGDAL.crs2transform(EPSG(epsg), EPSG(4326); order = :trad) do tf
+        p = ArchGDAL.createpoint(cx, cy)
+        ArchGDAL.transform!(p, tf)
+        lon, lat = ArchGDAL.getx(p, 0), ArchGDAL.gety(p, 0)
+    end
+    return (lon, lat)
+end
+
+"""
+    footprint_epsg(fp::ImageFootprint) -> Int
+
+The footprint's EPSG code, as an integer.
+"""
+footprint_epsg(fp) = GeoFormatTypes.val(fp.crs)
