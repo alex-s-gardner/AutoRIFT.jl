@@ -4442,3 +4442,63 @@ chip-size derivation is right on a non-square pixel rather than merely unexercis
 
 Its endpoint is deferred rather than attempted: the pair is 11.5 GiB of imagery before the correlator's
 working set, and the thinned endpoint on the NISAR cases is what gate `3.nisar` measures.
+
+## The Sentinel-1 and NISAR cases on the ladder
+
+Three of the five Sentinel-1 SLC pairs and the NISAR L2 GSLC are green on every rung. The two that are
+not are the two whose merged mosaic extent is unresolved, and they red at rung 5.0 — the grid window
+follows the footprint, which follows the mosaic — so every rung after it is being asked a question whose
+premise has failed.
+
+| case | rungs | endpoint |
+|---|---|---|
+| `S1A_IW_SLC__1SSH_20150828` | **31/31** | bias core +0.00013 / −0.00002, median 0, p95 0.024 / 0.031, within 0.1 px 99.2% / 98.9% |
+| `S1B_IW_SLC__1SDH_20180809` | **31/31** | bias core −0.0085, median 0, p99 0.45, exact 77.1% |
+| `S1C_IW_SLC__1SDV_20250416` | **31/31** | — |
+| `S1A_IW_SLC__1SSH_20151120` | 5/28 | mosaic width: 66172 x 23856 against 65978 x 23857 |
+| `S1A_IW_SLC__1SSH_20170221` | 5/28 | mosaic width: 67945 x 23862 against 67860 x 24043 |
+| `NISAR_L2_PR_GSLC` | **26/26** | deferred, 11.5 GiB of imagery |
+
+### Four things the radar path needed that the projected one did not
+
+**The transform maps the grid to geodetic degrees**, not to an image's projection. A radar footprint is
+solved for with `rdr2geo` rather than transformed, so `footprint_bounds` calls `transform(lon, lat, h)`.
+
+**The nodata sentinel comes from the `vx` raster**, not the DEM (`geogridRadar.cpp:509-512` against
+`geogridOptical.cpp:339`). Reading it from the DEM would apply a different sentinel to five bands than
+the reference did.
+
+**The chip size is derived from the *ground* range pixel size.** `xsize` is `abs(spacing[1])` for a
+projected image and `dr / sin(incidence)` for a radar one, and the driver takes the latter — its
+`XPixelSize` is printed as "Ground range pixel size" against "X-direction pixel size" for optical. A chip
+is a fixed distance on the ground, so the slant spacing would make it too small by `1 / sin(incidence)`.
+`AutoRIFT.params(::PairGeometry)` now reads `xsize` rather than the spacing, which is also what makes it
+correct on the NISAR L2 case's anisotropic pixel.
+
+**Three float bands are held relatively, not absolutely.** `off2vel` band 3 is a velocity per pixel along
+the image's own axis and runs to thousands, so the 1e-3 absolute bound tuned for a coefficient near 75 is
+meaningless there. `ImagePairGeometry`'s `REFERENCE.md` bounds the three bands that divide by the
+along-track step — `off2vx_dy`, `off2vy_dy`, `off2vy_dr` — at 3.5e-4 relative and attributes it exactly:
+the step is measured between two solved ground points and inherits the reference's own ~0.0013-line
+azimuth residual, whose maximum is 1.07e-4. Those are the three bands this reds without it, at **1.073e-4**
+— agreeing with the documented cause to three digits.
+
+### Two gates that were measuring the wrong quantity, both fixed from precedent
+
+**A sentinel is not a value.** `relative_stage` compared every element, so a point the reference marks
+`-32767` and AutoRIFT.jl measures contributed a difference the size of the sentinel — `off2vy_dx` reported
+a maximum of 3.27e4 from two such points out of 6,733,887. Those are *coverage* disagreements and
+`rounded_stage` counts them separately; the float statistics now exclude them and report how many.
+
+**A coverage difference is not a value difference.** On the radar path the footprint is solved for, so a
+grid point within a metre of the swath edge can fall either side of it: 3 points of 6,733,887 on
+`location_x`, where the reference has the sentinel and AutoRIFT.jl a valid index. `rounded_stage` now
+counts the two separately and bounds each — values by one step and 0.1%, coverage by 0.001% — rather than
+reding a band for three edge decisions.
+
+**The bias is the core, not the mean.** `S1B_IW_SLC__1SDH_20180809` reported a plain mean of −0.0103 px
+against a core of −0.0085. `regate.jl` established the distinction on these same cases and the reasoning
+carries: a pair correlating over SAR speckle puts a few hundred points on the far side of a nearly flat
+peak surface, two-sided and tens of pixels out, which drags the mean while the points that agree at all
+sit near zero. Gating the mean sets a threshold around that tail's cancellation; the tail is bounded by
+the p99 instead.

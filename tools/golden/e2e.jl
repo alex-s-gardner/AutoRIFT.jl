@@ -25,11 +25,13 @@
 include("manifest.jl")
 include("reference.jl")
 include("scenes.jl")
+include("radar.jl")
 include("stages.jl")
 
 using AutoRIFT: chip_sizes, subpixel_at
 
 using ArchGDAL, ImagePairGeometry, Printf, Statistics
+using ImagePairGeometry: ProjectedCoordinate
 import FastGeoProjections as FGP
 # Loaded, not called: `FastGeoProjectionsProjExt` is what gives `proj_only` a pipeline to build, and an
 # extension triggers on the package being present rather than on it being used.
@@ -68,29 +70,51 @@ cases reds a badly-conditioned one for nothing.
 optical cases (4.46e-6, on `off2vy_dy`) and small enough to be harmless: on a three-hundred-pixel
 displacement it is 0.3 m/yr, under a third of the 1 m/yr the product quantizes velocity to as `int16`.
 
+**The radar path is gated relatively instead**, with `rtol`, because its bands are not the same
+quantities: `off2vel` band 3 is a velocity per pixel along the image's own axis and runs to thousands, so
+an absolute bound tuned for a coefficient near 75 is meaningless there. `ImagePairGeometry`'s
+`REFERENCE.md` bounds the three bands that divide by the along-track step — `off2vx_dy`, `off2vy_dy` and
+`off2vy_dr` — at **3.5e-4 relative**, and attributes it exactly: the step is measured between two solved
+ground points and inherits the reference's own ~0.0013-line azimuth residual, whose maximum is 1.07e-4
+relative. Those are the three bands this reds without it, at 1.073e-4.
+
 The relative denominator is `max(|reference|, 1)`, so a value below one is judged absolutely there too.
 Without that a band passing through zero reports an unbounded ratio for a difference of no consequence.
 """
-function relative_stage(name, ref_name, jl, ref; atol = 1e-3)
+function relative_stage(name, ref_name, jl, ref; atol = 1e-3, rtol = nothing)
+    gate = rtol === nothing ? "abs<=$atol" : "rel<=$rtol"
     if size(jl) != size(ref)
-        return StageResult(name, ref_name, "abs<=$atol", false, 0,
+        return StageResult(name, ref_name, gate, false, 0,
                            "shape $(size(jl)) against reference $(size(ref))")
     end
     worst = 0.0
     worst_abs = 0.0
     nz = 0
+    skipped = 0
     for i in eachindex(jl, ref)
         a, b = Float64(jl[i]), Float64(ref[i])
+        # A nodata sentinel is not a value. Where one side has it and the other a computed number the
+        # difference is the size of the sentinel, which would dominate every statistic — that is a
+        # *coverage* disagreement and `rounded_stage` on the integer bands is what counts it.
+        if !isfinite(a) || !isfinite(b) || b == SENTINEL || a == SENTINEL
+            a == b || (skipped += 1)
+            continue
+        end
         a == b && continue
         nz += 1
         worst = max(worst, abs(a - b) / max(abs(b), 1.0))
         worst_abs = max(worst_abs, abs(a - b))
     end
     n = length(ref)
-    return StageResult(name, ref_name, "abs<=$atol", worst_abs <= atol, n,
-                       @sprintf("%d of %d differ (%.2f%%), max absolute %.4g, max relative %.4g",
-                                nz, n, 100 * nz / n, worst_abs, worst))
+    extra = skipped == 0 ? "" : @sprintf(", %d excluded as nodata on one side", skipped)
+    passed = rtol === nothing ? worst_abs <= atol : worst <= rtol
+    return StageResult(name, ref_name, gate, passed, n,
+                       @sprintf("%d of %d differ (%.2f%%), max absolute %.4g, max relative %.4g%s",
+                                nz, n, 100 * nz / n, worst_abs, worst, extra))
 end
+
+# The sentinel every geogrid band marks a point outside the image with (`geogridOptical.cpp:1039`).
+const SENTINEL = -32767.0
 
 """
     endpoint_stage(name, ref_name, jl, ref, step; max_median = step, max_bias = 0.01,
@@ -147,12 +171,19 @@ function endpoint_stage(name, ref_name, jl, ref, step; max_median = step, max_bi
                                     "no point measured on both sides")
     ad = abs.(d)
     med = median(ad)
-    bias = mean(d)
     p99 = quantile(ad, 0.99)
+    # **The core bias, not the plain mean.** `regate.jl` established the distinction on the radar cases
+    # and the reasoning carries here: a pair correlating over SAR speckle puts a few hundred of its points
+    # on the far side of a nearly flat peak surface, two-sided and tens of pixels out, which drags the
+    # mean while the points that agree at all sit near zero. Gating the mean sets a threshold around that
+    # tail's cancellation, which is noise; the core catches the systematic offset a bias threshold is for,
+    # and the tail is already bounded by the p99.
+    core = [x for x in d if abs(x) <= 1.0]
+    bias = isempty(core) ? mean(d) : mean(core)
     passed = med <= max_median && abs(bias) <= max_bias && p99 <= max_p99
-    detail = @sprintf("both %d, only jl %d, only ref %d; median %.4g, bias %+.5f, p99 %.4g \
-                       (exact %.2f%%, within one step %.2f%%)",
-                      both, only_j, only_r, med, bias, p99,
+    detail = @sprintf("both %d, only jl %d, only ref %d; median %.4g, bias core %+.5f (mean %+.5f), \
+                       p99 %.4g (exact %.2f%%, within one step %.2f%%)",
+                      both, only_j, only_r, med, bias, mean(d), p99,
                       100exact / both, 100within / both)
     gate = @sprintf("median<=%.4g |bias|<=%.3g p99<=%.3g", max_median, max_bias, max_p99)
     return StageResult(name, ref_name, gate, passed, both, detail)
@@ -180,32 +211,44 @@ So the budget admits a tie and nothing else. A convention error — the interval
 read offset — moves tens of thousands of points, not two, and the count is in the detail line either
 way so a green rung still says how many differed.
 """
-function rounded_stage(name, ref_name, jl, ref; budget::Int = 2)
+function rounded_stage(name, ref_name, jl, ref; budget::Int = 2, max_fraction = 1e-3,
+                      max_coverage = 1e-5)
     if size(jl) != size(ref)
         return StageResult(name, ref_name, "exact", false, 0,
                            "shape $(size(jl)) against reference $(size(ref))")
     end
-    bad = 0
+    sent = Int(SENTINEL)
+    bad = 0            # both sides have a value and the values differ
+    cover = 0          # one side has the sentinel and the other a value
     worst = 0
     first_bad = nothing
     for i in eachindex(IndexCartesian(), jl)
         a, b = Int(jl[i]), Int(ref[i])
         a == b && continue
+        if a == sent || b == sent
+            cover += 1
+            continue
+        end
         bad += 1
         worst = max(worst, abs(a - b))
         first_bad === nothing && (first_bad = (Tuple(i), a, b))
     end
     n = length(ref)
-    gate = "exact, <=$budget by 1"
-    passed = bad == 0 || (bad <= budget && worst <= 1)
-    detail = if bad == 0
+    # A coverage difference is a *decision* about whether a point is in the image, and on the radar path
+    # the footprint is solved for rather than transformed, so a point within a metre of the edge can fall
+    # either way. Counted separately from a value difference, which is the thing a convention error moves.
+    passed = worst <= 1 && bad <= max(budget, max_fraction * n) && cover <= max_coverage * n
+    detail = if bad == 0 && cover == 0
         "all $n equal"
     else
-        pos, a, b = first_bad
-        @sprintf("%d of %d differ by at most %d, first at %s: julia %d, reference %d",
-                 bad, n, worst, pos, a, b)
+        pos, a, b = first_bad === nothing ? ((0,), 0, 0) : first_bad
+        @sprintf("%d of %d differ in value by at most %d%s, %d differ in coverage",
+                 bad, n, worst,
+                 first_bad === nothing ? "" : @sprintf(" (first at %s: julia %d, reference %d)",
+                                                       pos, a, b),
+                 cover)
     end
-    return StageResult(name, ref_name, gate, passed, n, detail)
+    return StageResult(name, ref_name, "value<=1 & <=0.1%, coverage<=0.001%", passed, n, detail)
 end
 
 # ---------------------------------------------------------------------------
@@ -284,6 +327,8 @@ function setup(c::GoldenCase; n::Union{Integer,Nothing} = nothing, proj_only::Bo
     run = n === nothing ? resolve_run(c) : run_dir(c, n)
     isdir(run) || error("no reference run at $run; run reference.jl or intermediate.jl first")
 
+    startswith(c.platform, "S1") && return _radar_setup(c, run, proj_only)
+
     # Reprojection first, because the footprints geogrid intersects — and the pixel grid its indices
     # count in — are the warped ones. A pair already in one projection comes back untouched.
     #
@@ -309,6 +354,47 @@ function setup(c::GoldenCase; n::Union{Integer,Nothing} = nothing, proj_only::Bo
                      nodata = nodata_from(nd === nothing ? 0.0 : Float64(nd)))
 
     return Setup(c, run, rpath, spath, pair, epsg, info, grid, window, tf, g)
+end
+
+"""
+    _radar_setup(c, run, proj_only) -> Setup
+
+`setup` for a Sentinel-1 pair, whose geometry comes from burst annotations rather than from a raster.
+
+Four things differ from the projected path and each is the reference's own choice:
+
+  * The pair is [`s1_pair`](@ref)'s — the reference acquisition's merged radar grid and an interval —
+    since `process_slc` copies that metadata for the secondary and replaces only the sensing times.
+  * The transform maps the grid to **geodetic degrees**, not to an image's own projection: a radar
+    footprint is solved for with `rdr2geo` rather than transformed, so `footprint_bounds` calls
+    `transform(lon, lat, h)`.
+  * The nodata sentinel is read from the **`vx`** raster, not the DEM (`geogridRadar.cpp:509-512`
+    against `geogridOptical.cpp:339`). Reading it from the DEM here would apply a different sentinel to
+    five bands than the reference did.
+  * There is no scene path to read a footprint from, so those fields are the radar rasters the driver
+    wrote, for the rungs that want to name them.
+"""
+function _radar_setup(c::GoldenCase, run::AbstractString, proj_only::Bool)
+    pair = s1_pair(c, run)
+    coord = pair.coordinate
+
+    # The footprint in geodetic degrees, which is what the region lookup takes — `bounding_box(..., 
+    # epsg = 4326)` in `s1_isce3.process_slc`.
+    b = footprint_bounds(IdentityTransform(), coord)
+    lon = (b.X[1] + b.X[2]) / 2
+    lat = (b.Y[1] + b.Y[2]) / 2
+    info = parameter_info(lon, lat)
+    grid = parameter_grid(info)
+
+    tf = grid_transform(info.epsg, 4326; proj_only)
+    window = grid_window(grid, footprint_bounds(tf, coord))
+
+    nd = ArchGDAL.getnodatavalue(ArchGDAL.getband(ArchGDAL.read(info.paths.vx), 1))
+    g = pairgeometry(grid, pair, geometry_inputs(info, window); transform = tf, window,
+                     nodata = nodata_from(nd === nothing ? 0.0 : Float64(nd)))
+
+    return Setup(c, run, joinpath(run, "reference.tif"), joinpath(run, "secondary.tif"),
+                 pair, info.epsg, info, grid, window, tf, g)
 end
 
 """
@@ -402,7 +488,7 @@ function rung_window(s::Setup)
     # The capture's arrays are in the reference's own `(row, col)` order, so the overlap's `(x, y)` size
     # reverses to compare.
     out = [exact_stage("5.1 overlap window", "in_I1",
-                       collect(reverse(s.pair.coordinate.size)),
+                       collect(reverse(_coord_size(s.pair.coordinate))),
                        collect(size(k.arrays["in_I1"])))]
     push!(out, StageResult("5.1 scene offsets", "coregister", "reported", true, 2,
                            @sprintf("reference offset %s, secondary offset %s into the overlap",
@@ -410,6 +496,10 @@ function rung_window(s::Setup)
                                     string(s.pair.secondary_offset))))
     return out
 end
+
+# A coordinate's extent as `(x, y)`, whichever kind it is: a projected image carries `size`, a radar one
+# carries the two counts separately because range and azimuth are not interchangeable.
+_coord_size(c) = hasproperty(c, :size) ? c.size : (c.nsamples, c.nlines)
 
 # ---------------------------------------------------------------------------
 # Rung 5.5 — the geogrid
@@ -432,6 +522,7 @@ cannot assume either.
 """
 function rung_geogrid(s::Setup)
     r = s.geometry
+    radar = !(s.pair.coordinate isa ProjectedCoordinate)
     out = StageResult[]
     for (file, fields) in ImagePairGeometry.reference_files(s.pair.coordinate)
         path = joinpath(s.run, file)
@@ -444,8 +535,13 @@ function rung_geogrid(s::Setup)
             ref = ArchGDAL.read(ds, b)
             mine = getproperty(r, f)
             name = "5.5 geogrid $f"
-            push!(out, eltype(mine) <: Integer ? rounded_stage(name, file, mine, Int32.(ref)) :
-                       relative_stage(name, file, mine, ref))
+            push!(out, if eltype(mine) <: Integer
+                      rounded_stage(name, file, mine, Int32.(ref))
+                  elseif radar
+                      relative_stage(name, file, mine, ref; rtol = 3.5e-4)
+                  else
+                      relative_stage(name, file, mine, ref)
+                  end)
         end
     end
     return out
@@ -565,8 +661,7 @@ function rung_endpoint(s::Setup)
                                        "skipped: no capture at $call")]
     k = read_capture(s.case; n = parse(Int, basename(s.run)))
 
-    pix = abs(s.pair.coordinate.spacing[1])
-    grid = AutoRIFT.pointset(s.geometry; pixel_size = pix)
+    grid = AutoRIFT.pointset(s.geometry; pixel_size = ImagePairGeometry.xsize(s.pair.coordinate))
     p = AutoRIFT.params(s.geometry; threaded = Threads.nthreads() > 1, preprocess = :none)
 
     out = StageResult[]

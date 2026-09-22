@@ -44,7 +44,7 @@ module AutoRIFTImagePairGeometryExt
 
 import AutoRIFT
 using ImagePairGeometry: PairGeometry, ProjectedCoordinate, chip_size_pixels,
-                         y_displacement_sign
+                         y_displacement_sign, xsize
 
 """
     AutoRIFT.pointset(g::PairGeometry; chip_size = nothing, chip_size_0 = 240.0,
@@ -240,8 +240,12 @@ the above by passing it.
 function AutoRIFT.params(g::PairGeometry; chip_size_0 = 240.0,
                          optical::Bool = g.coordinate isa ProjectedCoordinate, kwargs...)
     sentinel = Int32(g.nodata.output)
-    pixel_size = abs(g.coordinate.spacing[1])
-    chip_x = chip_size_pixels(chip_size_0, pixel_size)
+    # **The ground pixel size, not the sample spacing.** `xsize` is `abs(spacing[1])` for a projected
+    # image and `dr / sin(incidence)` for a radar one, and the driver takes the latter for radar —
+    # `geogrid_run_info['XPixelSize']` is printed as "Ground range pixel size" there against
+    # "X-direction pixel size" for optical. A chip is a fixed distance on the ground, so the slant
+    # spacing would make it too small by `1 / sin(incidence)`.
+    chip_x = chip_size_pixels(chip_size_0, xsize(g.coordinate))
 
     # Over the points where *both* bounds are present, which is the reference's own condition. A
     # point missing either would contribute a ratio of zero or a division by zero.
