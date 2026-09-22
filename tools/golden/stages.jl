@@ -192,8 +192,16 @@ function unquantized_stage(name, ref_name, jl, ref; max_bias = 0.01, min_within_
     ad = abs.(d)
     bias = mean(d)
     tenth = count(<=(0.1), ad) / length(ad)
-    detail = @sprintf("both %d; bias %+.5f, median %.4g, p95 %.4g, within 0.1 px %.1f%%",
-                      length(d), bias, median(ad), quantile(ad, 0.95), 100tenth)
+    # The core reported beside the mean, and the *mean* gated. `endpoint_stage` gates the core because a
+    # speckle pair's two-sided tail drags the mean, and the same could be true here — so it is reported,
+    # to say whether a bias is a tail's or the field's. On the one case where the two are far enough apart
+    # to matter they are not: −0.0394 core against −0.0446 mean, so the tail is not what fails it and
+    # gating the core would move the threshold without answering anything.
+    core = [x for x in d if abs(x) <= 1.0]
+    detail = @sprintf("both %d; bias %+.5f (core %+.5f of %d), median %.4g, p95 %.4g, \
+                       within 0.1 px %.1f%%",
+                      length(d), bias, isempty(core) ? bias : mean(core), length(core),
+                      median(ad), quantile(ad, 0.95), 100tenth)
     gate = string("|bias|<=", max_bias, " within0.1>=", round(Int, 100min_within_tenth), "%")
     return StageResult(name, ref_name, gate,
                        abs(bias) <= max_bias && tenth >= min_within_tenth, length(d), detail)

@@ -384,20 +384,23 @@ const GATES = Gate[
     end),
 
     Gate("5.e2e", "the end-to-end ladder on every case it reaches", true, function ()
-        # The sixteen golden cases the ladder runs green, by group: eight same-CRS optical, four
+        # The eighteen golden cases the ladder runs green, by group: eight same-CRS optical, four
         # cross-projection optical whose scenes rung 5.2 warps first (slow on a cold cache, free after),
-        # three Sentinel-1 SLC and both NISAR products.
+        # three Sentinel-1 SLC, two OPERA burst pairs and both NISAR products.
         #
-        # Six are absent and each for a recorded reason rather than by omission — `LT05_L1GS_001013`'s
-        # `dy` bias, two Sentinel-1 pairs whose mosaic width needs a CSLC to measure, and the three OPERA
-        # burst pairs, which have not been started. `dev/GATES.md` holds all three.
+        # Four are absent and each for a recorded reason rather than by omission: two Sentinel-1 pairs
+        # whose mosaic width needs a CSLC to measure, and `LT05_L1GS_001013` and
+        # `S1C_IW_SLC__1SSV_20250416`, whose residual lives entirely at the decimated levels. `dev/GATES.md`
+        # holds both.
         cases = ["LC08_L1TP_009011", "LC08_L1TP_062018", "LC09_L1GT_215109",
                  "LE07_L1TP_063018_20040810", "S2A_MSIL1C_20200626", "S2B_MSIL1C_20200612",
                  "LT04_L1TP_063018",
                  "LC08_L1TP_060018_20130330_20200912_02_T1_X", "LE07_L1TP_061018_20120428",
                  "LE07_L1TP_061018_20130314", "LT05_L1TP_060018",
                  "S1A_IW_SLC__1SSH_20150828", "S1B_IW_SLC__1SDH_20180809",
-                 "S1C_IW_SLC__1SDV_20250416", "NISAR_L1", "NISAR_L2"]
+                 "S1C_IW_SLC__1SDV_20250416",
+                 "S1A_IW_SLC__1SSV_20240618T025528", "S1A_IW_SLC__1SSV_20240618T025533",
+                 "NISAR_L1", "NISAR_L2"]
         worst = Symbol[]
         detail = String[]
         for c in cases
