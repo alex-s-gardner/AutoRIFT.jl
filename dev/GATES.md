@@ -1147,22 +1147,42 @@ on a UTM raster is a *grid* bearing, and grid north departs from true north by t
 lives. Transforming two consecutive ECEF positions straight into the raster's CRS and differencing gets that
 right without deriving a convergence formula, because the projection applies it.
 
-| scene | orbit along | orbit cross | reference along | reference cross | Δ along | Δ cross |
-|---|---:|---:|---:|---:|---:|---:|
-| `LT05_L1TP_060018_19851028` | 69.725° | **−20.275°** | 71.602° | **−20.245°** | −1.877° | **−0.030°** |
-| `LT05_L1GS_061018_19860123` | 73.589° | **−16.411°** | 75.490° | **−16.370°** | −1.901° | **−0.041°** |
+Measured over **all six scenes of the three L4/5 pairs**, by `tools/golden/orbit.jl` under gate `5.orbit`,
+so these are reproducible from the repository rather than from a scratch script:
 
-**Cross-track agrees to 0.03–0.04° on both scenes.** That is the confirmation: the orbit, projected into the
-scene CRS, is measuring the same physical direction the reference recovers from pixels. An unprojected
-true-north heading gives 71.63° for both scenes — which appeared to match scene 1's along-track to 0.03° and
-was a coincidence, since the two scenes' grid bearings differ by 3.9° while their true bearings differ by
+| scene | EPSG | orbit along | ref along | Δ along | orbit cross | ref cross | Δ cross | axes apart |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `LT05_L1TP_060018_19851028` | 32608 | 69.731° | 71.60° | −1.869° | **−20.269°** | **−20.25°** | **−0.019°** | 90.00 / 91.85 |
+| `LT05_L1GS_061018_19860123` | 32607 | 73.598° | 75.49° | −1.892° | **−16.402°** | **−16.37°** | **−0.032°** | 90.00 / 91.86 |
+| `LT04_L1TP_063018_19880611` | 32607 | 70.858° | 72.72° | −1.862° | **−19.142°** | **−19.04°** | **−0.102°** | 90.00 / 91.76 |
+| `LT04_L1TP_063018_19880627` | 32607 | 70.846° | 72.74° | −1.894° | **−19.154°** | **−19.05°** | **−0.104°** | 90.00 / 91.79 |
+| `LT05_L1GS_001013_19920425` | 32624 | 66.141° | 67.59° | −1.449° | **−23.859°** | **−23.83°** | **−0.029°** | 90.00 / 91.42 |
+| `LT05_L1GS_001013_19920628` | 32624 | 66.130° | 67.58° | −1.450° | **−23.870°** | **−23.88°** | **+0.010°** | 90.00 / 91.46 |
+
+**Cross-track agrees to 0.104° at worst.** That is the confirmation: the orbit, projected into the scene CRS,
+is measuring the same physical direction the reference recovers from pixels. An unprojected true-north
+heading gives 71.63° for the first two scenes — which appeared to match scene 1's along-track to 0.03° and
+was a coincidence, since those two scenes' grid bearings differ by 3.9° while their true bearings differ by
 0.02°.
 
-**Along-track is off by a constant −1.89°** on both scenes, same sign and magnitude. That is not noise: the
-reference takes `nanmax` of *two* edge slopes per axis (`autoRIFT.py:143-151`), so its along-track is biased
-toward whichever edge is worse-conditioned, while its cross-track happens to land on the good edge. The
-orbit's two axes are exactly perpendicular by construction; the reference's are not — −20.245° against
-71.602° − 90° = −18.398°, off by 1.85°, which a real cross-track direction cannot be.
+**Along-track is 1.45° to 1.89° low, and the spread matters** — a two-scene check read it as a constant
+−1.89°, which the other four scenes refute. The error is the reference's and it is confined to one axis: it
+takes `nanmax` of *two* edge slopes per axis (`autoRIFT.py:143-151`), so its along-track is biased toward
+whichever edge is worse-conditioned while its cross-track lands on the good one. The orbit's two axes are
+perpendicular to the last digit by construction; the reference's are 91.42° to 91.86° apart, never 90°, and
+that non-perpendicularity accounts for the along-track gap case by case — which is what identifies the
+`nanmax` as the cause rather than merely being consistent with it.
+
+Two details of the derivation are load-bearing and each would pass a casual reading:
+
+  * **The ephemeris pair.** The heading is not constant along the track — over the 28 one-second steps of
+    `LT05_L1TP_060018` it spans 69.647° to 69.813°, a 0.166° range, which is larger than the cross-track
+    agreement above. `orbit_scan_angles` takes the pair at the middle of the ephemeris, where the
+    acquisition is centred; a first-or-last pair would move the answer by more than the residual being
+    measured.
+  * **The y sign.** `spacing` enters as magnitudes, so the bearing stays in the map's y-up frame. Dividing
+    by a north-up raster's signed `−30` puts it in a row-down frame and negates both angles — the results
+    still look plausible, being right in magnitude and perpendicular, and are wrong in sign on both axes.
 
 So the metadata route is viable and better: `_ANG.txt` carries the geometry once projected, and the MTL
 corners do not carry it at all. What it cannot do is *match* the reference's along-track, because that value
@@ -1226,7 +1246,8 @@ filter's **output**, so it is what a filter comparison is gated against and neve
 **Decision for Step 5, taken here rather than during implementation:** reproduce the derived route, because
 agreement is the objective and the reference's along-track is what it is. The orbit route is registered in
 `README.md` as the more correct alternative with the measurement above as its justification, to be adopted
-once the L4/5 pairs agree. `tools/golden/mtl.jl` keeps the ephemeris reader so that switch is one call.
+once the L4/5 pairs agree. `tools/golden/mtl.jl` holds the reader — `ang_ephemeris` and
+`orbit_scan_angles` — and gate `5.orbit` keeps the measurement honest, so that switch is one call.
 
 ## Step 5 — the destripe filter, exact against the reference's own chain
 

@@ -383,6 +383,30 @@ const GATES = Gate[
         end
     end),
 
+    Gate("5.orbit", "the scan geometry from the orbit, against the reference's own", false, function ()
+        # Every scene of the three L4/L5 pairs. The gate is the *cross*-track agreement and the
+        # perpendicularity of the pair, because those are the two properties the derivation has to have;
+        # the along-track gap is the reference's own error and is reported rather than bounded.
+        cmd = `julia --project=$(@__DIR__) $(joinpath(@__DIR__, "orbit.jl"))`
+        return capture_run(cmd) do t
+            m = match(r"SUMMARY scenes (\d+) cross ([\d.]+) skew ([\d.e+-]+) along_high ([\d.]+) ([\d.]+)", t)
+            m === nothing && return (:red, "could not read the summary: " * last_line(t))
+            n = parse(Int, m.captures[1])
+            cross = parse(Float64, m.captures[2])
+            skew = parse(Float64, m.captures[3])
+            lo, hi = parse(Float64, m.captures[4]), parse(Float64, m.captures[5])
+            # Cross-track agreement and perpendicularity are the two properties the derivation must
+            # have. The along-track gap is the reference's own error — its `nanmax` over two edge slopes
+            # takes the worse-conditioned edge — so it is reported rather than bounded, and it varies by
+            # case rather than being the constant one pair suggested.
+            ok = n == 6 && cross <= 0.15 && skew <= 1e-9
+            return (ok ? :green : :red,
+                    @sprintf("%d scenes: cross-track within %.3f deg, our axes %.1e deg off \
+                              perpendicular, reference along-track high by %.3f..%.3f deg",
+                             n, cross, skew, lo, hi))
+        end
+    end),
+
     Gate("5.e2e", "the end-to-end ladder on every case it reaches", true, function ()
         # The eighteen golden cases the ladder runs green, by group: eight same-CRS optical, four
         # cross-projection optical whose scenes rung 5.2 warps first (slow on a cold cache, free after),
