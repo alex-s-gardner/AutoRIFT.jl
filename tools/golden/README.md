@@ -300,17 +300,18 @@ container run left on disk.
 
 | rung | Julia produces | reference truth |
 |---|---|---|
+| 5.2 | both scenes in one projection | the warp `ensure_same_projection` applies |
 | 5.0 | the output grid's geotransform and size | `window_location.tif`'s own |
 | 5.5 | the geogrid, all 17 bands | the nine `window_*.tif` |
 | 5.6 | the base and maximum chip size, the grid spacing, the upsampling ladder | `capture/call1.json` |
 
-**Eight of the twelve optical cases are green on every rung** — every integer band identical over 33.8
-million grid points on four platforms and three projections, bar a single `search_x` that sits within
-3.5e-8 of a pixel of a rounding boundary, and every `Float64` band within 1.3e-5 m/yr per pixel of
-displacement. The other four have their two scenes in different UTM zones, and `coregister` refuses
-them exactly as the reference does; reprojecting the secondary is the rung that does not exist yet.
-`dev/GATES.md` holds the per-case table, the four driver conventions this established, and the
-measurement behind each.
+**All twelve optical cases are green on every rung** — every integer band identical over 33.8 million
+grid points on four platforms and three projections, bar a single `search_x` that sits within 3.5e-8 of
+a pixel of a rounding boundary, and every `Float64` band within 1.3e-5 m/yr per pixel of displacement.
+Four of the twelve have their two scenes in different UTM zones; rung 5.2 warps both into one
+projection first, as `utils.ensure_same_projection` does, and caches the result under
+`<cache>/reprojected/`. `dev/GATES.md` holds the per-case table, the driver conventions this
+established, and the measurement behind each.
 
 The transform is `FastGeoProjections`, which is what production uses; `--proj-only` sets that package's
 own `proj_only` keyword to route the same pipeline through PROJ instead, taking the projection library

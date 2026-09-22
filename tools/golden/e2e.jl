@@ -51,24 +51,29 @@ implementation: it is compiled with floating-point contraction enabled, so `a*b 
 while the kernel divides a difference of projected coordinates by the pixel spacing, so a couple of
 ULP of input emerges amplified.
 
-**Both magnitudes are reported, and the absolute one is what says whether a difference matters.** A
-relative error is taken wherever the ratio is largest, which for these bands is where the coefficient
-is near its own minimum — so a bare ratio overstates the consequence. `off2vy_dy` is metres per year
-per pixel of displacement with a median magnitude near 75; its worst absolute disagreement across the
-optical set is 1.3e-5, which on a hundred-pixel displacement is a millimetre per year against
-velocities of hundreds to thousands, and six orders below the 1 m/yr the product quantizes to.
+**The gate is on the absolute difference, and the relative one is reported beside it.** Every band
+here multiplies a measured displacement in pixels: the off2vel entries give metres per year per pixel,
+the scale factors are dimensionless. So an absolute difference converts directly into a velocity error
+and a relative one does not.
 
-`tol` is 1e-6 relative, which is six times the largest value measured across the eight same-CRS
-optical cases (1.724e-7, on `off2vy_dy`) rather than a bound carried over from another comparison.
-`ImagePairGeometry`'s own 1e-7 figure is for PROJ against PROJ on a different platform and does not
-govern a comparison that also changes the projection library.
+Gating relatively would gate on the kernel's conditioning rather than on either implementation. The
+shared determinant is a difference of products of nearly equal terms, and how much it amplifies a given
+input difference varies by case: `FastGeoProjections` and PROJ agree to 1.9e-7 m in position and 1e-10
+relative in the one-cell step the kernel consumes on *both* the Sentinel-2 case and the cross-zone
+Landsat 8 one, while the resulting `off2vy_dy` disagreement is 1.7e-7 relative on the first and 4.2e-6
+on the second — a 25x spread from an identical input. A relative bound calibrated on well-conditioned
+cases reds a badly-conditioned one for nothing.
 
-The denominator is `max(|reference|, 1)`, so a value below one is judged absolutely. Without that a
-band passing through zero reports an unbounded ratio for a difference of no consequence.
+`atol` is 1e-3, which is both 224 times the largest absolute difference measured across the twelve
+optical cases (4.46e-6, on `off2vy_dy`) and small enough to be harmless: on a three-hundred-pixel
+displacement it is 0.3 m/yr, under a third of the 1 m/yr the product quantizes velocity to as `int16`.
+
+The relative denominator is `max(|reference|, 1)`, so a value below one is judged absolutely there too.
+Without that a band passing through zero reports an unbounded ratio for a difference of no consequence.
 """
-function relative_stage(name, ref_name, jl, ref; tol = 1e-6)
+function relative_stage(name, ref_name, jl, ref; atol = 1e-3)
     if size(jl) != size(ref)
-        return StageResult(name, ref_name, "rel<=$tol", false, 0,
+        return StageResult(name, ref_name, "abs<=$atol", false, 0,
                            "shape $(size(jl)) against reference $(size(ref))")
     end
     worst = 0.0
@@ -82,7 +87,7 @@ function relative_stage(name, ref_name, jl, ref; tol = 1e-6)
         worst_abs = max(worst_abs, abs(a - b))
     end
     n = length(ref)
-    return StageResult(name, ref_name, "rel<=$tol", worst <= tol, n,
+    return StageResult(name, ref_name, "abs<=$atol", worst_abs <= atol, n,
                        @sprintf("%d of %d differ (%.2f%%), max absolute %.4g, max relative %.4g",
                                 nz, n, 100 * nz / n, worst_abs, worst))
 end
@@ -213,8 +218,9 @@ function setup(c::GoldenCase; n::Union{Integer,Nothing} = nothing, proj_only::Bo
     run = n === nothing ? resolve_run(c) : run_dir(c, n)
     isdir(run) || error("no reference run at $run; run reference.jl or intermediate.jl first")
 
-    rpath = scene_path(c, :reference)
-    spath = scene_path(c, :secondary)
+    # Reprojection first, because the footprints geogrid intersects — and the pixel grid its indices
+    # count in — are the warped ones. A pair already in one projection comes back untouched.
+    rpath, spath = aligned_scenes(c)
     rfp = scene_footprint(rpath)
     sfp = scene_footprint(spath)
     pair = coregister(rfp, sfp; dt = geogrid_seconds(c))
@@ -373,8 +379,30 @@ function rung_params(s::Setup)
     out = StageResult[]
     push!(out, exact_stage("5.6 base chip size", "ChipSize0X",
                            [p.chip_size_min.X, p.chip_size_min.Y], [chip0, chip_y(chip0)]))
-    push!(out, exact_stage("5.6 max chip size", "in_ChipSizeMaxX",
-                           [p.chip_size_max.X, p.chip_size_max.Y], [maxchip, chip_y(maxchip)]))
+
+    # The geogrid's own maximum over the points that fall inside the image, which is what
+    # `params(::PairGeometry)` derives and the only maximum a geometry knows.
+    sent = Int32(s.geometry.nodata.output)
+    inside = s.geometry.location_x .!= sent
+    geo_max = maximum(s.geometry.chip_max_x[inside])
+    push!(out, exact_stage("5.6 max chip size", "window_chip_size_max.tif",
+                           [p.chip_size_max.X, p.chip_size_max.Y],
+                           [Int(geo_max), chip_y(Int(geo_max))]))
+
+    # **The driver's effective maximum can be lower, and that is not this derivation being wrong.**
+    # `testautoRIFT.py:402` zeroes `ChipSizeMaxX` wherever `noDataMask` is set, and `noDataMask` is the
+    # *imagery's* zero mask sampled at each grid point (`:349`) rather than anything geometric — so a
+    # pair whose overlap is largely gap or fill loses its coarsest level entirely. Reported rather than
+    # gated, because a `PairGeometry` carries no imagery and so cannot reproduce it; a caller that needs
+    # the reference's level count passes `chip_size_max` explicitly.
+    if maxchip != Int(geo_max)
+        push!(out, StageResult("5.6 driver max after nodata", "in_ChipSizeMaxX", "reported", true, 1,
+                               @sprintf("geogrid reaches %d over in-image points, the driver hands \
+                                         the correlator %d; %d grid points lose a level to the \
+                                         imagery's zero mask",
+                                        Int(geo_max), maxchip,
+                                        count(==(geo_max), s.geometry.chip_max_x[inside]))))
+    end
     push!(out, exact_stage("5.6 grid spacing", "GridSpacingX",
                            [p.grid_spacing.X, p.grid_spacing.Y], [spacing, spacing]))
 

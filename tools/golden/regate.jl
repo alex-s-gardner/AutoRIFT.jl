@@ -383,14 +383,15 @@ const GATES = Gate[
         end
     end),
 
-    Gate("5.e2e", "the end-to-end ladder on every same-CRS optical case", true, function ()
-        # The eight optical cases whose two scenes share a projection. The four cross-zone pairs are
-        # excluded by name rather than allowed to report red: `coregister` refuses them as the
-        # reference does, and reprojecting the secondary is rung 5.2, which does not exist yet. A gate
-        # that counts a missing rung as a regression stops distinguishing the two.
+    Gate("5.e2e", "the end-to-end ladder on every optical case", true, function ()
+        # All twelve. The last four are the cross-projection pairs, whose scenes rung 5.2 warps into one
+        # projection before anything else runs; they are slow on a cold cache because the warp is minutes
+        # per scene, and free afterwards.
         cases = ["LC08_L1TP_009011", "LC08_L1TP_062018", "LC09_L1GT_215109",
                  "LE07_L1TP_063018_20040810", "S2A_MSIL1C_20200626", "S2B_MSIL1C_20200612",
-                 "LT04_L1TP_063018", "LT05_L1GS_001013"]
+                 "LT04_L1TP_063018", "LT05_L1GS_001013",
+                 "LC08_L1TP_060018_20130330_20200912_02_T1_X", "LE07_L1TP_061018_20120428",
+                 "LE07_L1TP_061018_20130314", "LT05_L1TP_060018"]
         worst = Symbol[]
         detail = String[]
         for c in cases

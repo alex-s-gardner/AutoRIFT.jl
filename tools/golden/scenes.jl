@@ -109,6 +109,75 @@ function _s2_path(name::AbstractString)
 end
 
 """
+    aligned_scenes(c::GoldenCase) -> (reference, secondary)
+
+Paths to `c`'s two scenes in one projection, reprojecting both if they are not already.
+
+`GeogridOptical.coregister` refuses a pair in two coordinate systems outright
+(`GeogridOptical.py:297-298`) — its overlap is index arithmetic in a single system — so the pipeline
+brings them together first. `utils.ensure_same_projection` warps **both** scenes, not just the
+secondary, to the reference's EPSG at the reference's own resolution, with `lanczos` resampling and
+`targetAlignedPixels`. The reference is warped too because `-tap` snaps the output extent to a
+multiple of the resolution, which can move its origin.
+
+This must happen before the footprints are read: what geogrid intersects, and what its pixel indices
+count in, is the *warped* grid. Four of the twelve optical golden pairs need it — the two cross-path
+L7 pairs, the L8×L7 pair and one L5 pair, each straddling UTM 32607 and 32608.
+
+Warped scenes are written to `<cache>/reprojected/<product>/`, mirroring the `reprojected/` directory
+the container writes beside its outputs, and are kept: a warp is minutes of compute and, for Landsat,
+requester-pays egress. A pair already in one projection is returned untouched, with nothing written.
+"""
+function aligned_scenes(c::GoldenCase)
+    rpath, spath = scene_path(c, :reference), scene_path(c, :secondary)
+    rfp, sfp = scene_footprint(rpath), scene_footprint(spath)
+    target = footprint_epsg(rfp)
+    target == footprint_epsg(sfp) && return (rpath, spath)
+
+    dir = joinpath(CACHE, "reprojected", c.product)
+    mkpath(dir)
+    @info "reprojecting a cross-projection pair" product=c.product target reference=footprint_epsg(rfp) secondary=footprint_epsg(sfp) dir
+    return (_warp_to(rpath, rfp, target, dir), _warp_to(spath, rfp, target, dir))
+end
+
+# `reference` supplies the resolution for both scenes, since that is what the reference warps to.
+#
+# `ArchGDAL.gdalwarp` on the opened dataset rather than `Rasters.warp`, which is the idiomatic call and
+# would be preferred but for one thing: it takes a `Raster` and builds a GDAL dataset from it before
+# warping (`RastersArchGDALExt/warp.jl:28-45`, whose own TODO is to pass a lazy `FileArray` straight
+# through), so the whole scene moves through memory on the way in. Given the dataset, GDAL pulls source
+# blocks and writes destination blocks, which is what the command-line tool does.
+#
+# Measured on one 10980² Sentinel-2 band over `/vsicurl`: the two produce the **identical** output
+# geometry — 12099² at the same geotransform — and this path peaks about 200 MiB lower, which is the
+# scene at `UInt16`. Switching back is a one-line change once that TODO lands.
+function _warp_to(path::AbstractString, reference, target::Integer, dir::AbstractString)
+    out = joinpath(dir, replace(basename(path), r"\.(TIF|tif|jp2)$"i => "") * ".tif")
+    isfile(out) && (@info "warped scene already cached" out; return out)
+
+    # `abs` on the y resolution: the reference passes the geotransform's own negative value and
+    # gdalwarp's `-tr` takes magnitudes. No creation options, because `ensure_same_projection` passes
+    # none — a compressed or tiled output would be a different file from the one it wrote.
+    #
+    # `-of GTiff` is explicit rather than inferred from the extension, because the temporary name below
+    # has to carry one GDAL recognizes or it writes nothing and reports no error.
+    flags = ["-of", "GTiff", "-t_srs", "EPSG:$target",
+             "-tr", string(abs(reference.spacing[1])), string(abs(reference.spacing[2])),
+             "-r", "lanczos", "-tap"]
+    @info "warping" from=basename(path) to=basename(out)
+    # Written through a temporary name and moved, so an interrupted warp cannot leave a truncated file
+    # that the `isfile` check above would then treat as cached.
+    tmp = out * ".partial.tif"
+    ArchGDAL.read(path) do src
+        ArchGDAL.gdalwarp([src], flags; dest = tmp) do _
+            nothing
+        end
+    end
+    mv(tmp, out; force = true)
+    return out
+end
+
+"""
     scene_footprint(path) -> ImageFootprint
 
 The image's footprint: origin, signed spacing, size and CRS, read from its geotransform.
