@@ -768,6 +768,225 @@ function rung_endpoint(s::Setup)
 end
 
 """
+    rung_filter(s::Setup) -> Vector{StageResult}
+
+Rung 5.3 — `apply_landsat_filtering` on Julia's own read of the granule, on the native grid.
+
+The pass `process.py` runs *before* geogrid, on the full scene rather than the overlap
+([`native_filter`](@ref)). Only the seven Landsat 4/5/7 cases have one; every other pair is filtered
+inside the correlator and rung 5.4 is where its filter is tested.
+
+Two filters and two different gates, because the two differ from the reference for different reasons:
+
+  * **L7 and L8 take `wallis_fill`**, whose gaps are filled from a random draw. The reference draws from
+    NumPy's unseeded global generator and so cannot reproduce *itself*, which makes the filled values
+    unmatched by construction. So the gate is the **zero mask exactly** — which positions were filled is
+    a decision, not a draw — and the unfilled values on tolerance.
+  * **L4 and L5 take Wallis followed by the band-reject.** The reference's Wallis variance is
+    `E[x²] − E[x]²`, which AutoRIFT.jl deliberately does not reproduce: about-the-mean is ~360,000×
+    more accurate against an exact `Float64` truth. So this is a tolerance gate too, and a loose one.
+
+`Destripe`'s scan angles come from the reference's own log, which is this ladder's discipline for an
+input a rung is not testing — gate `5.orbit` is where the orbit-derived angles are measured against
+those, and `tools/golden/README.md` records why they are not yet the default.
+"""
+function rung_filter(s::Setup)
+    native = native_filter(s.case, first(s.case.reference))
+    native === nothing && return [StageResult("5.3 native filter", "filtered/", "tolerance", true, 0,
+                                              "skipped: this pair is filtered inside the correlator, \
+                                               which rung 5.4 covers")]
+    log = joinpath(s.run, "capture.log")
+    angles = native === :fft ? reference_scan_angles(log) : nothing
+    fired = native === :fft ? reference_banding(log) : nothing
+    out = StageResult[]
+    for (i, name) in enumerate((first(s.case.reference), first(s.case.secondary)))
+        img_path, zero_path = native_filtered_paths(s.case, s.run, name)
+        scene = ArchGDAL.getband(ArchGDAL.read(scene_path_for(s.case, name)), 1)
+        nd = ArchGDAL.getnodatavalue(scene)
+        raw = permutedims(ArchGDAL.read(scene))
+        # `prepare_array_for_filtering`: the nodata value becomes zero and the array becomes Float32,
+        # and the valid domain is remembered rather than inferred again downstream.
+        valid = nd === nothing ? trues(size(raw)) : raw .!= eltype(raw)(nd)
+        img = Float32.(raw)
+        img[.!valid] .= 0.0f0
+        truth = permutedims(ArchGDAL.read(ArchGDAL.getband(ArchGDAL.read(img_path), 1)))
+        if native === :wallis_fill
+            got, ok = AutoRIFT.wallis_gapfill(img, valid, 5, 0.25)
+            push!(out, _zero_mask_stage("5.3 $name zero mask", zero_path, ok))
+            # **Only where both sides call the pixel valid, and the median carries the verdict.** The
+            # reference fills its gaps from NumPy's unseeded global generator, so a filled value cannot be
+            # matched — it cannot even be reproduced by the reference itself. Which positions were filled
+            # is not written out, so the fills stay in the population and appear as the tail; the median
+            # is over the overwhelming majority that were not filled.
+            refok = _zero_mask_of(zero_path)
+            push!(out, _filter_stage("5.3 $name wallis_fill", img_path, got, truth,
+                                     ok .& .!refok; max_median = 5e-3))
+        else
+            a = angles[i]
+            m = AutoRIFT.Destripe(; along_track = a.along, cross_track = a.cross)
+            wj, wmask = AutoRIFT.preprocess(img, valid, AutoRIFT.Wallis(5, 0.0))
+            wj[.!valid] .= 0.0f0
+            wr = _ref_wallis(img, 5)
+            wr[.!valid] .= 0.0f0
+            keep = valid .& wmask
+            best = nothing
+            parts = String[]
+            for (label, w) in (("ours", wj), ("reference variance", wr))
+                d, _ = AutoRIFT.preprocess(w, valid, m)
+                d[.!valid] .= 0.0f0
+                # **The band-reject's fire-or-decline is a binary branch, read rather than reported.** A
+                # decline returns the clamped input, so `d == _clamped(w)` is the branch that was taken.
+                cl = _clamped(w, valid)
+                ours = !all(j -> d[j] == cl[j], eachindex(d))
+                st = _filter_stage("5.3 $name $label", img_path, d, truth, keep)
+                push!(parts, @sprintf("%s: reject %s (reference %s), %s", label,
+                                      ours ? "fired" : "declined", fired[i] ? "fired" : "declined",
+                                      st.detail))
+                agree = ours == fired[i]
+                score = (agree, agree && st.passed)
+                best = best === nothing || score > best[1] ? (score, st) : best
+            end
+            push!(out, StageResult("5.3 $name wallis+destripe", basename(img_path),
+                                   "reject agrees & median<=1e-3 p99.9<=5e-2 of scale",
+                                   last(best).passed && first(best)[1], last(best).n,
+                                   join(parts, " | ")))
+        end
+    end
+    return out
+end
+
+"""
+    _ref_wallis(img, width) -> Matrix{Float32}
+
+The reference's own Wallis filter, written out: `(x − mean) / std` with the variance as
+`E[x²] − E[x]²`.
+
+A harness-side reproduction of a deviation the package declines to make, the same role
+[`_zeropad_frame!`](@ref) plays for the high-pass border. `AutoRIFT.wallis` computes the variance about
+the measured mean, which is ~360,000x more accurate against an exact `Float64` truth — the reference's
+difference-of-large-numbers form cancels catastrophically in a bright, low-contrast window. Keeping both
+here is what separates "the chain is right" from "the variance formula is deliberately different", which
+one number cannot.
+
+Both box means use `BORDER_REFLECT`, which is `cv2.filter2D`'s setting here and *not* the zero-padding
+the high-pass uses. The standard deviation is corrected to the sample form by `sqrt(n / (n - 1))` and
+snapped to `NaN` where it is ~0, both as `_preprocess_filt_std` and `_wallis_filter` do
+(`autoRIFT.py:45-63`).
+"""
+function _ref_wallis(img::AbstractMatrix, width::Integer)
+    nr, nc = size(img)
+    h = Int(width) ÷ 2
+    w2 = Float32(width * width)
+    # Reflection indices hoisted: the inner loop runs 25 times per pixel over ~70 million pixels, so
+    # recomputing a branch per neighbour costs more than the filter.
+    refl(i, n) = i < 1 ? 2 - i : (i > n ? 2n - i : i)
+    ri = [refl(i, nr) for i in (1 - h):(nr + h)]
+    ci = [refl(j, nc) for j in (1 - h):(nc + h)]
+    out = Matrix{Float32}(undef, nr, nc)
+    for j in 1:nc, i in 1:nr
+        s1 = 0.0f0
+        s2 = 0.0f0
+        for dj in (-h):h
+            b = ci[j + dj + h]
+            for di in (-h):h
+                v = Float32(img[ri[i + di + h], b])
+                s1 += v
+                s2 += v * v
+            end
+        end
+        m1 = s1 / w2
+        sd = sqrt(s2 / w2 - m1 * m1) * sqrt(w2 / (w2 - 1))
+        out[i, j] = abs(sd) <= 1.0f-8 ? NaN32 : (Float32(img[i, j]) - m1) / sd
+    end
+    return out
+end
+
+# `_fft_filter`'s own preamble, which applies whether or not the reject fires: clamp to +/-3 and send
+# NaN to zero (`autoRIFT.py:198-201`). A declined reject returns exactly this.
+function _clamped(w, valid)
+    y = similar(w)
+    for i in eachindex(w, valid, y)
+        v = w[i]
+        y[i] = !valid[i] ? 0.0f0 : (isnan(v) ? 0.0f0 : clamp(v, -3.0f0, 3.0f0))
+    end
+    return y
+end
+
+# The scene `name` names, on whichever route reaches it. `scene_path` resolves by side rather than by
+# name, and rung 5.3 walks the pair in the job's order because that is the order the filter logs in.
+function scene_path_for(c::GoldenCase, name::AbstractString)
+    early, _ = acquisition_order(c)
+    return scene_path(c, name == early ? :reference : :secondary)
+end
+
+# The reference's own `_zeroMask` raster: `~valid_domain`, the outer frame the filter zeroes
+# (`autoRIFT.py:78-79`). `nothing` where the filter writes none, which is the L4/L5 branch.
+_zero_mask_of(zero_path) = zero_path === nothing ? nothing :
+    permutedims(ArchGDAL.read(ArchGDAL.getband(ArchGDAL.read(zero_path), 1))) .!= 0
+
+"""
+    _zero_mask_stage(name, zero_path, ok) -> StageResult
+
+AutoRIFT.jl's validity against the reference's zeroed frame, as a coverage comparison.
+
+**Our mask is a superset of theirs by construction, so this is not an equality.** The reference's
+`zero_mask` is `~valid_domain` alone; `wallis_gapfill` additionally marks a pixel invalid where its local
+mean or standard deviation came out non-finite, which the reference leaves in the field as a `NaN` that
+`_fft_filter`'s successor sends to zero. So the gate is that every pixel the reference zeroed is one we
+also decline — an inclusion — and the extra count is reported rather than bounded, since each one is a
+pixel we refuse to invent a value for.
+"""
+function _zero_mask_stage(name, zero_path, ok)
+    ref = _zero_mask_of(zero_path)
+    ref === nothing && return StageResult(name, "zeroMask", "inclusion", true, 0,
+                                          "skipped: this filter writes no zero mask")
+    size(ok) == size(ref) || return StageResult(name, basename(zero_path), "inclusion", false, 0,
+                                               "shape $(size(ok)) against reference $(size(ref))")
+    missed = 0
+    extra = 0
+    for i in eachindex(ok, ref)
+        if ref[i] && ok[i]
+            missed += 1
+        elseif !ref[i] && !ok[i]
+            extra += 1
+        end
+    end
+    n = length(ref)
+    return StageResult(name, basename(zero_path), "reference's zeroed set is a subset of ours",
+                       missed == 0, n,
+                       @sprintf("%d of %d the reference zeroed and we did not; %d (%.4f%%) we decline \
+                                 and it kept, each a non-finite local statistic", missed, n, extra,
+                                100extra / n))
+end
+
+# A filtered float field against the reference's, over the positions `keep` selects. Gated on the
+# median and the 99.9th percentile rather than on a maximum: the Wallis variance difference is a
+# deliberate accuracy improvement, so a few pixels in a low-contrast window legitimately diverge, and a
+# maximum would gate on the worst-conditioned pixel in a hundred million.
+function _filter_stage(name, ref_path, jl, ref, keep; max_median = 1e-3)
+    if size(jl) != size(ref)
+        return StageResult(name, basename(ref_path), "tolerance", false, 0,
+                           "shape $(size(jl)) against reference $(size(ref))")
+    end
+    d = Float64[]
+    for i in eachindex(jl, ref, keep)
+        keep[i] && isfinite(jl[i]) && isfinite(ref[i]) || continue
+        push!(d, abs(Float64(jl[i]) - Float64(ref[i])))
+    end
+    isempty(d) && return StageResult(name, basename(ref_path), "tolerance", false, 0,
+                                     "no position compared on both sides")
+    med = median(d)
+    p999 = quantile(d, 0.999)
+    scale = quantile(filter(isfinite, abs.(vec(Float64.(ref)))), 0.99)
+    passed = med <= max_median * max(scale, 1) && p999 <= 5e-2 * max(scale, 1)
+    return StageResult(name, basename(ref_path),
+                       @sprintf("median<=%.0e p99.9<=5e-2 of scale", max_median), passed,
+                       length(d),
+                       @sprintf("%d compared; median %.4g, p99.9 %.4g, max %.4g against a p99 \
+                                 magnitude of %.4g", length(d), med, p999, maximum(d), scale))
+end
+
+"""
     rung_bytes(s::Setup) -> Vector{StageResult}
 
 Rung 5.4 — the bytes the correlator is handed, from Julia's own read of the granule.
@@ -801,25 +1020,37 @@ function rung_bytes(s::Setup)
         return [StageResult("5.4 correlator bytes", "capture/in_I1", "exact", true, 0,
                             "skipped: the radar pair reaching the correlator is ISCE3's raster, so \
                              this needs rung 5.2's coregistration rather than a read and a filter")]
-    # **A Landsat 4/5/7 pair is filtered twice, on two different grids**, and this rung reads the
-    # granule rather than `filtered/`, so it reproduces only the second application. `process.py`
-    # filters the *native* scene and writes `filtered/`; `runAutorift` then filters the *cropped*
-    # overlap again ([`correlator_filter`](@ref)). Declined with what it needs rather than run on the
-    # wrong input, which would report a filter difference as a quantization one.
-    native = native_filter(s.case, first(s.case.reference))
-    native === nothing || return [StageResult("5.4 correlator bytes", "capture/in_I1", "exact", true,
-                                              0, "skipped: a $(native) pair is filtered on its \
-                                               native scene before geogrid, so this rung needs rung \
-                                               5.3's output as its input rather than the granule")]
+    # **A Landsat 4/5/7 pair is filtered twice, on two different grids**, so the granule is the wrong
+    # input for it. `process.py` filters the *native* scene and, for a cross-projection pair, warps the
+    # result; `runAutorift` then filters the *cropped* overlap again ([`correlator_filter`](@ref)). Rung
+    # 5.3 is what tests that first pass, so this reads the reference's own output of it —
+    # [`filtered_path`](@ref) — which keeps a filter difference from being reported here as a
+    # quantization one.
     k = read_capture(s.case; n = parse(Int, basename(s.run)))
     m = correlator_filter(s.case)
+    # **A `wallis_fill` pair cannot match here, by construction rather than by defect.** The filter fills
+    # its gaps from NumPy's *unseeded* global generator, so the reference cannot reproduce itself either —
+    # and those values are not confined to the gaps, because `uniform_data_type` takes its mean and
+    # standard deviation over the whole array. So a draw nobody can reproduce sets the quantization window
+    # for every pixel. Skipped with the measurement rather than reded against a bound it can never meet.
+    if m isa AutoRIFT.WallisGapfill
+        return [StageResult("5.4 correlator bytes", "capture/in_I1", "exact", true, 0,
+                            "skipped: this pair is gap-filled from an unseeded RNG inside the \
+                             correlator, and `uniform_data_type` takes its statistics over the whole \
+                             array, so the unreproducible draw rescales every pixel — measured at \
+                             1.85% exact on `LE07_L1TP_063018`")]
+    end
+    rpath = something(filtered_path(s.case, s.run, first(s.case.reference)), s.reference_path)
+    spath = something(filtered_path(s.case, s.run, first(s.case.secondary)), s.secondary_path)
+    # `filtered_path` resolves by name and the offsets are in acquisition order, so the two are paired
+    # back up here rather than assumed to line up.
+    early, _ = acquisition_order(s.case)
+    first(s.case.reference) == early || ((rpath, spath) = (spath, rpath))
     out = StageResult[]
-    for (nm, path, off, truth) in (("in_I1", s.reference_path, s.pair.reference_offset,
-                                    k.arrays["in_I1"]),
-                                   ("in_I2", s.secondary_path, s.pair.secondary_offset,
-                                    k.arrays["in_I2"]))
+    for (nm, path, off, truth) in (("in_I1", rpath, s.pair.reference_offset, k.arrays["in_I1"]),
+                                   ("in_I2", spath, s.pair.secondary_offset, k.arrays["in_I2"]))
         win = _cropped_scene(path, off, size(truth))
-        push!(out, _bytes_stage(nm, win, truth, m, native))
+        push!(out, _bytes_stage(nm, win, truth, m))
     end
     return out
 end
@@ -856,7 +1087,7 @@ function _zeropad_frame!(out, img, width::Integer)
     return out
 end
 
-function _bytes_stage(nm, win, truth, m, native)
+function _bytes_stage(nm, win, truth, m)
     mask = trues(size(win))
     if m === nothing
         field = Float32.(win)
@@ -1006,7 +1237,8 @@ function e2e(c::GoldenCase; n::Union{Integer,Nothing} = nothing, stop_on_red::Bo
     @info "e2e setup" product=c.product region=s.info.name epsg=s.info.epsg window=size(s.window) dt_days=s.pair.dt / 86400
 
     out = StageResult[]
-    for rung in (rung_grid, rung_window, rung_bytes, rung_geogrid, rung_params, rung_endpoint)
+    for rung in (rung_grid, rung_window, rung_filter, rung_bytes, rung_geogrid, rung_params,
+                 rung_endpoint)
         rs = rung(s)
         append!(out, rs)
         stop_on_red && !all(r -> r.passed, rs) && break

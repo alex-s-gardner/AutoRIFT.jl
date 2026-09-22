@@ -4334,6 +4334,90 @@ The rung reports both and gates the better, since the worse is a recorded deviat
 disagreement this rung is asking about. The floor is one level everywhere, which is `np.mean`'s
 summation order moving whatever sits nearest a rounding boundary.
 
+## Rung 5.3 — `apply_landsat_filtering`, and what the Wallis variance choice costs
+
+The pass `process.py` runs on the **native** scene before geogrid, on the seven Landsat 4/5/7 cases.
+Two filters, two gates, and one dominant cause behind every disagreement.
+
+### The chain is right; the variance formula is the difference
+
+`LT05_L1TP_060018` declines the band-reject on both scenes, so its `filtered/` output is *exactly*
+clamped Wallis — which isolates the Wallis step with nothing else in the way:
+
+| Wallis variance form | median | p99 | max | pixels differing > 0.01 |
+|---|---:|---:|---:|---:|
+| AutoRIFT.jl, about-the-mean | 0.113 | 0.882 | 2.36 | **90.6%** |
+| reference, `E[x²] − E[x]²` | **0.000116** | 0.00448 | 0.0499 | **0.094%** |
+
+So the granule read, the nodata handling, the reflected box means, the `±3` clamp, the `NaN → 0` and the
+band-reject are all correct: with the reference's own formula the field reproduces to a median of 1.2e-4.
+**Every remaining difference is the deliberate variance choice**, and the ladder now reports both forms
+per scene, gating the reference-form one — the same design rung 5.4 uses for the high-pass border.
+
+| case | reject | ours, median | reference-variance, median |
+|---|---|---:|---:|
+| `LT05_L1TP_060018_19851028` | declines / declines | 0.1141 | **5.18e-5** |
+| `LT05_L1GS_061018_19860123` | declines / declines | 0.06896 | **6.74e-5** |
+| `LT04_L1TP_063018_19880611` | fires / fires | 0.1671 | 0.00456 |
+| `LT04_L1TP_063018_19880627` | fires / fires | 0.09305 | 0.00486 |
+| `LT05_L1GS_001013_19920425` | **declines / fires** | 0.1983 | 0.01141 |
+| `LT05_L1GS_001013_19920628` | fires / fires | 0.02398 | 0.00833 |
+
+### The cost is not only a tolerance — it flips a binary branch
+
+`tools/golden/README.md` records the Wallis variance as a deliberate accuracy improvement whose cost is
+that "`wallis_fill` cases are gated on tolerance rather than on equality". That understates it twice.
+
+**It moves 90% of the filtered field**, by a median of 0.113 on a field clamped to ±3 — about 4% of the
+range — where the register quantified only the *accuracy* of the two formulas against an exact truth and
+never what the choice costs in agreement on a real scene.
+
+**And on `LT05_L1GS_001013_19920425` it changes the band-reject's decision.** That branch is
+`(sA/sB ≥ 2 | sB/sA ≥ 2) & (max > 500)`, and this scene's powers are 1588 and 3279 — clearing the ratio
+test by **3.2%**. The perturbed field puts AutoRIFT.jl on the other side: it **declines where the
+reference fires**, so the entire scene's output becomes clamped Wallis instead of a band-rejected field.
+With the reference's variance form the decision agrees on **all six** scenes, which is what identifies the
+Wallis difference as the cause rather than something in the reject itself. The rung therefore reads the
+branch directly — a decline returns the clamped input, so `d == clamp(w)` is the decision — and reports it
+beside the field, because a whole scene changing is not a slightly larger median.
+
+The reject's own residual is ~0.005 median where both fire, against 5e-5 where both decline. That extra
+two orders of magnitude is the full-scene `Float32` FFT and the bilinearly-rotated band mask, whose cell
+edges need not land identically; `gen_warpaffine`'s fixtures cover that rotation. Measured, not explained.
+
+### The gap-fill branch matches its decisions exactly and cannot match its values
+
+On `LE07_L1TP_063018` the zero mask is **exact — 0 of 261,488,361 either way**. The values are not, at a
+median of 0.119 and a p99.9 of 4.14, and the causes are the same Wallis variance plus the fills
+themselves: the reference draws them from NumPy's *unseeded* global generator, so no run reproduces
+another, including its own.
+
+## Rung 5.4 on the Landsat cases
+
+Rung 5.4 now takes its input from [`filtered_path`](@ref) rather than the granule for a filtered pair,
+since those scenes are filtered twice on two different grids and rung 5.3 is what tests the first pass.
+The three L4/L5 cases then close completely, because their in-correlator filter is a **no-op** — the
+`fft` branch is commented out:
+
+| case | `in_I1` | `in_I2` |
+|---|---|---|
+| `LT05_L1GS_001013` | **99.9992%** exact, max 0 | **100.0000%** exact, max 0 |
+| `LT04_L1TP_063018` | 99.9972%, max 1 | 99.9993%, max 1 |
+| `LT05_L1TP_060018` | 99.9978%, max 1 | 99.9989%, max 1 |
+
+That is the crop and the byte quantization validated end to end against the reference's own bytes, with
+no filter between them to absorb an error.
+
+**The four `wallis_fill` pairs cannot be reached and the reason is structural.** Their in-correlator
+filter fills gaps from the unseeded generator, and `uniform_data_type` takes its statistics over the
+**whole array** — so a draw nobody can reproduce sets the quantization window for every pixel, measured
+at 1.85% exact. Skipped with that reason rather than reded against a bound it can never meet.
+
+**Three separate findings now share one mechanism**: the high-pass border frame, `bytescale`'s `Float32`
+accumulation, and these random fills all differ on a small or bounded part of the field and all reach
+*every* pixel, because the quantization window is global. Anything upstream of `uniform_data_type` that
+moves the mean or the standard deviation moves the whole image.
+
 ## What Gate 5 does not yet establish
 
 - **Rungs 5.1, 5.3 and 5.4 in the ladder.** The granule read, the filter on Julia's own read, and the
