@@ -5,13 +5,24 @@
 # negotiation rather than a type conversion, and each clause is a place a wrong answer would look
 # entirely plausible:
 #
-# Index base. Geogrid's pixel index is zero-based — `round((x - startingX) / XSize)`, bounds-tested
-# against `0` and `nPixels - 1` (`geogridOptical.cpp:723-724,775`). `PointSet` carries one-based
-# positions, so every index gains 1.
+# Index base and the half pixel, which together are `+ 1.5`. Geogrid's pixel index is zero-based —
+# `round((x - startingX) / XSize)`, bounds-tested against `0` and `nPixels - 1`
+# (`geogridOptical.cpp:723-724,775`) — so every index gains 1. And `runAutorift` stores
+# `round(xGrid) + 0.5` before correlating (`autoRIFT.py:818`), which the grid has to carry too.
 #
-# The half pixel. `autoRIFT.py:890` stores `round(xGrid) + 0.5`, and `_shift_points` reproduces that at
-# correlation time for every pyramid level alike (`src/multichip.jl`). So the `+ 0.5` must *not* be
-# applied here: doing it twice moves every search centre a pixel.
+# **Measured, not reasoned.** The half pixel looks like it should be left to `_shift_points`, which adds
+# one at correlation time for every pyramid level alike (`src/multichip.jl`). It is not: with `+ 1` the
+# golden S2B endpoint agrees on 2.8% of points against the reference's own `Dx`, and with `+ 1.5` on
+# 74.7%, median residual 1.062 px against 0 and p99 19.5 px against 0.5. The two half pixels are the same
+# convention counted once on each side rather than one substituting for the other —
+# `tools/golden/README.md` records the same conclusion reached twice before from the other direction.
+#
+# Layout. A `PairGeometry` is indexed over its grid window as `[x, y]`, the order its `window_*.tif`
+# rasters are written and read in. `PointSet` and everything downstream is `[row, col]` like every other
+# Julia matrix, so every band is transposed on the way through. **On a square grid this is silent**: the
+# shapes agree, the correlator runs, and it returns a plausible field having lost two thirds of its
+# agreement. With the layout right, `dx_prior` matches the reference's own grid at every one of 1,016,064
+# points on the golden S2B case.
 #
 # Missing values. Geogrid marks a point outside the image with `-32767`, while a point is skipped here
 # by giving it a zero search radius (`src/points.jl`). Passing the sentinel through as a radius would
@@ -41,12 +52,13 @@ using ImagePairGeometry: PairGeometry, ProjectedCoordinate, chip_size_pixels,
 
 The search grid in `g`, as a [`PointSet`](@ref).
 
-Pixel positions become one-based, since geogrid's are zero-based, and a point that fell outside the
-image gets a search radius of zero — how a point is marked to skip.
+Pixel positions gain `1.5` — one for the index base, since geogrid's indices are zero-based, and a half
+for the offset `runAutorift` bakes into its grid before correlating — and a point that fell outside the
+image gets a search radius of zero, which is how a point is marked to skip.
 
-The half-pixel offset the reference bakes into its grid is *not* applied here: it is added at
-correlation time for every pyramid level, so applying it twice would displace every search centre by a
-pixel.
+Bands are **transposed**: a `PairGeometry` is indexed `[x, y]` over its grid window, and `PointSet` is
+`[row, col]`. On a square grid the difference is invisible and costs two thirds of the agreement with the
+reference, so it is not left to the caller.
 
 `chip_size` sets the base chip extent in pixels. Given `pixel_size` instead, it is derived as the
 reference does — `ceil(chip_size_0 / pixel_size / 4) * 4` — from a chip size in meters. One of the two
@@ -72,16 +84,21 @@ function AutoRIFT.pointset(g::PairGeometry; chip_size = nothing, chip_size_0 = 2
     end
 
     sentinel = Int32(g.nodata.output)
-    valid = g.location_x .!= sentinel
+    # `[x, y]` to `[row, col]`, once, here — see this file's header on why the caller cannot be left to
+    # do it.
+    t(A) = permutedims(A)
+    location_x, location_y = t(g.location_x), t(g.location_y)
+    valid = location_x .!= sentinel
 
-    # One-based, and a skipped point still needs a coordinate: `PointSet` has no missing value, so its
-    # position is arbitrary and its zero radius is what excludes it.
-    x = [v ? Float64(l + 1) : 1.0 for (v, l) in zip(valid, g.location_x)]
-    y = [v ? Float64(l + 1) : 1.0 for (v, l) in zip(valid, g.location_y)]
+    # `+ 1.5`: one for the index base and a half for the grid offset the reference bakes in. A skipped
+    # point still needs a coordinate, since `PointSet` has no missing value — its position is arbitrary
+    # and its zero radius is what excludes it.
+    x = [v ? Float64(l) + 1.5 : 1.0 for (v, l) in zip(valid, location_x)]
+    y = [v ? Float64(l) + 1.5 : 1.0 for (v, l) in zip(valid, location_y)]
 
     # A radius is zero where the point is invalid, where the search extent itself is missing, or where
     # geogrid computed no extent at all — each meaning "do not search here".
-    rad(band) = [(v && b != sentinel && b > 0) ? Int(b) : 0 for (v, b) in zip(valid, band)]
+    rad(band) = [(v && b != sentinel && b > 0) ? Int(b) : 0 for (v, b) in zip(valid, t(band))]
     rx = rad(g.search_x)
     ry = rad(g.search_y)
 
@@ -96,10 +113,10 @@ function AutoRIFT.pointset(g::PairGeometry; chip_size = nothing, chip_size_0 = 2
 
     dy_flip = y_displacement_sign(coordinate)
     prior(band, flip) = [(v && b != sentinel) ? flip * Float64(b) : 0.0
-                         for (v, b) in zip(valid, band)]
+                         for (v, b) in zip(valid, t(band))]
 
     # Chip-size bounds are per point, and zero means unbounded — which is what a missing bound means.
-    bound(band) = [(v && b != sentinel && b > 0) ? Int(b) : 0 for (v, b) in zip(valid, band)]
+    bound(band) = [(v && b != sentinel && b > 0) ? Int(b) : 0 for (v, b) in zip(valid, t(band))]
 
     # The misregistration between the two images, where one was supplied. It *adds* to the
     # velocity-derived prior rather than replacing it: `offset_x`/`offset_y` are where the ice is expected
@@ -127,7 +144,9 @@ function _misregistration(g::PairGeometry, offset)
     axes(offset) == axes(g.location_x) || throw(DimensionMismatch(
         "the misregistration field has axes $(axes(offset)) but the geometry covers " *
         "$(axes(g.location_x)); both must be over the same window."))
-    return ([Float64(o[1]) for o in offset], [Float64(o[2]) for o in offset])
+    # Transposed with every other band, since it is added to a prior that already is.
+    return ([Float64(o[1]) for o in permutedims(offset)],
+            [Float64(o[2]) for o in permutedims(offset)])
 end
 
 """
