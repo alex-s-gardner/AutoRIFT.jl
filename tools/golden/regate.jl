@@ -382,6 +382,31 @@ const GATES = Gate[
             return (red == 0 ? :green : :red, m.match)
         end
     end),
+
+    Gate("5.e2e", "the end-to-end ladder on every same-CRS optical case", true, function ()
+        # The eight optical cases whose two scenes share a projection. The four cross-zone pairs are
+        # excluded by name rather than allowed to report red: `coregister` refuses them as the
+        # reference does, and reprojecting the secondary is rung 5.2, which does not exist yet. A gate
+        # that counts a missing rung as a regression stops distinguishing the two.
+        cases = ["LC08_L1TP_009011", "LC08_L1TP_062018", "LC09_L1GT_215109",
+                 "LE07_L1TP_063018_20040810", "S2A_MSIL1C_20200626", "S2B_MSIL1C_20200612",
+                 "LT04_L1TP_063018", "LT05_L1GS_001013"]
+        worst = Symbol[]
+        detail = String[]
+        for c in cases
+            cmd = `julia --project=$(@__DIR__) $(joinpath(@__DIR__, "e2e.jl")) $c --all`
+            state, d = capture_run(cmd) do t
+                m = match(r"(\d+) rungs?, (\d+) green, (\d+) red", t)
+                m === nothing && return (:red, "could not read the rung count: " * last_line(t))
+                return (parse(Int, m.captures[3]) == 0 ? :green : :red, m.match)
+            end
+            push!(worst, state)
+            state === :green || push!(detail, "$c: $d")
+        end
+        red = count(==(:red), worst)
+        return (red == 0 ? :green : :red,
+                red == 0 ? "$(length(cases)) cases, every rung green" : join(detail, "; "))
+    end),
 ]
 
 function main(args)
