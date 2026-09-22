@@ -15,9 +15,11 @@ NetworkOptions = "ca575930-c2e3-43a9-ace4-1e988b2c1908"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Proj = "c94c279d-25a6-4763-9509-64d165bea63e"
 Rasters = "a3a2b9e3-a471-40c9-b274-f788e487c689"
+SLCDatasets = "1d8f5cac-0b48-4ea8-8d35-4fce00b6c96f"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 
 [sources]
 AutoRIFT = {path = "../.."}
 FastGeoProjections = {rev = "main", url = "https://github.com/alex-s-gardner/FastGeoProjections.jl"}
 ImagePairGeometry = {rev = "main", url = "https://github.com/alex-s-gardner/ImagePairGeometry.jl"}
+SLCDatasets = {rev = "main", url = "https://github.com/alex-s-gardner/SLCDatasets.jl"}
