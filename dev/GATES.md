@@ -4328,3 +4328,66 @@ a restatement.
   different slant ranges, so merging them would need one range origin for two". hyp3 does it anyway. A
   pure-Julia mosaic wants that to become a supported construction rather than a relaxed check, since what
   it produces is a mosaic whose phase is not on one grid.
+
+## Rung 5.7 — the endpoint, and two bugs it found in the geogrid handoff
+
+`autorift` on the grid and parameters the ladder derives, against the reference's own `Dx`/`Dy` from the
+capture. The imagery is the reference's — `in_I1`/`in_I2`, filtered and byte-quantized — so the one input
+the ladder has not yet reproduced is held fixed and what is under test is the geogrid handoff composed
+with the correlator.
+
+The rung is the reason the others exist. Rungs 5.0, 5.5 and 5.6 established that both sides *would be
+handed* the same grid; this is the first that asks whether running on it gives the same answer. It did
+not, and the two reasons were both in `AutoRIFT.pointset(::PairGeometry)`.
+
+| golden S2B, `dx` / `dy` | as written | transposed | transposed and `+1.5` |
+|---|---:|---:|---:|
+| exact | 2.81% / 2.74% | — | **74.73% / 76.20%** |
+| within one step | 10.06% / 9.82% | — | **92.01% / 94.33%** |
+| median residual | 1.062 / 0.6875 px | — | **0 / 0** |
+| p99 | 19.5 / 8.938 px | — | **0.5 / 0.3125** |
+| both measured | 471,694 | — | **609,786** |
+| only jl / only ref | 140,161 / 146,186 | — | **2,890 / 8,094** |
+
+### The layout was the geogrid's, not the correlator's
+
+A `PairGeometry` is indexed `[x, y]` over its grid window — the order its `window_*.tif` rasters are
+written and read in — and `PointSet` is `[row, col]` like every other Julia matrix. `pointset` preserved
+the geometry's layout, so every band arrived transposed.
+
+**A square grid hides it completely.** The shapes agree, the correlator runs, and it returns a field that
+looks like ice flow. Measured against the reference's own captured grid, transposing takes `dx_prior`
+from 479,884 differing points of 1,016,064 to **zero**. The golden S2 grid is 1009x1009 and
+`test/imagepairgeometry.jl`'s fixture window was 101x101 — both square, which is why neither caught it.
+The fixture is now deliberately non-square.
+
+### The half pixel, for the third time
+
+With the layout right, `x` and `y` still differed from the reference's grid by a uniform **−0.5** at every
+point. `pointset` added only the index base, on the documented grounds that `_shift_points` contributes
+the half pixel at correlation time. The measurement says otherwise, and the table above is the
+measurement: `+1` gives 2.8% exact and `+1.5` gives 74.7%.
+
+So the reference's `round(xGrid) + 0.5` and AutoRIFT.jl's own `_shift_points` are the same convention
+counted once on each side, not one substituting for the other — which is exactly the conclusion
+`correlator.jl` reached from the other direction when it measured `+1` against `+0.5` on the *captured*
+grid and found 85.0% against 49.2%. The reasoning that looked sound in `pointset`'s docstring was the same
+reasoning that had already been refuted there.
+
+### What the rung now says, and what it does not
+
+**Better coverage than the capture-fed path.** `correlator.jl` on this case, given the reference's own
+grid, reports 17,238 jl-only and 17,970 ref-only points against this rung's 2,890 and 8,094 — and 67.9%
+exact against 74.7%. So AutoRIFT.jl's own geogrid agrees with the reference's endpoint *better* than the
+reference's own captured grid does when fed through the same correlator. That is worth understanding
+rather than celebrating: the captured grid carries the driver's rewritten search limits while the geogrid
+carries raw ones that AutoRIFT.jl then rewrites itself, and one of those two paths is closer to what the
+reference actually correlated.
+
+**Still short of the gate.** 74.73% exact against 77.4% and 92.01% within one step against 97.3%. The
+shape is right — median 0, p99 0.5 px, bias 0.005 — so what remains is a tail rather than an offset. The
+search radii are the first thing to look at: geogrid-raw against capture-rewritten differs at 407,273 of
+1,016,064 points, by −5 to 0.
+
+**The imagery is still the reference's.** Rungs 5.1, 5.3 and 5.4 replace it, and until they do a
+disagreement here belongs to the grid or the correlator rather than to a filter.

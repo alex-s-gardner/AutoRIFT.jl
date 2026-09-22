@@ -20,8 +20,12 @@ using Test
 function ipg_case(; csminy = 360.0, ssm = 1.0)
     grid = MapGrid(geotransform = (295000.0, 120.0, 0.0, 7805000.0, 0.0, -120.0),
                    size = (200, 200), crs = 32624)
+    # **Deliberately non-square.** A square footprint gives a square grid window, and a square window
+    # hides a transposed band: the shapes agree, the correlator runs, and the answer is wrong by two
+    # thirds of its agreement. Every assertion below that compares against a band therefore has a shape
+    # to disagree about.
     fp = ImageFootprint(origin = (300000.0, 7800000.0), spacing = (30.0, -30.0),
-                        size = (400, 400))
+                        size = (400, 560))
     pair = coregister(fp, fp; dt = 91 * 86400.0)
     win = grid_window(grid, footprint_bounds(IdentityTransform(), pair.coordinate))
     n = size(win)
@@ -40,25 +44,34 @@ end
 const IPG_R, IPG_GRID, IPG_PAIR, IPG_WIN = ipg_case()
 const SENTINEL = Int32(-32767)
 
-@testset "pixel positions are one-based" begin
+@testset "pixel positions gain 1.5, and the layout transposes" begin
     pts = AutoRIFT.pointset(IPG_R; pixel_size = 30.0)
     @test pts isa AutoRIFT.PointSet{2}
-    @test size(pts) == size(IPG_R)
 
-    valid = findall(!=(SENTINEL), IPG_R.location_x)
-    # Geogrid's index is zero-based; a `PointSet`'s is one-based. Exactly one, and no half pixel —
-    # that is added at correlation time for every pyramid level. Asserted over the whole grid at
-    # once: the property is uniform, so one assertion per point would report the same fact
-    # thousands of times.
-    @test all(k -> pts.x[k] == IPG_R.location_x[k] + 1, valid)
-    @test all(k -> pts.y[k] == IPG_R.location_y[k] + 1, valid)
-    @test all(k -> isinteger(pts.x[k]), valid)
+    # **A `PairGeometry` is indexed `[x, y]` and a `PointSet` `[row, col]`, so the shape reverses.**
+    # Asserted on a deliberately non-square window: on a square one the shapes agree whichever layout
+    # the bands are in, the correlator runs, and it returns a plausible field having lost two thirds of
+    # its agreement with the reference. That is exactly how this went unnoticed.
+    @test size(IPG_WIN, 1) != size(IPG_WIN, 2)
+    @test size(pts) == reverse(size(IPG_R))
+
+    loc_x = permutedims(IPG_R.location_x)
+    loc_y = permutedims(IPG_R.location_y)
+    valid = findall(!=(SENTINEL), loc_x)
+    # `+1.5`: one for the index base, since geogrid's index is zero-based, and a half for the offset
+    # `runAutorift` bakes into its grid before correlating. Asserted over the whole grid at once, since
+    # the property is uniform and one assertion per point would report the same fact thousands of times.
+    @test all(k -> pts.x[k] == loc_x[k] + 1.5, valid)
+    @test all(k -> pts.y[k] == loc_y[k] + 1.5, valid)
+    # Half-integers, not integers: a whole-pixel grid is the signature of the offset being dropped.
+    @test all(k -> pts.x[k] % 1 == 0.5, valid)
+    @test all(k -> pts.y[k] % 1 == 0.5, valid)
 end
 
 @testset "invalid points are skipped, not searched" begin
     pts = AutoRIFT.pointset(IPG_R; pixel_size = 30.0)
 
-    invalid = findall(==(SENTINEL), IPG_R.location_x)
+    invalid = findall(==(SENTINEL), permutedims(IPG_R.location_x))
     @test !isempty(invalid)     # the window overhangs the image, so some points are outside
     # Zero radius is how a point is marked to skip. Passing the fill value through would make the
     # radius negative, which `gridpoints`' margin logic would then size itself from.
@@ -66,7 +79,7 @@ end
     @test all(iszero, pts.radius_y[invalid])
     @test !any(k -> AutoRIFT.issearchable(pts, k), invalid)
 
-    valid = findall(!=(SENTINEL), IPG_R.location_x)
+    valid = findall(!=(SENTINEL), permutedims(IPG_R.location_x))
     @test AutoRIFT.nsearchable(pts) == length(valid)
     @test all(k -> AutoRIFT.issearchable(pts, k), valid)
     @test all(>(0), pts.radius_x[valid])
@@ -74,11 +87,12 @@ end
 
 @testset "search radius and prior carry through" begin
     pts = AutoRIFT.pointset(IPG_R; pixel_size = 30.0)
-    valid = findall(!=(SENTINEL), IPG_R.location_x)
-    @test all(k -> pts.radius_x[k] == IPG_R.search_x[k], valid)
-    @test all(k -> pts.radius_y[k] == IPG_R.search_y[k], valid)
-    @test all(k -> pts.dx_prior[k] == IPG_R.offset_x[k], valid)
-    @test all(k -> pts.dy_prior[k] == IPG_R.offset_y[k], valid)
+    # Every band is transposed together, so a comparison against the geometry transposes too.
+    valid = findall(!=(SENTINEL), permutedims(IPG_R.location_x))
+    @test all(k -> pts.radius_x[k] == permutedims(IPG_R.search_x)[k], valid)
+    @test all(k -> pts.radius_y[k] == permutedims(IPG_R.search_y)[k], valid)
+    @test all(k -> pts.dx_prior[k] == permutedims(IPG_R.offset_x)[k], valid)
+    @test all(k -> pts.dy_prior[k] == permutedims(IPG_R.offset_y)[k], valid)
 end
 
 @testset "the y prior's sign comes from the coordinate system" begin
@@ -110,10 +124,10 @@ end
     @test all(==(32), pts32.chip_size_y)
 
     # Bounds are per point, and a bound of zero means unbounded.
-    valid = findall(!=(SENTINEL), IPG_R.location_x)
-    invalid = findall(==(SENTINEL), IPG_R.location_x)
-    @test all(k -> pts.chip_size_min_x[k] == IPG_R.chip_min_x[k], valid)
-    @test all(k -> pts.chip_size_max_x[k] == IPG_R.chip_max_x[k], valid)
+    valid = findall(!=(SENTINEL), permutedims(IPG_R.location_x))
+    invalid = findall(==(SENTINEL), permutedims(IPG_R.location_x))
+    @test all(k -> pts.chip_size_min_x[k] == permutedims(IPG_R.chip_min_x)[k], valid)
+    @test all(k -> pts.chip_size_max_x[k] == permutedims(IPG_R.chip_max_x)[k], valid)
     @test all(iszero, pts.chip_size_min_x[invalid])
     @test all(iszero, pts.chip_size_max_x[invalid])
 

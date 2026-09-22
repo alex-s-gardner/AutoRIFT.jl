@@ -569,6 +569,29 @@ function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, p::Param
 end
 
 """
+    autorift(reference, secondary, grid::PointSet, p::Params) -> MultichipResult
+
+Correlate at `grid`'s points with an already-resolved [`Params`](@ref).
+
+The production input path: a caller with a geogrid result has both halves of the handoff already —
+`AutoRIFT.pointset` gives the per-point grid and `AutoRIFT.params` the scene-wide settings — and this
+is where the two meet. The keyword form builds a `Params` from keywords instead, which a caller holding
+one would have to take apart to use.
+
+`grid` carries the per-point coordinates, priors, search radii and chip-size bounds; `p` carries what
+is uniform over the scene. Where the two overlap, `grid` wins for the points it names, exactly as in
+the keyword form.
+
+Validity masks belong to the images rather than to either argument, so pass an [`ImagePair`](@ref) as
+`reference` to supply them.
+"""
+autorift(reference::AbstractMatrix, secondary::AbstractMatrix, grid::PointSet, p::Params) =
+    _run(ImagePair(reference, secondary), grid, p, _block_size(nothing), :auto)
+
+autorift(pair::ImagePair, grid::PointSet, p::Params) =
+    _run(pair, grid, p, _block_size(nothing), :auto)
+
+"""
     autorift(reference, secondary, p::Params, block_size::Tuple{Int,Int}, cache_budget::Int) -> MultichipResult
 
 Correlate a block at a time, with an already-resolved [`Params`](@ref).

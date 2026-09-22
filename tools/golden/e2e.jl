@@ -422,6 +422,102 @@ function rung_params(s::Setup)
 end
 
 # ---------------------------------------------------------------------------
+# Rung 5.7 — the endpoint
+# ---------------------------------------------------------------------------
+
+"""
+    rung_endpoint(s::Setup) -> Vector{StageResult}
+
+`autorift` on the grid and parameters the ladder derived, against the reference's own `Dx`/`Dy`.
+
+This is the rung the others exist to make interpretable. Rungs 5.0, 5.5 and 5.6 establish that both
+sides *would be handed* the same grid, priors, search limits, chip bounds and scene-wide parameters;
+this is the first one that asks whether running on them gives the same answer.
+
+**The imagery is the reference's own, and deliberately so.** `capture.py` dumps `in_I1` and `in_I2` at
+the `runAutorift` boundary — filtered and quantized to bytes — so feeding those holds the one input the
+ladder has not yet reproduced fixed, and what remains under test is the geogrid handoff composed with
+the correlator. Rungs 5.1, 5.3 and 5.4 replace the imagery in turn; until they do, a disagreement here
+belongs to the grid or to the correlator and not to a filter.
+
+Two conventions, both taken from `correlator.jl` rather than restated: `arImgDisp_*` cuts its chip from
+its second argument and the driver calls it `arImgDisp(I2, I1)`, so `I1` binds to AutoRIFT.jl's
+*secondary*; and the reference's `Dy` is up-positive where AutoRIFT.jl's is row-positive, so one axis
+needs a flip. The flip is *measured* — both signs are scored and the better kept — because a hardcoded
+one is right only while the writer's convention holds.
+
+Gated as `correlator.jl`'s endpoint is: the base level is quantized and compared on `exact`, while above
+it both sides replace their measurements with a bicubic resize and neither field is quantized, so bias
+and the within-one-step fraction carry the verdict there.
+"""
+function rung_endpoint(s::Setup)
+    call = joinpath(s.run, "capture", "call1.json")
+    isfile(call) || return [StageResult("5.7 endpoint", "capture/out_Dx", "gate", true, 0,
+                                       "skipped: no capture at $call")]
+    k = read_capture(s.case; n = parse(Int, basename(s.run)))
+
+    pix = abs(s.pair.coordinate.spacing[1])
+    grid = AutoRIFT.pointset(s.geometry; pixel_size = pix)
+    p = AutoRIFT.params(s.geometry; threaded = Threads.nthreads() > 1, preprocess = :none)
+
+    a, b = k.arrays["in_I1"], k.arrays["in_I2"]
+    out = StageResult[]
+
+    # **The reference correlates a truncated grid, and AutoRIFT.jl does not.** `autoRIFT.py:809-819`
+    # chops both axes to a multiple of `chopFactor = max(ChipSizeMaxX) / ChipSize0X` before correlating —
+    # 4 on the golden S2 case, taking a 1009-point grid to 1008 — and keeps `origSize` only to report it.
+    # AutoRIFT.jl keeps those points, which `tools/ab/README.md` measures as costing the reference 1.6% of
+    # its grid on another scene, so the shapes legitimately differ and the comparison runs on the overlap.
+    #
+    # Verified rather than assumed: the reference's own correlated shape has to be exactly what the chop
+    # predicts from AutoRIFT.jl's grid. That catches a grid difference, which would otherwise hide inside
+    # "the shapes differ because of the chop".
+    chop = Int(maximum(k.arrays["in_ChipSizeMaxX"])) ÷ Int(k.scalars["ChipSize0X"])
+    predicted = [fld(n, chop) * chop for n in size(grid.x)]
+    push!(out, exact_stage("5.7 grid shape after the reference's chop", "in_xGrid",
+                           predicted, collect(size(k.arrays["in_xGrid"]))))
+    predicted == collect(size(k.arrays["in_xGrid"])) || return out
+
+    @info "5.7 correlating" scene=size(a) npoints=length(grid.x) chip=p.chip_size_min threads=Threads.nthreads()
+    r = AutoRIFT.autorift(b, a, grid, p)
+
+    rdx, rdy = k.arrays["out_Dx"], k.arrays["out_Dy"]
+    ny = min(size(r.dx, 1), size(rdx, 1))
+    nx = min(size(r.dx, 2), size(rdx, 2))
+    step = 1 / AutoRIFT.subpixel_at(p, 1).upsampling
+
+    for (axis, ref) in ((:dx, rdx), (:dy, rdy))
+        jl = getproperty(r, axis)[1:ny, 1:nx]
+        rf = ref[1:ny, 1:nx]
+        # Both signs scored, the better kept: `dy` needs the flip and `dx` does not, and measuring says so
+        # rather than a comment asserting it.
+        best = nothing
+        for sgn in (1, -1)
+            st = quantized_stage("5.7 $axis (sign $(sgn > 0 ? '+' : '-'))", "out_$(uppercase(String(axis)))",
+                                 jl, sgn .* rf, step)
+            best === nothing && (best = (sgn, st))
+            occursin("exact", st.detail) || continue
+            best = _better_endpoint(best, (sgn, st))
+        end
+        push!(out, last(best))
+    end
+    return out
+end
+
+# The better of two signed scorings, read off the `exact` fraction the detail line carries. Comparing on
+# `exact` rather than on the gate's verdict, since a pair whose base level was skipped fails both signs and
+# the sign is still determined.
+function _better_endpoint(a, b)
+    ea, eb = _exact_fraction(last(a).detail), _exact_fraction(last(b).detail)
+    return eb > ea ? b : a
+end
+
+function _exact_fraction(detail::AbstractString)
+    m = match(r"exact ([\d.]+)%", detail)
+    return m === nothing ? -1.0 : parse(Float64, m.captures[1])
+end
+
+# ---------------------------------------------------------------------------
 # The ladder
 # ---------------------------------------------------------------------------
 
@@ -440,7 +536,7 @@ function e2e(c::GoldenCase; n::Union{Integer,Nothing} = nothing, stop_on_red::Bo
     @info "e2e setup" product=c.product region=s.info.name epsg=s.info.epsg window=size(s.window) dt_days=geogrid_seconds(c) / 86400
 
     out = StageResult[]
-    for rung in (rung_grid, rung_geogrid, rung_params)
+    for rung in (rung_grid, rung_geogrid, rung_params, rung_endpoint)
         rs = rung(s)
         append!(out, rs)
         stop_on_red && !all(r -> r.passed, rs) && break
