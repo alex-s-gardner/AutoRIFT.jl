@@ -305,7 +305,12 @@ container run left on disk.
 | 5.5 | the geogrid, all 17 bands | the nine `window_*.tif` |
 | 5.6 | the base and maximum chip size, the grid spacing, the upsampling ladder | `capture/call1.json` |
 
-**All twelve optical cases are green on every rung** — every integer band identical over 33.8 million
+**Sixteen of the twenty-two cases are green on every rung** — eleven optical, three Sentinel-1 SLC and
+both NISAR products. `dev/GATES.md` holds the per-case table and the reason each of the other six is not
+there: one `dy` bias, two Sentinel-1 mosaic widths that need a CSLC to measure, and the three OPERA burst
+pairs, which have not been started.
+
+**All twelve optical cases are green through rung 5.6** — every integer band identical over 33.8 million
 grid points on four platforms and three projections, bar a single `search_x` that sits within 3.5e-8 of
 a pixel of a rounding boundary, and every `Float64` band within 1.3e-5 m/yr per pixel of displacement.
 Four of the twelve have their two scenes in different UTM zones; rung 5.2 warps both into one
