@@ -45,7 +45,7 @@ using Dates, Printf
 using ImagePairGeometry
 using ImagePairGeometry: IdentityTransform, LookRight, incidence_angle
 using SLCDatasets
-using SLCDatasets: asf_bursts, merge_bursts, orbit, seconds_between
+using SLCDatasets: asf_bursts, merge_bursts, open_slc, orbit, seconds_between
 
 # Sentinel-1 IW covers the swath with three subswaths, and a full-SLC job processes all three
 # (`s1_isce3.process_slc` defaults `swaths=(1, 2, 3)`).
@@ -207,4 +207,31 @@ function s1_pair(c::GoldenCase, run::AbstractString)
     _, sec_start = s1_mosaic(sg, s1_polarization(sg), s1_orbit(run, sg))
 
     return CoregisteredPair(ref; dt = seconds_between(ref_start, sec_start))
+end
+
+"""
+    nisar_l1_pair(c::GoldenCase, run) -> CoregisteredPair
+
+A NISAR L1 RSLC pair, from the two products the run holds.
+
+Much simpler than Sentinel-1 and for one reason: an RSLC is a single acquisition on a single radar grid,
+so there is nothing to merge and nothing to mosaic. `loadMetadataRslc` (`testGeogrid.py:240-260`) reads
+the zero-Doppler start, the dimensions and the orbit straight off the product, and the orbit travels
+*inside* it rather than in a separate `.EOF` — so no orbit file is resolved here.
+
+`dt` is the full-precision difference of the two zero-Doppler starts, which is what `runGeogrid`'s radar
+branch takes (`:439`). `CoregisteredPair(::SLC, ::SLC)` computes exactly that.
+
+The products are read from the run directory rather than fetched: they are 11.2 GiB each and the driver
+already downloaded them there.
+"""
+function nisar_l1_pair(c::GoldenCase, run::AbstractString)
+    early, late = acquisition_order(c)
+    path(name) = begin
+        p = joinpath(run, name * ".h5")
+        isfile(p) || error("$(name).h5 is not in $run. A NISAR L1 pair is read from the products the " *
+                           "driver downloaded there; each is 11.2 GiB.")
+        p
+    end
+    return CoregisteredPair(open_slc(path(early)), open_slc(path(late)))
 end

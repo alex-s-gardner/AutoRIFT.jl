@@ -4502,3 +4502,49 @@ carries: a pair correlating over SAR speckle puts a few hundred points on the fa
 peak surface, two-sided and tens of pixels out, which drags the mean while the points that agree at all
 sit near zero. Gating the mean sets a threshold around that tail's cancellation; the tail is bounded by
 the p99 instead.
+
+## Where the twenty-two stand
+
+| group | cases | on the ladder |
+|---|---:|---|
+| optical (Landsat 4/5/7/8/9, Sentinel-2) | 12 | **11 green**, 1 red |
+| Sentinel-1 SLC | 5 | **3 green**, 2 blocked at rung 5.0 |
+| Sentinel-1 OPERA burst | 3 | not attempted |
+| NISAR L1 RSLC | 1 | **green** |
+| NISAR L2 GSLC | 1 | **green** |
+
+**Sixteen of the twenty-two are green on every rung the ladder runs.** Two are red for reasons that are
+measured and attributed, and one group of three has not been started.
+
+### NISAR L1 is the simplest radar case, not the hardest
+
+An RSLC is one acquisition on one radar grid, so there is nothing to merge and nothing to mosaic:
+`loadMetadataRslc` reads the zero-Doppler start, the dimensions and the orbit straight off the product,
+and the orbit travels inside it rather than in a separate `.EOF`. `CoregisteredPair(::SLC, ::SLC)` is the
+whole construction, and 28 rungs come out green over 5,382,279 grid points.
+
+Its residual is the same azimuth offset the Sentinel-1 cases show, one step larger: 3.504e-4 relative on
+the three along-track float bands against Sentinel-1's 1.073e-4, and 0.251% of `search_y` indices off by
+one against 0.065%. One mechanism, and the radar bounds are set above the larger of the two.
+
+### The three remaining reds, and what each needs
+
+**`LT05_L1GS_001013`**, the `P000` case: a −0.126 px `dy` bias over 17,968 shared points of 5,048,320, all
+inside a single 324x170 patch, at the smallest base chip in the set (8 px). `dx`'s bias grows with the
+reference's own displacement — −0.064 px in the smallest magnitude quartile to −0.227 in the largest — and
+concentrates in one quadrant at −0.405. That is the gradient-correlated shape, which this file records as
+the signature of a geometry error rather than of arithmetic; on 0.36% coverage it could equally be the
+case being marginal. Needs a difference map before anything else.
+
+**`S1A_IW_SLC__1SSH_20151120` and `S1A_IW_SLC__1SSH_20170221`**: the merged mosaic width, which
+`merge_swaths` takes from the COMPASS CSLC raster of the far subswath's first burst rather than from any
+annotation. Five hypotheses refuted, each by measurement: `samples_per_burst` (the SAFE agrees with ASF's
+burst extractor at 23894, so the input was never wrong), `last_valid_sample + 1`,
+`samples_per_burst - first_valid_sample`, a `first_valid_sample`-adjusted range offset, and a static topo
+layer (none of the five cases used one). What remains is `burst.as_isce3_radargrid()`'s own width, which
+needs a CSLC to measure.
+
+**The three OPERA burst pairs** take `process_burst` rather than `process_slc` and get their geometry from
+the single-burst branch (`testGeogrid.py:141-154`), where `numberOfLines` is the burst's own shape. Their
+inputs are OPERA CSLC-S1 products from ASF rather than SAFE granules, so the route to them is
+`asf_bursts`' sibling rather than `open_slc`.
