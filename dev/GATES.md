@@ -4016,7 +4016,8 @@ reason: `window_location`, `window_offset`, `window_search_range`, the two chip-
 stable-surface mask all pass through a rounding or truncating conversion that absorbs a last-bit
 difference, while the off2vel and scale-factor bands do not.
 
-Rungs 5.2 and 5.3 — the secondary onto the reference's grid, and the pre-geogrid filter on Julia's own
+Rungs 5.2 and 5.3 — the secondary onto the reference's grid, and `apply_landsat_filtering`'s pass over
+the native scene on Julia's own
 read — are not yet wired in. Rung 5.2's optical half runs inside `setup` as the warp that
 `aligned_scenes` performs; its radar half, the coregistration, does not exist. Rung 5.3 is what the
 seven Landsat 4/5/7 cases need before rung 5.4 can reach them, since those are filtered twice on two
