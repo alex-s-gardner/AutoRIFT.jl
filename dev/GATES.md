@@ -4391,3 +4391,54 @@ search radii are the first thing to look at: geogrid-raw against capture-rewritt
 
 **The imagery is still the reference's.** Rungs 5.1, 5.3 and 5.4 replace it, and until they do a
 disagreement here belongs to the grid or the correlator rather than to a filter.
+
+## Rung 5.7 across the optical set, and the NISAR L2 case
+
+Eleven of the twelve optical pairs are green on every rung, endpoint included, and so is the NISAR L2
+GSLC. The endpoint runs on the reference's own imagery — `in_I1`/`in_I2` from the capture — so what it
+measures is the geogrid handoff composed with the correlator; rungs 5.3 and 5.4 are what replace the
+imagery.
+
+| case | rungs | endpoint `dx` / `dy` |
+|---|---|---|
+| `LC08_L1TP_009011` | **29/29** | exact 62.8 / 64.9%, median 0, p99 0.75 / 0.55, bias +0.0067 / −0.0024 |
+| `LC08_L1TP_060018_20130330` | **30/30** | exact 79.5 / 79.7%, median 0, p99 0.094 / 0.086 |
+| `LC08_L1TP_062018` | **29/29** | exact 70.3 / 71.4%, median 0, p99 0.63 / 0.52 |
+| `LC09_L1GT_215109` | **29/29** | exact 69.1 / 71.7%, median 0, p99 0.44 / 0.25 |
+| `LE07_L1TP_061018_20120428` | **30/30** | unquantized: bias +0.00024, p95 0.048, within 0.1 px 97.4% |
+| `LE07_L1TP_061018_20130314` | **30/30** | unquantized: bias +0.00019, p95 0.032, within 0.1 px 98.4% |
+| `LE07_L1TP_063018_20040810` | **29/29** | — |
+| `S2A_MSIL1C_20200626` | **29/29** | exact 78.3 / 78.6%, median 0, p99 0.105 / 0.079 |
+| `S2B_MSIL1C_20200612` | **29/29** | exact 74.7 / 76.2%, median 0, p99 0.5 / 0.31 |
+| `LT04_L1TP_063018` | **29/29** | — |
+| `LT05_L1TP_060018` | **30/30** | — |
+| `LT05_L1GS_001013` | 27/29 | **red**: bias −0.126 px on `dy`, within 0.1 px 44.4% |
+| `NISAR_L2_PR_GSLC` | **26/26** | deferred, 11.5 GiB of imagery |
+
+The thirty-rung cases are the four cross-projection pairs, which run rung 5.2's warp as well.
+
+### The one red is structure, not a threshold
+
+`LT05_L1GS_001013` is the `P000` case — the one golden product with no valid pixel in its ROI, and the
+one that exercises the uncropped path. Its endpoint shares only 17,968 points, its base chip level is
+never reached, and its `dy` carries a **−0.126 px bias** with 44.4% of points within a tenth of a pixel
+against the gate's 45%. `dx` is −0.028 px and 50.9%.
+
+A bias is what the gate exists to catch, and 0.126 px is two upsampling steps. It is not tie-breaking and
+it is not the interpolation regime, both of which are symmetric. Open, and the first thing to look at is
+whether the shared 17,968 points are all in one corner of a grid whose valid region is marginal.
+
+### What the NISAR L2 case adds
+
+It is geocoded, so `nisar_isce3.process_gslc` runs the **projected** geogrid over it with
+`optical_flag = 1` and the pair is correlated from `reference_adjusted.tif` and `secondary_adjusted.tif`
+— `convert_slc_to_uint8_amplitude` of the cropped products, already on one map grid. So no reprojection,
+no filter and no byte rescale apply to it, and the existing projected path handles it unchanged.
+
+What it exercises that no optical case does is an **anisotropic pixel**: 2.5 m in range against 5.0 m in
+azimuth, so `ScaleChipSizeY` is not 1 and `chip_size.Y` differs from `chip_size.X`. Every geogrid band is
+exact over 5,248,672 grid points and the driver's four scalars agree, which is the first evidence that the
+chip-size derivation is right on a non-square pixel rather than merely unexercised.
+
+Its endpoint is deferred rather than attempted: the pair is 11.5 GiB of imagery before the correlator's
+working set, and the thinned endpoint on the NISAR cases is what gate `3.nisar` measures.

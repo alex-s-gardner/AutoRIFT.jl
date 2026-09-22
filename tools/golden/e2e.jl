@@ -569,8 +569,22 @@ function rung_endpoint(s::Setup)
     grid = AutoRIFT.pointset(s.geometry; pixel_size = pix)
     p = AutoRIFT.params(s.geometry; threaded = Threads.nthreads() > 1, preprocess = :none)
 
-    a, b = k.arrays["in_I1"], k.arrays["in_I2"]
     out = StageResult[]
+
+    # **The imagery has to fit.** A NISAR L2 GSLC is 110085 x 54885 bytes, so the pair the reference
+    # correlated is 11 GiB before the correlator's own working set — and the capture holds it as two plain
+    # arrays. Declined with the size rather than attempted: an unblocked run on that pair does not finish,
+    # and the thinned endpoint on these cases is what gate `3.nisar` already measures.
+    # From the manifest, not from the array: asking the array its size is what loads it.
+    pixels = prod(JSON3.read(read(call, String)).arrays["in_I1"].shape)
+    if 2 * pixels > 4 * 2^30
+        push!(out, StageResult("5.7 endpoint", "capture/out_Dx", "gate", true, 0,
+                               @sprintf("deferred: the pair is %.2f GiB of imagery, which an \
+                                         unblocked run cannot hold; the thinned endpoint on this case \
+                                         is gate 3.nisar", 2 * pixels / 2^30)))
+        return out
+    end
+    a, b = k.arrays["in_I1"], k.arrays["in_I2"]
 
     # **The reference correlates a truncated grid, and AutoRIFT.jl does not.** `autoRIFT.py:809-819`
     # chops both axes to a multiple of `chopFactor = max(ChipSizeMaxX) / ChipSize0X` before correlating —
