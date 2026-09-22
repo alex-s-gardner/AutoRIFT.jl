@@ -17,9 +17,15 @@
 # What does carry it is the **orbit**: the `_ANG.txt` beside the MTL holds `EPHEMERIS_ECEF_{X,Y,Z}` at 1 s
 # spacing, and two consecutive positions transformed into the raster's own CRS give the ground-track
 # direction. The projection step is not optional — a slope on a UTM raster is a grid bearing, and grid north
-# departs from true north by the meridian convergence, 3.2° here and more near the poles. Measured that way
-# the orbit's cross-track lands within 0.03° of the reference's, while its along-track differs by a constant
-# 1.89° because the reference takes `nanmax` of two edge slopes and so is biased toward the worse edge.
+# departs from true north by the meridian convergence, 3.2° at `LT05_L1TP_060018` and more near the poles.
+#
+# **Measured over all six scenes of the three L4/5 pairs** (`orbit_angle_check`, gate `5.orbit`): the
+# orbit's cross-track agrees with the reference's to **0.10° at worst**, while its along-track sits
+# **1.45° to 1.89° below** it. The error is the reference's and it is all in one axis — the orbit's two
+# directions are perpendicular to the last digit by construction, and the reference's are 91.42° to 91.86°
+# apart, never 90°. Its own non-perpendicularity accounts for the along-track gap case by case, which is
+# what identifies `nanmax` over two edge slopes as the cause: the worse-conditioned edge wins and only the
+# along-track pair is affected.
 #
 # `tools/golden/README.md` registers the orbit route as the more correct alternative, to be adopted once the
 # L4/5 pairs agree. `mtl_corners` and `scan_angles` below are kept for that comparison, not because the
@@ -140,6 +146,227 @@ function reference_scan_angles(log::AbstractString)
             push!(out, (; along, cross = parse(Float64, m.captures[1])))
             along = nothing
         end
+    end
+    return out
+end
+
+"""
+    ang_fields(path) -> Dict{String,Vector{Float64}}
+
+Every numeric field of a Landsat `_ANG.txt`, scalars as one-element vectors.
+
+A separate parser from [`mtl_fields`](@ref) because the format is not the same one: the fields that
+matter here are **parenthesised lists spanning several lines**, `EPHEMERIS_ECEF_X = (-2513196.897534,
+-2519426.030063, ...`, which a line-at-a-time `KEY = VALUE` reader truncates to its first row without
+complaining. Numeric rather than textual for the same reason `mtl_fields` is textual: every consumer
+here wants numbers, and a malformed ephemeris should fail at the parse rather than reach a bearing.
+"""
+function ang_fields(path::AbstractString)
+    isfile(path) || error("no ANG at $path")
+    out = Dict{String,Vector{Float64}}()
+    text = read(path, String)
+    key = nothing
+    buf = Float64[]
+    open_list = false
+    for raw in split(text, '\n')
+        s = strip(raw)
+        if open_list
+            # A continuation row of the list opened above; the closing parenthesis ends it.
+            done = occursin(')', s)
+            append!(buf, _numbers(s))
+            if done
+                out[key] = copy(buf)
+                open_list = false
+            end
+            continue
+        end
+        i = findfirst('=', s)
+        i === nothing && continue
+        k = strip(s[1:prevind(s, i)])
+        v = strip(s[nextind(s, i):end])
+        (startswith(k, "GROUP") || startswith(k, "END_GROUP")) && continue
+        if startswith(v, "(")
+            key = String(k)
+            buf = _numbers(v)
+            occursin(')', v) ? (out[key] = copy(buf)) : (open_list = true)
+        else
+            n = tryparse(Float64, v)
+            n === nothing || (out[String(k)] = [n])
+        end
+    end
+    isempty(out) && error("$path parsed to no numeric fields; is it an ANG?")
+    return out
+end
+
+_numbers(s::AbstractString) =
+    [parse(Float64, m.match) for m in eachmatch(r"-?\d+\.?\d*(?:[eE][-+]?\d+)?", s)]
+
+"""
+    ang_ephemeris(path) -> NamedTuple
+
+The satellite's trajectory from `_ANG.txt`: `time` in seconds of day and `x`, `y`, `z` in ECEF metres.
+
+`GROUP = EPHEMERIS` carries `NUMBER_OF_POINTS` samples at 1 s spacing, centred on the acquisition. The
+count is checked against all four vectors rather than trusted, because a truncated list would otherwise
+produce a shorter trajectory and a bearing taken from the wrong pair of points.
+"""
+function ang_ephemeris(path::AbstractString)
+    f = ang_fields(path)
+    get1(k) = haskey(f, k) ? f[k] :
+              error("$path has no $k; the ephemeris is what the scan geometry is derived from")
+    t, x, y, z = get1("EPHEMERIS_TIME"), get1("EPHEMERIS_ECEF_X"),
+                 get1("EPHEMERIS_ECEF_Y"), get1("EPHEMERIS_ECEF_Z")
+    n = haskey(f, "NUMBER_OF_POINTS") ? Int(first(f["NUMBER_OF_POINTS"])) : length(t)
+    all(v -> length(v) == n, (t, x, y, z)) || error(
+        "$path declares $n ephemeris points but parsed " *
+        "$(length(t))/$(length(x))/$(length(y))/$(length(z)); the list parse is wrong")
+    return (; time = t, x, y, z)
+end
+
+"""
+    orbit_scan_angles(ang_path, epsg; spacing) -> (along_track, cross_track)
+
+The scan geometry from the **orbit**, in the reference's own angle convention.
+
+Two consecutive ephemeris positions transformed into the raster's CRS give the ground-track direction
+directly, which is what `_fft_filter` is trying to recover from the valid-data region's shape. The pair
+is taken at the middle of the ephemeris, which is where the acquisition is centred.
+
+**The projection step is not optional.** A slope on a UTM raster is a *grid* bearing, and grid north
+departs from true north by the meridian convergence — 3.2° at `LT05_L1TP_060018`, more near the poles.
+Taking the bearing from ECEF or from lat/lon and calling it a raster angle would be wrong by exactly
+that.
+
+The two returned angles are perpendicular by construction, which is the property the reference's pair
+does *not* have: it logs 71.60° and −20.25°, which are 91.85° apart. `spacing` is required for the
+reason it is in [`scan_angles`](@ref) — a non-square pixel does not cancel out of a slope.
+"""
+function orbit_scan_angles(ang_path::AbstractString, epsg::Integer; spacing::Tuple{Real,Real})
+    e = ang_ephemeris(ang_path)
+    k = length(e.time) ÷ 2
+    # Geocentric ECEF is EPSG:4978. `order = :trad` keeps the projected result (x, y).
+    p = Vector{Tuple{Float64,Float64}}(undef, 2)
+    ArchGDAL.crs2transform(EPSG(4978), EPSG(Int(epsg)); order = :trad) do tf
+        for (j, i) in enumerate((k, k + 1))
+            q = ArchGDAL.createpoint(e.x[i], e.y[i], e.z[i])
+            ArchGDAL.transform!(q, tf)
+            p[j] = (ArchGDAL.getx(q, 0), ArchGDAL.gety(q, 0))
+        end
+    end
+    # **Magnitudes, so the frame stays y-up.** `spacing` is only here to undo pixel anisotropy — an
+    # angle on a grid sampled differently in x and y is not the angle in metres — and dividing by a
+    # north-up raster's *signed* `-30` would flip the bearing into a row-down frame and negate both
+    # results. Measured on both scenes of `LT05_L1TP_060018`: y-up reproduces the reference's signs,
+    # row-down inverts them.
+    sx, sy = abs(Float64(spacing[1])), abs(Float64(spacing[2]))
+    dx = (p[2][1] - p[1][1]) / sx
+    dy = (p[2][2] - p[1][2]) / sy
+    # The reference's convention: `atan` of a ratio, in degrees, so the result is in (-90, 90) and
+    # carries no quadrant. The ground track is the **along**-track direction and the cross-track is its
+    # perpendicular, folded back into the same open interval.
+    along = rad2deg(atan(dy / dx))
+    cross = along + (along > 0 ? -90.0 : 90.0)
+    return (along, cross)
+end
+
+"""
+    ang_path(scene_path) -> String
+
+The `_ANG.txt` beside a Landsat band raster, on whatever route reached the band.
+
+Derived from the band's own path rather than resolved separately, so a scene read from `/vsis3` finds
+its ephemeris in the same bucket and one read from disk finds it in the same directory.
+"""
+ang_path(scene::AbstractString) =
+    replace(scene, r"_B\d+\.TIF$"i => "_ANG.txt")
+
+"""
+    vsi_text(path) -> String
+
+A whole text object read through GDAL's virtual filesystem.
+
+The route exists because an `_ANG.txt` is only reachable over requester-pays S3: the STAC item's plain
+`https` href redirects to an HTML landing page rather than the object, so `Downloads.download` returns a
+login form that parses to no fields. `/vsis3` with `AWS_REQUEST_PAYER` is the same access this harness
+already uses for the band rasters, and `ArchGDAL.GDAL` re-exports the VSI calls, so this needs no
+dependency `ArchGDAL` does not already bring.
+"""
+function vsi_text(path::AbstractString)
+    G = ArchGDAL.GDAL
+    ArchGDAL.setconfigoption("AWS_REQUEST_PAYER", "requester")
+    h = G.vsifopenl(path, "rb")
+    h == C_NULL && error("cannot open $path through GDAL's virtual filesystem; a requester-pays " *
+                         "object needs AWS_PROFILE to name credentials that can pay")
+    try
+        G.vsifseekl(h, 0, 2)                 # SEEK_END
+        n = Int(G.vsiftelll(h))
+        G.vsifseekl(h, 0, 0)
+        buf = Vector{UInt8}(undef, n)
+        got = G.vsifreadl(pointer(buf), 1, n, h)
+        Int(got) == n || error("short read of $path: $got of $n bytes")
+        return String(buf)
+    finally
+        G.vsifclosel(h)
+    end
+end
+
+"""
+    scene_ang(name, cache) -> String
+
+A local copy of `name`'s `_ANG.txt`, fetched once through the STAC item and cached.
+
+Cached because the gate reads it on every run and the object is requester-pays: 34 KiB is not the cost,
+the round trip is. The name is the granule's, so a cache entry is unambiguous.
+"""
+function scene_ang(name::AbstractString, cache::AbstractString)
+    local_path = joinpath(cache, name * "_ANG.txt")
+    isfile(local_path) && return local_path
+    mkpath(cache)
+    url = "https://landsatlook.usgs.gov/stac-server/collections/landsat-c2l1/items/$name"
+    item = JSON3.read(String(take!(Downloads.download(url, IOBuffer(); timeout = 60))))
+    asset = get(item.assets, Symbol("ANG.txt"), nothing)
+    asset === nothing && error("STAC item $name has no `ANG.txt` asset")
+    href = asset.alternate.s3.href
+    text = vsi_text("/vsis3/" * href[6:end])
+    # Through a temporary, so an interrupted fetch does not leave a truncated file that parses.
+    tmp = local_path * ".partial"
+    write(tmp, text)
+    mv(tmp, local_path; force = true)
+    return local_path
+end
+
+"""
+    orbit_angle_check(c::GoldenCase, run, cache) -> Vector{NamedTuple}
+
+Each filtered scene's orbit-derived scan angles beside the reference's own logged pair.
+
+The comparison the register turns on: whether the `_ANG.txt` ephemeris reproduces what `_fft_filter`
+recovers from the valid-data region's shape, and where it does not, whether the orbit or the pixels are
+the better answer. Scenes are taken in **job order**, since `apply_landsat_filtering(reference,
+secondary)` filters and logs them in that order rather than in acquisition order.
+
+Each scene's EPSG comes from its own `filtered/` raster: the two scenes of a cross-zone pair are in
+different projections, and a bearing is a grid bearing, so using one CRS for both would put the second
+scene's angles several degrees out.
+"""
+function orbit_angle_check(c::GoldenCase, run::AbstractString, cache::AbstractString)
+    logged = reference_scan_angles(joinpath(run, "capture.log"))
+    names = [first(c.reference), first(c.secondary)]
+    length(logged) >= length(names) || error(
+        "$(run)/capture.log logs $(length(logged)) angle pairs for $(length(names)) filtered " *
+        "scenes; the log is truncated or this is not an L4/L5 pair")
+    out = NamedTuple[]
+    for (i, name) in enumerate(names)
+        tif = joinpath(run, "filtered", name * "_B2.TIF")
+        isfile(tif) || error("no $tif; the scene EPSG and spacing are read from the filtered raster")
+        ds = ArchGDAL.read(tif)
+        epsg = parse(Int, ArchGDAL.toEPSG(ArchGDAL.importWKT(ArchGDAL.getproj(ds))) |> string)
+        gt = ArchGDAL.getgeotransform(ds)
+        along, cross = orbit_scan_angles(scene_ang(name, cache), epsg; spacing = (gt[2], gt[6]))
+        r = logged[i]
+        push!(out, (; name, epsg, along, cross, ref_along = r.along, ref_cross = r.cross,
+                    d_along = along - r.along, d_cross = cross - r.cross,
+                    ours_apart = abs(along - cross), ref_apart = abs(r.along - r.cross)))
     end
     return out
 end
