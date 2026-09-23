@@ -4806,26 +4806,38 @@ the median alone, at roughly 2.6x the gate.
     only ~4e4 and the difference of squares does not cancel catastrophically. Accumulating the window in
     `Float32` row-major against `Float32` column-major gives **identical** results — median 0, max 0.
 
-**What it is: the box filter's accumulation precision, amplified by a scene with almost no contrast.**
-`_masked_boxmean` accumulates running sums in `Float64` where `cv2.filter2D` convolves in `Float32`, and
-this scene's DN spans 196 to 207 over its middle 99% — so the local standard deviation is tiny and dividing
-by it amplifies any difference in the local mean. Measured on the Wallis output, `Float32` against
-`Float64` accumulation:
+  * **Not the box filter's accumulator width, and not its sliding-window scheme.** An earlier revision of
+    this page named that as the cause. It cannot be: `_ref_wallis`, the harness's reproduction of the
+    reference, already accumulates in `Float32` with a direct 25-tap sum — cv2's own precision model — and
+    feeding *it* to `destripe` still gives 0.0053794. The 6.7e-4 measured between `Float32` and `Float64`
+    accumulation is real but is a different quantity from the residual, and 8x too small for it.
+  * **Not the reflection variant, and the earlier border result was right by accident.** cv2 asks for
+    `BORDER_REFLECT`, which includes the edge pixel, where the harness reflects 101-style. Substituting it
+    changes the Wallis output by **exactly zero** — an L1GS footprint is a rotated parallelogram, so the
+    whole raster border is nodata and reflection never reaches a valid pixel's 5x5 window. Neither border
+    hypothesis was ever testable on this scene.
+  * **Only 12% is the normalized kernel.** cv2 divides the kernel *before* convolving, so it computes
+    `sum(v^2 * 0.04)` with 25 separate roundings where summing and dividing once is a different
+    computation. Reproducing that takes the median from 0.0053794 to **0.0047342**, the p99.9 from 0.0615
+    to 0.0399 and the max from 0.423 to 0.255. A real contributor, and not the cause.
 
-| case | DN median / p99 | Wallis output, F32 vs F64 | rung 5.3 residual |
-|---|---|---:|---:|
-| `LT05_L1GS_001013` | 196 / 207 | **6.7e-4** | 0.0054 |
-| `LT04_L1TP_063018` | 192 / 255 | 4.9e-6 | 0.00069 |
+**There is no single cause, and the arithmetic of this scene says there cannot be.** Its DN runs 196 to 249
+with the middle 99% inside 196 to 207, so a 5x5 window has `E[x²]` near 38416 and a variance near **4** —
+the adopted `E[x²] - E[x]²` obtains that 4 by cancelling two numbers near 38416, where a `Float32` mantissa
+resolves only 0.0039. The variance therefore carries a few tenths of a percent of error whatever order the
+terms are summed in, the standard deviation half that, and dividing by it lands ~0.005 in the output. That
+is the measured residual.
 
-A 137x spread in precision sensitivity across two scenes of the same sensor and the same filter, tracking
-contrast rather than brightness. It is the same ordering as the residuals themselves, and it is why this
-case is the hard one while `LT04_L1TP_063018` is green.
+**So 0.005 is the `Float32` noise floor of the formula adopted in `CORRECTNESS.md` item 4, and rung 5.3's
+median gate of 0.002 is below it.** Two independent implementations of that formula cannot agree more
+closely than this on a scene whose variance-to-mean-squared ratio is 1e-4, short of reproducing
+`cv2.filter2D` bit for bit. The stable about-the-mean form has no such floor — it is the *accurate* form
+that was given up for agreement — so this is a cost of item 4 rather than a defect to find. The honest
+resolution is to gate rung 5.3 relative to the local contrast the scene actually has, rather than to widen
+an absolute bound until this case fits; the case stays red until that is decided.
 
-**So closing it means matching `cv2.filter2D`'s accumulation, not fixing a defect.** That is another
-agreement-over-accuracy change of the same kind as item 4, and a more invasive one: `windowmean`'s
-`Float64` running sums are deliberate — `REFERENCE.md` records a running sum drifting across a whole row —
-and every local filter in the package shares them. It is not attempted here, and the case stays red at
-rung 5.3 with the cause named rather than open.
+For contrast, `LT04_L1TP_063018` spans DN 192 to 255 with a real spread, so its variance is not a near-total
+cancellation and it sits at 0.00069 against a gate of 0.00158 — green on the same code.
 
 ### The gap-fill branch matches its decisions exactly and cannot match its values
 
