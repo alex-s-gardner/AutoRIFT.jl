@@ -4361,6 +4361,31 @@ positions each — and the result is uniform:
 both sides — `reference.tif` against the raw reference burst — peaks at `(0, 0)` with correlation
 **1.000**, so the mosaic row mapping is exact and the residual is not the comparison's.
 
+### Resolved: `Geo2Rdr`'s own convention, and the geometry agrees to eight decimals
+
+The one line is ISCE3's, and it was settled by running ISCE3 rather than reasoning about it.
+`tools/golden/isce_offsets.py` executes `Rdr2Geo` and `Geo2Rdr` with COMPASS's own arguments — a
+zero-Doppler `LUT2d()` for each and the burst's own `as_isce3_radargrid()`, read straight out of
+`s1_rdr2geo.run` and `s1_geo2rdr.run` — and reads the `azimuth.off` and `range.off` the resampler
+consumes. Over twenty points spanning a burst:
+
+| axis | julia − isce3, before the correction | after | scatter |
+|---|---:|---:|---:|
+| range | **−0.00000000** | −0.00000000 | sd 8.0e-10 |
+| azimuth | **+0.99999904** | −0.00000096 | sd 5.1e-08 |
+
+So `Geo2Rdr` does not define the azimuth offset as `(t − t₀)·prf − line`; it defines it one line lower.
+Subtracting that one line leaves the two implementations agreeing **to eight decimal places on both
+axes** — the geometry was never wrong, and what looked like an error was a single exact constant.
+
+**COMPASS's chain matches the Julia construction step for step**, which is why only the convention was
+left: `s1_rdr2geo` builds the reference's `topo` on the burst's own grid at zero Doppler; `s1_geo2rdr`
+solves the *secondary's* grid and orbit against that topo, also at zero Doppler; `s1_resample` consumes
+the resulting offsets. The Doppler LUT and azimuth carrier polynomial reach `ResampSlc` for the deramp
+and the flattening, which are phase operations and move no amplitude.
+
+The independent check came first and is what established the residual was real rather than bookkeeping:
+
 **Pinned to sub-pixel precision, then narrowed by elimination.** Refining the correlation peak with a
 parabola over 15 points — five bursts at three range positions — gives a residual of
 **+1.0162 ± 0.0310 lines**, median +1.0250. Integer search alone could not have said this: the true offset
@@ -4376,10 +4401,8 @@ Four candidate causes, each ruled out by measurement rather than by argument:
 | the Sentinel-1 bistatic delay | `burst.bistatic_delay()` evaluated in lines | 0.234–0.264 lines, and **identical** for both acquisitions, so it cancels in the difference |
 
 A strongly line-varying term is excluded by the same line-invariance, which rules out the TOPS steering
-Doppler as well. What is left is a **constant one-line index convention inside COMPASS's resampling** —
-not in the metadata, not in the grid, not in the azimuth corrections. `s1reader` and `isce3` are installed
-locally and were used for the tests above; COMPASS itself is not, so reading `s1_cslc`'s offset convention
-needs the container.
+Doppler as well. Every elimination pointed at a constant index convention, which the ISCE3 run above then
+confirmed exactly.
 
 One structural detail confirms the solve is tracking the metadata correctly rather than by luck: the
 annotation places bursts 2, 6 and 7 one line differently from 1, 3, 4 and 5 (443.35 against 442.35 lines

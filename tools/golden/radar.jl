@@ -523,23 +523,26 @@ resulting position, solve again. Four passes, which is past convergence for Sent
 round to a whole line and sample for the geogrid's benefit, which is exactly the sub-pixel part a
 resampler needs.
 
-# What this reproduces, and the one thing it does not
+# The one line, and where it comes from
 
-Validated against COMPASS's own coregistration on `S1C_IW_SLC__1SSV_20250416`, by correlating
-`secondary.tif` — the secondary already resampled onto the reference grid — against the *raw* secondary
-burst. Those are the same acquisition, so the peak locates COMPASS's offset rather than any prediction,
-and it is sharp: correlation 0.61 to 0.78 across bursts 1, 3 and 5 at two range positions each.
+**`Geo2Rdr` does not define the azimuth offset as `(t - t0) * prf - line`.** It defines it one line
+lower, so that is subtracted here. Measured against ISCE3 itself rather than inferred:
+`tools/golden/isce_offsets.py` runs `Rdr2Geo` and `Geo2Rdr` with COMPASS's own arguments and reads the
+`azimuth.off` and `range.off` the resampler consumes. Over twenty points spanning a burst of
+`S1C_IW_SLC__1SSV_20250416`:
 
-    range:   exact, 0 samples at every point tested
-    azimuth: a systematic  -1.00 line
+    range:   julia - isce3  mean -0.00000000   sd 8.0e-10
+    azimuth: julia - isce3  mean +0.99999904   sd 5.1e-08   before this correction
 
-The azimuth residual is one line, the same at every point, and it is not the comparison's: the same
-correlation run with the *reference* on both sides — `reference.tif` against the raw reference burst —
-peaks at `(0, 0)` with correlation **1.000**, so the mosaic row mapping is exact and the one line
-belongs to the geometry. A convention shared by both acquisitions would cancel in the difference, so
-the cause is an asymmetry: the next thing to check is each burst's `sensing_start` against the
-annotation's own `azimuthTime`, since `s1reader` and `SLCDatasets` need not place a burst's first line
-identically.
+So the geometry agrees with the reference implementation to eight decimal places on both axes and the
+difference is a single exact constant. It is the *resampling position* that matters to a caller — the
+input line a given output line reads from — and that is what this returns.
+
+Confirmed independently against the imagery before ISCE3 was consulted, which is what said the residual
+was real rather than a bookkeeping artifact: correlating `secondary.tif` against the *raw* secondary
+burst locates the offset COMPASS actually used, since those are the same acquisition, and a parabola
+through the peak over fifteen points gave +1.0162 +/- 0.0310 lines. The same correlation with the
+*reference* on both sides peaks at `(0, 0)` with correlation 1.000, so the mosaic mapping is exact.
 """
 function coregistration_offset(cr, cs, line::Integer, sample::Integer, height;
                                iters::Integer = 4)
@@ -558,6 +561,7 @@ function coregistration_offset(cr, cs, line::Integer, sample::Integer, height;
     pm, vm = ImagePairGeometry.interpolate(cs.orbit, ImagePairGeometry.orbit_midtime(cs))
     p = ImagePairGeometry.geo2rdr(cs.orbit, xyz, ImagePairGeometry.midtime(cs),
                                  ImagePairGeometry.orbit_midtime(cs), pm, vm)
-    return ((p.aztime - cs.sensing_start) * cs.prf - line,
+    # The `- 1` is `Geo2Rdr`'s convention, measured against it; see above.
+    return ((p.aztime - cs.sensing_start) * cs.prf - line - 1,
             (p.range - cs.starting_range) / cs.dr - sample, h)
 end
