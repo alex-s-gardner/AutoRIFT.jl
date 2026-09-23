@@ -1123,6 +1123,9 @@ function rung_filter(s::Setup)
             wr = _ref_wallis(img, 5)
             wr[.!valid] .= 0.0f0
             keep = valid .& wmask
+            # One pass over the scene, shared by both variants: the floor is the scene's, not the
+            # implementation's.
+            cond = wallis_conditioning(img, valid, 5)
             best = nothing
             parts = String[]
             for (label, w) in (("ours", wj), ("reference variance", wr))
@@ -1132,7 +1135,7 @@ function rung_filter(s::Setup)
                 # decline returns the clamped input, so `d == _clamped(w)` is the branch that was taken.
                 cl = _clamped(w, valid)
                 ours = !all(j -> d[j] == cl[j], eachindex(d))
-                st = _filter_stage("5.3 $name $label", img_path, d, truth, keep)
+                st = _filter_stage("5.3 $name $label", img_path, d, truth, keep; conditioning = cond)
                 push!(parts, @sprintf("%s: reject %s (reference %s), %s", label,
                                       ours ? "fired" : "declined", fired[i] ? "fired" : "declined",
                                       st.detail))
@@ -1140,8 +1143,10 @@ function rung_filter(s::Setup)
                 score = (agree, agree && st.passed)
                 best = best === nothing || score > best[1] ? (score, st) : best
             end
+            # The inner stage's own gate text, so a scene whose bound came from its conditioning rather
+            # than from the absolute median says so instead of reporting a threshold it was not held to.
             push!(out, StageResult("5.3 $name wallis+destripe", basename(img_path),
-                                   "reject agrees & median<=1e-3 p99.9<=5e-2 of scale",
+                                   "reject agrees & " * last(best).gate,
                                    last(best).passed && first(best)[1], last(best).n,
                                    join(parts, " | ")))
         end
@@ -1257,7 +1262,46 @@ end
 # median and the 99.9th percentile rather than on a maximum: the Wallis variance difference is a
 # deliberate accuracy improvement, so a few pixels in a low-contrast window legitimately diverge, and a
 # maximum would gate on the worst-conditioned pixel in a hundred million.
-function _filter_stage(name, ref_path, jl, ref, keep; max_median = 1e-3)
+"""
+    wallis_conditioning(img, valid, width) -> Float64
+
+How far one ulp of the adopted variance formula's cancellation moves the Wallis quotient, relative to the
+field — the conditioning of `sqrt(E[x²] - E[x]²)` on this scene, and a property of the scene rather than of
+either implementation.
+
+`_masked_boxstd` computes the variance as a difference of two nearly equal `Float32` quantities
+(`CORRECTNESS.md` item 4). The error that leaves in the variance is about `eps(E[x²])`, which moves the
+standard deviation by `eps(E[x²]) / 2σ` and so the quotient `(x - m) / σ` by
+
+    eps(Float32(E[x²])) / (2 σ²)
+
+relatively. That is tiny on a scene with real contrast and large on one without: measured across the six
+`wallis+destripe` scenes it runs from **2.3e-5** on `LT04_L1TP_063018` to **3.2e-3** on
+`LT05_L1GS_001013`, a hundredfold spread that tracks the residuals rather than the brightness — 196 to 207
+DN over that scene's middle 99% leaves a local standard deviation near 0.8 against an `E[x²]` near 38574.
+
+Returned as a median over the scene, which is what a median residual is judged against.
+"""
+function wallis_conditioning(img::AbstractMatrix{Float32}, valid, width::Integer)
+    w = Int(width)
+    m1 = AutoRIFT._masked_boxmean(img, valid, w)
+    sq = Matrix{Float32}(undef, size(img))
+    for i in eachindex(sq)
+        sq[i] = valid[i] ? img[i]^2 : NaN32
+    end
+    m2 = AutoRIFT.windowmean(sq, w; hasnan = !all(valid))
+    rel = Float64[]
+    for i in eachindex(m1, m2)
+        (valid[i] && isfinite(m1[i]) && isfinite(m2[i])) || continue
+        v = Float64(max(m2[i] - m1[i] * m1[i], 0.0f0))
+        v > 0 || continue
+        push!(rel, eps(Float32(m2[i])) / (2v))
+    end
+    return isempty(rel) ? 0.0 : median(rel)
+end
+
+function _filter_stage(name, ref_path, jl, ref, keep; max_median = 1e-3,
+                       conditioning = 0.0)
     if size(jl) != size(ref)
         return StageResult(name, basename(ref_path), "tolerance", false, 0,
                            "shape $(size(jl)) against reference $(size(ref))")
@@ -1272,9 +1316,22 @@ function _filter_stage(name, ref_path, jl, ref, keep; max_median = 1e-3)
     med = median(d)
     p999 = quantile(d, 0.999)
     scale = quantile(filter(isfinite, abs.(vec(Float64.(ref)))), 0.99)
-    passed = med <= max_median * max(scale, 1) && p999 <= 5e-2 * max(scale, 1)
-    return StageResult(name, basename(ref_path),
-                       @sprintf("median<=%.0e p99.9<=5e-2 of scale", max_median), passed,
+    # **The median is gated against the larger of an absolute bound and the scene's own numerical floor.**
+    # `CORRECTNESS.md` item 4 adopted the reference's `E[x²] - E[x]²`, which on a scene with almost no
+    # local contrast obtains a small variance by cancelling two large nearly equal `Float32` numbers. Two
+    # independent implementations of that formula cannot agree more closely than a couple of ulps of the
+    # cancellation, so an absolute bound below it is not a test of either — it is a test of whether the
+    # scene happens to be well conditioned. [`wallis_conditioning`](@ref) is that floor, and the factor of
+    # two is the cancellation being a difference of two separately rounded terms rather than one.
+    #
+    # Measured across the six `wallis+destripe` scenes, the conditioning term binds on exactly the one
+    # scene whose contrast is degenerate and leaves the other five on the absolute bound unchanged.
+    floor_med = max(max_median, 2 * conditioning)
+    passed = med <= floor_med * max(scale, 1) && p999 <= 5e-2 * max(scale, 1)
+    gate = conditioning > max_median / 2 ?
+           @sprintf("median<=%.1e (2x conditioning) p99.9<=5e-2 of scale", floor_med) :
+           @sprintf("median<=%.0e p99.9<=5e-2 of scale", max_median)
+    return StageResult(name, basename(ref_path), gate, passed,
                        length(d),
                        @sprintf("%d compared; median %.4g, p99.9 %.4g, max %.4g against a p99 \
                                  magnitude of %.4g", length(d), med, p999, maximum(d), scale))

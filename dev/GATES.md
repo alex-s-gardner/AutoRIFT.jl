@@ -4369,6 +4369,38 @@ relative to a peak amplitude of 4,665 while a byte level here is not. `in_I1` re
 same code is what makes this a property of the secondary's resample rather than of the quantization, and it
 is the open thread on this case.
 
+### Rung 5.3's median is gated against the scene's own conditioning
+
+`CORRECTNESS.md` item 4 adopted the reference's `sqrt(E[x²] - E[x]²)`. On a scene with almost no local
+contrast that obtains a small variance by cancelling two large nearly equal `Float32` numbers, so two
+independent implementations of the same formula cannot agree below a couple of ulps of the cancellation. An
+absolute median bound under that floor tests whether the scene happens to be well conditioned rather than
+testing either implementation.
+
+The floor is the conditioning of the quotient: one ulp in `E[x²]` moves the standard deviation by
+`eps(E[x²]) / 2σ` and so `(x - m) / σ` by `eps(Float32(E[x²])) / (2σ²)` relatively. Measured as a median
+over each scene, against the residual each one actually shows:
+
+| scene | reject | local sd | E[x²] | conditioning | residual / scale |
+|---|---|---:|---:|---:|---:|
+| `LT04 ... 19880611` | fired | 4.877 | 36852 | 3.2e-5 | 4.7e-4 |
+| `LT04 ... 19880627` | fired | 4.192 | 18351 | 2.3e-5 | 2.2e-4 |
+| `LT05_L1TP_060018 ... 19851028` | declined | 1.242 | 4278 | 1.0e-4 | 2.5e-5 |
+| `LT05_L1GS_061018 ... 19860123` | declined | 0.676 | 849 | 7.4e-5 | 3.0e-5 |
+| `LT05_L1GS_001013 ... 19920425` | fired | **0.802** | **38574** | **3.2e-3** | 2.4e-3 |
+| `LT05_L1GS_001013 ... 19920628` | fired | **0.918** | **62062** | **2.4e-3** | 3.0e-3 |
+
+A hundredfold spread that tracks contrast rather than brightness — the two hard scenes are *dark in
+variance and bright in level*, 196 to 207 DN across the middle 99% of one of them. So the gate is
+`median <= max(1e-3, 2 x conditioning) x scale`, where the two is the cancellation being a difference of two
+separately rounded terms. **The conditioning term binds on exactly the one degenerate scene and leaves the
+other five on the absolute bound unchanged**, which the re-swept optical set confirms: eleven of twelve
+green, with no case moving except the intended one.
+
+`LT05_L1GS_001013` then clears rung 5.3 on both scenes and its ladder runs on to rung 5.7, where it reds on
+the coarse endpoint bias already tabulated for it — hidden until now behind the earlier red rather than
+absent.
+
 ### `S1A ... 20170221` is green, and the Sentinel-1 SLC path has no metadata gap left
 
 **37 rungs, 37 green.** The two fixes it needed were the same one seen twice: the mosaic's extents follow
