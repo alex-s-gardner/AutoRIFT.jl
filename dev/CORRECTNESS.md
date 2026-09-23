@@ -107,6 +107,28 @@ centroid, so the two coincide by construction. What matters is that **both halve
 changing the correlation position without the read-back measures the field in one place and reports it at
 another, which is measurable as the coarse residual growing rather than shrinking.
 
+### What the end-to-end ladder added, and the condition for acting on items 2 and 3
+
+The ladder localized these two precisely enough to say what fixing them should achieve and how to check it.
+Splitting each golden endpoint's residual by the chip size its points resolved at — `rung_endpoint`'s
+`_by_level`, `dev/GATES.md` — gives the same answer on every case measured:
+
+  * **every base level agrees with the reference to a median of exactly 0** and a bias under 0.0004 px;
+  * the whole-field bias tracks **only** the share of points that never reached the base level, and nothing
+    else: 62% at base gives −0.006, 35% gives −0.039, 0% gives −0.089.
+
+So these two items are the whole of two golden reds — `LT05_L1GS_001013`, which has **no** base-level
+measurement at all, and `S1C_IW_SLC__1SSV_20250416T010159`, which has 35% — and they are not implicated
+anywhere else. A fix should take those two cases' endpoint bias to the base level's, which is zero.
+
+**Deferred by decision until the rest of the golden set is green, and the reason is measurability rather
+than caution.** These are the widest-blast-radius items in the register: the node position is a property of
+the *grid*, so changing it moves the coarse levels of every radar and NISAR case at once and re-opens the
+`3.rdr` and `3.nisar` gates. With four cases still red on a missing COMPASS CSLC, a change here could not be
+attributed — a green that appeared and a red that appeared would be indistinguishable from each other and
+from the CSLC gap. Act on it when the reds that remain are only these two, and measure against all 22 plus
+both radar gates, not against the two targets.
+
 ## 4. The rest of the register
 
 Recorded in full, with per-item evidence and revisit conditions, in **`tools/golden/README.md`**:
