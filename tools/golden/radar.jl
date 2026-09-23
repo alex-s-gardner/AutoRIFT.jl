@@ -160,15 +160,24 @@ and the centre moves when the range extent widens from one subswath to three.
 The absolute sensing start comes back alongside, because the pair's interval is the difference of two
 acquisitions' and each acquisition's own `sensing_start` is relative to its own orbit epoch.
 """
-function s1_mosaic(src::Union{AsfSwaths,SafeSwaths}, swaths = S1_SWATHS)
-    ann = [swath_annotation(src, sw) for sw in swaths]
+function s1_mosaic(src::Union{AsfSwaths,SafeSwaths}, swaths = S1_SWATHS; grid = nothing)
+    sws = collect(swaths)
+    ann = [swath_annotation(src, sw) for sw in sws]
+    # **Both extents follow the burst shape `merge_bursts_in_swath` reads, which is the CSLC's.** It takes
+    # `num_az_samples, num_rng_samples` off the first burst's resampled raster (`s1_isce3.py:565-566`), not
+    # off the annotation, and the two coincide only when the reference burst was written by `rdr2geo`. A
+    # pair whose reference took the resample path instead lands on COMPASS's own grid — 136 to 195 lines
+    # taller and 72 to 97 samples narrower — and every extent below inherits that.
+    shape = [grid === nothing ? (a.lines_per_burst, a.samples_per_burst) : grid(sw)
+             for (a, sw) in zip(ann, sws)]
 
     # **The mosaic's extents are `merge_swaths`'s, not a subswath's.** `loadMetadataSlc:210` takes both
     # `numberOfLines` and `numberOfSamples` straight from the merged shape when it is given one — the
     # closed-form width at `:197-200` is only the fallback — so the grid geogrid is told about is the
     # mosaic hyp3 laid out, and both extents have to be reproduced from its own arithmetic.
-    lo = argmin(a -> a.starting_range, ann)
-    hi = argmax(a -> a.starting_range, ann)
+    ilo = argmin(i -> ann[i].starting_range, eachindex(ann))
+    ihi = argmax(i -> ann[i].starting_range, eachindex(ann))
+    lo, hi = ann[ilo], ann[ihi]
     dr = lo.range_pixel_spacing
     adt = lo.azimuth_time_interval
 
@@ -176,8 +185,8 @@ function s1_mosaic(src::Union{AsfSwaths,SafeSwaths}, swaths = S1_SWATHS)
     # merge runs from the first burst's start to the last burst's start plus one burst
     # (`merge_bursts_in_swath:575-579`).
     swath_lines = [1 + round(Int, (seconds_between(first(a.burst_start), last(a.burst_start)) +
-                                   (a.lines_per_burst - 1) * a.azimuth_time_interval) /
-                                  a.azimuth_time_interval) for a in ann]
+                                   (shape[k][1] - 1) * a.azimuth_time_interval) /
+                                  a.azimuth_time_interval) for (k, a) in enumerate(ann)]
 
     # **And then the swath stack adds that whole merged length to the *last* burst's start again**
     # (`merge_swaths:437-439`: `burst_sensing_stop = ref_bursts[-1].sensing_start + burst_length`, where
@@ -192,15 +201,14 @@ function s1_mosaic(src::Union{AsfSwaths,SafeSwaths}, swaths = S1_SWATHS)
     nlines = 1 + round(Int, span / adt)
 
     # `floor` here, against the fallback formula's `round`, and the far subswath's own sample count.
-    nsamples = hi.samples_per_burst +
+    nsamples = shape[ihi][2] +
                floor(Int, (hi.starting_range - lo.starting_range) / dr)
 
     prf = 1 / adt
 
     # The near subswath's merged acquisition supplies what an annotation does not carry: the orbit, its
     # epoch, and the look side.
-    near = argmin(i -> ann[i].starting_range, eachindex(ann))
-    base = merged_swath(src, collect(swaths)[near])
+    base = merged_swath(src, sws[ilo])
     c = RadarCoordinate(base)
     base_start = first(_annotation_of(base).burst_start)
 
@@ -235,7 +243,7 @@ function s1_pair(c::GoldenCase, run::AbstractString)
     # pair before geogrid sees it exactly as it does on the optical path.
     rg, sg = acquisition_order(c)
     src(g) = AsfSwaths(g, s1_polarization(g), s1_orbit(run, g))
-    return _s1_pair(src(rg), src(sg), S1_SWATHS)
+    return _s1_pair(src(rg), src(sg), S1_SWATHS; grid = cslc_grid(run, S1_SWATHS))
 end
 
 """
@@ -264,15 +272,17 @@ function s1_burst_pair(c::GoldenCase, run::AbstractString)
     src(safe) = SafeSwaths(Sentinel1Product(safe; orbit = s1_orbit(run, basename(safe)),
                                             polarization = lowercase(pol(safe)),
                                             swaths = burst_swaths(c)))
-    return _s1_pair(src(early), src(late), burst_swaths(c))
+    return _s1_pair(src(early), src(late), burst_swaths(c); grid = cslc_grid(run, burst_swaths(c)))
 end
 
 # Shared by both routes, because only the annotation source and the subswath set differ: the reference
 # acquisition's merged grid, and the interval between the two sensing starts.
-function _s1_pair(ref_src, sec_src, swaths)
-    ref, ref_start = s1_mosaic(ref_src, swaths)
+function _s1_pair(ref_src, sec_src, swaths; grid = nothing)
+    ref, ref_start = s1_mosaic(ref_src, swaths; grid)
 
-    # Only the secondary's sensing start is wanted, so its geometry is built and its grid discarded.
+    # Only the secondary's sensing start is wanted, so its geometry is built and its grid discarded — and
+    # with it the question of which acquisition `product/` holds. The mosaic's shape is one thing rather
+    # than one per acquisition, so the grid belongs to the coordinate that is kept.
     _, sec_start = s1_mosaic(sec_src, swaths)
 
     return CoregisteredPair(ref; dt = seconds_between(ref_start, sec_start))
@@ -463,6 +473,25 @@ function burst_offsets(dir::AbstractString)
     finally
         ArchGDAL.setconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", prev)
     end
+end
+
+"""
+    cslc_grid(run, swaths) -> (swath -> (lines, samples)) or `nothing`
+
+The shape `merge_bursts_in_swath` reads per subswath: its **first** burst's resampled raster, since that is
+the one whose `shape` it takes `num_az_samples` and `num_rng_samples` from and then applies to every burst
+of the subswath.
+
+`nothing` when the run kept no `product/`, or when any subswath has no resampled burst in it — a reference
+written by `rdr2geo` has no offsets and its CSLC is the annotation's burst, so the annotation is already
+right there.
+"""
+function cslc_grid(run::AbstractString, swaths)
+    isdir(joinpath(run, "product")) || return nothing
+    dirs = Dict(sw => resampled_burst_dirs(run, sw) for sw in swaths)
+    any(isempty, values(dirs)) && return nothing
+    shapes = Dict(sw => burst_offset_grid(first(dirs[sw])) for sw in swaths)
+    return sw -> shapes[sw]
 end
 
 """
