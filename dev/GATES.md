@@ -4580,9 +4580,34 @@ Wallis difference as the cause rather than something in the reject itself. The r
 branch directly — a decline returns the clamped input, so `d == clamp(w)` is the decision — and reports it
 beside the field, because a whole scene changing is not a slightly larger median.
 
-The reject's own residual is ~0.005 median where both fire, against 5e-5 where both decline. That extra
-two orders of magnitude is the full-scene `Float32` FFT and the bilinearly-rotated band mask, whose cell
-edges need not land identically; `gen_warpaffine`'s fixtures cover that rotation. Measured, not explained.
+### The reject's own residual was the mask's binary edge, and it is fixed
+
+Where both implementations fired the reject the residual was ~0.005 median, against 5e-5 where both
+declined — two orders of magnitude the reject itself was adding. The cause is a **split the reference makes
+and `destripe` did not**: `_fft_filter` counts band power with `filter == 1` but *rejects* with
+`fft * (1 - filter)` on the **float** mask (`autoRIFT.py:208-219`). So a frequency cell the rotated band
+covers partially is attenuated in proportion, where `_reject_band` returned the `== 1` selection and
+`destripe` hard-zeroed it — keeping every partially covered cell in full, a thin ring around the band's
+rotated edge.
+
+`_reject_band` now returns the float mask, the power comparison takes `== 1` of it, and the rejection is a
+proportional multiply. Worth 6x to 17x on the cases where the reject fires:
+
+| scene | before | after | gate |
+|---|---:|---:|---:|
+| `LT04 ... 19880611` | 0.00456 | **0.00069** | 0.00158 |
+| `LT04 ... 19880627` | 0.00486 | **0.00028** | 0.00186 |
+| `LT05_L1GS_001013 ... 19920628` | 0.00833 | 0.00647 | 0.00206 |
+
+**`LT04_L1TP_063018` goes green on both scenes.** The fixture test now asserts the rotated *float* mask as
+well as the `== 1` selection, since the rejection reads every partially covered cell.
+
+`LT05_L1GS_001013` stays red, and for a cause already on this page rather than a new one: its scene 1 has
+AutoRIFT.jl *declining* the reject where the reference fires — the ratio test clears by 3.2% and the
+deliberate Wallis variance moves the field across it. That case cannot go green at rung 5.3 without
+adopting the reference's variance formula, which is the same matching-versus-correctness decision as
+`dev/CORRECTNESS.md` items 2 and 3. Its scene 2's remaining 3x over the gate is unexplained and is the
+smaller question.
 
 ### The gap-fill branch matches its decisions exactly and cannot match its values
 

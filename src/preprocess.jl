@@ -1240,12 +1240,14 @@ function destripe(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::De
         σ² = sum(x -> (Float64(x) - μ)^2, power) / n
         Float32(μ + m.sigma * sqrt(σ²))
     end
+    # `== 1` here and a proportional multiply below, which is the reference's own split: a partially
+    # covered cell does not count toward either band's power but is still partially rejected.
     sum_a = 0
     sum_b = 0
     @inbounds for i in eachindex(power)
         power[i] > threshold || continue
-        band_a[i] && (sum_a += 1)
-        band_b[i] && (sum_b += 1)
+        band_a[i] == 1.0f0 && (sum_a += 1)
+        band_b[i] == 1.0f0 && (sum_b += 1)
     end
 
     strongest = max(sum_a, sum_b)
@@ -1260,9 +1262,9 @@ function destripe(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::De
         return clamped
     end
 
-    keep = sum_a > sum_b ? band_a : band_b
+    reject = sum_a > sum_b ? band_a : band_b
     @inbounds for i in eachindex(spectrum)
-        keep[i] && (spectrum[i] = zero(eltype(spectrum)))
+        spectrum[i] *= (1.0f0 - reject[i])
     end
     out = real.(FFTW.ifft(FFTW.ifftshift(spectrum)))
     result = Matrix{Float32}(undef, size(img))
@@ -1292,12 +1294,11 @@ function _reject_band(sz::Tuple{Int,Int}, angle::Real, m::Destripe)
     cols = max(cx - m.notch_half + 1, 1):min(cx + m.notch_half, nx)
     base[rows, :] .= 1.0f0
     base[:, cols] .= 0.0f0
-    rotated = _rotate_bilinear(base, Float64(angle), (nx / 2, ny / 2))
-    out = BitMatrix(undef, ny, nx)
-    @inbounds for i in eachindex(out, rotated)
-        out[i] = rotated[i] == 1.0f0
-    end
-    return out
+    # The **float** mask, not the `== 1` selection. The reference rejects with `fft * (1 - filter)`
+    # (`autoRIFT.py:219`), so a cell the rotation covers partially is attenuated in proportion; only its
+    # *power comparison* takes `filter == 1` (`:208-209`). Returning the selection here would keep every
+    # partially covered cell in full, which is a thin ring of frequencies around the band's rotated edge.
+    return _rotate_bilinear(base, Float64(angle), (nx / 2, ny / 2))
 end
 
 # `A` rotated by `angle` degrees about `centre = (x, y)`, sampled bilinearly, zero outside — which is
