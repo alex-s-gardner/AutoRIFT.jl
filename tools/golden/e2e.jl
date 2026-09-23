@@ -795,22 +795,35 @@ function rung_coregister(s::Setup)
     path = joinpath(s.run, "reference.tif")
     isfile(path) || return [StageResult("5.2 radar mosaic", "reference.tif", "set", true, 0,
                                         "skipped: no $path")]
-    p = _reference_product(s.case, s.run)
-    got = radar_mosaic(p, burst_swaths(s.case))
-    return [_mosaic_stage("5.2 radar mosaic", path, got)]
+    rp, sp = _burst_products(s.case, s.run)
+    sws = burst_swaths(s.case)
+    out = [_mosaic_stage("5.2 reference mosaic", path, radar_mosaic(rp, sws))]
+    sec = joinpath(s.run, "secondary.tif")
+    isfile(sec) || return out
+    dem = joinpath(s.run, "dem.tif")
+    isfile(dem) || return push!(out, StageResult("5.2 secondary mosaic", "secondary.tif", "set", true,
+                                                0, "skipped: no $dem, and the coregistration solves \
+                                                 for terrain height"))
+    # The secondary is gated more loosely than the reference and for a stated reason: it travels through a
+    # full resample — an eight-tap windowed sinc over a deramped burst — where the reference is a copy.
+    push!(out, _mosaic_stage("5.2 secondary mosaic", sec,
+                             secondary_mosaic(rp, sp, sws, dem_sampler(dem)); max_median = 3e-4))
+    return out
 end
 
-# The reference acquisition's parsed SAFE, which is the earlier of the two `burst2safe` wrote.
-function _reference_product(c::GoldenCase, run::AbstractString)
-    early, _ = _burst_safes(run)
-    return Sentinel1Product(early; orbit = s1_orbit(run, basename(early)),
-                            polarization = lowercase(s1_polarization(basename(early))),
-                            swaths = burst_swaths(c))
+# Both parsed SAFEs, reference first, which is the earlier of the two `burst2safe` wrote.
+function _burst_products(c::GoldenCase, run::AbstractString)
+    early, late = _burst_safes(run)
+    prod(p) = Sentinel1Product(p; orbit = s1_orbit(run, basename(p)),
+                               polarization = lowercase(s1_polarization(basename(p))),
+                               swaths = burst_swaths(c))
+    return prod(early), prod(late)
 end
+_reference_product(c::GoldenCase, run::AbstractString) = first(_burst_products(c, run))
 
 # `got` against a reference raster, read in row strips so neither is held whole. The filled *set* is the
 # gate; the values are reported relative to the amplitudes they sit on.
-function _mosaic_stage(name, ref_path, got)
+function _mosaic_stage(name, ref_path, got; max_median = 1e-4)
     bd = ArchGDAL.getband(ArchGDAL.read(ref_path), 1)
     if size(got) != (ArchGDAL.height(bd), ArchGDAL.width(bd))
         return StageResult(name, basename(ref_path), "set", false, 0,
@@ -822,6 +835,7 @@ function _mosaic_stage(name, ref_path, got)
     d = Float64[]
     scale = 0.0
     only_r_peak = 0.0
+    only_j_peak = 0.0
     for r0 in 1:4096:nr
         rows = r0:min(r0 + 4095, nr)
         want = permutedims(ArchGDAL.read(bd, rows, 1:nc))
@@ -830,6 +844,7 @@ function _mosaic_stage(name, ref_path, got)
             a, b = Float64(g[i]), Float64(want[i])
             if a != 0 && b == 0
                 only_j += 1
+                only_j_peak = max(only_j_peak, a)
             elseif a == 0 && b != 0
                 only_r += 1
                 only_r_peak = max(only_r_peak, b)
@@ -849,12 +864,15 @@ function _mosaic_stage(name, ref_path, got)
     # negligible: measured on `S1C_IW_SLC__1SSV_20250416`, 27,860 such pixels of 363,775,172 with a
     # *maximum* of 0.106 against amplitudes near 200. Bounding the peak rather than the count says that
     # the disagreement is the taper and not a misplaced burst, which a count cannot.
-    passed = only_j == 0 && only_r_peak <= 1e-3 * max(scale, 1) && med <= 1e-4 * max(scale, 1)
+    passed = only_j_peak <= 1e-3 * max(scale, 1) && only_r_peak <= 1e-3 * max(scale, 1) &&
+             med <= max_median * max(scale, 1)
     return StageResult(name, basename(ref_path),
-                       "none only ours, their extras <= 1e-3 of scale, median <= 1e-4", passed, n,
-                       @sprintf("%d of %d filled on both; %d only ours, %d only the reference (peak \
-                                 %.4g there); median |d| %.5g, p99 %.5g against a peak amplitude of %.4g",
-                                both, n, only_j, only_r, only_r_peak, med, p99, scale))
+                       @sprintf("extras on either side <= 1e-3, median <= %.0e of scale",
+                                max_median), passed, n,
+                       @sprintf("%d of %d filled on both; %d only ours (peak %.4g), %d only the \
+                                 reference (peak %.4g); median |d| %.5g, p99 %.5g against a peak \
+                                 amplitude of %.4g",
+                                both, n, only_j, only_j_peak, only_r, only_r_peak, med, p99, scale))
 end
 
 """
@@ -1135,11 +1153,18 @@ function rung_bytes(s::Setup)
         # grid. `secondary.tif` is the coregistered one, and that half of rung 5.2 does not exist yet, so
         # `in_I2` is declined rather than compared against a mosaic built from the wrong grid.
         k = read_capture(s.case; n = parse(Int, basename(s.run)))
-        got = radar_mosaic(_reference_product(s.case, s.run), burst_swaths(s.case))
-        out = StageResult[_bytes_stage("in_I1", got, k.arrays["in_I1"], correlator_filter(s.case))]
-        push!(out, StageResult("5.4 in_I2", "capture/in_I2", "exact", true, 0,
-                              "skipped: the secondary is the coregistered half of rung 5.2, which is \
-                               not built — an uncoregistered mosaic would compare two different grids"))
+        rp, sp = _burst_products(s.case, s.run)
+        sws = burst_swaths(s.case)
+        m = correlator_filter(s.case)
+        out = StageResult[_bytes_stage("in_I1", radar_mosaic(rp, sws), k.arrays["in_I1"], m)]
+        dem = joinpath(s.run, "dem.tif")
+        if isfile(dem)
+            push!(out, _bytes_stage("in_I2", secondary_mosaic(rp, sp, sws, dem_sampler(dem)),
+                                    k.arrays["in_I2"], m))
+        else
+            push!(out, StageResult("5.4 in_I2", "capture/in_I2", "exact", true, 0,
+                                   "skipped: no $dem, and the coregistration solves for terrain height"))
+        end
         return out
     end
     (startswith(s.case.platform, "S1") || s.case.platform == "NISAR-L1") &&
