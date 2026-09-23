@@ -117,9 +117,26 @@ Splitting each golden endpoint's residual by the chip size its points resolved a
   * the whole-field bias tracks **only** the share of points that never reached the base level, and nothing
     else: 62% at base gives −0.006, 35% gives −0.039, 0% gives −0.089.
 
-So these two items are the whole of two golden reds — `LT05_L1GS_001013`, which has **no** base-level
-measurement at all, and `S1C_IW_SLC__1SSV_20250416T010159`, which has 35% — and they are not implicated
-anywhere else. A fix should take those two cases' endpoint bias to the base level's, which is zero.
+So the two golden endpoint reds — `LT05_L1GS_001013`, which has **no** base-level measurement at all, and
+`S1C_IW_SLC__1SSV_20250416T010159`, which has 35% — are entirely a coarse-level effect.
+
+**That is not the same as saying these two items cause them, and an earlier revision of this file said so
+without evidence.** Items 2 and 3 describe behaviour AutoRIFT.jl reproduces *deliberately and identically*:
+both sides place the coarse node at the same fill-weighted mean and read the answer back from the same cell
+centre. A shared defect produces no residual, so it cannot be what makes the two disagree — and fixing it
+would *reduce* agreement, like every other item here, rather than turn a red green.
+
+**What produces the bias is therefore something unmatched, and it is not yet identified.** The register's own
+candidate in this area is the level-grid snap below — the reference applies `round(x + 0.5) - 0.5` literally,
+which moves an integer-valued grid by half a pixel, where `_cell_centres` reads the phase from the grid —
+and a half-pixel node offset on a spatially varying field would give exactly a coarse-only bias scaling with
+the coarse share. Against that: matching the reference's literal snap was measured to *cost* 8.3 points of
+exact match, which is the opposite of what a cause would do.
+
+**The measurement that settles it** is to compare the coarse lattice directly against the reference's
+captured one, on `S1C ... 010159` where the effect is partial and on `LT05_L1GS_001013` where it is total.
+If the node positions differ, that difference is the cause and closing it *improves* agreement, which makes
+it a matching fix rather than an item in this file. If they agree, the cause is downstream of the position.
 
 **Deferred by decision until the rest of the golden set is green, and the reason is measurability rather
 than caution.** These are the widest-blast-radius items in the register: the node position is a property of
