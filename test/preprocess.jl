@@ -650,6 +650,17 @@ end
             ny, nx = size(f.arrays.src)
             got = AutoRIFT._rotate_bilinear(f.arrays.src, f.params.angle, (nx / 2, ny / 2))
             @test map(==(1.0f0), got) == (f.arrays.selected .!= 0)
+            # The float mask as well as the selection, because the rejection multiplies by `1 - mask`
+            # and so reads every partially covered cell, not only the fully covered ones.
+            #
+            # **Bounded by one interpolation quantum, not by zero.** OpenCV accumulates the affine map in
+            # 10-bit fixed point — `adelta`/`bdelta` at `AB_SCALE = 1 << 10` — and shifts that to the
+            # 5-bit interpolation index, where this computes the coordinate in `Float64` and rounds once.
+            # The two land one quantum of 1/32 apart on a few cells: measured, 5 of 19,200 at 8.13
+            # degrees and 2 at 45, none at all at 0 or +-90, and the `== 1` selection above is unaffected.
+            d = abs.(got .- f.arrays.expected)
+            @test maximum(d) <= 1 / 32 + 1e-7
+            @test count(>(1e-6), d) <= 8
         end
     end
 end
