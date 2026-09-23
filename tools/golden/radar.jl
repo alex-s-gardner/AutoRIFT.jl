@@ -816,11 +816,27 @@ Amplitude rather than the complex value, so the reramp is omitted: it multiplies
 unit phasor and cannot change a magnitude.
 """
 function resample_burst(deramped, dl, ds, lines::AbstractUnitRange,
-                        samples::AbstractUnitRange, valid = nothing)
+                        samples::AbstractUnitRange, valid = nothing; doppler = nothing)
     out = zeros(Float32, length(lines), length(samples))
     nr, nc = size(deramped)
     Threads.@threads for (jj, s) in collect(enumerate(samples))
         for (ii, l) in enumerate(lines)
+            # `_dopplerLUT.contains(az, rng)`, the third of `ResampSlc::_transformTile`'s five rejections
+            # and the one the two bounds tests below do not cover.
+            #
+            # It is evaluated at the **output** pixel — `az = _sensingStart + iRow / _prf` and
+            # `rng = _startingRange + iCol * _rangePixelSpacing` — while the LUT is built from the *source
+            # burst's* own shape: `doppler_poly1d_to_lut2d` spans `starting_slant_range` to
+            # `starting_slant_range + (samples_per_burst - 1) * dr` in range and `0` to
+            # `lines_per_burst * dt` in azimuth (`s1_reader.py:131-168`). `ResampSlc` takes its
+            # `_sensingStart` and `_startingRange` from the burst's grid, the first constructor argument,
+            # rather than from the `ref_rdr_grid` keyword. So the whole test collapses to the output index
+            # lying inside the source burst's dimensions, and it bites whenever the output grid is the
+            # larger of the two — which is every full-SLC pair, where the CSLC is 136 to 195 lines taller
+            # than the burst it came from.
+            if doppler !== nothing
+                (l > doppler[1] || s > doppler[2] - 1) && continue
+            end
             y = l + dl(l, s) + 1.0
             x = s + ds(l, s) + 1.0
             iy, ix = floor(Int, y), floor(Int, x)
@@ -912,7 +928,8 @@ function secondary_swath_amplitude(rp::Sentinel1Product, sp::Sentinel1Product, s
         # No valid-window guard: measured, ISCE3's own criterion is the raster's bounds rather than the
         # annotation's valid region. Guarding on the valid window declines 137,782 pixels `secondary.tif`
         # fills, to avoid filling 2,746 it does not — fifty times the error it removes.
-        got = resample_burst(deramped, dl, ds, bstart:(bend - 1), (first(cols) - 1):(last(cols) - 1))
+        got = resample_burst(deramped, dl, ds, bstart:(bend - 1), (first(cols) - 1):(last(cols) - 1);
+                             doppler = (lpb, spb))
         out[(mstart + 1):mend, cols] = got
     end
     return (out, nlines, ns)
