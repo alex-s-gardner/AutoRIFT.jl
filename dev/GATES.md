@@ -4744,8 +4744,28 @@ well as the `== 1` selection, since the rejection reads every partially covered 
 AutoRIFT.jl *declining* the reject where the reference fires — the ratio test clears by 3.2% and the
 deliberate Wallis variance moves the field across it. That case cannot go green at rung 5.3 without
 adopting the reference's variance formula, which is the same matching-versus-correctness decision as
-`dev/CORRECTNESS.md` items 2 and 3. Its scene 2's remaining 3x over the gate is unexplained and is the
-smaller question.
+`dev/CORRECTNESS.md` items 2 and 3.
+
+Its scene 2's remaining 3x over the gate — 0.00647 against a gate of 0.00206, with the reference's variance
+fed in so the reject's decision agrees — has since had four candidates eliminated:
+
+  * **Not the band's angle.** The rung feeds `Destripe` the angles the reference *logged*, so the two masks
+    are built from identical inputs. Gate `5.orbit` measures the orbit-derived route separately, where the
+    cross-track angle agrees to 0.03 deg on all six scenes and the along-track one is 1.4 to 1.9 deg apart
+    because the reference's two edge directions are 91.4 to 91.9 deg apart rather than perpendicular — real
+    scan skew, and irrelevant here.
+  * **Not the moments' precision.** `destripe` already sums the spectrum's mean and variance in `Float64`
+    about the measured mean, and matches NumPy's population `n` rather than `n - 1`.
+  * **Not the mask's binary edge**, which is the fix above and took `LT04_L1TP_063018` green on both scenes
+    with the same code.
+  * **Not the transform's precision.** A `Float32` FFT round trip perturbs a field of magnitude ~2 by
+    order 1e-6, three orders below the residual.
+
+What remains is the **rotation itself**: `_reject_band` reproduces `cv2.warpAffine`'s bilinear rotation, and
+`test/preprocess.jl` bounds that at 1/32 on up to eight cells of the fixture. A 1/32 error on the band's
+edge cells, multiplied into the spectrum and inverted, is the right size for a 0.005 median. That is the
+open question, and it is downstream of the variance decision rather than a separate blocker: the case
+cannot go green at rung 5.3 while scene 1's reject still fires on one side only.
 
 ### The gap-fill branch matches its decisions exactly and cannot match its values
 
