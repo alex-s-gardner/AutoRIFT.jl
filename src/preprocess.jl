@@ -1322,43 +1322,50 @@ function _rotate_bilinear(A::AbstractMatrix{Float32}, angle::Real, centre::Tuple
     ny, nx = size(A)
     cx, cy = Float64(centre[1]), Float64(centre[2])
     s, c = sincosd(Float64(angle))
+    # `getRotationMatrix2D(centre, angle, 1)` reduced to the six coefficients `warpAffine` iterates:
+    # `sx = m0*x + m1*y + m2` and `sy = m3*x + m4*y + m5`, over 0-based destination coordinates.
+    #
+    # **The rotation direction is the trap, and matching counts hide it.** A rotation is area-preserving,
+    # so the *count* of selected cells is identical under either sign: measured on the pinned fixtures,
+    # 3,804 cells under both with 3,120 of them in different places. Only the positions catch it.
+    m0, m1, m2 = c, -s, cx * (1 - c) + s * cy
+    m3, m4, m5 = s, c, -s * cx + cy * (1 - c)
+    # OpenCV's fixed-point pipeline, reproduced exactly rather than approximated by a `Float64`
+    # coordinate rounded once. `AB_BITS = max(10, INTER_BITS) = 10` and `INTER_BITS = 5`, so the column
+    # and row contributions are each rounded to 1/1024 and accumulated as integers, the sum is shifted to
+    # 1/32, and the low five bits index a weight table built from exactly `i/32`.
+    #
+    # The distinction is load-bearing twice over. **The 1/32 snap decides membership**: the consumer tests
+    # `== 1` (`autoRIFT.py:225-226`), and a coordinate within 1/64 of an integer snaps onto it so the
+    # neighbour's weight is exactly zero — a cell a `Float64` bilinear puts at 0.993903 is kept at 1.0
+    # instead. On an odd-sized mask at 45 degrees that is 60 of 3,720 cells. **And the 1/1024 accumulation
+    # decides the rest**: rounding the two contributions separately moves a coordinate sitting within
+    # 1/1024 of a 1/64 boundary to the other side of the snap, which is a whole quantum in the mask.
+    adelta = [round(Int, m0 * x * 1024) for x in 0:(nx - 1)]
+    bdelta = [round(Int, m3 * x * 1024) for x in 0:(nx - 1)]
     out = zeros(Float32, ny, nx)
-    @inbounds for j in 1:nx, i in 1:ny
-        # Destination centre-of-pixel in OpenCV's 0-based coordinates, then the inverse map.
-        #
-        # **The rotation direction is the trap, and matching counts hide it.**
-        # `getRotationMatrix2D(centre, angle, 1)` builds `[[c, s], [-s, c]]` with `c = cos α`,
-        # `s = sin α` — which in a y-down image is *counter-clockwise* as seen on screen — and
-        # `warpAffine` treats that as the forward map, sampling the source at `M ⋅ dst`. So the source
-        # offset is `(c·dx + s·dy, −s·dx + c·dy)` with the angle's own sign, not its negation.
-        #
-        # Getting it backwards rotates the band the other way, and the *count* of selected cells is
-        # identical either way because a rotation is area-preserving: measured on the pinned fixtures,
-        # 3,804 cells selected under both signs with 3,120 of them in different places. A comparison on
-        # counts alone passes; only the positions catch it.
-        dx, dy = (j - 1) - cx, (i - 1) - cy
-        sxf = c * dx - s * dy + cx
-        syf = s * dx + c * dy + cy
-        # **OpenCV interpolates in fixed point, and on a 0/1 mask that changes the answer.**
-        # `warpAffine` rounds each source coordinate to 1/`INTER_TAB_SIZE` = 1/32 (`INTER_BITS = 5`)
-        # before splitting it into an integer part and a weight index. A coordinate landing within
-        # 1/64 of an integer therefore snaps *onto* it and the neighbour's weight becomes exactly
-        # zero — so the interpolated value is exactly 1 where a `Float64` computation gives 0.993903.
-        #
-        # That matters here and nowhere else in this package: the consumer tests `== 1`
-        # (`autoRIFT.py:225-226`), so a cell at 0.9939 is excluded and one at 1.0 is kept. Measured on
-        # the pinned fixtures, ignoring the quantization misses 60 of 3,720 selected cells on an
-        # odd-sized mask — all of them on the band's rotated edge, which is exactly where a band-reject
-        # decides how much it rejects.
-        sx = round(sxf * 32) / 32
-        sy = round(syf * 32) / 32
-        x0, y0 = floor(Int, sx), floor(Int, sy)
-        (x0 < -1 || y0 < -1 || x0 > nx - 1 || y0 > ny - 1) && continue
-        fx, fy = sx - x0, sy - y0
-        at(yy, xx) = (0 <= xx <= nx - 1 && 0 <= yy <= ny - 1) ? Float64(A[yy + 1, xx + 1]) : 0.0
-        v = (1 - fx) * (1 - fy) * at(y0, x0) + fx * (1 - fy) * at(y0, x0 + 1) +
-            (1 - fx) * fy * at(y0 + 1, x0) + fx * fy * at(y0 + 1, x0 + 1)
-        out[i, j] = Float32(v)
+    @inbounds for i in 1:ny
+        y = i - 1
+        # `round_delta = AB_SCALE / INTER_TAB_SIZE / 2`, which makes the shift below round to nearest
+        # rather than truncate.
+        X0 = round(Int, (m1 * y + m2) * 1024) + 16
+        Y0 = round(Int, (m4 * y + m5) * 1024) + 16
+        for j in 1:nx
+            X = (X0 + adelta[j]) >> 5
+            Y = (Y0 + bdelta[j]) >> 5
+            # Arithmetic shifts, so a negative coordinate floors rather than truncating toward zero —
+            # which is what keeps the weight index non-negative on the far side of the centre.
+            x0 = X >> 5
+            y0 = Y >> 5
+            (x0 < -1 || y0 < -1 || x0 > nx - 1 || y0 > ny - 1) && continue
+            # `Float32`, as `initInterTab2D` builds the table and `remapBilinear` accumulates for a
+            # single-precision destination.
+            fx = Float32(X & 31) / 32.0f0
+            fy = Float32(Y & 31) / 32.0f0
+            at(yy, xx) = (0 <= xx <= nx - 1 && 0 <= yy <= ny - 1) ? A[yy + 1, xx + 1] : 0.0f0
+            out[i, j] = (1 - fy) * (1 - fx) * at(y0, x0) + (1 - fy) * fx * at(y0, x0 + 1) +
+                        fy * (1 - fx) * at(y0 + 1, x0) + fy * fx * at(y0 + 1, x0 + 1)
+        end
     end
     return out
 end
