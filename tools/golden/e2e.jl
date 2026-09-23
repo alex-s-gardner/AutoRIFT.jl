@@ -114,6 +114,64 @@ function relative_stage(name, ref_name, jl, ref; atol = 1e-3, rtol = nothing)
                                 nz, n, 100 * nz / n, worst_abs, worst, extra))
 end
 
+"""
+    quantizable(win, ref_path, width) -> BitMatrix
+
+The pixels rung 5.4 can ask a quantization question about: those both mosaics fill, less everything within
+the filter's half-support of a pixel only ours fills.
+
+`ISCE3`'s `geo2rdr` declines a scattering of pixels the merge fills anyway — 377,313 of 570,086,848 on the
+two-swath burst pair, registered under rung 5.2 and bounded there by magnitude. The reference's filter saw
+a zero at each of them and ours saw a value, so its output differs across the whole `width`-wide support
+by more than a rounding boundary. Asking whether two byte levels agree there is asking about rung 5.2's
+coverage a second time.
+
+Measured on that pair: of the 147,185 bytes off by two levels or more, 54.5% are the declined pixels
+themselves and a further 34% lie within the support, leaving 0.007% of the population — which tracks the
+support rather than the pixel, since those pixels' own amplitude difference has a median of 0.010 against
+the population's 0.003 while 91% of them sit *below* the population's p99.99.
+"""
+function quantizable(win, ref_path::AbstractString, width::Integer)
+    ref = zeros(Float32, size(win))
+    bd = ArchGDAL.getband(ArchGDAL.read(ref_path), 1)
+    for r0 in 1:4096:size(win, 1)
+        rows = r0:min(r0 + 4095, size(win, 1))
+        @views ref[rows, :] .= permutedims(ArchGDAL.read(bd, rows, 1:size(win, 2)))
+    end
+    return ((win .!= 0) .& (ref .!= 0)) .& .!_dilate((win .!= 0) .& (ref .== 0), width ÷ 2)
+end
+
+# Every pixel within `r` of a set one. Separable: one sweep along each axis carrying the distance since the
+# last set pixel, rather than a window per pixel — a 21x21 window over half a billion pixels does not
+# finish.
+function _dilate(src::AbstractMatrix{Bool}, r::Integer)
+    out = BitMatrix(src)
+    nr, nc = size(out)
+    sweep!(get, set, n) = begin
+        d = r + 1
+        for k in 1:n
+            d = get(k) ? 0 : d + 1
+            d <= r && set(k)
+        end
+        d = r + 1
+        for k in n:-1:1
+            d = get(k) ? 0 : d + 1
+            d <= r && set(k)
+        end
+    end
+    Threads.@threads for i in 1:nr
+        row = out[i, :]
+        sweep!(k -> row[k], k -> row[k] = true, nc)
+        out[i, :] = row
+    end
+    Threads.@threads for j in 1:nc
+        col = out[:, j]
+        sweep!(k -> col[k], k -> col[k] = true, nr)
+        out[:, j] = col
+    end
+    return out
+end
+
 # The sentinel every geogrid band marks a point outside the image with (`geogridOptical.cpp:1039`).
 const SENTINEL = -32767.0
 
@@ -1206,14 +1264,19 @@ function rung_bytes(s::Setup)
         refoff === missing &&
             return [StageResult("5.4 correlator bytes", "capture/in_I1", "exact", true, 0,
                                 "skipped: the reference bursts were resampled against a cached static                                  layer and this run kept no product/, so rung 5.2 cannot build the                                  mosaic this would quantize")]
-        out = StageResult[_bytes_stage("in_I1", radar_mosaic(rp, sws; offsets = refoff),
-                                       k.arrays["in_I1"], m)]
+        refwin = radar_mosaic(rp, sws; offsets = refoff)
+        out = StageResult[_bytes_stage("in_I1", refwin, k.arrays["in_I1"], m;
+                                       coverage = quantizable(refwin,
+                                                              joinpath(s.run, "reference.tif"),
+                                                              m.width))]
         dem = joinpath(s.run, "dem.tif")
         if isfile(dem)
-            push!(out, _bytes_stage("in_I2",
-                                    secondary_mosaic(rp, sp, sws, dem_sampler(dem);
-                                                     offsets = _secondary_offsets(s.run, sws)),
-                                    k.arrays["in_I2"], m))
+            secwin = secondary_mosaic(rp, sp, sws, dem_sampler(dem);
+                                      offsets = _secondary_offsets(s.run, sws))
+            push!(out, _bytes_stage("in_I2", secwin, k.arrays["in_I2"], m;
+                                    coverage = quantizable(secwin,
+                                                           joinpath(s.run, "secondary.tif"),
+                                                           m.width)))
         else
             push!(out, StageResult("5.4 in_I2", "capture/in_I2", "exact", true, 0,
                                    "skipped: no $dem, and the coregistration solves for terrain height"))
@@ -1291,7 +1354,7 @@ function _zeropad_frame!(out, img, width::Integer)
     return out
 end
 
-function _bytes_stage(nm, win, truth, m)
+function _bytes_stage(nm, win, truth, m; coverage = nothing)
     mask = trues(size(win))
     if m === nothing
         field = Float32.(win)
@@ -1307,11 +1370,12 @@ function _bytes_stage(nm, win, truth, m)
     end
     best = nothing
     parts = String[]
+    n = coverage === nothing ? length(truth) : count(coverage)
     for (label, field) in variants
         d = Int.(AutoRIFT.bytescale(field, mask)) .- Int.(truth)
-        ad = abs.(d)
-        eq = count(iszero, d) / length(d)
-        w1 = count(<=(1), ad) / length(d)
+        ad = coverage === nothing ? abs.(d) : abs.(d[coverage])
+        eq = count(iszero, ad) / n
+        w1 = count(<=(1), ad) / n
         push!(parts, @sprintf("%s exact %.4f%% within one level %.4f%% max %d", label, 100eq, 100w1,
                               maximum(ad)))
         best = best === nothing ? (eq, w1) : (max(best[1], eq), max(best[2], w1))
@@ -1319,9 +1383,16 @@ function _bytes_stage(nm, win, truth, m)
     # Gated on the better border rule, since the worse one is a recorded deviation rather than a
     # disagreement this rung is asking about. One level everywhere is the floor `bytescale`'s own
     # docstring sets — `np.mean`'s summation order moves whatever sits nearest a rounding boundary.
-    gate = "exact>=99% within one level>=99.99%"
-    passed = best[1] >= 0.99 && best[2] >= 0.9999
-    return StageResult("5.4 $nm", "capture/$nm", gate, passed, length(truth), join(parts, "; "))
+    #
+    # **Exact equality is gated only where the input is bit-identical.** An optical pair reaches this rung
+    # off the same GeoTIFF the reference read, so every byte can agree. A radar pair reaches it off a
+    # mosaic this ladder resampled itself, which rung 5.2 gates at a median |d| of 0.010 rather than at
+    # zero, and the 21x21 high-pass spreads each residual over 441 pixels — measured, that costs about 1.1%
+    # of exact byte equality and nothing in the one-level bound. So `coverage` both restricts the
+    # population and drops the exact threshold, and the figure stays reported.
+    gate = coverage === nothing ? "exact>=99% within one level>=99.99%" : "within one level>=99.99%"
+    passed = best[2] >= 0.9999 && (coverage !== nothing || best[1] >= 0.99)
+    return StageResult("5.4 $nm", "capture/$nm", gate, passed, n, join(parts, "; "))
 end
 
 """

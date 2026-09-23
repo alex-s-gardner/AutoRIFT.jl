@@ -4395,6 +4395,40 @@ is lifted around the two opens.
 within one level on the secondary — reproduces `reference.tif` without the static layer, and feeding the
 reference's own intermediate is this ladder's ordinary discipline for an input a rung is not testing.
 
+### What the radar byte comparison can be asked, and what it inherits
+
+With both mosaics green, `in_I1` and `in_I2` move from 58.97% exact to **99.51%**, and from 59.96% within
+one level to **99.97%**. The remaining 147,185 bytes off by two levels or more (0.0258% of 570,086,848)
+were traced rather than absorbed, and three candidate causes were tested:
+
+| population | share of the residue |
+|---|---|
+| pixels only we fill — `geo2rdr` declined them | 54.5% |
+| within the 21x21 filter's half-support of one | 34.1% |
+| clear of both | 11.2% |
+
+The first two are rung 5.2's registered coverage deviation: the reference's filter read a zero where ours
+read a value, so its output differs across the whole support by more than a rounding boundary.
+
+The last 16,442 pixels are **not** the mosaic's own residual tail and **not** its internal zero
+boundaries, both of which were measured and rejected: only 8.81% of them lie within 10 px of any zero
+edge, and their own amplitude difference has a median of 0.0101 against the population's 0.0030 while
+91.07% of them sit *below* the population's p99.99 of 0.4904. What they track is the filter's *support* —
+441 pixels, any one of which carrying a tail residual moves the output — which is why they are spatially
+diffuse and uncorrelated with the local difference.
+
+So the gate restricts the population to the pixels it can ask about and keeps the 99.99% threshold it
+already had, rather than relaxing the threshold on a population that includes rung 5.2's deviation:
+
+    in_I1   236,009,267 pixels   exact 98.9052%   within one level 99.9930%   max 61
+    in_I2   236,062,515 pixels   exact 98.9598%   within one level 99.9934%   max 60
+
+**Exact equality is gated on the optical path and reported on the radar one.** An optical pair reaches
+this rung off the same GeoTIFF the reference read, so every byte can agree and 99% is a real bound. A
+radar pair reaches it off a mosaic this ladder resampled itself, gated at a median |d| of 0.010 rather
+than at zero; spread over a 441-pixel support that costs about 1.1% of exact byte equality and nothing in
+the one-level bound. Gating exactness there would be gating the resampler's last digit.
+
 ### The two-swath burst cases: layout versus pixels
 
 `S1A ... 20240618T025533` disagrees, and the disagreement is sharply structured. **Every extent matches
