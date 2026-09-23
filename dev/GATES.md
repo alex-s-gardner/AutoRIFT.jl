@@ -4325,7 +4325,43 @@ against amplitudes near 200, with a median of 0.008: COMPASS's resample tapers i
 value is exactly zero. So the gate bounds the *peak* value at a disagreeing pixel rather than the count —
 a magnitude says the difference is the taper, where a count cannot.
 
-### The two-swath cases: the layout is right and the pixels are not theirs
+### The two-swath burst cases: the reference burst is *resampled*, not copied
+
+Regenerating these does **not** change them — a fresh run reproduces the cached numbers exactly (median
+|d| 45.043, 443,425 pixels only ours), so unlike the two full-SLC pairs above these artifacts are not
+stale. With `product/` kept for the first time, the cause is visible directly.
+
+**The reference CSLC is not the raw burst.** Comparing `product/t050_105604_iw1/20240618/*.slc.tif`
+against the raw burst over a 301-line strip: correlation **0.298**, median |d| 31.2 on amplitudes near 51,
+and sample values that are simply unrelated — 33.5 against 164.83, 25.09 against 136.47. A one-line shift
+of speckle decorrelates exactly like that.
+
+**What wrote it was `s1_resample`, not `s1_rdr2geo`.** The two steps use different names —
+`file_name_pol` (`..._VV.slc.tif`) for rdr2geo and `file_name_stem` (`....slc.tif`) for resample — and the
+burst directory holds the *stem* name plus resample's own input VRT, with no `_VV.slc.tif` anywhere. It
+also holds `range.off` and `azimuth.off`, which only geo2rdr writes. So the reference acquisition went
+through geo2rdr and resample rather than being copied.
+
+**And `write_yaml` is why** (`s1_isce3.py:766-793`): its `use_static_layer` branch sets
+
+    bool_reference = 'False'
+
+unconditionally, so a reference burst with a cached static topographic layer is coregistered *to that
+layer* instead of being written out. COMPASS then takes the secondary path for it
+(`s1_cslc.py:29-35`), and combined with `Geo2Rdr`'s one-line offset convention the result is the reference
+shifted by about a line.
+
+**What this does not yet explain** is why the cases that *do* match also retrieved static files — 7 on
+`S1C ... 010159`, 27 on `S1B ... 20180809` — with no visible difference in the retrieval's outcome. So
+"a static layer was used" is necessary but not sufficient, and the discriminator is still open.
+
+**The tractable route is now open, and it needs nothing external.** `product/.../azimuth.off` and
+`range.off` for the *reference* burst are the offsets the reference itself resampled with. Feeding those to
+`resample_burst` — the eight-tap Hann sinc over a deramped burst that rung 5.4 already validates at 97%
+within one level on the secondary — reproduces `reference.tif` without the static layer, and feeding the
+reference's own intermediate is this ladder's ordinary discipline for an input a rung is not testing.
+
+### The two-swath burst cases: layout versus pixels
 
 `S1A ... 20240618T025533` disagrees, and the disagreement is sharply structured. **Every extent matches
 exactly** — at column 400 both run rows 1..5364, at column 30000 both run rows 457..5823, and both end at
