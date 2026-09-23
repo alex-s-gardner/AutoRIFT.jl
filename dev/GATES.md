@@ -4403,10 +4403,32 @@ over-fill from 1,913,472 to 1,093,932 but introduces **161,588 pixels the refere
 miss**, trading the harmless category for the fatal one. The note against the guard therefore stands on
 this grid too.
 
-What remains is to identify `ResampSlc`'s actual criterion. One lead not yet followed: the capture log
-reports `Resampling using 2 tiles of 1000 lines per tile`, so the resampler works in blocks and a source
-line outside the loaded block is unavailable to it — a rule that depends on the tiling rather than on the
-raster or the annotation.
+**`ResampSlc`'s criterion is explicit, and one of its five tests has no equivalent here.**
+`isce3::image::ResampSlc::_transformTile` skips an output pixel — leaving it at `_invalid_value`, which
+defaults to zero — on any of:
+
+    if (iRowResampledDbl < 0) continue;
+    if (iColResampledDbl < 0) continue;
+    if ((iRowResampled < chipHalf) || (iRowResampled >= (inLength - chipHalf))) continue;
+    if ((iColResampled < chipHalf) || (iColResampled >= (inWidth - chipHalf))) continue;
+    if (not _dopplerLUT.contains(az, rng)) continue;
+
+The two bounds tests are `resample_burst`'s own guard, which is why our filled region is exactly
+`chipHalf` inside the burst on both axes: rows 81 to 1576 for a 1504-line burst with a -75.78 line offset,
+measured, against a predicted 80 to 1575. **The Doppler LUT test is the one we do not model**, and it
+explains the residue: the LUT is built from the burst's *own* annotation and so spans its 1504 lines, while
+the output grid is 1640, so the tail of the output grid has no coverage whatever source sample exists there.
+That predicts the shape of the over-fill and the measurement agrees — **75.8% of it lies past line 1504**,
+which is precisely where coverage ends, and rows 1505 to 1576 are 72 rows against the ~68 rows' worth those
+1,450,159 pixels amount to.
+
+The tiling lead was wrong: `inLength` is the current block's, but `_initializeTile` derives the block from
+the offsets themselves — `imageLineDbl = iRow + round(azOff) + azOffTileRowStart -/+ chipHalf`, clipped at
+zero — so the block bound coincides with the raster bound rather than cutting inside it.
+
+So closing this rung needs the Doppler LUT's `(azimuth time, slant range)` extent as a third rejection
+beside the two bounds tests. The remaining 24% of the over-fill, inside line 1504, is then the LUT's
+*range* extent on the same argument, which is not yet measured separately.
 
 ### The mosaic extent: both outliers are the CSLC raster, and the discriminator predicts which
 
