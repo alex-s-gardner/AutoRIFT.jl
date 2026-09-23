@@ -5080,13 +5080,30 @@ they need is `dev/CORRECTNESS.md` items 2 and 3 — which are deliberately *not*
 are red, per that file's own rule, since diverging from the reference's placement desynchronizes every
 downstream comparison.
 
-**`S1A_IW_SLC__1SSH_20151120` and `S1A_IW_SLC__1SSH_20170221`**: the merged mosaic width, which
-`merge_swaths` takes from the COMPASS CSLC raster of the far subswath's first burst rather than from any
-annotation. Five hypotheses refuted, each by measurement: `samples_per_burst` (the SAFE agrees with ASF's
-burst extractor at 23894, so the input was never wrong), `last_valid_sample + 1`,
-`samples_per_burst - first_valid_sample`, a `first_valid_sample`-adjusted range offset, and a static topo
-layer (none of the five cases used one). What remains is `burst.as_isce3_radargrid()`'s own width, which
-needs a CSLC to measure.
+**`S1A_IW_SLC__1SSH_20151120` and `S1A_IW_SLC__1SSH_20170221`**: the merged mosaic width. Every route
+that does not require the container's own intermediates has now been eliminated, so this needs a re-run
+with `prune` disabled and `product/` kept.
+
+The granule's own annotation was read to settle it — **over HTTP range requests, not by transferring the
+2.5 GiB archive**: the End Of Central Directory from the tail, the central directory from the offset it
+names, then the one annotation member, 127 MiB in total and most of that a conservative tail window.
+`tools/golden/zip_annotation.py` does it.
+
+| link in the chain | checked against | result |
+|---|---|---|
+| `samples_per_burst` | the granule's own IW3 annotation | **23894**, identical to ASF's burst extractor and to ours |
+| `slantRangeTime` per swath | the granule's annotation | gives a total width of **66173** against our 66172 |
+| `starting_range` | `s1_reader.py:971` | `slantRangeTime * c / 2`, per swath, not per burst |
+| `range_pixel_spacing` | `s1_reader.py:972` | `c / (2 * rangeSamplingRate)`, which matches the annotation's value |
+| the CSLC's own width | `slc_to_vrt_file:412` | `rasterXSize = samplesPerBurst`, so the raster is 23894 wide |
+| `swaths` | `process_sentinel1_slc_isce3` | keyword arguments throughout, so it defaults to `(1, 2, 3)` |
+| `get_burst_path` | `s1_isce3.py:541` | globs the CSLC, as assumed |
+| the `s1reader` version | `pyproject.toml:232` | `v0.2.5`, the same one installed locally |
+
+**Every one of them says 66173 and the container wrote 65978** — 195 samples, or 454 m of range. So the
+earlier reading of this as "`burst.as_isce3_radargrid()`'s own width" is wrong: that width *is*
+`samplesPerBurst`, and the annotation is not where the difference lives. Nothing readable from the product
+or from the pinned sources accounts for it.
 
 A note on what that block is *not*: a burst job's SAFE is synthesized, and its annotation agrees with the
 bursts it contains, so all three burst pairs reproduce the merged width exactly. The two outliers are
