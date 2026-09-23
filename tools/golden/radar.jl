@@ -803,6 +803,17 @@ function deramped_burst(raster, rows::AbstractUnitRange, carrier)
     return out
 end
 
+# A burst's ramp margins zeroed in place, reproducing the source rectangle `slc_to_vrt_file` exposes.
+# Bounds are the annotation's, converted to 0-based by the caller, and the array is 1-based.
+function _zero_outside_valid!(A::AbstractMatrix, fvl::Integer, lvl::Integer, fvs::Integer, lvs::Integer)
+    nr, nc = size(A)
+    z = zero(eltype(A))
+    @inbounds for j in 1:nc, i in 1:nr
+        ((i - 1) < fvl || (i - 1) > lvl || (j - 1) < fvs || (j - 1) > lvs) && (A[i, j] = z)
+    end
+    return A
+end
+
 """
     resample_burst(deramped, dl, ds, lines, samples) -> Matrix{Float32}
 
@@ -917,6 +928,21 @@ function secondary_swath_amplitude(rp::Sentinel1Product, sp::Sentinel1Product, s
             offsets(i)
         end
         deramped = deramped_burst(sraster, ((i - 1) * lpb + 1):(i * lpb), carrier)
+        # **The resampler's source is the burst zeroed outside its own valid window, not the raw burst.**
+        # `slc_to_vrt_file` writes a VRT of the burst's full shape whose `SimpleSource` covers only
+        # `first_valid_line:last_valid_line` by `first_valid_sample:last_valid_sample`, with
+        # `NoDataValue` 0, so everything outside that rectangle reads as zero
+        # (`s1_burst_slc.py:slc_to_vrt_file`). A TOPS burst's ramp-up and ramp-down margins carry small but
+        # non-zero amplitudes — a median of 2.24 against a typical 50 on this pair — so reading them fills
+        # pixels the reference leaves empty.
+        #
+        # **Zeroed rather than declined.** Rejecting an output pixel whose interpolation support straddles
+        # the boundary is a different rule and a worse one: measured on IW1 burst 1 of
+        # `S1A ... 20170221`, guarding declines 161,588 pixels the reference fills. Zeroing the source
+        # keeps them, tapered, which is what the reference's own interpolation does with a source rectangle
+        # that ends there.
+        _zero_outside_valid!(deramped, sa.first_valid_line[i] - 1, sa.last_valid_line[i] - 1,
+                             sa.first_valid_sample[i] - 1, sa.last_valid_sample[i] - 1)
 
         prev = i > 1 ? fld(lims[i - 1][2] - lims[i][1], 2) : 0
         nxt = i < n ? fld(lims[i][2] - lims[i + 1][1], 2) : 0
