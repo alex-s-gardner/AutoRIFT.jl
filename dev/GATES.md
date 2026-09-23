@@ -5076,9 +5076,14 @@ one against 0.065%. One mechanism, and the radar bounds are set above the larger
 **`LT05_L1GS_001013` and `S1C_IW_SLC__1SSV_20250416`** are the coarse-level position gap, attributed in
 full above. Neither needs a difference map and neither is a defect in `src/`: both have a base level that
 agrees to a median of exactly zero, and both draw most or all of their shared points from above it. What
-they need is `dev/CORRECTNESS.md` items 2 and 3 — which are deliberately *not* fixed while golden cases
-are red, per that file's own rule, since diverging from the reference's placement desynchronizes every
-downstream comparison.
+they need is `dev/CORRECTNESS.md` items 2 and 3.
+
+**Held as to-do until the rest of the set is green, deliberately.** The node position is a property of the
+*grid*, so changing it moves the coarse levels of every radar and NISAR case at once and re-opens `3.rdr`
+and `3.nisar`. While four cases are red on a missing COMPASS CSLC, a green appearing and a red appearing
+here would be indistinguishable from each other and from that gap — so the change would not be
+attributable, which is the one thing this ladder exists to guarantee. That file carries the condition and
+what a fix should achieve.
 
 **`S1A_IW_SLC__1SSH_20151120` and `S1A_IW_SLC__1SSH_20170221`**: the merged mosaic width. Every route
 that does not require the container's own intermediates has now been eliminated, so this needs a re-run
