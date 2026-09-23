@@ -4746,26 +4746,56 @@ deliberate Wallis variance moves the field across it. That case cannot go green 
 adopting the reference's variance formula, which is the same matching-versus-correctness decision as
 `dev/CORRECTNESS.md` items 2 and 3.
 
-Its scene 2's remaining 3x over the gate — 0.00647 against a gate of 0.00206, with the reference's variance
-fed in so the reject's decision agrees — has since had four candidates eliminated:
+### `LT05_L1GS_001013`: the variance is adopted, the decision agrees, and the cause of what is left
 
-  * **Not the band's angle.** The rung feeds `Destripe` the angles the reference *logged*, so the two masks
-    are built from identical inputs. Gate `5.orbit` measures the orbit-derived route separately, where the
-    cross-track angle agrees to 0.03 deg on all six scenes and the along-track one is 1.4 to 1.9 deg apart
-    because the reference's two edge directions are 91.4 to 91.9 deg apart rather than perpendicular — real
-    scan skew, and irrelevant here.
-  * **Not the moments' precision.** `destripe` already sums the spectrum's mean and variance in `Float64`
-    about the measured mean, and matches NumPy's population `n` rather than `n - 1`.
-  * **Not the mask's binary edge**, which is the fix above and took `LT04_L1TP_063018` green on both scenes
-    with the same code.
-  * **Not the transform's precision.** A `Float32` FFT round trip perturbs a field of magnitude ~2 by
-    order 1e-6, three orders below the residual.
+The reject's decision now agrees on all six scenes, since `_masked_boxstd` computes the reference's form
+(`CORRECTNESS.md` item 4). Scene 1 went from *declining* the reject at a median of 0.1983 to firing it at
+0.005615, against the harness's own reproduction of the reference at 0.005387. Both scenes remain red on
+the median alone, at roughly 2.6x the gate.
 
-What remains is the **rotation itself**: `_reject_band` reproduces `cv2.warpAffine`'s bilinear rotation, and
-`test/preprocess.jl` bounds that at 1/32 on up to eight cells of the fixture. A 1/32 error on the band's
-edge cells, multiplied into the spectrum and inverted, is the right size for a 0.005 median. That is the
-open question, and it is downstream of the variance decision rather than a separate blocker: the case
-cannot go green at rung 5.3 while scene 1's reject still fires on one side only.
+**Seven candidates for that residual are eliminated by measurement.** Recorded so the work is spent once:
+
+  * **Not the band's angle.** The rung feeds `Destripe` the angles the reference *logged*, so both masks are
+    built from identical inputs.
+  * **Not the rotation.** `_rotate_bilinear` now reproduces OpenCV's fixed-point pipeline and is **bitwise
+    equal** to `cv2.warpAffine` on all ten pinned fixtures, every angle and both axis parities. The residual
+    did not move: 0.005615 before and after. An earlier revision of this page named the rotation as the
+    remaining cause; that was wrong.
+  * **Not the spectrum's moments.** `destripe` sums them in `Float64` about the measured mean, with NumPy's
+    population divisor.
+  * **Not the transform's precision.** Recomputing the whole reject with a `Float64` transform — which is
+    what `np.fft.fft2` does regardless of its input's type — gives **the same value to five figures**:
+    median 0.0053794 either way.
+  * **Not the Wallis filter's border modes.** The reference mixes two inside one call, `BORDER_CONSTANT`
+    for `_remove_local_mean` and `BORDER_REFLECT` for `_preprocess_filt_std`. Reproducing that mixture
+    changes the filtered field by **nothing at all** — median 0.0053794 against 0.0053794.
+  * **Not the masked statistics or the erosion.** Feeding `destripe` an unmasked, uneroded Wallis moves the
+    *tail* and leaves the median: p99.9 falls from 0.548 to 0.0615 and the max from 3.86 to 0.423, while the
+    median goes 0.005627 to 0.005379.
+  * **Not a summation-order or cancellation noise floor.** The scene's DN runs 196 to 249, so `x²` reaches
+    only ~4e4 and the difference of squares does not cancel catastrophically. Accumulating the window in
+    `Float32` row-major against `Float32` column-major gives **identical** results — median 0, max 0.
+
+**What it is: the box filter's accumulation precision, amplified by a scene with almost no contrast.**
+`_masked_boxmean` accumulates running sums in `Float64` where `cv2.filter2D` convolves in `Float32`, and
+this scene's DN spans 196 to 207 over its middle 99% — so the local standard deviation is tiny and dividing
+by it amplifies any difference in the local mean. Measured on the Wallis output, `Float32` against
+`Float64` accumulation:
+
+| case | DN median / p99 | Wallis output, F32 vs F64 | rung 5.3 residual |
+|---|---|---:|---:|
+| `LT05_L1GS_001013` | 196 / 207 | **6.7e-4** | 0.0054 |
+| `LT04_L1TP_063018` | 192 / 255 | 4.9e-6 | 0.00069 |
+
+A 137x spread in precision sensitivity across two scenes of the same sensor and the same filter, tracking
+contrast rather than brightness. It is the same ordering as the residuals themselves, and it is why this
+case is the hard one while `LT04_L1TP_063018` is green.
+
+**So closing it means matching `cv2.filter2D`'s accumulation, not fixing a defect.** That is another
+agreement-over-accuracy change of the same kind as item 4, and a more invasive one: `windowmean`'s
+`Float64` running sums are deliberate — `REFERENCE.md` records a running sum drifting across a whole row —
+and every local filter in the package shares them. It is not attempted here, and the case stays red at
+rung 5.3 with the cause named rather than open.
 
 ### The gap-fill branch matches its decisions exactly and cannot match its values
 
