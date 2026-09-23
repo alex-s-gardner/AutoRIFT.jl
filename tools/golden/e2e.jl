@@ -852,10 +852,19 @@ function rung_coregister(s::Setup)
     startswith(s.case.platform, "S1") || return [
         StageResult("5.2 radar mosaic", "reference.tif", "set", true, 0,
                     "skipped: not a Sentinel-1 pair, so there is no burst mosaic to merge")]
-    _source_products(s.run) === nothing && return [
+    products = _source_products(s.run)
+    products === nothing && return [
         StageResult("5.2 radar mosaic", "reference.tif", "set", true, 0,
                     "skipped: this run keeps no source product beside its outputs, so a pixel would need \
                      the granule transferred")]
+    # **Metadata is enough for the geometry rungs and not for this one.** `SLCDatasets` parses a zipped
+    # product without unpacking it but refuses a windowed measurement read, since the raster is deflated
+    # inside the archive and its lines are not addressable. So a run holding zips reaches rung 5.0 and is
+    # declined here by acquisition rather than failing the ladder.
+    isdir(products[1]) || return [
+        StageResult("5.2 radar mosaic", "reference.tif", "set", true, 0,
+                    "skipped: $(basename(products[1])) is still zipped, and a measurement raster cannot \
+                     be read a window at a time from the archive. Unpack it beside the outputs")]
     path = joinpath(s.run, "reference.tif")
     isfile(path) || return [StageResult("5.2 radar mosaic", "reference.tif", "set", true, 0,
                                         "skipped: no $path")]
@@ -880,6 +889,10 @@ function rung_coregister(s::Setup)
     end
     sec = joinpath(s.run, "secondary.tif")
     isfile(sec) || return out
+    isdir(products[2]) || return push!(out, StageResult(
+        "5.2 secondary mosaic", "secondary.tif", "set", true, 0,
+        "skipped: $(basename(products[2])) is still zipped, so the secondary's own pixels are not \
+         readable a window at a time"))
     dem = joinpath(s.run, "dem.tif")
     isfile(dem) || return push!(out, StageResult("5.2 secondary mosaic", "secondary.tif", "set", true,
                                                 0, "skipped: no $dem, and the coregistration solves \

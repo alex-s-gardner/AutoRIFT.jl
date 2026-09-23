@@ -12,29 +12,26 @@
 #
 # **The mosaic's grid is mostly metadata, and one number of it is not.** hyp3 lays all three subswaths
 # on the near-range subswath's range origin and zero-fills between them (`s1_isce3.merge_swaths`), and
-# `loadMetadataSlc:210` hands geogrid that mosaic's own shape. Both extents are reproduced here from burst
-# annotations and the orbit, so no granule is transferred and no pixels merged — and on three of the five
-# golden Sentinel-1 SLC pairs the result is exact against `reference.tif`:
+# `loadMetadataSlc:210` hands geogrid that mosaic's own shape.
 #
-#     case                      julia            reference.tif
-#     S1A ... 20150828       64751 x 15858      64751 x 15858    exact
-#     S1A ... 20151120       66172 x 23856      65978 x 23857    194 wide, 1 short
-#     S1A ... 20170221       67945 x 23862      67860 x 24043     85 wide, 181 short
-#     S1B ... 20180809       67945 x 23860      67945 x 23860    exact
-#     S1C ... 20250416       65643 x 23852      65643 x 23852    exact
+# **Both extents follow the burst shape `merge_bursts_in_swath` reads, and that is the CSLC's rather than
+# the annotation's.** `total_rng_samples` is `last_rng_samples + floor((far.starting_range -
+# near.starting_range) / dr)`, and `last_rng_samples` is `num_rng_samples` — taken off the *COMPASS CSLC
+# raster* of the far subswath's first burst (`s1_isce3.py:565-566`). The azimuth extent inherits the same
+# dependency, since the per-swath merged length is built from that raster's `num_az_samples`.
 #
-# **What the two outliers need is a pixel product, not metadata.** `total_rng_samples` is
-# `last_rng_samples + floor((far.starting_range - near.starting_range) / dr)`, and `last_rng_samples` is
-# `merge_bursts_in_swath`'s `num_rng_samples` — read off the *COMPASS CSLC raster* of the far subswath's
-# first burst (`s1_isce3.py:562`), not off the annotation. It equals `samples_per_burst` on the three exact
-# cases and is 194 and 85 narrower on the other two. Leading-invalid-sample trimming does not explain it:
-# `first_valid_sample` is 45, 592, 580, 524 and 164 across the five against needed deltas of 0, 194, 85, 0
-# and 0. The azimuth extent inherits the same dependency, since the per-swath merged length is built from
-# the CSLC's own `num_az_samples`.
+# The two agree exactly when the reference burst was written by `rdr2geo`, and not when it was resampled
+# against a cached static topographic layer — `write_yaml`'s `use_static_layer` branch sets
+# `bool_reference` false, so COMPASS coregisters the reference burst instead of writing it out, and the
+# result lands on its own geocoded grid. Which step ran is readable off the burst directory: `x`/`y`/`z`
+# beside a polarization-named SLC for `rdr2geo`, `azimuth.off` beside a stem-named one for the resample.
+# On `S1A ... 20170221` the difference is 136 to 195 lines taller and 72 to 97 samples narrower per
+# subswath, which is exactly its 181-short, 85-wide disagreement.
 #
-# So the derivation is exact where COMPASS's burst width is the annotation's and needs that width
-# otherwise. It is left deriving rather than reading `reference.tif`, so the rung that compares the two
-# stays a test.
+# [`cslc_grid`](@ref) reads that shape from `product/` when the run kept one, and returns `nothing`
+# otherwise — where the annotation is already the right answer. So the derivation stays a derivation: it
+# reads COMPASS's own intermediate, which is an *input* to `merge_swaths`, never `reference.tif`, which is
+# what the rung compares against.
 #
 # **`dt` is full precision here, unlike the optical path.** `testGeogrid.py:439` sets
 # `repeatTime = (info1.sensingStart - info.sensingStart).total_seconds()` for radar, against `:354`'s

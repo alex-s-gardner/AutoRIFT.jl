@@ -4369,6 +4369,23 @@ relative to a peak amplitude of 4,665 while a byte level here is not. `in_I1` re
 same code is what makes this a property of the secondary's resample rather than of the quantization, and it
 is the open thread on this case.
 
+### `S1A ... 20170221` is green, and the Sentinel-1 SLC path has no metadata gap left
+
+**37 rungs, 37 green.** The two fixes it needed were the same one seen twice: the mosaic's extents follow
+the CSLC's burst shape, not the annotation's, and that applies to rung 5.2's pixel mosaic *and* to
+`s1_mosaic`, the metadata-only derivation rung 5.0's geometry comes from. With `cslc_grid` threaded into
+both, `nsamples` is 67860 and `nlines` 24043 against a derivation that was 85 wide and 181 short — and the
+geotransform, which is derived from the footprint and so inherited the error, agrees too.
+
+Reaching the rung at all needs the granule **unpacked** beside the outputs, about 6 GiB per pair:
+`SLCDatasets` parses a zipped product's metadata without unpacking but refuses a windowed measurement read,
+since the raster is deflated and its lines are not addressable. The rung declines by acquisition with that
+reason rather than failing the ladder, so a run holding only zips still reaches rung 5.0.
+
+That closes the mosaic-extent table this file and `radar.jl` both carried as two unexplained outliers. The
+rule is now stated rather than tabulated: the annotation is right exactly when the reference burst went
+through `rdr2geo`, which is three of the five pairs, and `product/` carries the answer for the other two.
+
 ### The coverage disagreement was the source raster, and it is gone
 
 Every radar case carried a population of pixels only *we* filled — 377,313 on `S1A ... 025533`, 670,878 on
