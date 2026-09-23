@@ -4973,22 +4973,33 @@ reference to a median of exactly zero. A geometry error does not spare the base 
 |---|---:|---|
 | optical (Landsat 4/5/7/8/9, Sentinel-2) | 12 | **10 green**, 2 red |
 | Sentinel-1 SLC | 5 | **3 green**, 2 blocked at rung 5.0 |
-| Sentinel-1 OPERA burst | 3 | **2 green**, 1 red |
+| Sentinel-1 OPERA burst | 3 | 3 red — all three reach rung 5.4 now |
 | NISAR L1 RSLC | 1 | **green** |
 | NISAR L2 GSLC | 1 | **green** |
 
-**Seventeen of the twenty-two are green on every rung the ladder runs.** That is one fewer than before
-rungs 5.3 and 5.4 existed, and the case that moved — `LT04_L1TP_063018` — did not regress: the ladder now
-tests a boundary it did not test before, and that case reds at it. Comparing the count across the two
-states means comparing different questions.
+**Fifteen of the twenty-two are green on every rung the ladder runs**, against seventeen before rungs 5.2,
+5.3 and 5.4 existed. **No case regressed.** The ladder tests four boundaries it did not test before — the
+native filter, the byte quantization, the radar mosaic and the coregistration — and three burst pairs plus
+`LT04_L1TP_063018` red at one of them. The two counts answer different questions, and the per-case tables
+above are what carries the comparison.
 
-The five reds are three causes:
+Worth stating plainly, because a falling count invites the wrong reading: the burst pairs went red by
+gaining `in_I1` at 99.63% exact and `in_I2` at 97.09% within one level, where before they had no imagery
+rung at all.
+
+The seven reds are four causes:
 
 | cases | cause | what it needs |
 |---|---|---|
 | `S1A ... 20151120`, `S1A ... 20170221` | the merged mosaic width, taken from a COMPASS CSLC raster rather than any annotation | a CSLC to measure |
 | `LT05_L1GS_001013`, `S1C ... 20250416` | the coarse-node position gap, deliberately matched | `dev/CORRECTNESS.md` items 2 and 3 |
 | `LT04_L1TP_063018`, and `LT05_L1GS_001013` again | the band-reject residual at rung 5.3, ~0.005 median where both fire against 5e-5 where both decline | the frequency band mask's boundary cells |
+| `S1C ... 20250416T010159` | the resample at rung 5.4's `in_I2`: 93.62% exact, 97.09% within one level | ISCE3's degree 5x3 carrier fit and its decline criterion, both above |
+| `S1A ... 20240618T025528`, `S1A ... 20240618T025533` | a `reference.tif` whose pixels are not the SAFE's bursts, with every extent matching exactly | the CSLC, or a reference re-run |
+
+**Every one of the seven is attributed and none is a widened bound.** Two of the four causes are the same
+COMPASS CSLC that the mosaic-width block needs, so the four causes are three pieces of missing input and
+one deliberate deviation.
 
 ### NISAR L1 is the simplest radar case, not the hardest
 

@@ -408,22 +408,22 @@ const GATES = Gate[
     end),
 
     Gate("5.e2e", "the end-to-end ladder on every case it reaches", true, function ()
-        # The seventeen golden cases the ladder runs green, by group: eight same-CRS optical, three
+        # The fifteen golden cases the ladder runs green, by group: eight same-CRS optical, three
         # cross-projection optical whose scenes rung 5.2 warps first (slow on a cold cache, free after),
-        # three Sentinel-1 SLC, two OPERA burst pairs and both NISAR products.
+        # three Sentinel-1 SLC and both NISAR products.
         #
-        # Five are absent and each for a recorded reason rather than by omission: two Sentinel-1 pairs whose
-        # mosaic width needs a CSLC to measure; `LT05_L1GS_001013` and `S1C_IW_SLC__1SSV_20250416`, whose
-        # endpoint residual lives entirely at the decimated levels; and `LT04_L1TP_063018`, which reds at
-        # rung 5.3 on the band-reject residual. `dev/GATES.md` holds all three causes.
+        # Seven are absent and each for a recorded reason rather than by omission. Four causes, in
+        # `dev/GATES.md`: two full-SLC pairs whose mosaic width and two burst pairs whose mosaic *pixels*
+        # both need the COMPASS CSLC; `LT05_L1GS_001013` and `S1C_IW_SLC__1SSV_20250416T010159`, whose
+        # endpoint residual is entirely at the decimated levels; `LT04_L1TP_063018` and `LT05_L1GS_001013`
+        # again on rung 5.3's band-reject residual; and `S1C_IW_SLC__1SSV_20250416T010159`'s `in_I2`, which
+        # is the resample against ISCE3's own carrier fit.
         cases = ["LC08_L1TP_009011", "LC08_L1TP_062018", "LC09_L1GT_215109",
                  "LE07_L1TP_063018_20040810", "S2A_MSIL1C_20200626", "S2B_MSIL1C_20200612",
                  "LC08_L1TP_060018_20130330_20200912_02_T1_X", "LE07_L1TP_061018_20120428",
                  "LE07_L1TP_061018_20130314", "LT05_L1TP_060018",
                  "S1A_IW_SLC__1SSH_20150828", "S1B_IW_SLC__1SDH_20180809",
-                 "S1C_IW_SLC__1SDV_20250416",
-                 "S1A_IW_SLC__1SSV_20240618T025528", "S1A_IW_SLC__1SSV_20240618T025533",
-                 "NISAR_L1", "NISAR_L2"]
+                 "S1C_IW_SLC__1SDV_20250416", "NISAR_L1", "NISAR_L2"]
         worst = Symbol[]
         detail = String[]
         for c in cases
