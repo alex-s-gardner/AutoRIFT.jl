@@ -1196,18 +1196,23 @@ function rung_bytes(s::Setup)
                              clipping every negative response to zero — ~30% of `in_I1` is the single \
                              value 128. Untruncated this rung reaches 57.2% exact")]
     if s.case.platform == "S1-BURST"
-        # **The reference side only.** `radar_mosaic` builds what `merge_swaths` writes as
-        # `reference.tif`, which needs no coregistration — COMPASS writes the reference burst on its own
-        # grid. `secondary.tif` is the coregistered one, and that half of rung 5.2 does not exist yet, so
-        # `in_I2` is declined rather than compared against a mosaic built from the wrong grid.
         k = read_capture(s.case; n = parse(Int, basename(s.run)))
         rp, sp = _burst_products(s.case, s.run)
         sws = burst_swaths(s.case)
         m = correlator_filter(s.case)
-        out = StageResult[_bytes_stage("in_I1", radar_mosaic(rp, sws), k.arrays["in_I1"], m)]
+        # The same two mosaics rung 5.2 gates, so a red here is the filter or the quantization rather than
+        # the merge — including the reference's own resample where it took one.
+        refoff = _reference_offsets(s.run, sws)
+        refoff === missing &&
+            return [StageResult("5.4 correlator bytes", "capture/in_I1", "exact", true, 0,
+                                "skipped: the reference bursts were resampled against a cached static                                  layer and this run kept no product/, so rung 5.2 cannot build the                                  mosaic this would quantize")]
+        out = StageResult[_bytes_stage("in_I1", radar_mosaic(rp, sws; offsets = refoff),
+                                       k.arrays["in_I1"], m)]
         dem = joinpath(s.run, "dem.tif")
         if isfile(dem)
-            push!(out, _bytes_stage("in_I2", secondary_mosaic(rp, sp, sws, dem_sampler(dem)),
+            push!(out, _bytes_stage("in_I2",
+                                    secondary_mosaic(rp, sp, sws, dem_sampler(dem);
+                                                     offsets = _secondary_offsets(s.run, sws)),
                                     k.arrays["in_I2"], m))
         else
             push!(out, StageResult("5.4 in_I2", "capture/in_I2", "exact", true, 0,
