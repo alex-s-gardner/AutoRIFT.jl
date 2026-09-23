@@ -966,19 +966,21 @@ genuinely textureless areas, since dividing by a small standard deviation magnif
 whatever is there; `min_std` floors the divisor to limit that, and `0.0` disables the
 floor.
 
-The local variance is computed in a numerically stable form rather than as
-`E[x²] - E[x]²`. That difference-of-large-numbers formula cancels catastrophically for
-a bright, low-contrast window, and in the reference it produced negative variances whose
-square roots were `NaN` — which then propagated into the validity mask, silently
-discarding data. Upstream now clamps the variance at zero, which stops the `NaN`s but
-leaves the precision loss; computing the variance about the measured mean avoids both.
+!!! warning "The local variance is deliberately computed in a numerically poor form"
+    The divisor is `sqrt(E[x²] - E[x]²)` clipped at zero, which is `_preprocess_filt_std`
+    (`autoRIFT.py:47-56`) and **not** what this filter should compute. That difference of large,
+    nearly equal numbers cancels catastrophically on a bright, low-contrast window; measured against
+    an exact `Float64` result on a 256² scene of mean 130 and standard deviation 25 at `width = 5`, it
+    is off by a median of **0.54** and up to 5.79, where squaring the deviations about the measured
+    mean is off by a median of **1.5e-6**. The cancellation can drive the variance negative, whose
+    square root is `NaN`; the clip is what stops that `NaN` reaching the validity mask and silently
+    discarding data.
 
-The size of that precision loss, measured against an exact `Float64` result on a 256²
-scene of mean 130 and standard deviation 25 at `width = 5`: the reference's formula is off
-by a median of 0.54 and up to 5.79, this one by a median of 1.5e-6 and up to 9.5e-6. So
-the two cannot agree bit for bit, and the difference is ~10⁵× the size of the tolerance a
-Float32 rounding difference would justify. `tools/golden/README.md` records what that costs
-in the golden comparison.
+    **It is here for agreement with the production Python and for no other reason.** The stable form
+    moves 90% of a filtered scene by a median of 0.113 on a field clamped to ±3, and on
+    `LT05_L1GS_001013` it moves the band-reject's fire-or-decline decision — so while the golden set
+    is the objective, a more accurate divisor reads as a regression. `dev/CORRECTNESS.md` item 4 is
+    the standing debt to restore it, and `tools/golden/README.md` records the measurement.
 """
 function wallis(img::AbstractMatrix, mask::AbstractMatrix{Bool}, width::Integer,
                 min_std::Real = 0.0)
@@ -1058,15 +1060,24 @@ function _masked_boxmean!(out::AbstractMatrix{Float32}, img::AbstractMatrix,
     return windowmean!(out, masked, w; hasnan = gaps)
 end
 
-# Standard deviation about the local mean, computed from squared deviations rather than
-# from `E[x²] - E[x]²`.
+# Standard deviation over a `w`-wide window, as `sqrt(E[x²] - E[x]²)` clipped at zero.
 #
-# The textbook shortcut is a difference of two large, nearly equal quantities, and it
-# cancels catastrophically for a bright low-contrast window — which in the reference
-# produced negative variances whose square roots were NaN, and those NaNs propagated
-# into the validity mask and silently discarded data. Upstream now clamps the variance
-# at zero, which stops the NaNs but leaves the precision loss. Squaring the deviations
-# about the measured mean costs one more pass and avoids both.
+# **This form is numerically poor and is used for agreement, not because it is right.** It is a
+# difference of two large, nearly equal quantities, so it cancels catastrophically on a bright
+# low-contrast window: measured against an exact `Float64` result on a 256² scene of mean 130 and
+# standard deviation 25 at `width = 5`, it is off by a median of 0.54 and up to 5.79, where squaring the
+# deviations about the measured mean is off by a median of 1.5e-6. The cancellation can also drive the
+# variance negative, which is why it is clipped — without the clip the square root is `NaN` and the `NaN`
+# propagates into the validity mask, silently discarding data.
+#
+# It is what `_preprocess_filt_std` computes (`autoRIFT.py:47-56`), and reproducing it is the whole
+# reason: the accurate form moves 90% of a filtered scene by a median of 0.113 on a field clamped to ±3,
+# and on `LT05_L1GS_001013` it moves the band-reject's decision. `dev/CORRECTNESS.md` item 4 is the
+# standing debt to put the stable form back once the golden set agrees.
+#
+# The means are held in `Float32`, which is where the cancellation has to happen: `cv2.filter2D` returns
+# the input's depth, so the reference subtracts two `Float32` arrays and a `Float64` intermediate here
+# would be *more* accurate and therefore differently wrong.
 #
 # Bessel-corrected by the window *area*, `sqrt(w² / (w² - 1))`, which is a constant and so
 # costs one multiply. It is deliberately not the per-window valid count: the reference scales by
@@ -1076,27 +1087,26 @@ end
 # output by 2% and move which pixels the gap filler treats as low-contrast.
 function _masked_boxstd(img::AbstractMatrix, mask::AbstractMatrix{Bool},
                         mean::AbstractMatrix{Float32}, w::Int)
-    dev2 = Matrix{Float32}(undef, size(img))
+    sq = Matrix{Float32}(undef, size(img))
     gaps = false
-    @inbounds for i in eachindex(dev2)
+    @inbounds for i in eachindex(sq)
         if mask[i] && isfinite(mean[i])
-            d = Float32(img[i]) - mean[i]
-            v = d * d
-            dev2[i] = v
-            gaps |= isnan(v)
+            v = Float32(img[i])
+            sq[i] = v * v
         else
-            dev2[i] = NaN32
+            sq[i] = NaN32
             gaps = true
         end
     end
     # `windowmean` ignores NaN, so this averages over valid neighbours only, and the
     # loop above already established whether there are any.
-    msd = windowmean(dev2, w; hasnan = gaps)
+    msq = windowmean(sq, w; hasnan = gaps)
     bessel = _bessel_factor(w)
-    @inbounds for i in eachindex(msd)
-        msd[i] = sqrt(max(msd[i], 0.0f0)) * bessel
+    @inbounds for i in eachindex(msq)
+        m = mean[i]
+        msq[i] = sqrt(max(msq[i] - m * m, 0.0f0)) * bessel
     end
-    return msd
+    return msq
 end
 
 # `sqrt(n / (n - 1))` for a `w`-by-`w` window. `w == 1` has no spread to correct, and the

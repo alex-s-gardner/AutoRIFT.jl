@@ -566,25 +566,28 @@ else
         end
     end
 
-    @testset "wallis gap fill: the statistics differ, deliberately and in three ways" begin
-        # Every mask above is exact while the standard deviation differs by up to 183 in the input's own
-        # units. Three separate causes, each a choice the reference made:
+    @testset "wallis gap fill: the statistics differ, deliberately and in two ways" begin
+        # Every mask above is exact while the standard deviation still differs. Two causes remain, each a
+        # choice the reference made:
         #
         #   1. **The gap zeros are in its statistics.** It detects gaps as `isclose(image, 0)` and then
         #      computes the local mean and standard deviation over the raw array anyway, so a window
         #      touching a gap is normalized by a spread the gap itself created. AutoRIFT.jl excludes them
-        #      via the mask, which is the difference `wallis_gapfill`'s docstring records.
-        #   2. **`E[x²] − E[x]²`, clipped at zero** (`_preprocess_filt_std`), against AutoRIFT.jl's
-        #      about-the-mean form — `REFERENCE.md` measures the reference's median error at 0.54 and
-        #      AutoRIFT.jl's at 1.5e-6 against an exact `Float64` truth.
-        #   3. **Mixed border modes inside one filter.** `_remove_local_mean` uses `BORDER_CONSTANT`
+        #      via the mask, which is the difference `wallis_gapfill`'s docstring records. On this striped
+        #      fixture it is the dominant term by far, which is why the fixture cannot isolate either of
+        #      the others.
+        #   2. **Mixed border modes inside one filter.** `_remove_local_mean` uses `BORDER_CONSTANT`
         #      while `_preprocess_filt_std` uses `BORDER_REFLECT`, so the numerator and the divisor
         #      disagree about the border within a single call.
+        #
+        # The variance *formula* used to be a third cause and is no longer: `_masked_boxstd` computes the
+        # reference's `E[x²] − E[x]²` clipped at zero, adopted for agreement and carried as
+        # `dev/CORRECTNESS.md` item 4.
         #
         # This testset asserts the *shape* of the disagreement rather than tolerating it: the masks are
         # exact, the values are not, and the difference is confined to the border and the gap
         # neighbourhoods rather than being everywhere. A change that made the values agree would mean one
-        # of the three choices above had been silently adopted.
+        # of the two choices above had been silently adopted.
         f = fixture("wallisfill/stripes_w5_c0p25")
         a = f.arrays
         valid = a.invalid .== 0

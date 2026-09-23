@@ -129,7 +129,43 @@ attributed — a green that appeared and a red that appeared would be indistingu
 from the CSLC gap. Act on it when the reds that remain are only these two, and measure against all 22 plus
 both radar gates, not against the two targets.
 
-## 4. The rest of the register
+## 4. Restore the stable Wallis local variance
+
+**Adopted for agreement on 2026-09-23, and it is the clearest case in this file of the trade this
+document exists to record.** `_masked_boxstd` computes `sqrt(E[x²] - E[x]²)` clipped at zero, which is
+`_preprocess_filt_std` (`autoRIFT.py:47-56`). That is a difference of two large, nearly equal numbers, so
+it cancels catastrophically on a bright low-contrast window, and the cancellation can drive the variance
+negative — the clip is what stops the square root being `NaN` and the `NaN` reaching the validity mask,
+where it would silently discard data. Squaring the deviations about the measured mean costs one extra pass
+and has neither problem.
+
+**What it cost to be right, measured on `LT05_L1GS_001013`.** The stable form moved 90% of the filtered
+field by a median of 0.113 on a field clamped to ±3, and on scene 1 it moved the band-reject's
+fire-or-decline decision: the branch is `(sA/sB >= 2 | sB/sA >= 2) & (max > 500)` on counts of 1588 and
+3279, clearing the ratio test by 3.2%, and the more accurate field landed on the other side. So AutoRIFT.jl
+*declined* the reject where the reference fired, and a whole scene's output became clamped Wallis instead
+of a band-rejected field. Adopting the reference's form:
+
+| scene | stable form | reference's form | the harness's own reproduction of the reference |
+|---|---:|---:|---:|
+| `... 19920425` | declines the reject, median 0.1983 | **fires, 0.005615** | 0.005387 |
+| `... 19920628` | 0.02398 | **0.006666** | 0.00647 |
+
+The decision now agrees on all six scenes of the three `wallis+destripe` cases, and the field tracks the
+reference to within 4% of the residual that remains.
+
+**What the fix needs, and why it cannot be judged by the golden set.** Both implementations would then use
+the accurate form, so agreement says nothing — the judgement has to be a measurement against an exact
+`Float64` truth. That measurement exists and is unambiguous: on a 256² scene of mean 130 and standard
+deviation 25 at `width = 5`, the reference's form is off by a median of 0.54 and up to 5.79 where
+about-the-mean is off by a median of 1.5e-6.
+
+**A synthetic Gaussian field will not show you the difference.** On a smooth random field of the same mean
+and spread the two forms agree to a median of 4.4e-5 — a relative 1.8e-6, three orders below what the real
+scene shows. The cancellation needs the bright *low-contrast* regions a real image has and a Gaussian does
+not, so a test built on `randn` will report the change as harmless when it is not.
+
+## 5. The rest of the register
 
 Recorded in full, with per-item evidence and revisit conditions, in **`tools/golden/README.md`**:
 
@@ -147,6 +183,7 @@ Recorded in full, with per-item evidence and revisit conditions, in **`tools/gol
 | The level-grid snap assumes a half-integer grid | `round(x + 0.5) - 0.5` moves an integer-valued grid by half a pixel. **Not matched** — `_cell_centres` reads the phase from the grid |
 | Which side's coarse value is more nearly correct is unsettled | judged against a local truth neither wins: the reference is closer on `dx`, while its `dy` carries ~2x our rms at a comparable median |
 
-Two differences run the **other** way, where AutoRIFT.jl is more nearly correct and deliberately does not
-match: the Wallis variance (about-the-mean, ~360,000x more accurate than the reference's
-`E[x²] - E[x]²`) and a seeded gap-fill RNG. Both are gated on tolerance rather than equality.
+One difference runs the **other** way, where AutoRIFT.jl is more nearly correct and deliberately does not
+match: a seeded gap-fill RNG, which is gated on tolerance rather than equality because the reference draws
+from NumPy's unseeded global generator and so cannot match itself either. The Wallis variance used to be
+the second such difference and is now item 4 above, adopted for agreement.
