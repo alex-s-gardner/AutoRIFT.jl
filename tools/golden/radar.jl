@@ -288,12 +288,15 @@ reference list alone, so a pair whose secondary reached a subswath the reference
 processes only the reference's.
 """
 function burst_swaths(c::GoldenCase)
+    # A full-SLC granule names the mode without a subswath — `S1A_IW_SLC__1SSH_...` — and
+    # `process_slc` defaults to all three. A burst names exactly one.
+    all(g -> occursin("_IW_SLC_", g), c.reference) && return collect(S1_SWATHS)
     sw = Int[]
     for g in c.reference
         m = match(r"_IW(\d)_", g)
         m === nothing && throw(ArgumentError(
-            "\"$g\" does not name a Sentinel-1 IW subswath; a burst is named " *
-            "`S1_<id>_IW<n>_<time>_<pol>_<hash>-BURST`"))
+            "\"$g\" names neither a full-SLC product nor an IW subswath; a burst is named " *
+            "`S1_<id>_IW<n>_<time>_<pol>_<hash>-BURST` and an SLC `S1A_IW_SLC__...`"))
         push!(sw, parse(Int, m.captures[1]))
     end
     return sort!(unique!(sw))
@@ -429,10 +432,12 @@ and resampled rather than copied; see [`resampled_burst_dirs`](@ref). Each subsw
 [`secondary_swath_amplitude`](@ref) with the product on both sides, since the resampling is the same and
 only the source acquisition differs.
 """
-function radar_mosaic(p::Sentinel1Product, swaths; offsets = nothing)
+function radar_mosaic(p::Sentinel1Product, swaths; offsets = nothing, grid = nothing)
     sws = collect(swaths)
     merged = [offsets === nothing ? swath_amplitude(p, sw) :
-              secondary_swath_amplitude(p, p, sw, nothing; offsets = offsets(sw)) for sw in sws]
+              secondary_swath_amplitude(p, p, sw, nothing; offsets = offsets(sw),
+                                        grid = grid === nothing ? nothing : grid(sw))
+              for sw in sws]
     return _stack_swaths(p, sws, merged)
 end
 
@@ -455,6 +460,35 @@ function burst_offsets(dir::AbstractString)
     ArchGDAL.setconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", "NO")
     try
         return (lookup(read_off("azimuth.off")), lookup(read_off("range.off")))
+    finally
+        ArchGDAL.setconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", prev)
+    end
+end
+
+"""
+    burst_offset_grid(dir) -> (lines, samples)
+
+The grid COMPASS resampled one burst onto, read from `azimuth.off`'s header alone.
+
+**This is not the annotation's burst, and `merge_bursts_in_swath` uses this one.** It takes
+`num_az_samples, num_rng_samples` from the CSLC raster's own shape (`s1_isce3.py:565-566`) and then applies
+the *annotation's* `first_valid_line` and `first_valid_sample` as windows into it. On the burst jobs the two
+grids coincide, so the distinction is invisible; on the full-SLC pairs that take the resample path they do
+not, and every extent in the mosaic depends on this one:
+
+    subswath   annotation           CSLC and offsets
+    IW1        1504 x 21530         1640 x 21458
+    IW2        1515 x 25376         1696 x 25279
+    IW3        1520 x 24454         1715 x 24369
+
+Dimensions only, so this costs a header read rather than the quarter-gigabyte the offsets themselves are.
+"""
+function burst_offset_grid(dir::AbstractString)
+    prev = ArchGDAL.getconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", "")
+    ArchGDAL.setconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", "NO")
+    try
+        ds = ArchGDAL.read(joinpath(dir, "azimuth.off"))
+        return (ArchGDAL.height(ds), ArchGDAL.width(ds))
     finally
         ArchGDAL.setconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", prev)
     end
@@ -829,7 +863,7 @@ samples, interpolated bilinearly between. That is exact to about 1e-5 px on this
 million geometry solves per burst into a few hundred.
 """
 function secondary_swath_amplitude(rp::Sentinel1Product, sp::Sentinel1Product, swath::Integer, dem;
-                                   offsets = nothing)
+                                   offsets = nothing, grid = nothing)
     a = annotation(rp, swath)
     sa = annotation(sp, swath)
     n = nbursts(a)
@@ -845,10 +879,14 @@ function secondary_swath_amplitude(rp::Sentinel1Product, sp::Sentinel1Product, s
         s = round(Int, (seconds_between(first(a.burst_start), a.burst_start[i]) + fvl[i] * dt) / dt)
         (s, s + (lvl[i] - fvl[i]) + 1)
     end
-    nlines = n == 1 ? lpb :
+    # **The output grid is the one COMPASS resampled onto, which is the annotation's burst only sometimes.**
+    # `merge_bursts_in_swath` reads its `num_az_samples`/`num_rng_samples` off the first burst's CSLC, so
+    # the merged height and the merged width both follow that raster and not `lines_per_burst`.
+    nl, ns = grid === nothing ? (lpb, spb) : grid(1)
+    nlines = n == 1 ? nl :
              1 + round(Int, (seconds_between(first(a.burst_start), last(a.burst_start)) +
-                             (lpb - 1) * dt) / dt)
-    out = zeros(Float32, nlines, spb)
+                             (nl - 1) * dt) / dt)
+    out = zeros(Float32, nlines, ns)
 
     for i in 1:n
         ss = open_slc(sp.path; orbit = sp.orbit_path, swath = swath, burst = i,
@@ -866,16 +904,18 @@ function secondary_swath_amplitude(rp::Sentinel1Product, sp::Sentinel1Product, s
 
         prev = i > 1 ? fld(lims[i - 1][2] - lims[i][1], 2) : 0
         nxt = i < n ? fld(lims[i][2] - lims[i + 1][1], 2) : 0
-        bstart, bend = n == 1 ? (0, lpb) : (fvl[i] + prev, 1 + lvl[i] - nxt)
-        mstart, mend = n == 1 ? (0, lpb) : (lims[i][1] + prev, lims[i][2] - nxt)
-        cols = n == 1 ? (1:spb) : ((fvs[i] + 1):lvs[i])
+        bstart, bend = n == 1 ? (0, nl) : (fvl[i] + prev, 1 + lvl[i] - nxt)
+        mstart, mend = n == 1 ? (0, nl) : (lims[i][1] + prev, lims[i][2] - nxt)
+        # `min(lvs, ns)`: the valid-sample window is the annotation's and the raster it indexes is the
+        # CSLC's, which can be the narrower of the two. NumPy's slicing truncates there in silence.
+        cols = n == 1 ? (1:ns) : ((fvs[i] + 1):min(lvs[i], ns))
         # No valid-window guard: measured, ISCE3's own criterion is the raster's bounds rather than the
         # annotation's valid region. Guarding on the valid window declines 137,782 pixels `secondary.tif`
         # fills, to avoid filling 2,746 it does not — fifty times the error it removes.
         got = resample_burst(deramped, dl, ds, bstart:(bend - 1), (first(cols) - 1):(last(cols) - 1))
         out[(mstart + 1):mend, cols] = got
     end
-    return (out, nlines, spb)
+    return (out, nlines, ns)
 end
 
 # The offset field on a lattice, with bilinear interpolation between nodes. Two closures rather than two
@@ -910,10 +950,12 @@ The merged amplitude raster `merge_swaths` writes as `secondary.tif`.
 The same swath stack as [`radar_mosaic`](@ref) — the reference's extents, offsets and first-come writer —
 over [`secondary_swath_amplitude`](@ref)'s coregistered subswaths.
 """
-secondary_mosaic(rp::Sentinel1Product, sp::Sentinel1Product, swaths, dem; offsets = nothing) =
+secondary_mosaic(rp::Sentinel1Product, sp::Sentinel1Product, swaths, dem; offsets = nothing,
+                 grid = nothing) =
     _stack_swaths(rp, swaths,
                   [secondary_swath_amplitude(rp, sp, sw, dem;
-                                             offsets = offsets === nothing ? nothing : offsets(sw))
+                                             offsets = offsets === nothing ? nothing : offsets(sw),
+                                             grid = grid === nothing ? nothing : grid(sw))
                    for sw in collect(swaths)])
 
 """
