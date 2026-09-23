@@ -4369,6 +4369,41 @@ relative to a peak amplitude of 4,665 while a byte level here is not. `in_I1` re
 same code is what makes this a property of the secondary's resample rather than of the quantization, and it
 is the open thread on this case.
 
+### The coverage disagreement was the source raster, and it is gone
+
+Every radar case carried a population of pixels only *we* filled — 377,313 on `S1A ... 025533`, 670,878 on
+`025528`, 9,833,375 on the full-SLC `20170221` — and it was attributed here to `geo2rdr` declining pixels
+the merge fills anyway. That was wrong. **The resampler's source is not the raw burst.**
+`slc_to_vrt_file` writes a VRT of the burst's full shape whose `SimpleSource` covers only
+`first_valid_line:last_valid_line` by `first_valid_sample:last_valid_sample`, with `NoDataValue` 0, so
+everything outside that rectangle reads as zero. A TOPS burst's ramp margins carry small but non-zero
+amplitudes — a median of 2.24 against a typical 50 — and reading them filled pixels the reference leaves
+empty.
+
+**Zeroing the source, not declining the output.** Rejecting a pixel whose interpolation support straddles
+the boundary is a different rule and a worse one: measured, it declines 161,588 pixels the reference fills.
+Zeroing keeps them tapered, which is what the reference's interpolation does with a source rectangle that
+ends there. This is why the valid-window *guard* measured as a bad trade on both grids while the same bounds
+expressed as source zeroing is exact.
+
+| case | pixels only we fill, before | after |
+|---|---:|---:|
+| `S1A ... 025533` | 377,313 | **0** |
+| `S1A ... 025528` | 670,878 | **2** |
+| `S1C ... 010159` | 2,746 | **0** |
+| `S1A ... 20170221` full SLC | 9,833,375 | **4**, peak 6.0e-12 |
+
+None of them loses a pixel the reference fills: only-the-reference stays at zero everywhere. The four on
+`20170221` are floating-point dust at 6e-12.
+
+**Four consequences.** `20170221`'s reference mosaic goes **green**, at a median |d| of 0.0037651 over
+707,415,776 shared pixels. `S1C ... 010159`'s `in_I2` goes green — within one level on **100.0000%** of the
+quantizable population at a maximum of 2 levels — and its ladder, which used to stop at rung 5.4, now runs
+all 38 rungs and reds only on rung 5.7's `dx` bias, which is the coarse-node position gap of
+`CORRECTNESS.md` items 2 and 3 and was previously hidden behind the earlier red. `025533` and `025528` stay
+38 of 38 with their coverage now exact rather than bounded. And rung 5.4's `quantizable` mask, which exists
+to exclude this population and its filter support, now has almost nothing to exclude.
+
 ### Rung 5.2 on a full-SLC pair: the extent is solved and the coverage is not
 
 The rung reaches a full-SLC pair once the run keeps a source product, and reaches its *pixels* once that
