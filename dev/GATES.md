@@ -4470,6 +4470,40 @@ Without any deramp at all the same chain reaches 0.7535 of the reference's mean 
 0.736 — the TOPS sweep reaches a few kilohertz against a 486 Hz line rate, so an interpolation chip's
 samples are aliased against each other and cancel rather than sum. It is worth a quarter of the amplitude.
 
+### D: the carrier fit is derived, the decline criterion is found, and what remains is bounded
+
+Three of rung 5.2 and 5.4's four radar stages are green; only `in_I2` is not. Four candidate causes were
+tested and three are now settled:
+
+**The carrier fit, which ISCE3 evaluates instead of the carrier.** `get_az_carrier_poly` samples the
+carrier every 50 lines and 500 samples and least-squares fits eighteen terms — `x^j y^i` with `i <= 5`,
+`j <= 3`, `i + j <= 5` in normalized range and azimuth time. `CarrierFit` reproduces that. It gives
+**93.5026%** where the exact carrier with an empirical one-line shift gave **93.5025%**, which is the
+point: the fit evaluates the carrier at index `(y, x)` but is fitted against the coordinates of
+`(y + 1, x + 1)`, so the one-line shift *falls out of it* rather than being applied by hand. Applying both
+double-counts and costs 4 points. So that shift is now derived, and there is a one-sample range shift
+beside it that was never visible on its own.
+
+**The decline criterion is `geo2rdr`'s non-convergence sentinel.** ISCE3 writes **−1e6** where it did not
+converge — exactly 70,980 pixels of 31,034,324 per burst, 0.2287%, matching its own
+"30963344 out of 31034324" log line — and `ResampSlc` turns that into a zero. A lattice of offsets cannot
+reproduce a per-pixel convergence failure, so rung 5.2 bounds *pixels only we fill* by that measured rate
+rather than by a chosen number, and its secondary mosaic goes **green**: 2,746 of 363,775,172 is 0.00075%,
+well inside the 0.2287% the reference itself declines.
+
+**Two things ruled out by measurement.** `burst.doppler.lut2d`, which `ResampSlc` receives beside the
+carrier, is *identical* to the annotation's range polynomial and constant in azimuth — two azimuth nodes
+with the same values — so there is no azimuth-varying Doppler term missing. And the sinc's taps are centred
+at −3 through +4: shifting them to −4 through +3 costs 12 points.
+
+**What is left, and what it is not.** `in_I2` sits at 93.50% exact and 97.09% within one level. The
+residual is two populations. Where both implementations fill a pixel the median relative amplitude error is
+**6e-5 to 6e-4** — 25 to 250 times *smaller* than one byte level — and it grows smoothly with distance from
+each burst's centre and resets at the seam, a sawtooth whose shape says a term linear in azimuth time is
+slightly off. Separately, **2.71% of shared pixels differ by more than 10 amplitude units**, and only 0.2%
+of those sit within two pixels of a declined pixel, so they are not the decline. That second population is
+what the gate fails on and it is not yet explained.
+
 ### What rung 5.4 now reaches on radar
 
 | case | `in_I1` | `in_I2` |
