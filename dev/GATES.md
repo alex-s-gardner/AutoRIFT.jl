@@ -4415,17 +4415,74 @@ to bracket or the azimuth ramp aliases, and the coarse lattice COMPASS interpola
 `ImagePairGeometry` supplies `rdr2geo`, `geo2rdr` and the lattice interpolation; the kernel and the
 deramp have no implementation yet.
 
+### The resampler, and every piece of it chosen by measurement
+
+`ResampSlc` deramps each chip, interpolates with an eight-tap sinc, and reramps. Only the first two reach
+an amplitude — the reramp is a phase multiply on a finished value — so `in_I2` needs the deramp and the
+kernel, and nothing else.
+
+**The kernel is a Hann-windowed eight-tap sinc**, and that is derivable rather than merely best: ISCE's
+`sinc_coef`, which `Sinc2dInterpolator` is built from, weights the sinc by
+`(1 − pedestal)/2 · cos(πx/(ns/2)) + (1 + pedestal)/2`, and a pedestal of zero at `ns = 8` is exactly
+`0.5 + 0.5 cos(πx/4)`. Measured on a 512 × 4096 window against `secondary.tif`, as the ratio of means and
+the correlation:
+
+| kernel | mean / reference | correlation |
+|---|---:|---:|
+| bicubic (Catmull-Rom) | 0.9266 | 0.98640 |
+| eight-tap sinc, unwindowed | 1.2070 | 0.98365 |
+| eight-tap sinc, Hamming | 1.0116 | 0.99963 |
+| **eight-tap sinc, Hann** | **0.9976** | **0.99957** |
+
+**The deramp is `s1reader.az_carrier_components` plus two things that are easy to miss.** Its own carrier
+is `π·kt·(eta − eta_ref)²` with `eta` measured from the middle line *index* — `(line − lines ÷ 2)·dt`,
+integer division, half a line from the burst's mid *time* — and `eta_ref` a *difference*,
+`dc(r₀)/fm(r₀) − dc(r)/fm(r)`. Beyond that:
+
+  * **the carrier's line argument is shifted by one.** `get_az_carrier_poly` evaluates the components at
+    index `y` but fits the polynomial against `sensing_start + (y + 1)·dt`, so the polynomial ISCE3
+    evaluates at a line returns the component one line earlier.
+  * **a demodulation term belongs there too.** It is not in s1reader's `carrier` property, and it is still
+    part of the reference: `s1_resample.py` hands `ResampSlc` `burst.doppler.lut2d` *alongside* the carrier
+    polynomial, so the resampler applies both.
+
+Both were settled by measuring `in_I2` itself:
+
+| carrier line shift | demod term | `in_I2` exact | within one level |
+|---|---|---:|---:|
+| 0 | no (s1reader's carrier alone) | 67.75% | 82.82% |
+| 0 | yes | 89.63% | 97.06% |
+| **−1** | **yes** | **93.50%** | **97.09%** |
+| +1 | yes | 84.33% | 96.85% |
+
+Without any deramp at all the same chain reaches 0.7535 of the reference's mean and a correlation of
+0.736 — the TOPS sweep reaches a few kilohertz against a 486 Hz line rate, so an interpolation chip's
+samples are aliased against each other and cancel rather than sum. It is worth a quarter of the amplitude.
+
 ### What rung 5.4 now reaches on radar
 
 | case | `in_I1` | `in_I2` |
 |---|---|---|
-| `S1C ... 20250416T010159` | **99.6333% exact, 100.0000% within one level, max 1** | skipped |
+| `S1C ... 20250416T010159` | **99.6333% exact, 100.0000% within one level, max 1** | 93.62% exact, 97.09% within one level |
 
-That is the whole imagery chain in Julia for a radar case — SAFE bursts, the two-level mosaic, the
-high-pass at width 21, and the byte quantization — against the reference's own bytes, agreeing to within
-one level at every one of 363,775,172 pixels. `in_I2` is declined because it is the *coregistered* half:
-`secondary.tif` is COMPASS's resample of the secondary onto the reference grid, and that half of rung 5.2
-is not built.
+`in_I1` is the whole imagery chain in Julia for a radar case — SAFE bursts, the two-level mosaic, the
+high-pass at width 21, and the byte quantization — agreeing with the reference's own bytes to within one
+level at every one of 363,775,172 pixels.
+
+`in_I2` adds the coregistration and the resample on top of that, and reaches 97.09% within one level.
+Rung 5.2's secondary mosaic says where the remainder is: **where both implementations fill a pixel they
+agree to a median of 0.0077 against a peak amplitude of 4665 — 1.6e-6 relative** — while the p99 is 59.6.
+So the field is not uniformly slightly wrong; the great majority is near-exact and a few percent is far
+out. Two contributors, neither of which more precision on this side can remove:
+
+  * **ISCE3 evaluates a *fit*, not the carrier.** `get_az_carrier_poly` samples the carrier every 50 lines
+    and 500 samples and fits a degree 5 x 3 polynomial. This evaluates it exactly, which is more accurate
+    and therefore different.
+  * **The decline criterion at a burst margin.** 2,746 pixels of 363,775,172 are filled here and not by the
+    reference, with a peak of 274. Guarding the eight-tap support against the annotation's valid region
+    removes them but declines 137,782 pixels `secondary.tif` does fill — fifty times the error it fixes —
+    so ISCE3's criterion is the raster's bounds and not the valid window. Left unguarded, and this is what
+    keeps rung 5.2's secondary red.
 
 ## Rung 5.4 — the bytes, and the one deliberate deviation that reaches all of them
 

@@ -424,10 +424,14 @@ count plus the floored range offset to it, not a union of the three.
 A subswath other than the far one is trimmed by 64 samples at its far edge, which is the reference's
 `invalid_pixel_buffer` — the resampling margin at a subswath's far range.
 """
-function radar_mosaic(p::Sentinel1Product, swaths)
+radar_mosaic(p::Sentinel1Product, swaths) =
+    _stack_swaths(p, swaths, [swath_amplitude(p, sw) for sw in collect(swaths)])
+
+# `merge_swaths`'s swath stack, over per-subswath rasters a caller has already merged. Shared by the
+# reference and the secondary because the layout is the reference's in both cases.
+function _stack_swaths(p::Sentinel1Product, swaths, merged)
     sws = collect(swaths)
     ann = [annotation(p, sw) for sw in sws]
-    merged = [swath_amplitude(p, sw) for sw in sws]
 
     dr = first(ann).range_pixel_spacing
     dt = first(ann).azimuth_time_interval
@@ -565,3 +569,275 @@ function coregistration_offset(cr, cs, line::Integer, sample::Integer, height;
     return ((p.aztime - cs.sensing_start) * cs.prf - line - 1,
             (p.range - cs.starting_range) / cs.dr - sample, h)
 end
+
+# ---------------------------------------------------------------------------
+# The secondary, coregistered onto the reference grid
+# ---------------------------------------------------------------------------
+#
+# `ResampSlc` deramps each chip, interpolates with an eight-tap sinc, and reramps. Only the first two
+# reach an amplitude: the reramp is a phase multiply on the finished value.
+#
+# **Every piece of this was chosen by measurement**, on burst 1 of `S1C_IW_SLC__1SSV_20250416` against
+# `secondary.tif` over a 512 x 4096 window, reported as the ratio of means and the correlation:
+#
+#     no deramp, bicubic                 0.7535   0.73626
+#     deramp with the opposite sign      0.7641   0.76199
+#     deramp, bicubic                    0.9266   0.98640
+#     deramp, eight-tap sinc unwindowed  1.2070   0.98365
+#     deramp, eight-tap sinc + Hamming   1.0116   0.99963
+#     deramp, eight-tap sinc + Hann      0.9976   0.99957
+#
+# Hann is also derivable rather than merely best: ISCE's `sinc_coef`, which `Sinc2dInterpolator` is built
+# from, weights the sinc by `(1 - pedestal)/2 * cos(pi x / (ns/2)) + (1 + pedestal)/2`, and a pedestal of
+# zero makes that exactly `0.5 + 0.5 cos(pi x / 4)` at `ns = 8`.
+
+const CLIGHT = 299792458.0
+
+"""
+    range_poly(p::RangePolynomial, range) -> Float64
+
+`p` evaluated at a slant `range` in metres.
+
+**Not `p(range)`.** `RangePolynomial` stores `r0` in metres but keeps the annotation's coefficients in
+powers of *slant-range time*, so calling it with a range mixes the two units and returns a number about
+sixteen orders of magnitude out. The delta has to be the two-way time: at 838,557 m the FM rate is
+−2224.66 Hz/s this way and −3.6e16 Hz/s the other.
+"""
+range_poly(p, range::Real) = evalpoly(2 * (Float64(range) - p.r0) / CLIGHT, p.coeffs)
+
+"""
+    TopsCarrier(slc, coord, lines_per_burst)
+
+The azimuth carrier phase of one Sentinel-1 burst, as `(line, sample) -> radians`.
+
+The TOPS beam sweep puts a quadratic azimuth phase on each burst whose instantaneous frequency reaches a
+few kilohertz against a 486 Hz line rate, so the samples of any interpolation chip are aliased with
+respect to each other and interpolating the raw complex signal cancels rather than sums — worth 25% of the
+amplitude, measured. Removing it first is what `ResampSlc` does.
+
+`s1reader.az_carrier_components` verbatim, and each of its three choices matters:
+
+  * **azimuth time is measured from the middle line index**, `(line - lines_per_burst ÷ 2) * dt` with
+    integer division — not from the burst's mid *time*, which is half a line away;
+  * **the reference time is a difference**, `dc(r0)/fm(r0) - dc(r)/fm(r)`, so the quadratic's vertex
+    carries a constant offset that the beam-centre crossing alone does not;
+  * **there is no demodulation term.** The carrier is `pi * kt * (eta - eta_ref)^2` and nothing else.
+
+`kt` is `ks / (1 - ks/ka)` where `ks = 2|v| * steering_rate / wavelength` at the burst mid.
+"""
+struct TopsCarrier
+    fm::Any
+    dc::Any
+    ks::Float64
+    dt::Float64
+    r0::Float64
+    dr::Float64
+    mid_line::Int
+    eta_ref0::Float64
+end
+
+# Whether the carrier carries the demodulation term as well as the quadratic. `s1reader` has only the
+# quadratic; the flag exists because which one reproduces `secondary.tif` better is a measurement.
+const CARRIER_DEMOD = Ref(true)
+# `get_az_carrier_poly` evaluates the carrier at index `y` but fits it against `sensing_start + (y+1)*dt`,
+# so the polynomial ISCE3 evaluates at a line returns the component one line earlier.
+const CARRIER_LINE_SHIFT = Ref(-1)
+
+function TopsCarrier(slc, coord, lines_per_burst::Integer)
+    dp = SLCDatasets.deramp_parameters(slc)
+    _, v = ImagePairGeometry.interpolate(coord.orbit, ImagePairGeometry.orbit_midtime(coord))
+    # The annotation gives the steering rate in degrees per second; `s1reader` holds it in radians.
+    ks_rad = dp.azimuth_steering_rate * (abs(dp.azimuth_steering_rate) > 0.1 ? pi / 180 : 1.0)
+    ks = ks_rad * 2 * sqrt(sum(abs2, v)) / dp.wavelength
+    r0 = dp.starting_range
+    eta_ref0 = range_poly(dp.doppler_centroid, r0) / range_poly(dp.azimuth_fm_rate, r0)
+    return TopsCarrier(dp.azimuth_fm_rate, dp.doppler_centroid, ks, dp.azimuth_time_interval,
+                       r0, dp.range_pixel_spacing, Int(lines_per_burst) ÷ 2, eta_ref0)
+end
+
+@inline function (c::TopsCarrier)(line::Integer, sample::Integer)
+    r = c.r0 + sample * c.dr
+    ka = range_poly(c.fm, r)
+    fdc = range_poly(c.dc, r)
+    kt = c.ks / (1 - c.ks / ka)
+    eta = (line + CARRIER_LINE_SHIFT[] - c.mid_line) * c.dt
+    de = eta - (c.eta_ref0 - fdc / ka)
+    return pi * kt * de * de + (CARRIER_DEMOD[] ? 2pi * fdc * de : 0.0)
+end
+
+"""
+    sinc8(f) -> NTuple{8,Float64}
+
+The eight taps of a Hann-windowed sinc at fractional offset `f`, for taps at −3 through +4.
+
+`Sinc2dInterpolator`'s kernel: ISCE's `sinc_coef` weights `sinc(x)` by
+`(1 − pedestal)/2 · cos(πx/(ns/2)) + (1 + pedestal)/2`, which at `pedestal = 0` and `ns = 8` is
+`0.5 + 0.5 cos(πx/4)`. Unwindowed the same eight taps overshoot by 21%, and a bicubic undershoots by 7%.
+"""
+@inline function sinc8(f::Float64)
+    return ntuple(8) do k
+        x = (k - 4) - f
+        s = x == 0 ? 1.0 : sinpi(x) / (pi * x)
+        s * (0.5 + 0.5 * cospi(x / 4))
+    end
+end
+
+"""
+    deramped_burst(raster, rows, carrier) -> Matrix{ComplexF32}
+
+One burst's samples with its azimuth carrier removed, ready to interpolate.
+
+Done to the whole burst once rather than per interpolation chip: a chip would evaluate the carrier 64
+times per output pixel where this evaluates it once per input pixel, which is the difference between
+minutes and hours over a subswath.
+"""
+function deramped_burst(raster, rows::AbstractUnitRange, carrier::TopsCarrier)
+    nr, nc = length(rows), size(raster, 2)
+    out = Matrix{ComplexF32}(undef, nr, nc)
+    src = raster[rows, :]
+    Threads.@threads for j in 1:nc
+        for i in 1:nr
+            out[i, j] = ComplexF32(src[i, j]) * cis(-Float32(carrier(i - 1, j - 1)))
+        end
+    end
+    return out
+end
+
+"""
+    resample_burst(deramped, dl, ds, lines, samples) -> Matrix{Float32}
+
+`deramped` read at each reference pixel's own position in the secondary, as amplitude.
+
+`dl` and `ds` are callables giving the offsets at a reference `(line, sample)`; in practice they
+interpolate a lattice, since the field moves by 0.0036 lines over 1200 lines and the lattice's own
+interpolation error is 1e-5 px.
+
+Amplitude rather than the complex value, so the reramp is omitted: it multiplies the finished sample by a
+unit phasor and cannot change a magnitude.
+"""
+function resample_burst(deramped, dl, ds, lines::AbstractUnitRange,
+                        samples::AbstractUnitRange, valid = nothing)
+    out = zeros(Float32, length(lines), length(samples))
+    nr, nc = size(deramped)
+    Threads.@threads for (jj, s) in collect(enumerate(samples))
+        for (ii, l) in enumerate(lines)
+            y = l + dl(l, s) + 1.0
+            x = s + ds(l, s) + 1.0
+            iy, ix = floor(Int, y), floor(Int, x)
+            (iy - 3 < 1 || iy + 4 > nr || ix - 3 < 1 || ix + 4 > nc) && continue
+            # The eight-tap support has to sit inside the secondary's own valid region: outside it the
+            # reference's resampler has no samples either, and interpolating the zero margin invents a
+            # small non-zero value where `secondary.tif` holds none.
+            if valid !== nothing
+                (iy - 3 < valid[1] || iy + 4 > valid[2] || ix - 3 < valid[3] || ix + 4 > valid[4]) &&
+                    continue
+            end
+            ty = sinc8(y - iy)
+            tx = sinc8(x - ix)
+            acc = ComplexF64(0)
+            for m in 1:8
+                row = ComplexF64(0)
+                @simd for k in 1:8
+                    row += tx[k] * ComplexF64(deramped[iy - 4 + m, ix - 4 + k])
+                end
+                acc += ty[m] * row
+            end
+            out[ii, jj] = Float32(abs(acc) / (sum(ty) * sum(tx)))
+        end
+    end
+    return out
+end
+
+"""
+    secondary_swath_amplitude(rp, sp, swath, dem) -> (Matrix{Float32}, Int, Int)
+
+[`swath_amplitude`](@ref) for the secondary: each burst resampled onto the reference burst's grid first,
+then placed by the **reference's** own seam arithmetic.
+
+That the placement is the reference's is not a simplification — `merge_bursts_in_swath` takes
+`az_reference_offsets` from `ref_bursts` and the range window from the reference burst's valid samples,
+and applies both to the secondary. So the two mosaics share every index and differ only in pixel values.
+
+The offsets come from a lattice of [`coregistration_offset`](@ref) solves, one node every 64 lines and 512
+samples, interpolated bilinearly between. That is exact to about 1e-5 px on this field and turns 31
+million geometry solves per burst into a few hundred.
+"""
+function secondary_swath_amplitude(rp::Sentinel1Product, sp::Sentinel1Product, swath::Integer, dem)
+    a = annotation(rp, swath)
+    sa = annotation(sp, swath)
+    n = nbursts(a)
+    lpb, spb = a.lines_per_burst, a.samples_per_burst
+    dt = a.azimuth_time_interval
+    sraster = burst_raster(first(collect(bursts(sp, swath))).backend).raster
+    fvl = a.first_valid_line .- 1
+    lvl = a.last_valid_line .- 1
+    fvs = a.first_valid_sample .- 1
+    lvs = a.last_valid_sample .- 1
+
+    lims = map(1:n) do i
+        s = round(Int, (seconds_between(first(a.burst_start), a.burst_start[i]) + fvl[i] * dt) / dt)
+        (s, s + (lvl[i] - fvl[i]) + 1)
+    end
+    nlines = n == 1 ? lpb :
+             1 + round(Int, (seconds_between(first(a.burst_start), last(a.burst_start)) +
+                             (lpb - 1) * dt) / dt)
+    out = zeros(Float32, nlines, spb)
+
+    for i in 1:n
+        cr = RadarCoordinate(open_slc(rp.path; orbit = rp.orbit_path, swath = swath, burst = i,
+                                     polarization = rp.polarization))
+        ss = open_slc(sp.path; orbit = sp.orbit_path, swath = swath, burst = i,
+                      polarization = sp.polarization)
+        cs = RadarCoordinate(ss)
+        carrier = TopsCarrier(ss, cs, lpb)
+        dl, ds = _offset_lattice(cr, cs, dem, lpb, spb)
+        deramped = deramped_burst(sraster, ((i - 1) * lpb + 1):(i * lpb), carrier)
+
+        prev = i > 1 ? fld(lims[i - 1][2] - lims[i][1], 2) : 0
+        nxt = i < n ? fld(lims[i][2] - lims[i + 1][1], 2) : 0
+        bstart, bend = n == 1 ? (0, lpb) : (fvl[i] + prev, 1 + lvl[i] - nxt)
+        mstart, mend = n == 1 ? (0, lpb) : (lims[i][1] + prev, lims[i][2] - nxt)
+        cols = n == 1 ? (1:spb) : ((fvs[i] + 1):lvs[i])
+        # No valid-window guard: measured, ISCE3's own criterion is the raster's bounds rather than the
+        # annotation's valid region. Guarding on the valid window declines 137,782 pixels `secondary.tif`
+        # fills, to avoid filling 2,746 it does not — fifty times the error it removes.
+        got = resample_burst(deramped, dl, ds, bstart:(bend - 1), (first(cols) - 1):(last(cols) - 1))
+        out[(mstart + 1):mend, cols] = got
+    end
+    return (out, nlines, spb)
+end
+
+# The offset field on a lattice, with bilinear interpolation between nodes. Two closures rather than two
+# matrices so the caller reads a position rather than an index.
+const _LSTEP, _SSTEP = 64, 512
+function _offset_lattice(cr, cs, dem, lpb::Integer, spb::Integer)
+    ls = 0:_LSTEP:(lpb + _LSTEP)
+    ss = 0:_SSTEP:(spb + _SSTEP)
+    DL = Matrix{Float64}(undef, length(ls), length(ss))
+    DS = similar(DL)
+    Threads.@threads for jj in eachindex(ss)
+        for ii in eachindex(ls)
+            DL[ii, jj], DS[ii, jj], _ = coregistration_offset(cr, cs, ls[ii], ss[jj], dem)
+        end
+    end
+    lerp(A, l, s) = begin
+        fi = l / _LSTEP + 1
+        fj = s / _SSTEP + 1
+        i = clamp(floor(Int, fi), 1, length(ls) - 1)
+        j = clamp(floor(Int, fj), 1, length(ss) - 1)
+        u, v = fi - i, fj - j
+        (1-u)*(1-v)*A[i,j] + u*(1-v)*A[i+1,j] + (1-u)*v*A[i,j+1] + u*v*A[i+1,j+1]
+    end
+    return ((l, s) -> lerp(DL, l, s), (l, s) -> lerp(DS, l, s))
+end
+
+"""
+    secondary_mosaic(rp, sp, swaths, dem) -> Matrix{Float32}
+
+The merged amplitude raster `merge_swaths` writes as `secondary.tif`.
+
+The same swath stack as [`radar_mosaic`](@ref) — the reference's extents, offsets and first-come writer —
+over [`secondary_swath_amplitude`](@ref)'s coregistered subswaths.
+"""
+secondary_mosaic(rp::Sentinel1Product, sp::Sentinel1Product, swaths, dem) =
+    _stack_swaths(rp, swaths, [secondary_swath_amplitude(rp, sp, sw, dem) for sw in collect(swaths)])
