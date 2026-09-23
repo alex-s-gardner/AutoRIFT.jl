@@ -5105,10 +5105,36 @@ names, then the one annotation member, 127 MiB in total and most of that a conse
 | `get_burst_path` | `s1_isce3.py:541` | globs the CSLC, as assumed |
 | the `s1reader` version | `pyproject.toml:232` | `v0.2.5`, the same one installed locally |
 
-**Every one of them says 66173 and the container wrote 65978** — 195 samples, or 454 m of range. So the
+**Every one of them says 66173 and the cached run wrote 65978** — 195 samples, or 454 m of range. So the
 earlier reading of this as "`burst.as_isce3_radargrid()`'s own width" is wrong: that width *is*
-`samplesPerBurst`, and the annotation is not where the difference lives. Nothing readable from the product
-or from the pinned sources accounts for it.
+`samplesPerBurst`, and the annotation is not where the difference lives.
+
+### Resolved: the cached artifact is stale, and the derivation was right all along
+
+With every input and every line of code eliminated, the remaining possibility was that the cached run does
+not represent the code. It does not. Running the container **with `merge_swaths` patched to print its own
+values** — the same pinned image, the same two granules, today — gives:
+
+    [PROBE] swath=3  num_rng_samples=23894  shape_from_meta=(1509, 23894)
+    [PROBE] num_rng_pixels=42278  last_rng_samples=23894
+            total_rng_samples=66172  total_az_samples=23856
+
+**66172 x 23856, which is exactly what `s1_mosaic` derives**, and the regenerated `reference.tif` is that
+size. The cached `reference.tif` is 65978 x 23857. Same image tag, same granules, same annotations — a
+different result, so the artifact was produced by a build that no longer exists behind that tag.
+
+Against the regenerated run the case is **27/27 green**, including all seventeen geogrid bands over
+11,596,294 points. So this was never a defect in `src/` or in the harness: rung 5.0 was comparing a correct
+derivation against a stale file, and every rung after it inherited that.
+
+**Two lessons worth more than the case.** A mutable image tag is not a pinned reference — `0.28.4` served
+different code at different times, and nothing in the run directory recorded which. And an elimination
+chain is what made this findable: each link checked against the container image and the granule's own bytes
+is what left "the artifact is stale" as the only surviving explanation, where a looser investigation would
+have kept hunting for an arithmetic error that was not there.
+
+The regenerated run also **keeps `product/` and `product_sec/`** — COMPASS does not delete them — so the
+CSLCs are now on disk for the first time.
 
 A note on what that block is *not*: a burst job's SAFE is synthesized, and its annotation agrees with the
 bursts it contains, so all three burst pairs reproduce the merged width exactly. The two outliers are
