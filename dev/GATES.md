@@ -4351,9 +4351,43 @@ layer* instead of being written out. COMPASS then takes the secondary path for i
 (`s1_cslc.py:29-35`), and combined with `Geo2Rdr`'s one-line offset convention the result is the reference
 shifted by about a line.
 
-**What this does not yet explain** is why the cases that *do* match also retrieved static files — 7 on
-`S1C ... 010159`, 27 on `S1B ... 20180809` — with no visible difference in the retrieval's outcome. So
-"a static layer was used" is necessary but not sufficient, and the discriminator is still open.
+**Which step ran is readable off the burst directory, and that is the discriminator.** The two steps leave
+different files, so no log parsing is needed:
+
+    reference written out (rdr2geo)          reference resampled (geo2rdr + resample)
+    ------------------------------------     ----------------------------------------
+    t038_080963_iw2_20151120_HH.slc.tif      t050_105604_iw1_20240618.slc.tif
+    x.tif  y.tif  z.tif  topo.vrt            azimuth.off  azimuth.off.xml
+    layover_shadow_mask.tif                  range.off    range.off.xml
+    radar_grid.txt                           ..._VV.slc.vrt
+
+The full-SLC pair `S1A ... 20151120` has the left-hand set and **no offsets at all**, which is why its
+mosaic comes straight off the raw SAFE and the case is 27/27 green. The burst pair has the right-hand set.
+So "a static layer was retrieved" is not the condition — both runs hold a `static_topo_corrections/` —
+and counting retrievals in the log was measuring the wrong thing. What separates them is whether
+COMPASS's reference step was `rdr2geo` or `geo2rdr` plus `resample`.
+
+**Replaying the resample reproduces the reference burst.** The offsets are large — a median of 2.4631
+lines over a range of 2.3111 to 2.6080, and -82.3784 samples over -85.6337 to -78.5812 — which is why the
+raw burst is not merely noisy against the CSLC but decorrelated. Feeding them to
+[`resample_burst`](@ref) instead, over the reference burst deramped by its own carrier:
+
+    burst 1502 x 21182, compared on the 94.14% both fill
+    raw burst against the CSLC                     median |d| 29.90     corr 0.31678
+    resampled with the reference's own offsets      median |d| 0.0122    corr 0.99839
+
+a relative median of 2.44e-4 against amplitudes near 51.9. `Geo2Rdr` declines 181,967 pixels of
+31,815,364 with its -1e6 sentinel; those are moved far outside the burst so the resampler's bounds guard
+drops them rather than interpolating a sentinel.
+
+The secondary reads its offsets from `product_sec/` for the same reason: it is coregistered to whatever
+grid the reference ended on, so solving against the raw reference burst carries the reference's own
+2.46-line error.
+
+One trap in reading these: an ISCE flat file is described by a sibling `.off.xml`, and GDAL only finds it
+when it may list the directory. These tools set `GDAL_DISABLE_READDIR_ON_OPEN` to `EMPTY_DIR` for the S3
+reads, under which the open fails with "not recognized as being in a supported file format" — the option
+is lifted around the two opens.
 
 **The tractable route is now open, and it needs nothing external.** `product/.../azimuth.off` and
 `range.off` for the *reference* burst are the offsets the reference itself resampled with. Feeding those to

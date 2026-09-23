@@ -423,9 +423,71 @@ count plus the floored range offset to it, not a union of the three.
 
 A subswath other than the far one is trimmed by 64 samples at its far edge, which is the reference's
 `invalid_pixel_buffer` — the resampling margin at a subswath's far range.
+
+`offsets` maps a subswath to a per-burst `(dl, ds)` pair, for a reference that was itself coregistered
+and resampled rather than copied; see [`resampled_burst_dirs`](@ref). Each subswath then goes through
+[`secondary_swath_amplitude`](@ref) with the product on both sides, since the resampling is the same and
+only the source acquisition differs.
 """
-radar_mosaic(p::Sentinel1Product, swaths) =
-    _stack_swaths(p, swaths, [swath_amplitude(p, sw) for sw in collect(swaths)])
+function radar_mosaic(p::Sentinel1Product, swaths; offsets = nothing)
+    sws = collect(swaths)
+    merged = [offsets === nothing ? swath_amplitude(p, sw) :
+              secondary_swath_amplitude(p, p, sw, nothing; offsets = offsets(sw)) for sw in sws]
+    return _stack_swaths(p, sws, merged)
+end
+
+"""
+    burst_offsets(dir) -> (dl, ds)
+
+COMPASS's per-pixel azimuth and range offsets for one burst, as callables on a 0-based `(line, sample)`.
+
+`Geo2Rdr` marks a pixel it could not solve with -1e6. Those are moved far outside the burst rather than
+passed through, so [`resample_burst`](@ref)'s own bounds guard drops them.
+"""
+function burst_offsets(dir::AbstractString)
+    read_off(name) = permutedims(ArchGDAL.read(ArchGDAL.getband(
+                                     ArchGDAL.read(joinpath(dir, name)), 1)))
+    lookup(A) = (l, s) -> (v = A[l + 1, s + 1]; v <= -1e5 ? -1e7 : v)
+    # An ISCE flat file is described by a sibling `.off.xml`, which GDAL only finds if it may list the
+    # directory. `GDAL_DISABLE_READDIR_ON_OPEN` is `EMPTY_DIR` for the S3 reads elsewhere in these tools,
+    # so it is lifted for these two opens and put back.
+    prev = ArchGDAL.getconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", "")
+    ArchGDAL.setconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", "NO")
+    try
+        return (lookup(read_off("azimuth.off")), lookup(read_off("range.off")))
+    finally
+        ArchGDAL.setconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", prev)
+    end
+end
+
+"""
+    resampled_burst_dirs(run, swath; secondary = false) -> Vector{String}
+
+The COMPASS burst directories of one subswath that hold `azimuth.off` and `range.off`, in burst order,
+or empty when the acquisition was not resampled.
+
+Whether the *reference* acquisition has them is the whole question for a mosaic. `write_yaml` sets
+`bool_reference` false whenever a cached static topographic layer is available, so a reference burst is
+then coregistered against that layer and resampled rather than written out; without one it runs `rdr2geo`
+instead and its directory holds `x`/`y`/`z` and a polarization-named SLC with no offsets at all. So the
+presence of the offsets is both the test for which path ran and the input needed to follow it.
+
+The burst identifier encodes the absolute burst number along the track, so sorting the directory names
+puts them in acquisition order.
+"""
+function resampled_burst_dirs(run::AbstractString, swath::Integer; secondary::Bool = false)
+    root = joinpath(run, secondary ? "product_sec" : "product")
+    isdir(root) || return String[]
+    dirs = String[]
+    for id in sort!(filter(endswith("_iw$(swath)"), readdir(root)))
+        sub = joinpath(root, id)
+        for date in sort!(readdir(sub))
+            d = joinpath(sub, date)
+            isdir(d) && isfile(joinpath(d, "azimuth.off")) && (push!(dirs, d); break)
+        end
+    end
+    return dirs
+end
 
 # `merge_swaths`'s swath stack, over per-subswath rasters a caller has already merged. Shared by the
 # reference and the secondary because the layout is the reference's in both cases.
@@ -766,7 +828,8 @@ The offsets come from a lattice of [`coregistration_offset`](@ref) solves, one n
 samples, interpolated bilinearly between. That is exact to about 1e-5 px on this field and turns 31
 million geometry solves per burst into a few hundred.
 """
-function secondary_swath_amplitude(rp::Sentinel1Product, sp::Sentinel1Product, swath::Integer, dem)
+function secondary_swath_amplitude(rp::Sentinel1Product, sp::Sentinel1Product, swath::Integer, dem;
+                                   offsets = nothing)
     a = annotation(rp, swath)
     sa = annotation(sp, swath)
     n = nbursts(a)
@@ -788,13 +851,17 @@ function secondary_swath_amplitude(rp::Sentinel1Product, sp::Sentinel1Product, s
     out = zeros(Float32, nlines, spb)
 
     for i in 1:n
-        cr = RadarCoordinate(open_slc(rp.path; orbit = rp.orbit_path, swath = swath, burst = i,
-                                     polarization = rp.polarization))
         ss = open_slc(sp.path; orbit = sp.orbit_path, swath = swath, burst = i,
                       polarization = sp.polarization)
         cs = RadarCoordinate(ss)
         carrier = CarrierFit(TopsCarrier(ss, cs, lpb), lpb, spb)
-        dl, ds = _offset_lattice(cr, cs, dem, lpb, spb)
+        dl, ds = if offsets === nothing
+            cr = RadarCoordinate(open_slc(rp.path; orbit = rp.orbit_path, swath = swath, burst = i,
+                                          polarization = rp.polarization))
+            _offset_lattice(cr, cs, dem, lpb, spb)
+        else
+            offsets(i)
+        end
         deramped = deramped_burst(sraster, ((i - 1) * lpb + 1):(i * lpb), carrier)
 
         prev = i > 1 ? fld(lims[i - 1][2] - lims[i][1], 2) : 0
@@ -843,8 +910,11 @@ The merged amplitude raster `merge_swaths` writes as `secondary.tif`.
 The same swath stack as [`radar_mosaic`](@ref) — the reference's extents, offsets and first-come writer —
 over [`secondary_swath_amplitude`](@ref)'s coregistered subswaths.
 """
-secondary_mosaic(rp::Sentinel1Product, sp::Sentinel1Product, swaths, dem) =
-    _stack_swaths(rp, swaths, [secondary_swath_amplitude(rp, sp, sw, dem) for sw in collect(swaths)])
+secondary_mosaic(rp::Sentinel1Product, sp::Sentinel1Product, swaths, dem; offsets = nothing) =
+    _stack_swaths(rp, swaths,
+                  [secondary_swath_amplitude(rp, sp, sw, dem;
+                                             offsets = offsets === nothing ? nothing : offsets(sw))
+                   for sw in collect(swaths)])
 
 """
     CarrierFit(c::TopsCarrier, lines, samples)
