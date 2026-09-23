@@ -4325,6 +4325,32 @@ against amplitudes near 200, with a median of 0.008: COMPASS's resample tapers i
 value is exactly zero. So the gate bounds the *peak* value at a disagreeing pixel rather than the count —
 a magnitude says the difference is the taper, where a count cannot.
 
+### The three regenerated radar cases, on the resample-replay path
+
+All three captured against image digest `sha256:5fbfeeca…` (built 2026-07-23), the same local build as the
+`20151120` regeneration, so they are comparable with it rather than with a fresh pull of a mutable tag.
+**All three reproduced their cached artifacts exactly**, so only `20151120` was ever stale.
+
+| case | subswaths x bursts | reference burst path | ladder |
+|---|---|---|---|
+| `S1A ... 025533` | 2 x 5 | resample | **38/38** |
+| `S1A ... 025528` | 3 x 8 | resample | **38/38** |
+| `S1C ... 010159` | 1 x 7 | resample | 8/9, `5.4 in_I2` red |
+| `S1A ... 20170221` | 3 x 9, full SLC | resample | extent explained, below |
+
+**The replay generalizes.** `025528` compares 1,437,109,152 pixels per mosaic with **no pixel the reference
+fills and we do not**, at a median |d| of 0.011971 on the reference and 0.0038605 on the secondary, and both
+byte arrays inside one level on 99.96% of the quantizable population.
+
+**`S1C ... 010159` is the cleanest radar result in the set and still has one red.** Its reference mosaic has
+**zero** coverage disagreement in *either* direction over 363,775,172 pixels, and `in_I1` quantizes to a
+maximum difference of **one level** — 100.0000% within one. Its secondary does not: 99.8578% within one
+level with a maximum of 158, against 2,746 pixels only we fill at a peak of 274. So roughly 0.15% of the
+population carries a large byte disagreement that rung 5.2's own gate tolerates, since that gate is
+relative to a peak amplitude of 4,665 while a byte level here is not. `in_I1` reaching a maximum of 1 on the
+same code is what makes this a property of the secondary's resample rather than of the quantization, and it
+is the open thread on this case.
+
 ### The mosaic extent: both outliers are the CSLC raster, and the discriminator predicts which
 
 `S1A ... 20170221` regenerates to **24043 x 67860, identical to the cached run** — so unlike `20151120`
