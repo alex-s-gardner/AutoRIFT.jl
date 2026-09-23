@@ -4325,6 +4325,24 @@ against amplitudes near 200, with a median of 0.008: COMPASS's resample tapers i
 value is exactly zero. So the gate bounds the *peak* value at a disagreeing pixel rather than the count —
 a magnitude says the difference is the taper, where a count cannot.
 
+### The optical set re-measured against the adopted variance
+
+All twelve optical cases re-run after `CORRECTNESS.md` item 4, since `Wallis` and `wallis_gapfill` reach
+every one of them and the change was made for a single case. **Eleven of twelve green, no regression.**
+
+`LT04_L1TP_063018` is the one worth naming: it was already green *with* the accurate form, so it was the
+case at risk. It stays green and moves slightly the wrong way — 0.00069 and 0.00028 become 0.00085 and
+0.00047, against gates of 0.00158 and 0.00186 — because on that scene the accurate variance happened to
+agree marginally better. Its reject decision agrees either way.
+
+`LT05_L1TP_060018` is now **identical** between the two variants, 5.177e-05 and 6.738e-05 on both: with the
+variance adopted, `Wallis` and the harness's own reproduction of the reference produce the same destriped
+field on a scene whose reject is declined. That is the cleanest available check that the adoption landed,
+because it removes the last thing separating the two on such a scene — masked statistics and erosion, which
+an L1TP footprint makes a near no-op.
+
+`LT05_L1GS_001013` is the only red, at the `Float32` noise floor documented above.
+
 ### The three regenerated radar cases, on the resample-replay path
 
 All three captured against image digest `sha256:5fbfeeca…` (built 2026-07-23), the same local build as the
@@ -4872,13 +4890,21 @@ either direction, over 252 to 271 million pixels each. That is the whole of the 
 reproduced: both distance transforms, the 30-pixel reach that makes a missing scan line valid, the
 `sqrt(2((w-1)/2)²) + 0.01` buffer radius, and the low-standard-deviation dilation.
 
-The values are not matched, at a median of 0.19 to 0.37 and a p99.9 near 4.2, and both causes are already
-established elsewhere: the median is the Wallis variance choice, isolated at 0.113 on the `fft` branch
-where nothing else intervenes, and the tail is the fills themselves, drawn from NumPy's *unseeded* global
-generator so that no run reproduces another including the reference's own. **Reported rather than gated**,
-for the same reason rung 5.4 skips these cases — a bound neither implementation can meet is not a test.
-Separating the two causes here would need the gap fill's distance transforms reimplemented in the harness,
-which the `fft` branch's isolation makes unnecessary.
+The values were not matched either, at a median of 0.19 to 0.37 and a p99.9 near 4.2. **Adopting the
+reference's variance (`CORRECTNESS.md` item 4) collapsed the median by three to four orders of magnitude**,
+which confirms the attribution above — the median *was* the Wallis variance choice, isolated at 0.113 on the
+`fft` branch — and is the largest single effect that decision had anywhere in the set:
+
+| scene | median, before | median, after |
+|---|---:|---:|
+| `LC08_L1TP_060018 ... 20130330` pair | 0.19 to 0.37 | 2.772e-05 / 3.172e-04 |
+| `LE07_L1TP_061018 ... 20120428` pair | 0.19 to 0.37 | 6.863e-04 / 1.007e-04 |
+| `LE07_L1TP_061018 ... 20130314` pair | 0.19 to 0.37 | 3.302e-05 / 2.772e-05 |
+| `LE07_L1TP_063018 ... 20040810` pair | 0.19 to 0.37 | 4.752e-05 / 3.731e-05 |
+
+The tail is unchanged and unchangeable: the fills come from NumPy's *unseeded* global generator, so no run
+reproduces another including the reference's own. **Still reported rather than gated**, for that reason
+alone now rather than for two — a bound neither implementation can meet is not a test.
 
 ## Rung 5.4 on the Landsat cases
 
