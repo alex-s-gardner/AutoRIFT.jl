@@ -845,15 +845,21 @@ granule is not — the run directory holds `reference.tif` and no source product
 an 8 GiB transfer to read a pixel from.
 """
 function rung_coregister(s::Setup)
-    s.case.platform == "S1-BURST" || return [StageResult("5.2 radar mosaic", "reference.tif", "set",
-                                                         true, 0,
-                                                         "skipped: only a burst job keeps its SAFE in \
-                                                          the run directory; a full-SLC pair would need \
-                                                          the granule transferred to read a pixel")]
+    # **Any pair whose source product sits beside the outputs**, which is a burst job's `burst2safe` SAFE
+    # or a full-SLC pair's granule zips when the run was captured rather than pruned. The condition is the
+    # product being present, not the platform: a pruned run of either kind has nothing to read a pixel from
+    # and would need the granule transferred.
+    startswith(s.case.platform, "S1") || return [
+        StageResult("5.2 radar mosaic", "reference.tif", "set", true, 0,
+                    "skipped: not a Sentinel-1 pair, so there is no burst mosaic to merge")]
+    _source_products(s.run) === nothing && return [
+        StageResult("5.2 radar mosaic", "reference.tif", "set", true, 0,
+                    "skipped: this run keeps no source product beside its outputs, so a pixel would need \
+                     the granule transferred")]
     path = joinpath(s.run, "reference.tif")
     isfile(path) || return [StageResult("5.2 radar mosaic", "reference.tif", "set", true, 0,
                                         "skipped: no $path")]
-    rp, sp = _burst_products(s.case, s.run)
+    rp, sp = _s1_products(s.case, s.run)
     sws = burst_swaths(s.case)
     # A reference that was resampled against a cached static layer is reproduced by replaying that
     # resample, not by copying the burst: the offsets reach 2.46 lines and -82.4 samples, which
@@ -866,7 +872,9 @@ function rung_coregister(s::Setup)
                             and this run kept no product/, so the offsets they resampled with are not \
                             available to replay")]
     else
-        out = [_mosaic_stage("5.2 reference mosaic", path, radar_mosaic(rp, sws; offsets = refoff);
+        out = [_mosaic_stage("5.2 reference mosaic", path,
+                             radar_mosaic(rp, sws; offsets = refoff,
+                                          grid = _reference_grid(s.run, sws));
                              max_median = refoff === nothing ? 1e-4 : 3e-4,
                              max_only_ours = refoff === nothing ? 0.0 : 2.3e-3)]
     end
@@ -880,20 +888,55 @@ function rung_coregister(s::Setup)
     # full resample — an eight-tap windowed sinc over a deramped burst — where the reference is a copy.
     push!(out, _mosaic_stage("5.2 secondary mosaic", sec,
                              secondary_mosaic(rp, sp, sws, dem_sampler(dem);
-                                              offsets = _secondary_offsets(s.run, sws));
+                                              offsets = _secondary_offsets(s.run, sws),
+                                              grid = _secondary_grid(s.run, sws));
                              max_median = 3e-4, max_only_ours = 2.3e-3))
     return out
 end
 
-# Both parsed SAFEs, reference first, which is the earlier of the two `burst2safe` wrote.
-function _burst_products(c::GoldenCase, run::AbstractString)
-    early, late = _burst_safes(run)
+# The two source products a run keeps, earlier first, or `nothing` when it kept none. A burst job holds
+# the pair of SAFE directories `burst2safe` wrote; a full-SLC pair holds the two granule zips. Both are
+# readable by the same `Sentinel1Product`, so which one a case has changes only the glob.
+function _source_products(run::AbstractString)
+    # Keyed by the granule's own start time, so the two acquisitions pair up however they are stored, and
+    # an unpacked `.SAFE` wins over the `.zip` of the same granule.
+    #
+    # **Pixels need the unpacked form.** `SLCDatasets` reads a zipped product's *metadata* without
+    # unpacking, which is all the geometry rungs want, but refuses a windowed measurement read because the
+    # raster is deflated inside the archive and its lines are not addressable. So a run holding only zips
+    # reaches rung 5.0 and not rung 5.2, and unpacking one granule is what promotes it.
+    found = Dict{String,String}()
+    for n in sort!(readdir(run))
+        path = joinpath(run, n)
+        stem = replace(n, r"\.(SAFE|zip)$" => "")
+        occursin(r"^S1[ABC]_.._(SLC|GRD)", stem) || continue
+        parts = split(stem, '_')
+        length(parts) >= 6 || continue
+        key = parts[6]
+        if endswith(n, ".SAFE") && isdir(path)
+            found[key] = path
+        elseif endswith(n, ".zip") && !haskey(found, key)
+            found[key] = path
+        end
+    end
+    length(found) == 2 || return nothing
+    a, b = sort!(collect(keys(found)))
+    return (found[a], found[b])
+end
+
+# Both parsed products, reference first, which is the earlier acquisition of the two.
+function _s1_products(c::GoldenCase, run::AbstractString)
+    p = _source_products(run)
+    p === nothing && error("no source product beside the outputs in $run: expected either the two SAFE " *
+                          "directories `burst2safe` writes or the pair's two granule zips. A pruned run " *
+                          "has neither, and a pixel cannot be read without one.")
+    early, late = p
     prod(p) = Sentinel1Product(p; orbit = s1_orbit(run, basename(p)),
                                polarization = lowercase(s1_polarization(basename(p))),
                                swaths = burst_swaths(c))
     return prod(early), prod(late)
 end
-_reference_product(c::GoldenCase, run::AbstractString) = first(_burst_products(c, run))
+_reference_product(c::GoldenCase, run::AbstractString) = first(_s1_products(c, run))
 
 # How the reference acquisition's own bursts have to be built: `nothing` to copy them, a subswath-to-burst
 # offsets provider to replay the resample, `missing` when they were resampled and the offsets are gone.
@@ -910,6 +953,21 @@ function _reference_offsets(run::AbstractString, swaths)
     # One burst's offsets at a time: a subswath's worth is a quarter of a gigabyte per axis, and the
     # resample consumes them burst by burst anyway.
     return sw -> (i -> burst_offsets(dirs[sw][i]))
+end
+
+# The grid each burst was resampled onto, which `merge_bursts_in_swath` takes its extents from. A header
+# read per burst, so it is cheap enough to ask separately from the offsets themselves.
+function _reference_grid(run::AbstractString, swaths)
+    isdir(joinpath(run, "product")) || return nothing
+    dirs = Dict(sw => resampled_burst_dirs(run, sw) for sw in swaths)
+    any(isempty, values(dirs)) && return nothing
+    return sw -> (i -> burst_offset_grid(dirs[sw][i]))
+end
+
+function _secondary_grid(run::AbstractString, swaths)
+    dirs = Dict(sw => resampled_burst_dirs(run, sw; secondary = true) for sw in swaths)
+    any(isempty, values(dirs)) && return nothing
+    return sw -> (i -> burst_offset_grid(dirs[sw][i]))
 end
 
 # The secondary's own offsets, when COMPASS's are on disk. Preferred over solving for them: a secondary is
@@ -1255,7 +1313,7 @@ function rung_bytes(s::Setup)
                              value 128. Untruncated this rung reaches 57.2% exact")]
     if s.case.platform == "S1-BURST"
         k = read_capture(s.case; n = parse(Int, basename(s.run)))
-        rp, sp = _burst_products(s.case, s.run)
+        rp, sp = _s1_products(s.case, s.run)
         sws = burst_swaths(s.case)
         m = correlator_filter(s.case)
         # The same two mosaics rung 5.2 gates, so a red here is the filter or the quantization rather than
