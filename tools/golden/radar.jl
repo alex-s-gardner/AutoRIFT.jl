@@ -638,10 +638,7 @@ end
 
 # Whether the carrier carries the demodulation term as well as the quadratic. `s1reader` has only the
 # quadratic; the flag exists because which one reproduces `secondary.tif` better is a measurement.
-const CARRIER_DEMOD = Ref(true)
-# `get_az_carrier_poly` evaluates the carrier at index `y` but fits it against `sensing_start + (y+1)*dt`,
-# so the polynomial ISCE3 evaluates at a line returns the component one line earlier.
-const CARRIER_LINE_SHIFT = Ref(-1)
+
 
 function TopsCarrier(slc, coord, lines_per_burst::Integer)
     dp = SLCDatasets.deramp_parameters(slc)
@@ -660,9 +657,14 @@ end
     ka = range_poly(c.fm, r)
     fdc = range_poly(c.dc, r)
     kt = c.ks / (1 - c.ks / ka)
-    eta = (line + CARRIER_LINE_SHIFT[] - c.mid_line) * c.dt
+    eta = (line - c.mid_line) * c.dt
     de = eta - (c.eta_ref0 - fdc / ka)
-    return pi * kt * de * de + (CARRIER_DEMOD[] ? 2pi * fdc * de : 0.0)
+    # The quadratic is `s1reader`'s; the linear term is ISCE3's separate use of the Doppler, which
+    # `s1_resample.py` hands `ResampSlc` beside the carrier polynomial. Measured: without it `in_I2`
+    # reaches 69.55% of exact bytes against 93.50% with it, and the opposite sign gives 62.78%. Its
+    # `eta_ref` subtraction is immaterial — `eta_ref` is ~0.01 s against `eta`'s +/-1.5 — and dropping it
+    # changes `in_I2` by 4e-4 of a percent.
+    return pi * kt * de * de + 2pi * fdc * de
 end
 
 """
@@ -675,6 +677,8 @@ The eight taps of a Hann-windowed sinc at fractional offset `f`, for taps at −
 `0.5 + 0.5 cos(πx/4)`. Unwindowed the same eight taps overshoot by 21%, and a bicubic undershoots by 7%.
 """
 @inline function sinc8(f::Float64)
+    # Taps at -3 through +4, which is `Sinc2dInterpolator`'s centring: shifting them to -4 through +3
+    # costs `in_I2` 93.50% of exact bytes against 81.76%.
     return ntuple(8) do k
         x = (k - 4) - f
         s = x == 0 ? 1.0 : sinpi(x) / (pi * x)
@@ -691,7 +695,7 @@ Done to the whole burst once rather than per interpolation chip: a chip would ev
 times per output pixel where this evaluates it once per input pixel, which is the difference between
 minutes and hours over a subswath.
 """
-function deramped_burst(raster, rows::AbstractUnitRange, carrier::TopsCarrier)
+function deramped_burst(raster, rows::AbstractUnitRange, carrier)
     nr, nc = length(rows), size(raster, 2)
     out = Matrix{ComplexF32}(undef, nr, nc)
     src = raster[rows, :]
@@ -724,7 +728,7 @@ function resample_burst(deramped, dl, ds, lines::AbstractUnitRange,
             y = l + dl(l, s) + 1.0
             x = s + ds(l, s) + 1.0
             iy, ix = floor(Int, y), floor(Int, x)
-            (iy - 3 < 1 || iy + 4 > nr || ix - 3 < 1 || ix + 4 > nc) && continue
+            (iy - 4 < 1 || iy + 4 > nr || ix - 4 < 1 || ix + 4 > nc) && continue
             # The eight-tap support has to sit inside the secondary's own valid region: outside it the
             # reference's resampler has no samples either, and interpolating the zero margin invents a
             # small non-zero value where `secondary.tif` holds none.
@@ -789,7 +793,7 @@ function secondary_swath_amplitude(rp::Sentinel1Product, sp::Sentinel1Product, s
         ss = open_slc(sp.path; orbit = sp.orbit_path, swath = swath, burst = i,
                       polarization = sp.polarization)
         cs = RadarCoordinate(ss)
-        carrier = TopsCarrier(ss, cs, lpb)
+        carrier = CarrierFit(TopsCarrier(ss, cs, lpb), lpb, spb)
         dl, ds = _offset_lattice(cr, cs, dem, lpb, spb)
         deramped = deramped_burst(sraster, ((i - 1) * lpb + 1):(i * lpb), carrier)
 
@@ -841,3 +845,68 @@ over [`secondary_swath_amplitude`](@ref)'s coregistered subswaths.
 """
 secondary_mosaic(rp::Sentinel1Product, sp::Sentinel1Product, swaths, dem) =
     _stack_swaths(rp, swaths, [secondary_swath_amplitude(rp, sp, sw, dem) for sw in collect(swaths)])
+
+"""
+    CarrierFit(c::TopsCarrier, lines, samples)
+
+`c` as the **fitted polynomial** ISCE3 actually evaluates, rather than the carrier itself.
+
+`get_az_carrier_poly` samples the carrier every 50 lines and 500 samples and least-squares fits a
+polynomial in normalized range and azimuth time, keeping the terms of `x^j y^i` with `i <= 5`, `j <= 3`
+and `i + j <= 5` — eighteen of them (`s1reader.polyfit`, `max_order = True`). `ResampSlc` then evaluates
+that fit, so reproducing the carrier exactly is *more* accurate than the reference and therefore different
+from it.
+
+**The one-sample and one-line shifts fall out of the fit rather than being applied by hand.** The carrier
+is evaluated at index `(y, x)` but fitted against the coordinates of `(y + 1, x + 1)`, so the polynomial
+returns, at a given pixel, the carrier of the pixel before it on both axes. That is where
+`CARRIER_LINE_SHIFT`'s empirical `-1` came from, and with the fit in place the shift belongs at zero.
+"""
+struct CarrierFit
+    coef::Vector{Float64}
+    xmin::Float64
+    xnorm::Float64
+    ymin::Float64
+    ynorm::Float64
+    r0::Float64
+    dr::Float64
+    dt::Float64
+end
+
+# The eighteen exponent pairs, in `polyfit`'s own nesting order.
+const _CARRIER_TERMS = [(i, j) for i in 0:5 for j in 0:3 if i + j <= 5]
+
+function CarrierFit(c::TopsCarrier, lines::Integer, samples::Integer;
+                   ystep::Integer = 50, xstep::Integer = 500)
+    xs = 0:xstep:(samples - 1)
+    ys = 0:ystep:(lines - 1)
+    n = length(xs) * length(ys)
+    # The coordinates the fit is against: one sample and one line past the index the value belongs to.
+    rg = [c.r0 + (x + 1) * c.dr for x in xs]
+    az = [(y + 1) * c.dt for y in ys]
+    xmin, xnorm = minimum(rg), max(maximum(rg) - minimum(rg), 1.0)
+    ymin, ynorm = minimum(az), max(maximum(az) - minimum(az), 1.0)
+    A = Matrix{Float64}(undef, n, length(_CARRIER_TERMS))
+    z = Vector{Float64}(undef, n)
+    k = 0
+    for (jy, y) in enumerate(ys), (jx, x) in enumerate(xs)
+        k += 1
+        xn = (rg[jx] - xmin) / xnorm
+        yn = (az[jy] - ymin) / ynorm
+        for (t, (i, j)) in enumerate(_CARRIER_TERMS)
+            A[k, t] = xn^j * yn^i
+        end
+        z[k] = c(y, x)
+    end
+    return CarrierFit(A \ z, xmin, xnorm, ymin, ynorm, c.r0, c.dr, c.dt)
+end
+
+@inline function (f::CarrierFit)(line::Integer, sample::Integer)
+    xn = ((f.r0 + sample * f.dr) - f.xmin) / f.xnorm
+    yn = (line * f.dt - f.ymin) / f.ynorm
+    acc = 0.0
+    @inbounds for (t, (i, j)) in enumerate(_CARRIER_TERMS)
+        acc += f.coef[t] * xn^j * yn^i
+    end
+    return acc
+end
