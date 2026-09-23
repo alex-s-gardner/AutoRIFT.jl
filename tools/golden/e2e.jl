@@ -797,7 +797,21 @@ function rung_coregister(s::Setup)
                                         "skipped: no $path")]
     rp, sp = _burst_products(s.case, s.run)
     sws = burst_swaths(s.case)
-    out = [_mosaic_stage("5.2 reference mosaic", path, radar_mosaic(rp, sws))]
+    # A reference that was resampled against a cached static layer is reproduced by replaying that
+    # resample, not by copying the burst: the offsets reach 2.46 lines and -82.4 samples, which
+    # decorrelates speckle completely. Without the offsets on disk there is nothing to replay, so the
+    # stage says so rather than comparing a copy that cannot match.
+    refoff = _reference_offsets(s.run, sws)
+    if refoff === missing
+        out = [StageResult("5.2 reference mosaic", "reference.tif", "set", true, 0,
+                           "skipped: the reference bursts were resampled against a cached static layer \
+                            and this run kept no product/, so the offsets they resampled with are not \
+                            available to replay")]
+    else
+        out = [_mosaic_stage("5.2 reference mosaic", path, radar_mosaic(rp, sws; offsets = refoff);
+                             max_median = refoff === nothing ? 1e-4 : 3e-4,
+                             max_only_ours = refoff === nothing ? 0.0 : 2.3e-3)]
+    end
     sec = joinpath(s.run, "secondary.tif")
     isfile(sec) || return out
     dem = joinpath(s.run, "dem.tif")
@@ -807,8 +821,9 @@ function rung_coregister(s::Setup)
     # The secondary is gated more loosely than the reference and for a stated reason: it travels through a
     # full resample — an eight-tap windowed sinc over a deramped burst — where the reference is a copy.
     push!(out, _mosaic_stage("5.2 secondary mosaic", sec,
-                             secondary_mosaic(rp, sp, sws, dem_sampler(dem)); max_median = 3e-4,
-                             max_only_ours = 2.3e-3))
+                             secondary_mosaic(rp, sp, sws, dem_sampler(dem);
+                                              offsets = _secondary_offsets(s.run, sws));
+                             max_median = 3e-4, max_only_ours = 2.3e-3))
     return out
 end
 
@@ -821,6 +836,32 @@ function _burst_products(c::GoldenCase, run::AbstractString)
     return prod(early), prod(late)
 end
 _reference_product(c::GoldenCase, run::AbstractString) = first(_burst_products(c, run))
+
+# How the reference acquisition's own bursts have to be built: `nothing` to copy them, a subswath-to-burst
+# offsets provider to replay the resample, `missing` when they were resampled and the offsets are gone.
+#
+# `rdr2geo` and `resample` write to different names — `x.tif`/`z.tif` beside a polarization-named SLC
+# against a stem-named one beside `azimuth.off` — so which ran is read off the burst directory. A run that
+# kept no `product/` at all cannot be told apart from one that copied, so it is treated as a copy and the
+# comparison reports the difference.
+function _reference_offsets(run::AbstractString, swaths)
+    isdir(joinpath(run, "product")) || return nothing
+    dirs = Dict(sw => resampled_burst_dirs(run, sw) for sw in swaths)
+    all(isempty, values(dirs)) && return nothing
+    any(isempty, values(dirs)) && return missing
+    # One burst's offsets at a time: a subswath's worth is a quarter of a gigabyte per axis, and the
+    # resample consumes them burst by burst anyway.
+    return sw -> (i -> burst_offsets(dirs[sw][i]))
+end
+
+# The secondary's own offsets, when COMPASS's are on disk. Preferred over solving for them: a secondary is
+# coregistered to whatever grid the reference ended on, and if that was a static layer rather than the raw
+# burst then a solve against the raw burst carries the same error the reference's resample does.
+function _secondary_offsets(run::AbstractString, swaths)
+    dirs = Dict(sw => resampled_burst_dirs(run, sw; secondary = true) for sw in swaths)
+    any(isempty, values(dirs)) && return nothing
+    return sw -> (i -> burst_offsets(dirs[sw][i]))
+end
 
 # `got` against a reference raster, read in row strips so neither is held whole. The filled *set* is the
 # gate; the values are reported relative to the amplitudes they sit on.
