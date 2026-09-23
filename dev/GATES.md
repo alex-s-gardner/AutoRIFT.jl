@@ -4325,6 +4325,36 @@ against amplitudes near 200, with a median of 0.008: COMPASS's resample tapers i
 value is exactly zero. So the gate bounds the *peak* value at a disagreeing pixel rather than the count —
 a magnitude says the difference is the taper, where a count cannot.
 
+### The mosaic extent: both outliers are the CSLC raster, and the discriminator predicts which
+
+`S1A ... 20170221` regenerates to **24043 x 67860, identical to the cached run** — so unlike `20151120`
+this one is not a stale artifact and the 85-wide, 181-short disagreement is real. Its cause is now measured
+rather than inferred, and it is the same mechanism that decides whether a reference burst is copied.
+
+Its reference burst directory holds `azimuth.off` beside a stem-named SLC and a *polarization-named VRT* —
+`s1_resample`'s output and its input — with no `x`/`y`/`z`. So this full-SLC pair took the **resample**
+path, where `20151120` took `rdr2geo`. And a resampled burst is written on COMPASS's own geocoded radar
+grid, which is not the annotation's burst:
+
+| subswath | annotation, lines x samples | COMPASS CSLC | difference |
+|---|---|---|---|
+| IW1 | 1504 x 21530 | 1640 x 21458 | +136 lines, -72 samples |
+| IW2 | 1515 x 25376 | 1696 x 25279 | **+181** lines, -97 samples |
+| IW3 (far) | 1520 x 24454 | 1715 x 24369 | +195 lines, **-85** samples |
+
+**Both disagreements are single entries of that table.** `total_rng_samples` is `last_rng_samples` plus the
+floored range offset to the far subswath, and `last_rng_samples` is read off the far subswath's CSLC — IW3,
+24454 against 24369, which is the 85. `total_az_samples` is built from the merged subswath length, whose
+per-burst height is the CSLC's — IW2, 1515 against 1696, which is the 181. The capture log prints both
+numbers side by side on its own: `Radar image length: 1515` against `Geocoded lines: 1696`.
+
+So the metadata derivation is exact **exactly when the reference burst was written by `rdr2geo`**, because
+only then does the CSLC equal the annotation's burst. That is three of the five Sentinel-1 SLC pairs, and
+it predicts the other two rather than leaving them as outliers. The remaining work is to read the per-
+subswath CSLC dimensions out of `product/` and feed them to `_stack_swaths`, which is the same discipline
+the resample offsets already use: COMPASS's output is an input to `merge_swaths`, and `merge_swaths` is what
+this rung tests.
+
 ### The two-swath burst cases: the reference burst is *resampled*, not copied
 
 Regenerating these does **not** change them — a fresh run reproduces the cached numbers exactly (median
