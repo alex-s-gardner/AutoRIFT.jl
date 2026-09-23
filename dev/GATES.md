@@ -4325,15 +4325,26 @@ against amplitudes near 200, with a median of 0.008: COMPASS's resample tapers i
 value is exactly zero. So the gate bounds the *peak* value at a disagreeing pixel rather than the count —
 a magnitude says the difference is the taper, where a count cannot.
 
-### The two-swath cases need a CSLC, which is the blocker already on record
+### The two-swath cases: the layout is right and the pixels are not theirs
 
-`S1A ... 20240618T025533` disagrees structurally: a peak of 3529 at pixels only the reference fills, and a
-median of 45. Its cause is visible in the values — at the near-range edge the reference ramps
+`S1A ... 20240618T025533` disagrees, and the disagreement is sharply structured. **Every extent matches
+exactly** — at column 400 both run rows 1..5364, at column 30000 both run rows 457..5823, and both end at
+column 44260 — so the azimuth offsets, the range offsets, the per-swath merge and the first-come writer are
+all correct on two swaths as well as one. Only the first 75 columns of the near subswath differ (ours
+starts at 175, theirs at 250), and the **values differ everywhere**, by a median of 15 to 80 across every
+column band of both swaths.
+
+That combination can only mean the CSLC bursts behind this `reference.tif` are not the SAFE's raw bursts:
+a layout error moves an extent, and this moves none. At the near edge the reference ramps
 `0, 0.02, 0.42, 1.01, 3.58, 38.06` where the raw burst is already at full amplitude, which is an
-interpolation kernel running off the end of valid data. So **COMPASS resampled the reference burst on this
-pair and did not on `S1C`**, and its `s1_cslc.yaml` differs only in the burst-specific path — the
-discriminator is whether a cached static topographic correction existed for those bursts, which is
-external state and was pruned from the run directory.
+interpolation kernel running off the end of valid data.
+
+What it is *not*: a configuration difference. Both cases' `s1_cslc.yaml` are identical apart from the
+burst-specific path, both set `resample: flatten: False`, and both point `reference_burst.file_path` at a
+cached static topographic correction — which is the directory `s1_geo2rdr` reads `topo.vrt` from. The
+metadata is not it either: `s1reader` and `SLCDatasets` agree on every valid line and sample of every burst
+of both subswaths. So this needs the CSLC itself, or a re-run of the reference container, to go further —
+the same blocker as the two full-SLC pairs' mosaic width.
 
 That makes every remaining Sentinel-1 blocker the same one: the two SLC pairs' mosaic *width* and these
 two burst pairs' mosaic *values* both need the COMPASS CSLC raster.
@@ -4464,6 +4475,8 @@ samples are aliased against each other and cancel rather than sum. It is worth a
 | case | `in_I1` | `in_I2` |
 |---|---|---|
 | `S1C ... 20250416T010159` | **99.6333% exact, 100.0000% within one level, max 1** | 93.62% exact, 97.09% within one level |
+| `S1A ... 20240618T025533` | 58.97% | 58.95% — its `reference.tif` is not built from these bursts, above |
+| `S1A ... 20240618T025528` | not run — 5.75 GiB per mosaic | — |
 
 `in_I1` is the whole imagery chain in Julia for a radar case — SAFE bursts, the two-level mosaic, the
 high-pass at width 21, and the byte quantization — agreeing with the reference's own bytes to within one
