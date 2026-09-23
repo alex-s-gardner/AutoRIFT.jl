@@ -4369,6 +4369,45 @@ relative to a peak amplitude of 4,665 while a byte level here is not. `in_I1` re
 same code is what makes this a property of the secondary's resample rather than of the quantization, and it
 is the open thread on this case.
 
+### Rung 5.2 on a full-SLC pair: the extent is solved and the coverage is not
+
+The rung reaches a full-SLC pair once the run keeps a source product, and reaches its *pixels* once that
+product is unpacked — `SLCDatasets` reads a zipped granule's metadata without unpacking, which is all the
+geometry rungs want, but refuses a windowed measurement read because the raster is deflated and its lines
+are not addressable.
+
+**Building the mosaic on the CSLC grid makes `S1A ... 20170221`'s extent exact**, 24043 x 67860 against a
+derivation that was 181 short and 85 wide. So the CSLC dimensions are not a crop to apply afterwards: used
+as the resample's *output grid*, with the seams still driven by the annotation's `first_valid_line` exactly
+as `merge_bursts_in_swath` does it, they reproduce both extents outright.
+
+The values agree and the coverage does not. Over 1,631,557,980 pixels: 707,415,776 filled on both at a
+median |d| of 0.0038071 and a p99 of 0.032871 against a peak amplitude of 8553, **no pixel the reference
+fills and we do not**, and 9,833,375 that only we fill — 1.4% of the shared count against a bound of 0.23%.
+
+**Measured on one burst, the cause is ISCE3's own resample rejection, and it is neither of the two rules
+already considered.** On IW1 burst 1, grid 1640 x 21458:
+
+  * the azimuth offset is essentially constant at **-75.78** lines and the range offset runs 89.56 to 91.20;
+  * `geo2rdr` declines **8.431%** of the grid with its -1e6 sentinel, and there are no zeros and no `NaN`s,
+    so the sentinel is the only marker;
+  * the CSLC is zero on **18.604%** — more than twice the declined share, so about 10% of the grid is
+    zeroed by `ResampSlc` itself rather than by `geo2rdr`;
+  * our resample fills 1,913,472 of those (5.437%) and misses none, with a shared-set median |d| of
+    0.005291, and at every one of them the offset was **finite, not declined**.
+
+So the offsets are valid there, the source samples exist, and the reference still declines to write.
+**The annotation's valid window is not the rule either**, which is the same conclusion the burst cases
+reached and for the same shape of reason: guarding on lines 21..1487 and samples 739..21001 takes the
+over-fill from 1,913,472 to 1,093,932 but introduces **161,588 pixels the reference fills and we would
+miss**, trading the harmless category for the fatal one. The note against the guard therefore stands on
+this grid too.
+
+What remains is to identify `ResampSlc`'s actual criterion. One lead not yet followed: the capture log
+reports `Resampling using 2 tiles of 1000 lines per tile`, so the resampler works in blocks and a source
+line outside the loaded block is unavailable to it — a rule that depends on the tiling rather than on the
+raster or the annotation.
+
 ### The mosaic extent: both outliers are the CSLC raster, and the discriminator predicts which
 
 `S1A ... 20170221` regenerates to **24043 x 67860, identical to the cached run** — so unlike `20151120`
