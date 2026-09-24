@@ -133,10 +133,26 @@ and a half-pixel node offset on a spatially varying field would give exactly a c
 the coarse share. Against that: matching the reference's literal snap was measured to *cost* 8.3 points of
 exact match, which is the opposite of what a cause would do.
 
-**The measurement that settles it** is to compare the coarse lattice directly against the reference's
-captured one, on `S1C ... 010159` where the effect is partial and on `LT05_L1GS_001013` where it is total.
-If the node positions differ, that difference is the cause and closing it *improves* agreement, which makes
-it a matching fix rather than an item in this file. If they agree, the cause is downstream of the position.
+**That measurement has been made, and the positions agree exactly.** Comparing our coarse lattice against
+the reference's captured `lvlN_xgrid`/`lvlN_ygrid` on both cases, through the path the code actually takes —
+base to level grid by the chip ratio, then level to coarse pass by the sparse stride, which is 8 on both
+sides — the spread is **zero on both axes at every coarse level of both cases**:
+
+| case | coarse chips | spread x | spread y |
+|---|---|---:|---:|
+| `S1C ... 010159` | 56, 112, 224, 448 | 0 | 0 |
+| `LT05_L1GS_001013` | 8, 16, 32, 64 | 0 | 0 |
+
+What remains is one constant per level, which is the level's pad — the same single constant recorded against
+the captured chip-768 NISAR lattice under item 2. It cannot be a real translation: the offsets reach ~100 px,
+and a node displaced that far would produce a displacement error orders of magnitude larger than the 0.126 px
+bias actually seen.
+
+**So the position hypothesis is closed.** Items 2 and 3 are not the cause, now by measurement as well as by
+the argument above; nor is the `round(x + 0.5) - 0.5` snap, which is a position effect; nor the sparse
+stride. The cause is downstream of where the coarse node sits — in the coarse pass's *values*, or in how its
+result restricts the fine search and is read back. The capture carries `lvlN_dx`, `lvlN_dy`,
+`lvlN_searchx`/`searchy` and `lvlN_kept` per level, which is what a comparison of those would be fed.
 
 **Deferred by decision until the rest of the golden set is green, and the reason is measurability rather
 than caution.** These are the widest-blast-radius items in the register: the node position is a property of
