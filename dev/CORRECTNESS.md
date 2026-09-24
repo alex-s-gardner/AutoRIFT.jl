@@ -255,7 +255,39 @@ here), and peak conditioning (the matched green case has the same `peak_ratio` d
 against 1.625, and agrees exactly in every bin). The search window's edge is eliminated in the opposite
 direction: the red case never reaches it, at 0.00% against the green case's 6.65%.
 
-**The leading candidate is therefore the chip geometry at large displacement** — how each implementation
+**The regime is displacement comparable to the base chip size, and the threshold is measurable.** Binning
+the residual by the reference's own `dx`, fed identical inputs:
+
+| `|dx|` px | red case median `|r|` | red case mean `r` |
+|---|---:|---:|
+| 0 .. 1 | 0.0089 | -0.011 |
+| 1 .. 3 | 0.0083 | -0.036 |
+| 3 .. 6 | 0.0137 | -0.043 |
+| **6 .. 10** | **0.0653** | -0.102 |
+| **> 10** | **0.1518** | -0.211 |
+
+Flat near 0.01 while `|dx|` stays under 6, then five-fold at 6 to 10 and twelve-fold beyond — **against a
+chip of 8 px**. The matched green case settles it: `LT04_L1TP_063018` has a reference `dx` of median 0.57
+and p95 1.44, twelve times smaller than its identical 8-pixel chip, and a residual of zero. The red case
+runs at median 5.01 and p95 10.82.
+
+**That explains every other observation.** An 8-pixel chip cannot resolve an 11-pixel displacement, which is
+why this case has **no base-level points at all** and why its whole answer arrives through the coarse
+pyramid and the prior chain — the one region every other measurement pointed at. It is why the residual
+worsens toward the patch's interior, where the displacement is largest: exact agreement falls from 17.0% at
+distance 3-5 from the nodata edge to 3.5% at 21-40, the *opposite* of the boundary effect the green case
+shows (64.1% rising to 98.1%). And it is why twenty cases pass, their displacements being a small fraction
+of their chip.
+
+**So the disagreement is not a defect in a step; it is the pyramid's behaviour when the base level cannot
+measure.** What differs is how a coarse estimate is carried down and refined when no finer level can
+correct it. The fix, and the gate question, both belong there.
+
+**An earlier phrasing of this candidate said chip *overlap*, which is wrong**: in template matching the
+chip is always fully covered by the search window, which is the chip plus twice the search radius, so a
+large displacement costs no overlap. The regime is right and the mechanism was not.
+
+**The superseded candidate was chip geometry at large displacement** — how each implementation
 extracts or pads a chip whose match sits 6.5 px away on an 8-pixel template. A padding or overlap asymmetry
 there is one-signed by construction, which is the one property of this residual that noise and conditioning
 cannot produce. That is not yet measured.
