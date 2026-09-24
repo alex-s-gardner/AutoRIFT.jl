@@ -255,7 +255,40 @@ here), and peak conditioning (the matched green case has the same `peak_ratio` d
 against 1.625, and agrees exactly in every bin). The search window's edge is eliminated in the opposite
 direction: the red case never reaches it, at 0.00% against the green case's 6.65%.
 
-### The coarse correlation agrees; the divergence is after the interpolation
+### The coarse level agrees at 86.7% exact; what is left is a mean, and selection
+
+**With the refinement the pipeline actually uses**, level 16's own estimate on its own decimated grid, before
+`_undecimate_level` interpolates it:
+
+| case | exact | median `|r|` | mean |
+|---|---:|---:|---:|
+| `LT05_L1GS_001013` (red) | **86.69%** | **0** | -0.0067 |
+| `LT04_L1TP_063018` (green) | 98.54% | 0 | -0.0003 |
+
+**The refinement varies by level** — `PyramidRefine(16)` at the base, `(32)` at level 2, `(64)` above — and
+an earlier revision of this section used `first(p.subpixel)` for every level, which understated level 2's
+precision and produced a spurious median of exactly 1/32, half a step of the base's 1/16. Read
+`subpixel_at(p, k)`.
+
+**The endpoint's exact fraction follows from interpolation arithmetic, not from a defect.** A 2-D bicubic
+blends sixteen coarse nodes, so all sixteen must agree for the result to agree exactly: `0.867^16 = 0.10`
+against an observed 12.74%. Interpolating an 87%-exact field cannot do better than that.
+
+**What is not explained is the mean**: -0.0067 at the coarse nodes against -0.0800 at the endpoint.
+Interpolation is linear, its weights sum to one, and at stride 2 every fine sample sits at exactly a quarter
+of a source sample from its node — one phase for the whole grid — so it applies identical weights everywhere
+and **cannot change a mean**. The remaining route is therefore *selection*: which interpolated points survive
+`_undecimate_level`'s `valid` mask and `_merge_level!`. Three separate readings in this investigation have
+turned out to be population effects rather than value effects, so that is where to look and what to control
+for.
+
+**The hole-fill fallback is measured and is a minor term.** For this case the base level resolves nothing, so
+level 16's prior is entirely `NaN` and `_fill_level_holes` falls through to its 5x5 median and then the
+nearest-neighbour BFS — a path no other case in the set exercises, since every other base level supplies a
+prior. Disabling the median step moves the endpoint `dx` bias from -0.0804 to -0.0768, about 4.5%, with
+coverage unchanged. A contributor, not the cause.
+
+### Superseded: the coarse correlation agrees; the divergence is after the interpolation
 
 **Isolating the coarse level's own estimate, on its own decimated grid, before `_undecimate_level`
 interpolates it** — which every earlier endpoint comparison included:
