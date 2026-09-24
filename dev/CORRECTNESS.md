@@ -280,6 +280,36 @@ agreement threshold being a fraction of the full window area, and the filter nei
 from the X axis alone. This case is where they bite, because it is the only case whose points are
 overwhelmingly rejected, which leaves the filter's decisions to determine the answer rather than to trim it.
 
+**Decomposed within the filter, the bias is a minority of retained points, not a systematic offset.**
+Splitting the post-filter population on this case's one resolving level:
+
+| population | n | mean | median `|r|` | exact |
+|---|---:|---:|---:|---:|
+| before the filter | 18,919 | -0.0062 | — | — |
+| kept, not filled | 4,721 | **-0.0584** | **0** | **81.55%** |
+| filled by `_fill_holes!` | 310 | +0.1743 | **3.2812 px** | 2.58% |
+
+**Four out of five retained points agree exactly, with a median residual of zero.** The mean of -0.058 is
+carried by the remaining 18.45% — roughly 870 points — at about -0.3 px each, one-signed. So the endpoint
+bias is a minority disagreement amplified into the mean by the filter having already discarded three
+quarters of the population, not a shift applied to every point.
+
+**Both fill steps are measured and both are minor.** They are different functions and were tested
+separately: disabling `_fill_level_holes`'s median step inside `_undecimate_level` moves the endpoint `dx`
+bias from -0.0804 to -0.0768, about 4.5%, and skipping `_fill_holes!` inside `_reject_and_fill!` moves it to
+-0.0786, about 2.2%, at a cost of 1,240 points of coverage. The 310 values the latter invents are off by a
+median of 3.28 px, which is large per point but small in aggregate.
+
+**And the disagreement is not at the region border.** Only-ours retentions run at 1.3% to 2.6% of the
+measured points at every distance from the edge of the measured region, so the register's
+"agreement threshold is a fraction of the full window area" item is not what is biting here. What ours does
+is retain about 6% more points overall, 5,051 against 4,754, uniformly — and those cannot affect the mean
+anyway, since a point the reference rejected has no value to compare against.
+
+**So the remaining question is those ~870 points**, at one level of one case, surrounded by four times as
+many that agree bitwise. That is a tractable object to inspect individually, which nothing earlier in this
+investigation was.
+
 **Why the twenty others pass** follows: their base level resolves most points, so the filter trims a small
 minority and its decisions cannot dominate. This case has no base-level measurement at all — the reference
 abandons chips 8, 32 and 64 after their coarse passes and runs exactly one fine pass, at chip 16 — so a
