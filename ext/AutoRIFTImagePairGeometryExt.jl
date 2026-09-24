@@ -29,11 +29,13 @@
 # make it negative, and `gridpoints`' margin logic sizes itself from `maximum(radius)`, so the grid
 # would be mis-sized rather than the point skipped.
 #
-# The y sign. Azimuth increases along the track while a north-up raster's `+y` points down, so a radar
-# prior needs negating and a projected one does not (`testautoRIFT.py:405-407`, under
-# `optical_flag == 0`). `ImagePairGeometry.y_displacement_sign` answers this from the coordinate system,
-# and a `PairGeometry` carries its own — so the default is right and a caller has to go out of their
-# way to be wrong.
+# The y sign, which is two factors and not one. `ImagePairGeometry.y_displacement_sign` answers the
+# *driver-level* question from the coordinate system — azimuth increases along the track while a north-up
+# raster's `+y` points down, so the reference negates a radar prior and not a projected one
+# (`testautoRIFT.py:405-407`, under `optical_flag == 0`). But `arImgDisp_*` then negates `Dy0`
+# unconditionally as its first act, and AutoRIFT.jl has no such internal step: `dy_prior` is row-positive
+# throughout, the same axis as `dy`. So the factor stored here is the *negation* of the driver's, for
+# both coordinate systems.
 #
 # What does not fit. `PointSet` holds ten fields; geogrid produces eighteen numbers per point. The
 # displacement-to-velocity operator, the scale factors, the stable-surface mask and the y chip-size
@@ -111,7 +113,13 @@ function AutoRIFT.pointset(g::PairGeometry; chip_size = nothing, chip_size_0 = 2
             "`dhdx`/`dhdy`). Supply them, or build the PointSet with an explicit radius."))
     end
 
-    dy_flip = y_displacement_sign(coordinate)
+    # Negated, because `PointSet` holds the prior in the axis `dy` is measured along rather than in the
+    # axis the reference hands `Dy0` over in — see the y-sign note at the top of this file. Measured on
+    # both coordinate systems rather than reasoned: negating takes the `LT05_L1GS_001013` endpoint from a
+    # `dx`/`dy` bias of -0.0565/+0.0406 to -0.0003/-0.0005 and its within-0.1-px agreement from
+    # 50.5%/56.6% to 99.2%/99.5%, and the `S1C ... 010159` burst pair from +0.00068/+0.00024 to
+    # +0.00001/+0.00003.
+    dy_flip = -y_displacement_sign(coordinate)
     prior(band, flip) = [(v && b != sentinel) ? flip * Float64(b) : 0.0
                          for (v, b) in zip(valid, t(band))]
 
