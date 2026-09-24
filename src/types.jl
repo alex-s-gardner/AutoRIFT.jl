@@ -634,24 +634,31 @@ to a correlation extent yields a halo *shorter* than the correlation alone, whic
 silent under-read this trait exists to prevent; [`AutoRIFT.halo`](@ref) throws instead.
 
 Separate from [`filter_width`](@ref) because the two differ, and the difference is not a detail: a
-filter that applies two chained window passes reaches twice its half-width, since the second pass
-consumes the first's output over its own window. Tiled processing sizes its halo from this, so a
-value that is too small produces a filter output that is quietly wrong near every block edge rather
-than merely different — measured at 792 of 10201 points differing by up to 0.21 for `Wallis(5)` when
-padded by `width ÷ 2` instead of twice that.
+filter that consumes a window of an already-windowed quantity reaches twice its half-width, since the
+second window spans the first's output. Tiled processing sizes its halo from this, so a value that is
+too small produces a filter output that is quietly wrong near every block edge rather than merely
+different.
+
+**This is a bound, not necessarily the reach itself.** A halo wider than a filter needs costs work and
+changes no answer, while one too narrow is silently wrong, so a method whose worst case is hard to
+pin down returns the worst case. [`Wallis`](@ref) returns twice its half-width because excluding a
+pixel whose own local mean is not finite is a window of a window, though its variance terms are both
+single windows of the raw image and reach only the half-width on their own.
 
 A reach may also be far larger than the window suggests when the filter's *decisions* are not
 windowed: [`WallisGapfill`](@ref) reaches `GAPFILL_REACH` plus its dilation plus its window, because
 whether a pixel is filled depends on how far the nearest real data lies.
 
-Pinned per method by a test that measures the true reach and compares it against this trait, so the
+Pinned per method by a test that measures the true reach and requires this trait to bound it, so the
 two cannot drift.
 """
 filter_reach(m::PreprocessMethod) = filter_width(m) ÷ 2
 
-# `Wallis` subtracts a local mean and then divides by a local standard deviation computed *about
-# that mean*, so the window is applied twice in sequence and each output depends on a neighbourhood
-# twice as wide.
+# `Wallis` divides by a standard deviation whose *gap handling* is a window of a window: a pixel
+# contributes to the variance only where its own local mean is finite, and that mean is itself a
+# window, so which pixels a block excludes can differ from the whole image's two windows away. The
+# variance terms themselves are both single windows of the raw image and reach half this, which is
+# what `test/tile.jl` measures — so this is the bound, and the test asserts it as one.
 filter_reach(m::Wallis) = 2 * (filter_width(m) ÷ 2)
 
 # `WallisGapfill` reaches much further than its window, because deciding *whether* a pixel is filled
