@@ -191,7 +191,37 @@ against -0.0888, and 35% predicts -0.039 against -0.0394.
 reference's own *coarse* grid, so it establishes that the coarse correlation itself is right and places the
 cause downstream of it.
 
-**So what remains is what happens to a coarse estimate after it is correlated**: `_undecimate_level`'s
+**The read-back loses coarse points the reference keeps, and the endpoint bias is partly a
+population-selection effect rather than an offset.** Scanning the bicubic read-back's half-sample phase on
+`LT05_L1GS_001013` — an experiment, reverted — shows a discontinuity at exactly zero that no smooth
+parameter can produce:
+
+| phase (source samples) | points within 1 px | `dx` core | `dy` core |
+|---|---:|---:|---:|
+| y -0.5 | 19,498 | -0.0645 | -0.0492 |
+| y -0.25 | 19,579 | -0.0687 | -0.0630 |
+| **0, the current convention** | **17,090** | **-0.0804** | **-0.0900** |
+| y +0.5 | 19,502 | -0.0711 | -0.1005 |
+| x +0.5 | 19,525 | -0.0414 | -0.0556 |
+
+The mechanism is alignment. At phase zero a destination lands exactly on a coarse node, so
+`_cubic_weights!` collapses to `(0, 1, 0, 0)`; if that single tap is still `NaN` after
+`_fill_level_holes` then `wsum` is zero, the output is `NaN`, and `_undecimate_level` drops the point. At
+any offset the neighbours carry weight, `wsum >= 0.5` holds, and a value survives. **The reference cannot
+hit this**: `cv2.resize` runs on an array with no `NaN` in it.
+
+So we measure 17,090 points where the reference measures 20,016 and every offset measures about 19,500 —
+that is, the offsets are *closer* to the reference's coverage than the aligned case is. And `dx` moves over
+-0.041 to -0.097 purely with which points enter the comparison.
+
+**This is a lead about `_fill_level_holes`, not a licence to tune the phase.** Choosing +0.5 because it
+minimizes a bias would be fitting the convention to the metric, and the phase is independently verified
+correct: `(j - 0.5) * scale - 0.5` is `cv2.resize`'s mapping exactly, and `a = -0.75` is `INTER_CUBIC`. What
+the scan says is that a hole surviving `_fill_level_holes` costs a *point*, and that the surviving-point
+population is itself biased, so the next question is why those nodes are unfilled when the reference has
+nothing to fill.
+
+**What remains is what happens to a coarse estimate after it is correlated**: `_undecimate_level`'s
 read-back onto the fine grid and the merge that consumes it. That is the one link in this chain no
 measurement here has yet isolated — positions are exact, the radii are near-exact and the wrong shape of
 cause, and the correlation is bit-exact.
