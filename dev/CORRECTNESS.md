@@ -438,6 +438,55 @@ attributed — a green that appeared and a red that appeared would be indistingu
 from the CSLC gap. Act on it when the reds that remain are only these two, and measure against all 22 plus
 both radar gates, not against the two targets.
 
+### Resolved: `_decimate_level` computed the level's prior and search radius two ways the reference does not
+
+**The discriminator is a level replayed on the reference's own captured inputs.** Fed the reference's
+lattice, its per-level prior `lvlN_dx0` and its per-level radii `lvlN_searchx`/`searchy`, the chip-16 fine
+pass of `LT05_L1GS_001013` reproduces `lvlN_dx` **bit for bit**:
+
+| fed | nodes | exact | mean |
+|---|---:|---:|---:|
+| reference's prior + radius | 19,902 | **100.000%** | **+0.000000** |
+| … restricted to the nodes the reference's filter keeps | 4,754 | **100.000%** | +0.000000 |
+| … restricted to the nodes it drops | 15,148 | **100.000%** | +0.000000 |
+
+So neither the correlator nor `GardnerFilter` contributes any value error here, and the whole residual is in
+the two arrays `_decimate_level` hands the pass. Compared node by node against the capture, those two fail
+differently — which is what identifies them:
+
+| input | exact | character of the error |
+|---|---:|---|
+| prior `dx0` | 92.0% | wrong by **exactly ±0.5**, 778 negative against 808 positive |
+| radius `x` | 70.2% | **5,829 nodes one pixel too small** against 108 too large — one-signed |
+
+`colfilt` is a *sliding* filter over the full-resolution array, and `cv2.resize` then puts it on the lattice
+— **by a different route for each field** (`autoRIFT.py:546-586`):
+
+1. `Dx00 = np.round(cv2.resize(Dx00, dstShape, INTER_NEAREST))`. The reference **rounds** the decimated
+   prior. `Dx0` is integer-valued and a 2-by-2 mean of integers is an integer or exactly a half-integer,
+   which is why every error is exactly ±0.5 and why the sign looks like a coin flip: it is `round`'s
+   half-to-even parity, not a tie broken differently. Rounding takes the prior to **99.990%** exact.
+2. `SearchLimitX0 = np.ceil(cv2.resize(SearchLimitX0, dstShape))`, and `cv2.resize`'s default is
+   `INTER_LINEAR`. The reference bilinearly averages the sliding max-plus-range and only then takes
+   `ceil`; sampling one corner of the cell instead loses the +1 that `ceil` gives a fractional average,
+   and `ceil` is one-sided, so the loss is in one direction. The bilinear step takes the radius to
+   **99.794%** exact.
+
+Reproducing both takes the level from **86.780% to 99.905%** exact, and takes the case's correlator
+endpoint `dx` bias core from **-0.0847 to -0.00227**.
+
+**Why the symptom looked like tie-breaking.** A search window a pixel too narrow, or centred half a pixel
+off, does not return a slightly different displacement — it returns a *different correlation peak*, several
+pixels away. Those are sign-symmetric and largely cancel, so the surviving mean is small, and the outlier
+filter then selects a subset in which the cancellation is incomplete. Every test of the filter, the hole
+fill and the peak came back clean because they were measurements of the amplifier rather than of the signal.
+The `|dx|` dependence the superseded reading found is the same amplifier seen from another angle: a prior is
+worth more, and a window a pixel narrower costs more, exactly where the displacement is large.
+
+**This closes the endpoint reds without touching items 1 to 3.** The node position, the mask-versus-fill
+decimation and the shared-position question are all unrelated to it, and the deferral above stands on its
+own terms.
+
 ## 4. Restore the stable Wallis local variance
 
 **Adopted for agreement on 2026-09-23, and it is the clearest case in this file of the trade this

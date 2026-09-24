@@ -432,13 +432,30 @@ function _decimate_level(grid::PointSet{2}, wanted::AbstractMatrix{Bool}, stride
     ry = windowmax(grid.radius_y, stride) .+ windowrange(grid.dy_prior, stride)
     mx = windowmean(grid.dx_prior, stride)
     my = windowmean(grid.dy_prior, stride)
+    # **`colfilt` slides at full resolution, so both fields still have to be put on the lattice — and
+    # the reference puts them there by different routes.** The radius goes through `cv2.resize`'s
+    # default, a bilinear average, and only then through `ceil`; the prior goes through
+    # `INTER_NEAREST`, which at an integer scale is the first sample of each cell, and is then rounded
+    # (`autoRIFT.py:580-586`).
+    #
+    # Both routes decide the answer rather than polish it, because a search window that is a pixel
+    # short or half a pixel off-centre does not return a slightly different displacement — it returns a
+    # different correlation peak. `ceil` is one-sided, so a bilinear average with any fractional part
+    # widens the window where sampling one corner of the cell does not: on the `LT05_L1GS_001013`
+    # chip-16 lattice, taking the corner leaves the radius a pixel short at 29% of the nodes, all in
+    # the same direction. Rounding the prior is worth a further 8%. Together they are 13 points of
+    # exact agreement at that level.
+    #
     # `ceil` as the reference does, so a fractional widening never shrinks the window. A `NaN` mean —
     # a cell whose priors are all missing — carries through as the missing prior it is.
+    lat = (length(rows), length(cols))
+    srx = resample(rx, lat, Bilinear())
+    sry = resample(ry, lat, Bilinear())
     sub = rebuild(grid[rows, cols];
-                  radius_x = [ceil(Int, rx[i, j]) for i in rows, j in cols],
-                  radius_y = [ceil(Int, ry[i, j]) for i in rows, j in cols],
-                  dx_prior = [Float64(mx[i, j]) for i in rows, j in cols],
-                  dy_prior = [Float64(my[i, j]) for i in rows, j in cols])
+                  radius_x = [ceil(Int, v) for v in srx],
+                  radius_y = [ceil(Int, v) for v in sry],
+                  dx_prior = [round(Float64(mx[i, j])) for i in rows, j in cols],
+                  dy_prior = [round(Float64(my[i, j])) for i in rows, j in cols])
 
     return (; grid = _cell_means(sub, grid, rows, cols, stride, phase),
             wanted = keep, rows, cols)
