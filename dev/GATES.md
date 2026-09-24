@@ -5532,3 +5532,49 @@ CSLCs are now on disk for the first time.
 A note on what that block is *not*: a burst job's SAFE is synthesized, and its annotation agrees with the
 bursts it contains, so all three burst pairs reproduce the merged width exactly. The two outliers are
 specific to a full granule, where the annotation and the CSLC raster can disagree.
+
+## The endpoint bias was `_decimate_level`, and fixing it moves every case
+
+`dev/CORRECTNESS.md` records the diagnosis: `_decimate_level` sampled a cell corner where the reference
+bilinearly resizes before `ceil`, and left the decimated prior unrounded where the reference rounds it
+(`autoRIFT.py:580-586`). Both are reproduced now. Measured with `correlator.jl` against the capture, so
+none of these numbers need a scene download.
+
+| # | case | exact | was | bias core `dx` | was | both | was | tail |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | S2A Malaspina | **95.93%** | 94.24% | +0.000817 | +0.0018 | 594,141 | 586,129 | **0** |
+| 2 | LC09 Antarctic | **84.05%** | 83.01% | −0.000221 | −0.0048 | 465,368 | 464,316 | **0** |
+| 3 | S2B Jakobshavn | **88.49%** | 78.85% | +0.000557 | −0.0047 | 613,794 | 605,987 | 2 → **0** |
+| 4 | `LC08_062018` | **83.76%** | 72.74% | −0.000551 | −0.0226 | 724,312 | 691,714 | 3 → **0** |
+| 5 | `LC08_009011` | **84.14%** | 71.84% | −0.000605 | −0.0080 | 1,706,154 | 1,662,200 | **0** |
+| 6 | `LE07_..._20130314` | **82.46%** | 59.94% | +0.000658 | −0.0326 | 738,336 | 713,305 | **0** |
+| 7 | `LC08_060018` × `LE07` | **79.93%** | 58.56% | −0.0000726 | +0.0115 | 698,453 | 672,912 | **0** |
+| 8 | `LE07_..._20040810` | **77.07%** | 52.91% | −0.000319 | −0.0084 | 969,134 | 918,180 | **0** |
+| 9 | `LE07_..._20120428` | **49.76%** | 0.00% | +0.000207 | +0.0083 | 121,984 | 106,228 | **0** |
+| 10 | `LT04_063018` | **80.20%** | 56.02% | +0.000133 | +0.0008 | 292,219 | 272,875 | **0** |
+| 11 | `LT05_060018` | **66.04%** | 27.09% | +0.000542 | −0.0031 | 146,274 | 124,397 | **0** |
+| 12 | `LT05_001013` (`P000`) | **80.08%** | 0.00% | **−0.00227** | **−0.0847** | 20,004 | 18,540 | **0** |
+
+**Every case improves on all three measures at once** — exact match, bias and coverage — which is the shape
+a shared upstream input error has and a per-case tuning does not. The two cases previously at `exact 0.00%`
+are the two whose base level is skipped on both sides, so every point was coarse and unquantized; they now
+match bitwise at 80% and 50%, because the coarse lattice values they are built from now agree.
+
+The radar side, on the same gate:
+
+| case | exact | was | bias core `dx` | was |
+|---|---:|---:|---:|---:|
+| `S1C_..._010159` (the second red) | **59.46%** | 42.89% | **−0.000721** | **−0.0761** |
+| `S1B_..._20180809` | **83.30%** | 77.1% | −0.000995 | −0.0085 |
+| `S1A_..._20150828` | 63.25% | — | −0.000194 | +0.00013 |
+
+`S1A_..._20150828` is the one case that does not clearly improve: both axes move by about 3e-4 (`dy` from
+−0.00002 to +0.000348), which is four orders of magnitude inside any gate but is not an improvement and is
+recorded as such rather than folded into the claim above.
+
+**`bias core dx` is now within 0.0023 of zero on all fifteen cases measured**, against a previous spread
+reaching 0.085, and no case reports a residual beyond 10 px on either axis.
+
+**The reference is not bit-reproducible on `LT05_001013`.** Runs 200 and 201 of the identical input measure
+19,809 and 19,937 nodes at the chip-16 level. Some of the residual that remains is the reference disagreeing
+with itself, so an exact-match target of 100% is not available on this case at any level of effort.

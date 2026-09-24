@@ -10,6 +10,8 @@
 #   nearest   masks and labels, where an interpolated value would be meaningless
 #   area      averaging down, which is what makes a coarse displacement the mean of the
 #             fine ones it covers rather than a sample of one of them
+#   bilinear  averaging down a search radius, whose fractional part decides the answer because
+#             the result passes through `ceil`
 #   bicubic   smoothing a coarse displacement field back up, where the extra smoothness is
 #             the point: the result is used as a prior, and a blocky prior would put visible
 #             seams in the output
@@ -37,6 +39,16 @@ where a point sample would discard most of the data. See [`resample`](@ref).
 struct Area end
 
 """
+    Bilinear()
+
+Bilinear resampling: the weighted mean of the surrounding 2-by-2 neighbourhood, ignoring `NaN`.
+`cv2.resize`'s default, and so the reference's for the per-level search radius
+(`autoRIFT.py:580-581`), where the value passes through `ceil` and a fractional average therefore
+widens the window by a pixel. See [`resample`](@ref).
+"""
+struct Bilinear end
+
+"""
     Bicubic()
 
 Bicubic resampling: a smooth interpolant over the surrounding 4-by-4 neighbourhood. The right choice
@@ -50,8 +62,8 @@ struct Bicubic end
 
 Resample `A` to `dstsize`, ignoring `NaN`.
 
-`method` is [`Nearest`](@ref), [`Area`](@ref), or [`Bicubic`](@ref). A destination sample
-with no valid contributor is `NaN`.
+`method` is [`Nearest`](@ref), [`Area`](@ref), [`Bilinear`](@ref), or [`Bicubic`](@ref). A
+destination sample with no valid contributor is `NaN`.
 
 Coordinates use the half-sample convention: destination sample `i` maps to source position
 `(i - 0.5) * scale + 0.5`, so the two grids cover the same extent and neither is offset by
@@ -141,6 +153,45 @@ function resample!(out::AbstractMatrix, A::AbstractMatrix, ::Area;
                     end
                 end
                 out[i, j] = wsum > 0 ? Float32(acc / wsum) : NaN32
+            end
+        end
+    end
+    return out
+end
+
+# Bilinear interpolation over the four samples surrounding the destination centre, with the weights
+# renormalised over those that are not `NaN`. Requiring half the weight rather than all of it keeps a
+# radius defined on three corners of a cell from collapsing to no radius at all; below that the
+# estimate rests on one corner and is not supportable.
+function resample!(out::AbstractMatrix, A::AbstractMatrix, ::Bilinear;
+                   scale::Tuple{Real,Real} = (size(A, 1) / size(out, 1),
+                                              size(A, 2) / size(out, 2)))
+    sr, sc = size(A)
+    dr, dc = size(out)
+    ys, xs = Float64(scale[1]), Float64(scale[2])
+    _parallel_slices(1:dc, 4 * dr * dc) do cols
+        for j in cols
+            x = (j - 0.5) * xs - 0.5
+            j0 = floor(Int, x)
+            wx = x - j0
+            ja = clamp(j0 + 1, 1, sc)
+            jb = clamp(j0 + 2, 1, sc)
+            for i in 1:dr
+                y = (i - 0.5) * ys - 0.5
+                i0 = floor(Int, y)
+                wy = y - i0
+                ia = clamp(i0 + 1, 1, sr)
+                ib = clamp(i0 + 2, 1, sr)
+                acc = 0.0
+                wsum = 0.0
+                for (si, wi) in ((ia, 1 - wy), (ib, wy)), (sj, wj) in ((ja, 1 - wx), (jb, wx))
+                    v = Float64(A[si, sj])
+                    isnan(v) && continue
+                    w = wi * wj
+                    acc += w * v
+                    wsum += w
+                end
+                out[i, j] = wsum >= 0.5 ? Float32(acc / wsum) : NaN32
             end
         end
     end

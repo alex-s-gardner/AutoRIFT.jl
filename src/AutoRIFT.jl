@@ -199,7 +199,7 @@ const PUBLIC_NAMES = (
     :ondisk,
     # Post-processing steps a caller may want on their own.
     :reject_outliers, :outlier_filter, :dilate_within, :small_components, :resample, :resample!,
-    :Nearest, :Area, :Bicubic, :window, :relax, :rescale,
+    :Nearest, :Area, :Bilinear, :Bicubic, :window, :relax, :rescale,
     # Blocked processing: `halo` says how much overlap a block size costs. The layout types are
     # deliberately absent — they are the part free to change.
     :halo,
