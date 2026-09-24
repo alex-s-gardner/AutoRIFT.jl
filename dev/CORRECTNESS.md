@@ -255,7 +255,37 @@ here), and peak conditioning (the matched green case has the same `peak_ratio` d
 against 1.625, and agrees exactly in every bin). The search window's edge is eliminated in the opposite
 direction: the red case never reaches it, at 0.00% against the green case's 6.65%.
 
-### The coarse level agrees at 86.7% exact; what is left is a mean, and selection
+### Located: the level's outlier filter, where 74% of the points are discarded
+
+Walking the one level this case resolves at — chip 16, the only `fine` pass in its whole run — stage by
+stage against the reference's own per-level records:
+
+| stage | points | mean residual |
+|---|---:|---:|
+| fine pass, before the filter | 19,267 ours / 19,809 reference | **-0.0067** |
+| after `_reject_and_fill!` / `filtDisp` | **5,051 ours / 4,754 reference** | **-0.0441** |
+| endpoint, after interpolation, merge and selection | 19,608 | -0.0698 |
+
+**The filter discards 74% of the measured points, and the surviving quarter is disproportionately where the
+two disagree**, so the mean moves 6.6-fold in that one step. Interpolation is mean-preserving (verified) and
+the remaining 1.6-fold to the endpoint is its population selection.
+
+The *decisions* very nearly agree — 1,261,621 of 1,262,080 mask entries match, 378 only ours and 81 only the
+reference — but ours keeps 6% more points, 5,051 against 4,754, and the reference reports `filt_width` 9 over
+3 iterations.
+
+**So this is not the correlator, the node positions, the read-back, or the hole fill**, each measured clean
+above. It is the outlier rejection, and the register already carries two items about that step: the
+agreement threshold being a fraction of the full window area, and the filter neighbourhood being derived
+from the X axis alone. This case is where they bite, because it is the only case whose points are
+overwhelmingly rejected, which leaves the filter's decisions to determine the answer rather than to trim it.
+
+**Why the twenty others pass** follows: their base level resolves most points, so the filter trims a small
+minority and its decisions cannot dominate. This case has no base-level measurement at all — the reference
+abandons chips 8, 32 and 64 after their coarse passes and runs exactly one fine pass, at chip 16 — so a
+single filter invocation decides the entire product.
+
+### Superseded: the coarse level agrees at 86.7% exact; what is left is a mean, and selection
 
 **With the refinement the pipeline actually uses**, level 16's own estimate on its own decimated grid, before
 `_undecimate_level` interpolates it:
