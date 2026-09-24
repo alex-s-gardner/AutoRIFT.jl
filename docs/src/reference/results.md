@@ -42,8 +42,9 @@ rescale
 resample
 resample!
 Nearest
-Bicubic
 Area
+Bilinear
+Bicubic
 ```
 
 ## Mask operations
