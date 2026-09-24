@@ -639,15 +639,14 @@ second window spans the first's output. Tiled processing sizes its halo from thi
 too small produces a filter output that is quietly wrong near every block edge rather than merely
 different.
 
-**This is a bound, not necessarily the reach itself.** A halo wider than a filter needs costs work and
-changes no answer, while one too narrow is silently wrong, so a method whose worst case is hard to
-pin down returns the worst case. [`Wallis`](@ref) returns twice its half-width because excluding a
-pixel whose own local mean is not finite is a window of a window, though its variance terms are both
-single windows of the raw image and reach only the half-width on their own.
-
-A reach may also be far larger than the window suggests when the filter's *decisions* are not
-windowed: [`WallisGapfill`](@ref) reaches `GAPFILL_REACH` plus its dilation plus its window, because
-whether a pixel is filled depends on how far the nearest real data lies.
+**This is always an upper bound, and only sometimes the reach itself.** A halo wider than a filter needs
+costs work and changes no answer, while one too narrow is silently wrong, so a method whose worst case is
+hard to pin down returns the worst case. Three cases, all instances of that one rule: exact for a single
+convolution; doubled for [`Wallis`](@ref), because excluding a pixel whose own local mean is not finite is
+a window of a window, though its variance terms are both single windows of the raw image and reach only
+the half-width on their own; and looser still for [`WallisGapfill`](@ref), which reaches `GAPFILL_REACH`
+plus its dilation plus its window because whether a pixel is filled depends on how far the nearest real
+data lies — a distance-transform decision rather than a windowed one.
 
 Pinned per method by a test that measures the true reach and requires this trait to bound it, so the
 two cannot drift.

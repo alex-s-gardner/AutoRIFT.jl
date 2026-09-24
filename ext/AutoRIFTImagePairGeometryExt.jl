@@ -48,6 +48,18 @@ import AutoRIFT
 using ImagePairGeometry: PairGeometry, ProjectedCoordinate, chip_size_pixels,
                          y_displacement_sign, xsize
 
+# The factor taking a geometry's `offset_y` to the axis `PointSet.dy_prior` is held in — the negation of
+# the driver-level `y_displacement_sign`, for both coordinate systems. Named rather than written as a
+# unary minus at the call site: the composition is the whole content of the y-sign note at the top of
+# this file, it is invisible in a bare `-`, and a second caller building a prior from a coordinate needs
+# somewhere to reach for it.
+#
+# Measured on one case of each coordinate system rather than reasoned. Negating takes the
+# `LT05_L1GS_001013` endpoint from a `dx`/`dy` bias of -0.0565/+0.0406 to -0.0003/-0.0005 and its
+# within-0.1-px agreement from 50.5%/56.6% to 99.2%/99.5%; it takes the `S1C ... 010159` burst pair from
+# +0.00068/+0.00024 to +0.00001/+0.00003.
+_dy_prior_sign(coordinate) = -y_displacement_sign(coordinate)
+
 """
     AutoRIFT.pointset(g::PairGeometry; chip_size = nothing, chip_size_0 = 240.0,
                       pixel_size = nothing, coordinate = g.coordinate) -> PointSet{2}
@@ -113,13 +125,7 @@ function AutoRIFT.pointset(g::PairGeometry; chip_size = nothing, chip_size_0 = 2
             "`dhdx`/`dhdy`). Supply them, or build the PointSet with an explicit radius."))
     end
 
-    # Negated, because `PointSet` holds the prior in the axis `dy` is measured along rather than in the
-    # axis the reference hands `Dy0` over in — see the y-sign note at the top of this file. Measured on
-    # both coordinate systems rather than reasoned: negating takes the `LT05_L1GS_001013` endpoint from a
-    # `dx`/`dy` bias of -0.0565/+0.0406 to -0.0003/-0.0005 and its within-0.1-px agreement from
-    # 50.5%/56.6% to 99.2%/99.5%, and the `S1C ... 010159` burst pair from +0.00068/+0.00024 to
-    # +0.00001/+0.00003.
-    dy_flip = -y_displacement_sign(coordinate)
+    dy_flip = _dy_prior_sign(coordinate)
     prior(band, flip) = [(v && b != sentinel) ? flip * Float64(b) : 0.0
                          for (v, b) in zip(valid, t(band))]
 

@@ -106,10 +106,11 @@ end
     # which is why the product is pinned rather than left to the reader.
     pts = AutoRIFT.pointset(IPG_R; pixel_size = 30.0)
 
+    # Only the projected branch has a fixture here, so this pins the sign the negation is applied to and
+    # the testset above pins the negation itself. The radar branch — where `y_displacement_sign` is
+    # `-1.0` and the stored prior is therefore `+offset_y` — is covered end to end by the golden ladder's
+    # Sentinel-1 cases rather than here, since a `RadarCoordinate` fixture needs an orbit.
     @test y_displacement_sign(IPG_PAIR.coordinate) === 1.0
-    valid = findall(!=(SENTINEL), permutedims(IPG_R.location_x))
-    @test all(k -> pts.dy_prior[k] ==
-                   -y_displacement_sign(IPG_PAIR.coordinate) * permutedims(IPG_R.offset_y)[k], valid)
     # Passing it explicitly agrees with the default.
     @test AutoRIFT.pointset(IPG_R; pixel_size = 30.0,
                             coordinate = IPG_PAIR.coordinate).dy_prior == pts.dy_prior
