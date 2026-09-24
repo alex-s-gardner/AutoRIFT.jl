@@ -221,6 +221,45 @@ than a verbatim reproduction of its own coarse nodes — so the question is what
 is independently correct, `(j - 0.5) * scale - 0.5` being `cv2.resize`'s mapping and `a = -0.75` being
 `INTER_CUBIC`, so moving it to minimize a bias would be fitting the convention to the metric.
 
+### The endpoint reds are data-driven, established by a controlled pair
+
+`LT04_L1TP_063018` and `LT05_L1GS_001013` are a matched pair: **all 21 captured scalars and all
+`kwargs_from_capture` keys are identical**, both are 30 m L4/L5 band-2 imagery, both run a four-level
+pyramid from chip 8 to chip 64 at `ScaleChipSizeY` 1.0 and grid spacing 4. Fed the reference's own images
+and grid through `correlator.jl`, one has a `dx` bias of **-0.00004** and the other **-0.070**.
+
+So the same code on the same parameters diverges on the data alone, and no code path is implicated that the
+two do not share. The other twenty cases pass because their data does not trigger it.
+
+**What is distinctive about the red pair is the correlation geometry.** It is the only case in the set where
+*both* scenes are `L1GS` — systematic geometric correction, no ground control on either image — so its
+apparent displacement is largely residual misregistration: `v` median 1102 m/yr against an `off2vx` of
+170 m/yr per pixel is **6.5 px of displacement on an 8-pixel chip**. The chip in the second image overlaps
+the first by about a fifth of its area. `LT05_L1TP_060018` pairs an L1TP reference with an L1GS secondary
+and is green; `LC09` is L1GT on both sides and is green.
+
+**The residual's shape, fed identical inputs.** Not a tail, not a discrete step, not a uniform offset:
+
+    band                negative   positive
+    0.031 .. 0.5 px        6,212      2,526        2.5 : 1
+    exactly zero                     2,498 (12.74%)
+
+against the matched green case's **65.8% exactly zero** with symmetric wings. A third of the points
+disagree by a sub-pixel amount, one-sided.
+
+**Six mechanisms are eliminated by measurement**, each recorded above: the coarse node positions (exact),
+the coarse correlation given the reference's coarse grid (bit-exact), the read-back's phase, kernel and
+scale (verified against `cv2.resize`), `_fill_level_holes` leaving `NaN` (impossible — it ends in
+`_fill_nan_nearest`), the byte-versus-float correlator path (the reference's two paths are bit-identical
+here), and peak conditioning (the matched green case has the same `peak_ratio` distribution, median 1.619
+against 1.625, and agrees exactly in every bin). The search window's edge is eliminated in the opposite
+direction: the red case never reaches it, at 0.00% against the green case's 6.65%.
+
+**The leading candidate is therefore the chip geometry at large displacement** — how each implementation
+extracts or pads a chip whose match sits 6.5 px away on an 8-pixel template. A padding or overlap asymmetry
+there is one-signed by construction, which is the one property of this residual that noise and conditioning
+cannot produce. That is not yet measured.
+
 **What remains is what happens to a coarse estimate after it is correlated**: `_undecimate_level`'s
 read-back onto the fine grid and the merge that consumes it. That is the one link in this chain no
 measurement here has yet isolated — positions are exact, the radii are near-exact and the wrong shape of
