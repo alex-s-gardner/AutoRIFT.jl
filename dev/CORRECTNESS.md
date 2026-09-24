@@ -171,6 +171,31 @@ points with a median of zero produces *scattered* errors — a window either con
 out. What the endpoint shows is a systematic **bias**, a median shift of -0.126 px, which is the signature
 of a convention or position offset rather than of occasional window differences.
 
+**The bias predates the end-to-end ladder, measured both ways.** The correlator-only endpoint —
+`correlator.jl`, fed `pointset_from_capture` and the captured imagery, with no geometry built — carries it
+already:
+
+| case | correlator-only, reference's grid | e2e rung 5.7, our grid | share at base |
+|---|---|---|---|
+| `LT05_L1GS_001013` | dx **-0.0800**, dy **-0.0914** | dx -0.126, core -0.0888 | 0% |
+| `S1C ... 010159` | dx **-0.0768**, dy -0.0145 | dx -0.0446, core -0.0394 | 35% |
+
+So the ladder did not introduce it; it exposed it at a gate that bounds the bias where the older gates
+reported it without failing on it, which is also what `3.rdr` at 3/8 and `3.nisar` at 0/2 were failing on.
+The e2e core figures reproduce the base-share model on this page to three digits — 0% predicts -0.089
+against -0.0888, and 35% predicts -0.039 against -0.0394.
+
+**The stage ladder being green is not evidence against this.** `stages.jl` on
+`LT05_L1GS_001013_19920425` is 13 of 13, and its `3.7 coarse correlation` rung is **bitwise exact** —
+37,311 nodes, median 0, max 0, bias +0, on both the `UInt8` and `Float32` paths. That rung is fed the
+reference's own *coarse* grid, so it establishes that the coarse correlation itself is right and places the
+cause downstream of it.
+
+**So what remains is what happens to a coarse estimate after it is correlated**: `_undecimate_level`'s
+read-back onto the fine grid and the merge that consumes it. That is the one link in this chain no
+measurement here has yet isolated — positions are exact, the radii are near-exact and the wrong shape of
+cause, and the correlation is bit-exact.
+
 **So the position hypothesis is closed.** Items 2 and 3 are not the cause, now by measurement as well as by
 the argument above; nor is the `round(x + 0.5) - 0.5` snap, which is a position effect; nor the sparse
 stride. The cause is downstream of where the coarse node sits — in the coarse pass's *values*, or in how its
