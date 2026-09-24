@@ -255,7 +255,35 @@ here), and peak conditioning (the matched green case has the same `peak_ratio` d
 against 1.625, and agrees exactly in every bin). The search window's edge is eliminated in the opposite
 direction: the red case never reaches it, at 0.00% against the green case's 6.65%.
 
-**The regime is displacement comparable to the base chip size, and the threshold is measurable.** Binning
+### The coarse correlation agrees; the divergence is after the interpolation
+
+**Isolating the coarse level's own estimate, on its own decimated grid, before `_undecimate_level`
+interpolates it** — which every earlier endpoint comparison included:
+
+| case | chip 16, stride 2 | exact | mean | median `|r|` |
+|---|---|---:|---:|---:|
+| `LT05_L1GS_001013` (red) | 19,774 | 41.42% | **-0.0096** | **0.03125** |
+| `LT04_L1TP_063018` (green) | 309,758 | 45.70% | **-0.0046** | **0.03125** |
+
+The coarse estimates agree about equally well — a factor of two apart — where the *endpoints* are -0.070
+against +0.0002, a factor of 370. So the coarse correlation is not where the two diverge.
+
+**Both medians are exactly 1/32**, one subpixel quantization step at `PyramidRefine(16)`. So the typical
+coarse disagreement is a single step on roughly 55% of points in *both* cases, which is tie-breaking rather
+than error, and it is harmless in the green case.
+
+**The open question is therefore how a one-step disagreement becomes a one-signed mean of -0.070 after
+interpolation in one case and cancels in the other.** Interpolation is linear and cannot amplify a mean
+sevenfold, so the disagreeing points must be weighted asymmetrically. The candidate is that the red case's
+entire field comes from this single coarse level — `out_ChipSizeX` resolves to `[16.0]` and nothing else —
+where the green case's chip-16 points sit beside chip-8 base measurements that agree exactly.
+
+**Two attributions to retire.** The threshold at the chip size was an artifact of binning a quantity that
+scales: the search radius grows with the displacement (median 20, 31, 43, 58, 76 across the `|dx|` bins) so
+`|dx|/radius` stays flat near 0.15 throughout, and no point on this case comes near its search edge. And
+chip size does not bound measurable displacement at all — the search range does.
+
+**The superseded reading was displacement against the base chip size.** Binning
 the residual by the reference's own `dx`, fed identical inputs:
 
 | `|dx|` px | red case median `|r|` | red case mean `r` |
