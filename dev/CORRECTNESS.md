@@ -148,6 +148,29 @@ the captured chip-768 NISAR lattice under item 2. It cannot be a real translatio
 and a node displaced that far would produce a displacement error orders of magnitude larger than the 0.126 px
 bias actually seen.
 
+**The search radius is measured and is probably not the cause either.** Comparing the coarse pass's
+*inputs* against the reference's captured `searchx`/`searchy`/`dx0`:
+
+| level | stride | `searchx` exact | differing | max abs difference |
+|---|---|---:|---:|---:|
+| chip 56 | **1** | **100.00%** | 0 | 0 |
+| chip 112 | 2 | 98.35% | 182 | 20 |
+| chip 224 | 4 | 96.12% | 107 | 58 |
+| chip 448 | 8 | 92.94% | 48 | 59 |
+
+The divergence appears exactly where the level decimation begins — stride 1 is exact, so `_coarse_points`
+is right and the difference is in `_decimate_level`'s radius. But it is not a simple wrong choice among
+reductions. A/B-ing the three candidate forms carried through the same coarse pass, **none is exact and the
+two cases disagree about which is best**: `max + range` gives 98.35% on `S1C ... 010159` where a plain
+subsample gives 96.69%, while on `LT05_L1GS_001013` those are 97.08% and 98.42%. The differing positions
+are contiguous column runs rather than the periodic pattern `colfilt`'s chunk seam would leave, so that
+entry is not the explanation either.
+
+**And the signature argues against the radius entirely.** A search window differing on a few percent of
+points with a median of zero produces *scattered* errors — a window either contains the same peak or rails
+out. What the endpoint shows is a systematic **bias**, a median shift of -0.126 px, which is the signature
+of a convention or position offset rather than of occasional window differences.
+
 **So the position hypothesis is closed.** Items 2 and 3 are not the cause, now by measurement as well as by
 the argument above; nor is the `round(x + 0.5) - 0.5` snap, which is a position effect; nor the sparse
 stride. The cause is downstream of where the coarse node sits — in the coarse pass's *values*, or in how its
