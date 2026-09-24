@@ -275,9 +275,15 @@ blends sixteen coarse nodes, so all sixteen must agree for the result to agree e
 against an observed 12.74%. Interpolating an 87%-exact field cannot do better than that.
 
 **What is not explained is the mean**: -0.0067 at the coarse nodes against -0.0800 at the endpoint.
-Interpolation is linear, its weights sum to one, and at stride 2 every fine sample sits at exactly a quarter
-of a source sample from its node — one phase for the whole grid — so it applies identical weights everywhere
-and **cannot change a mean**. The remaining route is therefore *selection*: which interpolated points survive
+Interpolation cannot change a mean, and this is verified rather than argued. The kernel is bicubic —
+`a = -0.75`, `cv2.INTER_CUBIC` — which is linear *in the data*: a cubic in position applied as a normalized
+weighted sum. At stride 2 every fine sample sits at exactly a quarter of a source sample from its node, one
+phase for the whole grid, so identical weights apply everywhere. The one worry worth having is that
+`resample!` clamps its indices at the array edge, which would redistribute weight onto duplicated boundary
+nodes; measured on this case's geometry — a small island of constant difference in a large empty grid, one
+touching the array corner so the clamp engages, and one graded so the cubic's negative lobes bite — the
+output mean matches the input mean to **six decimal places in all three**. `NaN` taps are skipped and
+`wsum` renormalizes over those present, so the operator stays a weighted average over available data. The remaining route is therefore *selection*: which interpolated points survive
 `_undecimate_level`'s `valid` mask and `_merge_level!`. Three separate readings in this investigation have
 turned out to be population effects rather than value effects, so that is where to look and what to control
 for.
