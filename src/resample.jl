@@ -175,6 +175,12 @@ end
 #
 # `cv2.resize`'s default, and so the reference's for the per-level search radius
 # (`autoRIFT.py:580-581`), where the result passes through `ceil`.
+#
+# **No `@inbounds`, deliberately, where the three kernels around it have one.** Every index here is
+# `clamp`ed before use, so the annotation would be safe — but safe is not the bar. Its only effect is to
+# remove a bounds check, and on the one path that calls this the whole resize is 0.002% of a run, so
+# there is no cost to remove. An `@inbounds` whose benefit has not been measured is silent undefined
+# behaviour bought for nothing; add one here only alongside a benchmark that shows the check mattering.
 function resample!(out::AbstractMatrix, A::AbstractMatrix, ::Bilinear;
                    scale::Tuple{Real,Real} = (size(A, 1) / size(out, 1),
                                               size(A, 2) / size(out, 2)))
