@@ -446,8 +446,7 @@ function _decimate_level(grid::PointSet{2}, wanted::AbstractMatrix{Bool}, stride
     # the same direction. Rounding the prior is worth a further 8%. Together they are 13 points of
     # exact agreement at that level.
     #
-    # `ceil` as the reference does, so a fractional widening never shrinks the window. A `NaN` mean —
-    # a cell whose priors are all missing — carries through as the missing prior it is.
+    # A `NaN` mean — a cell whose priors are all missing — carries through as the missing prior it is.
     lat = (length(rows), length(cols))
     srx = resample(rx, lat, Bilinear())
     sry = resample(ry, lat, Bilinear())

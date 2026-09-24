@@ -41,10 +41,10 @@ struct Area end
 """
     Bilinear()
 
-Bilinear resampling: the weighted mean of the surrounding 2-by-2 neighbourhood, ignoring `NaN`.
-`cv2.resize`'s default, and so the reference's for the per-level search radius
-(`autoRIFT.py:580-581`), where the value passes through `ceil` and a fractional average therefore
-widens the window by a pixel. See [`resample`](@ref).
+Bilinear resampling: the weighted mean of the surrounding 2-by-2 neighbourhood, ignoring `NaN`. The
+right choice for decimating a quantity whose *fractional* part carries meaning — one about to be
+rounded or taken to a ceiling — where sampling a single corner of the cell would discard the
+fraction that decides the answer. See [`resample`](@ref).
 """
 struct Bilinear end
 
@@ -159,10 +159,22 @@ function resample!(out::AbstractMatrix, A::AbstractMatrix, ::Area;
     return out
 end
 
+# Destination sample `i` placed in the source, under the half-sample convention `resample` documents,
+# split into the sample below it and the fraction past that sample. The two interpolating kernels both
+# need exactly this, so the convention is written once here rather than re-derived in each.
+@inline function _src_frac(i::Integer, scale::Real)
+    t = (i - 0.5) * scale - 0.5
+    i0 = floor(Int, t)
+    return i0, t - i0
+end
+
 # Bilinear interpolation over the four samples surrounding the destination centre, with the weights
 # renormalised over those that are not `NaN`. Requiring half the weight rather than all of it keeps a
 # radius defined on three corners of a cell from collapsing to no radius at all; below that the
 # estimate rests on one corner and is not supportable.
+#
+# `cv2.resize`'s default, and so the reference's for the per-level search radius
+# (`autoRIFT.py:580-581`), where the result passes through `ceil`.
 function resample!(out::AbstractMatrix, A::AbstractMatrix, ::Bilinear;
                    scale::Tuple{Real,Real} = (size(A, 1) / size(out, 1),
                                               size(A, 2) / size(out, 2)))
@@ -171,15 +183,11 @@ function resample!(out::AbstractMatrix, A::AbstractMatrix, ::Bilinear;
     ys, xs = Float64(scale[1]), Float64(scale[2])
     _parallel_slices(1:dc, 4 * dr * dc) do cols
         for j in cols
-            x = (j - 0.5) * xs - 0.5
-            j0 = floor(Int, x)
-            wx = x - j0
+            j0, wx = _src_frac(j, xs)
             ja = clamp(j0 + 1, 1, sc)
             jb = clamp(j0 + 2, 1, sc)
             for i in 1:dr
-                y = (i - 0.5) * ys - 0.5
-                i0 = floor(Int, y)
-                wy = y - i0
+                i0, wy = _src_frac(i, ys)
                 ia = clamp(i0 + 1, 1, sr)
                 ib = clamp(i0 + 2, 1, sr)
                 acc = 0.0
@@ -225,13 +233,11 @@ function resample!(out::AbstractMatrix, A::AbstractMatrix, ::Bicubic;
         wx = MVector4()
         wy = MVector4()
         @inbounds for j in cols
-            x = (j - 0.5) * xs - 0.5
-            j0 = floor(Int, x)
-            _cubic_weights!(wx, x - j0)
+            j0, fx = _src_frac(j, xs)
+            _cubic_weights!(wx, fx)
             for i in 1:dr
-                y = (i - 0.5) * ys - 0.5
-                i0 = floor(Int, y)
-                _cubic_weights!(wy, y - i0)
+                i0, fy = _src_frac(i, ys)
+                _cubic_weights!(wy, fy)
                 acc = 0.0
                 wsum = 0.0
                 for dj in 0:3

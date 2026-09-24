@@ -34,10 +34,11 @@ using AutoRIFT: ImagePair, gridpoints, params, scatter, issearchable,
         # `Wallis` divides by `sqrt(E[x²] - E[x]²)`, and both terms are single windows of the raw
         # image, so its output reaches only the half-width. What reaches twice as far is the
         # *exclusion* of a pixel whose own local mean is not finite — a window of a window — which a
-        # gapless probe cannot exhibit. Both sides are pinned so neither can drift: the trait must
-        # bound the measurement, and the measurement must stay where the arithmetic puts it.
+        # gapless probe cannot exhibit. So the trait over-declares here, deliberately and *strictly*:
+        # asserting the inequality rather than an equality is what says the looseness is intended, and
+        # pinning the measurement is what stops either side drifting.
         @test measured_reach(Wallis(; width = w)) == w ÷ 2
-        @test AutoRIFT.filter_reach(Wallis(; width = w)) >= measured_reach(Wallis(; width = w))
+        @test AutoRIFT.filter_reach(Wallis(; width = w)) > measured_reach(Wallis(; width = w))
         @test AutoRIFT.filter_reach(Wallis(; width = w)) ==
               2 * AutoRIFT.filter_reach(Highpass(w))
     end
