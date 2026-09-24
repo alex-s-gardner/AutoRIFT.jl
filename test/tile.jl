@@ -7,11 +7,9 @@ using AutoRIFT: ImagePair, gridpoints, params, scatter, issearchable,
     # rather than what its window width suggests. Measured here by filtering a padded block and
     # finding the smallest pad whose interior matches a whole-image filter bit for bit.
     #
-    # This is the check that catches the failure the trait was introduced for: `Wallis` subtracts a
-    # local mean and then divides by a local standard deviation computed *about that mean*, so its
-    # window is applied twice and its reach is twice its half-width. At `Wallis(5)` a halo of
-    # `width ÷ 2` leaves 792 of 10201 interior points differing by up to 0.21 — a visibly wrong
-    # filter output, not a rounding artefact.
+    # For most methods the trait is the measured reach exactly. `Wallis` is the exception and is
+    # checked as a bound: a halo wider than a filter needs changes no answer, so a trait that
+    # over-declares is sound while one that under-declares is silently wrong at every block edge.
     n = 512
     img = synthetic_texture(n; seed = 1)
     mask = trues(n, n)
@@ -30,10 +28,16 @@ using AutoRIFT: ImagePair, gridpoints, params, scatter, issearchable,
     end
 
     for w in (5, 9, 21)
-        for m in (Highpass(w), Wallis(; width = w))
-            @test AutoRIFT.filter_reach(m) == measured_reach(m)
-        end
-        # And the property that motivated the trait: these two are not the same number.
+        # One convolution, so the reach is exactly the kernel half-width.
+        @test AutoRIFT.filter_reach(Highpass(w)) == measured_reach(Highpass(w))
+
+        # `Wallis` divides by `sqrt(E[x²] - E[x]²)`, and both terms are single windows of the raw
+        # image, so its output reaches only the half-width. What reaches twice as far is the
+        # *exclusion* of a pixel whose own local mean is not finite — a window of a window — which a
+        # gapless probe cannot exhibit. Both sides are pinned so neither can drift: the trait must
+        # bound the measurement, and the measurement must stay where the arithmetic puts it.
+        @test measured_reach(Wallis(; width = w)) == w ÷ 2
+        @test AutoRIFT.filter_reach(Wallis(; width = w)) >= measured_reach(Wallis(; width = w))
         @test AutoRIFT.filter_reach(Wallis(; width = w)) ==
               2 * AutoRIFT.filter_reach(Highpass(w))
     end
