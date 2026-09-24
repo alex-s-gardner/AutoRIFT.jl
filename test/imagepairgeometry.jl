@@ -92,17 +92,24 @@ end
     @test all(k -> pts.radius_x[k] == permutedims(IPG_R.search_x)[k], valid)
     @test all(k -> pts.radius_y[k] == permutedims(IPG_R.search_y)[k], valid)
     @test all(k -> pts.dx_prior[k] == permutedims(IPG_R.offset_x)[k], valid)
-    @test all(k -> pts.dy_prior[k] == permutedims(IPG_R.offset_y)[k], valid)
+    # `dy_prior` is negated on the way in, because it is held in the axis `dy` is measured along and
+    # the geometry's `offset_y` is in the axis the reference hands `Dy0` over in. See the next testset.
+    @test all(k -> pts.dy_prior[k] == -permutedims(IPG_R.offset_y)[k], valid)
 end
 
 @testset "the y prior's sign comes from the coordinate system" begin
-    # A projected image needs no negation: its +y already points down its own second axis. A radar
-    # image's azimuth opposes it, and `ImagePairGeometry.y_displacement_sign` is what answers that.
-    # A wrong sign here sends the correlator the wrong way and returns a plausible velocity, so the
-    # value is read off the coordinate the result carries rather than asked for.
+    # Two factors compose here, and only their product is observable. `y_displacement_sign` answers the
+    # driver-level question — a projected image's +y already points down its own second axis, a radar
+    # image's azimuth opposes it — while `arImgDisp_*` negates `Dy0` again inside the call and AutoRIFT.jl
+    # has no such step. So the stored prior carries the opposite sign to the coordinate's, for both
+    # systems. A wrong sign here sends the correlator the wrong way and returns a plausible velocity,
+    # which is why the product is pinned rather than left to the reader.
     pts = AutoRIFT.pointset(IPG_R; pixel_size = 30.0)
 
     @test y_displacement_sign(IPG_PAIR.coordinate) === 1.0
+    valid = findall(!=(SENTINEL), permutedims(IPG_R.location_x))
+    @test all(k -> pts.dy_prior[k] ==
+                   -y_displacement_sign(IPG_PAIR.coordinate) * permutedims(IPG_R.offset_y)[k], valid)
     # Passing it explicitly agrees with the default.
     @test AutoRIFT.pointset(IPG_R; pixel_size = 30.0,
                             coordinate = IPG_PAIR.coordinate).dy_prior == pts.dy_prior

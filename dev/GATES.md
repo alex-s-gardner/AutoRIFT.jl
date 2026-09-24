@@ -5578,3 +5578,31 @@ reaching 0.085, and no case reports a residual beyond 10 px on either axis.
 **The reference is not bit-reproducible on `LT05_001013`.** Runs 200 and 201 of the identical input measure
 19,809 and 19,937 nodes at the chip-16 level. Some of the residual that remains is the reference disagreeing
 with itself, so an exact-match target of 100% is not available on this case at any level of effort.
+
+## The golden set after both input fixes
+
+`dev/CORRECTNESS.md` records the two faults: `_decimate_level`'s per-level prior and search radius, and
+the geometry extension's `dy_prior` sign. Ladder runs after both, with `AWS_PROFILE` set for the
+requester-pays Landsat scenes:
+
+| case | rungs | state |
+|---|---:|---|
+| `LT05_L1GS_001013` (`P000`, was **2 red**) | 36 | **all green** |
+| `LT04_L1TP_063018` (its controlled twin) | 36 | all green |
+| `LE07_..._20130314` (`wallis_fill`) | 38 | all green |
+| `LC08_..._009011` (`hps`) | 35 | all green |
+| `S2B_..._150759` (`hps`) | 35 | all green |
+| `LT05_..._060018` (`fft`) | 37 | all green |
+| `S1C_..._010159` (was **1 red**) | 38 | **all green** |
+| `S1A_..._025528`, `S1A_..._025533` | 38 each | all green |
+
+Chosen to cover all three preprocessing families and both coordinate systems, since the `dy_prior` sign
+is per-coordinate-system and the decimation is per-level. `Pkg.test()` passes at 704,700 tests.
+
+**Three cases could not be reached and none of the three is a code question.** `S1A_..._20151120` and
+`S1A_..._20170221` fail in `SLCDatasets.asf_annotation` with **HTTP 502** from
+`sentinel1-burst.asf.alaska.edu` — a server error, not the `401` that would mean a bad `~/.netrc` or the
+`404` that would mean a wrong burst index. `S1A_..._20150828`, `S1B_..._20180809` and `S1C_..._010214`
+keep no source product beside their outputs, so a pixel would need the granule transferred; their
+correlator gates run from the local capture and are in the table above this one. The two NISAR cases were
+not attempted.

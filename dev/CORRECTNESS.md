@@ -483,9 +483,53 @@ fill and the peak came back clean because they were measurements of the amplifie
 The `|dx|` dependence the superseded reading found is the same amplifier seen from another angle: a prior is
 worth more, and a window a pixel narrower costs more, exactly where the displacement is large.
 
-**This closes the endpoint reds without touching items 1 to 3.** The node position, the mask-versus-fill
-decimation and the shared-position question are all unrelated to it, and the deferral above stands on its
-own terms.
+**This is one of the two faults behind the endpoint reds, and it is the one the correlator gate could
+see.** `correlator.jl` is fed `pointset_from_capture`, so it exercises the pyramid but not the grid
+construction; fixing the decimation took its `dx` bias core on `LT05_L1GS_001013` from -0.0847 to -0.00227
+while the *end-to-end* endpoint only went from -0.126 to -0.0565 against a gate of 0.01. The residue is
+the second fault, below.
+
+**Neither fault touches items 1 to 3.** The node position, the mask-versus-fill decimation and the
+shared-position question are unrelated to both, and the deferral above stands on its own terms.
+
+### Resolved: the geometry extension gave `dy_prior` the driver's y sign, not the correlator's
+
+Diffing the pointset the end-to-end endpoint builds against `pointset_from_capture`, over the 2,357,307
+points searchable on both sides, leaves exactly one field standing:
+
+| field | exact |
+|---|---:|
+| `x`, `y`, `dx_prior`, `radius_x`, `radius_y`, `chip_size_min_x`, `chip_size_max_x` | **100.000%** |
+| `dy_prior` | 83.867% — and every disagreement is an **exact sign flip**, `+v` against `-v` |
+
+The 83.867% is the 1,977,007 points whose prior is zero, so the sign differs wherever it is observable at
+all. Two factors compose on this axis and only their product is observable:
+`ImagePairGeometry.y_displacement_sign` answers the **driver-level** question — the reference negates a
+radar prior and not a projected one (`testautoRIFT.py:405-407`, guarded on `optical_flag == 0`) — while
+`arImgDisp_*` then negates `Dy0` again as its first act. AutoRIFT.jl has no such internal step: `dy_prior`
+is row-positive throughout, the same axis as `dy`. So the extension needs the **negation** of the
+coordinate's sign, for both systems, and it was applying the sign itself.
+
+Measured on one case of each coordinate system rather than reasoned:
+
+| | `LT05_L1GS_001013` (projected) | `S1C_..._010159` (radar) |
+|---|---|---|
+| `dx` bias | -0.05650 → **-0.00030** | +0.00068 → **+0.00001** |
+| `dy` bias | +0.04057 → **-0.00049** | +0.00024 → **+0.00003** |
+| within 0.1 px | 50.5% / 56.6% → **99.2% / 99.5%** | 95.4% / 97.3% → **98.6% / 99.3%** |
+| median `\|r\|` | 0.0986 / 0.0802 → **0.00000** | 0 → 0 |
+
+**A wrong prior sign is invisible until the prior is large.** It moves the search centre by twice the
+prior, so a case whose `offset_y` is near zero everywhere is unaffected and a case with priors reaching
+40 px loses the peak entirely. That is why twenty-one cases passed with it and this one did not, and it is
+the same selectivity the decimation fault had — both are input errors that only bite where the input
+matters.
+
+**A probe of mine reported a third fault that does not exist**, and it is recorded because the number
+looked larger than either real one: comparing the same two pointsets *before* `sanitize!` showed
+`radius_x` short by 5 px at 94.6% of points, one-signed. `sanitize!` floors every non-zero radius at
+`p.min_search_radius = 6` and `autorift` applies it before correlating, so that comparison was against an
+already-floored array. After sanitizing both sides the radii are 100.000% exact.
 
 ## 4. Restore the stable Wallis local variance
 
