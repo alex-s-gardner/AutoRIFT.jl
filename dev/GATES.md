@@ -5599,10 +5599,30 @@ requester-pays Landsat scenes:
 Chosen to cover all three preprocessing families and both coordinate systems, since the `dy_prior` sign
 is per-coordinate-system and the decimation is per-level. `Pkg.test()` passes at 704,700 tests.
 
-**Three cases could not be reached and none of the three is a code question.** `S1A_..._20151120` and
-`S1A_..._20170221` fail in `SLCDatasets.asf_annotation` with **HTTP 502** from
-`sentinel1-burst.asf.alaska.edu` — a server error, not the `401` that would mean a bad `~/.netrc` or the
-`404` that would mean a wrong burst index. `S1A_..._20150828`, `S1B_..._20180809` and `S1C_..._010214`
-keep no source product beside their outputs, so a pixel would need the granule transferred; their
-correlator gates run from the local capture and are in the table above this one. The two NISAR cases were
-not attempted.
+### All twenty-two, end to end
+
+| case | rungs | red |
+|---|---:|---:|
+| `LC08_..._009011`, `LC08_..._062018`, `LC09_..._215109`, `S2A_..._204021`, `S2B_..._150759` | 35 each | **0** |
+| `LC08_..._060018`, `LE07_..._20120428`, `LE07_..._20130314` | 38 each | **0** |
+| `LE07_..._20040810`, `LT05_..._060018` | 37 each | **0** |
+| `LT04_..._063018`, `LT05_..._001013` (`P000`) | 36 each | **0** |
+| `S1A_..._025528`, `S1A_..._025533`, `S1C_..._010159` | 38 each | **0** |
+| `S1A_..._20150828`, `S1B_..._20180809`, `S1C_..._010214` | 36 each | **0** |
+| `S1A_..._20170221` | 37 | **0** |
+| `S1A_..._20151120` | 27 | **0** |
+| `NISAR_L1_PR_RSLC` | 31 | **0** |
+| `NISAR_L2_PR_GSLC` | 29 | **0** |
+
+The rung count varies because a rung with no input reports *skipped* rather than green, and which inputs
+a run kept differs by platform and by how the run was captured. Two deferrals are worth naming, since
+neither is a pass: **both NISAR endpoints are deferred**, not green — 5.43 GiB and 11.25 GiB of imagery is
+more than an unblocked run can hold, so the endpoint on those two is gate `3.nisar` instead. And NISAR
+L1's rung 5.3 is skipped because the pair reaching its correlator is a radar-grid mosaic, which is rung
+5.2's question.
+
+An earlier attempt reported `S1A_..._20151120` and `S1A_..._20170221` as unreachable on **HTTP 502** from
+`sentinel1-burst.asf.alaska.edu`. That was a transient outage on ASF's side — not the `401` that would
+mean a bad `~/.netrc` nor the `404` that would mean a wrong burst index — and both pass on retry. Worth
+recording only because a 502 from a metadata service is indistinguishable from a broken harness until the
+status code is read.
