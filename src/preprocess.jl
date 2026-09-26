@@ -1185,6 +1185,35 @@ function replace_nonfinite(img::AbstractMatrix{<:Union{AbstractFloat,Complex}},
     return out, copy(mask)
 end
 
+"""
+    AutoRIFT.replace_nonfinite!(img, mask) -> (img, mask)
+
+[`replace_nonfinite`](@ref)'s substitution applied to `img` itself, returning it.
+
+For a caller that owns `img` and has no use for the original — a block's read window in
+`AutoRIFT.BlockBuffers`, which is overwritten by the next block either way. The allocating form
+is two full-size arrays per image per call, and on a wide read window that is the larger part of a
+blocked run's allocation.
+
+`mask` is returned unchanged, as the allocating form also leaves it: what records that a substituted
+pixel carries no information is the mask the caller already has, not one this narrows.
+
+Dispatches on the same two element-type sets as the allocating form rather than on `AbstractMatrix`, so
+an element type neither of them handles raises a `MethodError` here too. A permissive fallback would
+silently do nothing for that type where the allocating form refuses, which is the worse failure: an
+image whose non-finite values reach the transform looks like a correlator defect.
+"""
+replace_nonfinite!(img::AbstractMatrix{<:Integer}, mask::AbstractMatrix{Bool}) = (img, mask)
+
+function replace_nonfinite!(img::AbstractMatrix{<:Union{AbstractFloat,Complex}},
+                            mask::AbstractMatrix{Bool})
+    for i in eachindex(img)
+        v = img[i]
+        isfinite(v) || (img[i] = zero(v))
+    end
+    return (img, mask)
+end
+
 # ---------------------------------------------------------------------------
 # Destriping: a frequency-domain band reject along one scan direction
 # ---------------------------------------------------------------------------
