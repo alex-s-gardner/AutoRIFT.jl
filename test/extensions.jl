@@ -880,10 +880,9 @@ end
     # Emitted as `(X, Y)`, which is how `process_block_size` is read. Checked against `block_size_for`
     # itself so the two cannot drift, and so a transposed pair — invisible on this square halo — fails
     # the anisotropic assertion in `test/tile.jl` rather than nothing at all.
-    @test got == (AutoRIFT.block_size_for(pblk, (n, n); chunk = (256, 256),
-                                          floor_pixels = ext.MIN_BLOCK).X,
-                  AutoRIFT.block_size_for(pblk, (n, n); chunk = (256, 256),
-                                          floor_pixels = ext.MIN_BLOCK).Y)
+    want = AutoRIFT.block_size_for(pblk, (n, n); chunk = (256, 256),
+                                   floor_pixels = ext.MIN_BLOCK)
+    @test got == (want.X, want.Y)
     # A chunk too small to be a sensible block is raised to `MIN_BLOCK`. `Rasters.write` produces
     # *striped* GeoTIFFs, whose chunks are one row tall, and a 5-pixel block is below the halo — which
     # `block_layout` rejects outright. Bounded above by the scene, so a small image stays one block.

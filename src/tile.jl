@@ -109,44 +109,7 @@ function halo(grid::PointSet, p::Params, imagesize::Tuple{Int,Int})
     # for the half-pixel grid offset and index truncation.
     _, _, pad, _ = _pass_geometry(_worst_level_points(grid, p), imagesize)
     ox, oy = _level_centre_offset(p)
-    # `_pass_geometry` reduces over *searchable* points, and the coarse pass searches more than those.
-    ex, ey = _widened_prior_reach(grid, p)
-    return Extent((max(pad.X, ex) + w + ox, max(pad.Y, ey) + w + oy))
-end
-
-# The reach of the points `_cell_max_radius!` can make searchable but the grid does not, as `(x, y)`.
-#
-# Their **priors** are the reason this exists. `_pass_geometry` skips a point with a zero radius, so such a
-# point contributes nothing to the halo — yet the widening can hand it a neighbour's radius, after which
-# the pass reaches `chip/2 + radius + ceil(abs(prior))` from it. The radius it receives is bounded by one
-# already counted; its prior is not, and on a 24-day Sentinel-1 pair a prior is ~18 px of range.
-#
-# The widest radius in the grid is used rather than the one each point would actually receive: the radius
-# term is already at its maximum over the searchable points, so this cannot inflate the halo through it,
-# and it saves reproducing the neighbourhood reduction here.
-#
-# `(0, 0)` for a `PointSet{1}`, which has no grid layout for a neighbourhood to be taken over.
-_widened_prior_reach(::PointSet, ::Params) = (0, 0)
-
-function _widened_prior_reach(grid::PointSet{2}, p::Params)
-    wide = _widened_searchable(grid, _widening_reach(p))
-    mx = my = 0
-    for i in eachindex(grid)
-        issearchable(grid, i) || continue
-        mx = max(mx, grid.radius_x[i])
-        my = max(my, grid.radius_y[i])
-    end
-    (mx == 0 || my == 0) && return (0, 0)
-    mx = max(mx, p.min_search_radius)
-    my = max(my, p.min_search_radius)
-    ex = ey = 0
-    for i in eachindex(grid.x, wide)
-        (wide[i] && !issearchable(grid, i)) || continue
-        # The same arithmetic `_pass_geometry` performs, at this grid's widest chip and radius.
-        ex = max(ex, p.chip_size_max.X ÷ 2 + mx + ceil(Int, abs(grid.dx_prior[i])) + 2)
-        ey = max(ey, p.chip_size_max.Y ÷ 2 + my + ceil(Int, abs(grid.dy_prior[i])) + 2)
-    end
-    return (ex, ey)
+    return Extent((pad.X + w + ox, pad.Y + w + oy))
 end
 
 """
@@ -203,6 +166,11 @@ set by `chip_size_max` however the caller sized the grid; and `_level_points` en
 [`AutoRIFT.sanitize!`](@ref), which floors every non-zero radius at `p.min_search_radius`, so a
 grid whose radii sit below that floor is searched wider than it asks for.
 
+A third correction applies to a gridded set: the coarse pass's `_cell_max_radius!` gives a point the
+widest radius in its neighbourhood, so a point the grid marks unsearchable is searched anyway, and
+`_pass_geometry` skips exactly those. Their radii are widened here so it does not — see
+`AutoRIFT._widen_for_halo!` for why their *priors* are what makes this matter.
+
 Both corrections matter only for a grid the caller built: [`AutoRIFT.autorift`](@ref)'s own grid
 takes `chip_size = p.chip_size_max` already, and its radii come from the same keywords the floor
 is compared against. A grid built at a smaller chip size is the case that breaks — at
@@ -221,9 +189,45 @@ function _worst_level_points(grid::PointSet, p::Params)
     pts = rebuild(flat; radius_x = copy(flat.radius_x), radius_y = copy(flat.radius_y),
                   chip_size_x = Uniform(cs.X, n),
                   chip_size_y = Uniform(cs.Y, n))
+    _widen_for_halo!(pts, grid, p)
     # The same floor a level applies, applied by the same function, so the two cannot drift.
     sanitize!(pts, p.min_search_radius)
     return pts
+end
+
+# Give the points `_cell_max_radius!` can make searchable the grid's widest radius, so `_pass_geometry`
+# reduces over them too.
+#
+# Their **priors** are why this is needed. `_pass_geometry` skips a point with a zero radius, so such a
+# point contributes nothing to the halo — yet the widening can hand it a neighbour's radius, after which
+# the pass reaches `chip/2 + radius + ceil(abs(prior))` from it. The radius it receives is bounded by one
+# already counted; its prior is not, and on a 24-day Sentinel-1 pair a prior is ~18 px of range.
+#
+# Widening the radii here rather than computing the extra reach separately is what keeps one copy of that
+# arithmetic: `_pass_geometry` is the only place it lives, and a second implementation would have to be
+# kept in step with it by hand. The widest radius in the grid is used rather than the one each point would
+# actually receive, which cannot inflate the halo through the radius term — that is already at its maximum
+# over the searchable points — and saves reproducing the neighbourhood reduction.
+#
+# Mutates `pts`, whose radii `_worst_level_points` has already copied, so nothing reaches the caller's
+# grid. A no-op without a grid layout for a neighbourhood to be taken over.
+_widen_for_halo!(::PointSet, ::PointSet, ::Params) = nothing
+
+function _widen_for_halo!(pts::PointSet{1}, grid::PointSet{2}, p::Params)
+    wide = vec(_widened_searchable(grid, _widening_reach(p)))
+    mx = my = 0
+    for i in eachindex(pts)
+        issearchable(pts, i) || continue
+        mx = max(mx, pts.radius_x[i])
+        my = max(my, pts.radius_y[i])
+    end
+    (mx == 0 || my == 0) && return nothing
+    for i in eachindex(pts.radius_x, wide)
+        (wide[i] && !issearchable(pts, i)) || continue
+        pts.radius_x[i] = mx
+        pts.radius_y[i] = my
+    end
+    return nothing
 end
 
 """
@@ -342,8 +346,8 @@ function block_layout(grid::PointSet{2}, p::Params, imagesize::Tuple{Int,Int},
         rlo, rhi, clo, chi = _coordinate_span(grid, grows, gcols, wide, true)
         # A block with nothing to search reads nothing. `_run_one_block!` returns before any I/O for
         # such a block, so the window only has to be empty rather than meaningful.
-        rows = isnothing(rlo) ? (1:0) : max(rlo - hy, 1):min(rhi + hy, nrows)
-        cols = isnothing(rlo) ? (1:0) : max(clo - hx, 1):min(chi + hx, ncols)
+        rows = isnothing(rlo) ? (1:0) : _clip(rlo - hy, rhi + hy, nrows)
+        cols = isnothing(rlo) ? (1:0) : _clip(clo - hx, chi + hx, ncols)
         push!(blocks, Block(grows, gcols, rows, cols))
     end
     return BlockLayout(blocks, h)
@@ -893,7 +897,8 @@ _prepare_block(::BlockBuffers, raw::ImagePair, p::Params, ::PreprocessMethod, ::
 #
 # `search_bounds` rather than re-deriving the reach, so this and `inbounds` cannot disagree about what a
 # point needs. Returns an index rather than the bounds so that nothing is allocated or formatted on the
-# path that finds nothing, which is every block of a grid `gridpoints` built.
+# path that finds nothing — which is every block of a grid `gridpoints` built, and is why this reads the
+# point set in place rather than flattening it.
 function _block_window_shortfall(rows, cols, pts::PointSet, imagesize::Tuple{Int,Int})
     nrows, ncols = length(rows), length(cols)
     (nrows == 0 || ncols == 0) && return 0
@@ -902,13 +907,15 @@ function _block_window_shortfall(rows, cols, pts::PointSet, imagesize::Tuple{Int
     hi_row = last(rows) == imagesize[1]
     lo_col = first(cols) == 1
     hi_col = last(cols) == imagesize[2]
-    flat = scatter(pts)
-    for i in eachindex(flat)
-        issearchable(flat, i) || continue
-        inbounds(flat, i, (nrows, ncols)) && continue
-        # Positionless rather than short of halo: the coordinate disagrees with the grid index.
-        (1 <= flat.x[i] <= ncols && 1 <= flat.y[i] <= nrows) || continue
-        rows, cols = search_bounds(flat, i)
+    # Indexed directly rather than through `scatter`: `search_bounds`, `inbounds` and `issearchable` are
+    # already generic over a `PointSet` of any dimension, and `eachindex` is linear over either, so
+    # flattening would allocate eleven array views per call for nothing.
+    for i in eachindex(pts)
+        issearchable(pts, i) || continue
+        inbounds(pts, i, (nrows, ncols)) && continue
+        # Belongs to another window rather than short of halo: the coordinate is outside this one.
+        (1 <= pts.x[i] <= ncols && 1 <= pts.y[i] <= nrows) || continue
+        rows, cols = search_bounds(pts, i)
         ((first(rows) < 1 && !lo_row) || (last(rows) > nrows && !hi_row) ||
          (first(cols) < 1 && !lo_col) || (last(cols) > ncols && !hi_col)) || continue
         return i
@@ -924,7 +931,7 @@ end
 # inexact to unusable on exactly the cases that need it, and blocking is the only route that fits them in
 # 16 GiB. `_warn_coarse_fallback` is the same call made for the same reason a few lines above.
 function _warn_block_window(wrows, wcols, pts::PointSet, i::Int)
-    rows, cols = search_bounds(scatter(pts), i)
+    rows, cols = search_bounds(pts, i)
     # Components interpolated one at a time: showing a `Tuple` reaches `Base.repeat` through `textwidth`,
     # which `--trim` cannot resolve — the same constraint `src/track.jl` records for its messages.
     @warn("a point reaches past its block's read window away from the scene's edge, so this blocked run " *
@@ -1000,17 +1007,24 @@ function _read_windows(pts::PointSet{2}, b::Block, h::Extent, imagesize::Tuple{I
                 nothing)
     end
 
-    # Bucket at halo resolution, then flood-fill to find the clusters. The bucket grid spans this block's
-    # coordinates only, so it is a few thousand entries even when those coordinates span the scene.
+    # One pass collecting the points worth reading, so the guard is applied once rather than at every
+    # stage below. `at` is each point's bucket, which the clustering and the assignment both key on.
     by, bx = max(h.Y, 1), max(h.X, 1)
     nbi = fld(floor(Int, rhi - rlo), by) + 1
     nbj = fld(floor(Int, chi - clo), bx) + 1
     occupied = falses(nbi, nbj)
-    for j in b.grid_cols, i in b.grid_rows
+    idx = Int[]
+    ys = Float64[]
+    xs = Float64[]
+    at = Tuple{Int,Int}[]
+    lin = LinearIndices((length(b.grid_rows), length(b.grid_cols)))
+    for (jj, j) in enumerate(b.grid_cols), (ii, i) in enumerate(b.grid_rows)
         issearchable(pts, CartesianIndex(i, j)) || continue
         y, x = pts.y[i, j], pts.x[i, j]
         (isfinite(y) && isfinite(x)) || continue
-        occupied[fld(floor(Int, y - rlo), by) + 1, fld(floor(Int, x - clo), bx) + 1] = true
+        bucket = (fld(floor(Int, y - rlo), by) + 1, fld(floor(Int, x - clo), bx) + 1)
+        occupied[bucket...] = true
+        push!(idx, lin[ii, jj]); push!(ys, y); push!(xs, x); push!(at, bucket)
     end
     comp = zeros(Int32, nbi, nbj)
     ncomp = 0
@@ -1034,31 +1048,26 @@ function _read_windows(pts::PointSet{2}, b::Block, h::Extent, imagesize::Tuple{I
 
     # Each cluster's own span, which decides whether it needs tiling at all.
     cspan = fill((Inf, -Inf, Inf, -Inf), ncomp)
-    for j in b.grid_cols, i in b.grid_rows
-        issearchable(pts, CartesianIndex(i, j)) || continue
-        y, x = pts.y[i, j], pts.x[i, j]
-        (isfinite(y) && isfinite(x)) || continue
-        c = comp[fld(floor(Int, y - rlo), by) + 1, fld(floor(Int, x - clo), bx) + 1]
+    for n in eachindex(idx)
+        c = comp[at[n]...]
         s = cspan[c]
-        cspan[c] = (min(s[1], y), max(s[2], y), min(s[3], x), max(s[4], x))
+        cspan[c] = (min(s[1], ys[n]), max(s[2], ys[n]), min(s[3], xs[n]), max(s[4], xs[n]))
     end
+    # A cluster that fits is one window whatever its shape; only a cluster wider than the buffers is cut,
+    # and then from its own origin so the cut does not depend on where the block starts.
+    fits = [_window_fits(s[1], s[2], s[3], s[4], h, imagesize, maxrows, maxcols) for s in cspan]
 
     # Group the points by cluster, and within an oversized cluster by tile. Window numbers follow first
-    # encounter over a fixed loop order, so the result is deterministic even though the lookup is a `Dict` —
+    # encounter over a fixed order, so the result is deterministic even though the lookup is a `Dict` —
     # a blocked run has to be reproducible to the bit, and `Dict` iteration order is not.
     seen = Dict{Tuple{Int32,Int,Int},Int}()
     spans = NTuple{4,Float64}[]
     assign = zeros(Int16, length(b.grid_rows), length(b.grid_cols))
-    for (jj, j) in enumerate(b.grid_cols), (ii, i) in enumerate(b.grid_rows)
-        issearchable(pts, CartesianIndex(i, j)) || continue
-        y, x = pts.y[i, j], pts.x[i, j]
-        (isfinite(y) && isfinite(x)) || continue
-        c = comp[fld(floor(Int, y - rlo), by) + 1, fld(floor(Int, x - clo), bx) + 1]
+    for n in eachindex(idx)
+        y, x = ys[n], xs[n]
+        c = comp[at[n]...]
         s = cspan[c]
-        # A cluster that fits is one window whatever its shape; only a cluster wider than the buffers is
-        # cut, and then from its own origin so the cut does not depend on where the block starts.
-        fits = _window_fits(s[1], s[2], s[3], s[4], h, imagesize, maxrows, maxcols)
-        key = fits ? (c, 0, 0) :
+        key = fits[c] ? (c, 0, 0) :
               (c, fld(floor(Int, y - s[1]), prows), fld(floor(Int, x - s[3]), pcols))
         w = get(seen, key, 0)
         if w == 0
@@ -1069,7 +1078,7 @@ function _read_windows(pts::PointSet{2}, b::Block, h::Extent, imagesize::Tuple{I
             t = spans[w]
             spans[w] = (min(t[1], y), max(t[2], y), min(t[3], x), max(t[4], x))
         end
-        assign[ii, jj] = w
+        assign[idx[n]] = w
     end
     windows = [ReadWindow(_clip(floor(Int, s[1]) - h.Y, ceil(Int, s[2]) + h.Y, imagesize[1]),
                           _clip(floor(Int, s[3]) - h.X, ceil(Int, s[4]) + h.X, imagesize[2]))
