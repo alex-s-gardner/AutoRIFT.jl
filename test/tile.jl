@@ -376,7 +376,7 @@ end
     # visible on the square halo every optical configuration has, so it is asserted here — on a halo wide
     # enough that the floor does not flatten the aspect.
     aniso = params(; chip_size = (64, 16), chip_size_max = (64, 16), grid_spacing = (16, 16),
-                   search_radius = (1800, 700))
+                   search_radius = (3000, 1100))
     ha = AutoRIFT.halo(aniso)
     @test ha.X > 2 * ha.Y                                  # the configuration does what it claims
     @test AutoRIFT.BLOCK_HALO_MULTIPLE * ha.Y > AutoRIFT.BLOCK_FLOOR   # both axes clear the floor
@@ -390,7 +390,7 @@ end
     # follows the halo, because the floor exists to stop a block being small in absolute terms — where
     # read amplification dominates — and that argument is per axis.
     narrow = params(; chip_size = (64, 16), chip_size_max = (64, 16), grid_spacing = (16, 16),
-                    search_radius = (900, 300))
+                    search_radius = (1500, 500))
     hn = AutoRIFT.halo(narrow)
     bn = AutoRIFT.block_size_for(narrow, (8192, 8192))
     @test AutoRIFT.BLOCK_HALO_MULTIPLE * hn.Y < AutoRIFT.BLOCK_FLOOR

@@ -468,7 +468,8 @@ end
     AutoRIFT.block_size_for(p::Params, imagesize; kw...) -> Extent
 
 A `process_block_size` for this configuration: `AutoRIFT.BLOCK_HALO_MULTIPLE` times the halo in each
-axis, floored at `AutoRIFT.BLOCK_FLOOR` pixels and clamped to the scene.
+axis, floored at `AutoRIFT.BLOCK_FLOOR` pixels and clamped to the scene — which at a multiple of 1 is
+the smallest block the halo permits, floored so a narrow halo does not produce a tiny one.
 
 Keywords: `chunk` as `(rows, cols)` of the storage's own grid, and `floor_pixels`.
 
@@ -482,11 +483,18 @@ deliver five.
 
 **The rule is fitted to a measured sweep of every golden case**, not to a model.
 `tools/golden/block_optimum.jl` walks each case's ladder and keeps only the arms that reproduce that
-case's untiled run, so every row scored is answer-preserving. Against each case's own best arm, this
-rule costs a mean of 1.10x and a worst of 1.35x the runtime, and a mean of +0.19 GiB and a worst of
-+0.65 GiB of peak — and it is the best of the rules tried under *both* objectives, which do not
-otherwise agree. A fixed size cannot do it: the per-case optima span 128 px to 6144 px and
-`2240x1152`, and the ratio of the best block to the halo runs from 1.0x to 6.1x.
+case's untiled run, so every row scored is answer-preserving. A fixed size cannot do the job: the
+per-case optima span 128 px to 6144 px and `2240x1152`, so the rule has to be relative to something,
+and the halo is what sets both failure modes above.
+
+**A caveat on that sweep, because it is easy to over-read.** It was run before
+`_inflate_for_decimation!` corrected the halo, and a rule expressed as a multiple of a *broken* halo
+does not transfer to a corrected one — the sweep preferred a multiple of 2, which at the corrected halo
+picks about 110 blocks on NISAR L1 and cannot be balanced across twelve threads. The multiple is 1 for
+that reason, and because 1x is the configuration measured to reproduce an untiled run on NISAR L1, the
+hardest case. Re-fitting properly means re-sweeping against the corrected halo and scoring each rule's
+*actual pick* rather than the nearest measured arm — which is what understated the cost last time:
+NISAR L2's default measured 1.50x its own optimum where the score said 1.30x.
 
 **Why a multiple of the halo rather than a block count.** An earlier form maximized the size subject
 to `blocks_per_thread * nthreads` pieces, and the count it produced does not track the optimum: at the
@@ -520,10 +528,19 @@ function _block_size_for(h::Extent, imagesize::Tuple{Integer,Integer};
 end
 
 # Multiples of the halo to make a block, and the floor below which the halo stops being the binding
-# term. Both are fitted to `tools/golden/block_optimum.jl`'s sweep of all 22 golden cases, which
-# measured each case's whole block-size ladder and kept only the arms reproducing that case's untiled
-# run. See `block_size_for` for the scoring.
-const BLOCK_HALO_MULTIPLE = 2
+# term. `tools/golden/block_optimum.jl`'s sweep of all 22 golden cases is what these are fitted to.
+#
+# **The multiple is 1, which makes the default the smallest block the halo permits**, and that is a
+# deliberate reversal. A sweep against the *old* halo preferred 2, but that halo was short of what a
+# decimated level reaches (see `_inflate_for_decimation!`), so 1x of a correct halo is a larger block
+# than 1x of a broken one and the fit does not carry over. At the corrected halo, 2x picks 7186x3686 on
+# the golden NISAR L1 case — about 110 blocks, where one block holds a large share of the granule and
+# the twelve threads cannot balance it — against 3696 blocks at 1x, which is also the configuration
+# measured to reproduce an untiled run there.
+#
+# The floor is what stops 1x being a bad trade on a narrow halo: a block equal to a 50 px halo reads 9x
+# its own area, and on every optical case the halo is under 400 px so the floor is what binds.
+const BLOCK_HALO_MULTIPLE = 1
 const BLOCK_FLOOR = 1024
 
 
