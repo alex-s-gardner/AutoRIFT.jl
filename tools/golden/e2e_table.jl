@@ -32,9 +32,36 @@ const OPT = joinpath(get(ENV, "AUTORIFT_GOLDEN_CACHE",
                          joinpath(expanduser("~/data/autorift/tests"), "golden_tests")),
                      "mem", "block_optimum.jls")
 
-pick(rows) = isempty(rows) ? nothing : begin
-    best = argmin(r -> r.peak, rows)
-    argmin(r -> r.seconds, filter(r -> r.peak <= 1.03 * best.peak, rows))
+# The row a user actually gets: the block `AutoRIFT.block_size_for` returns, which is
+# `BLOCK_HALO_MULTIPLE` times the halo per axis floored at `BLOCK_FLOOR`. Falls back to the fastest
+# blocked arm when the default was never measured on that case, and says which it used — reporting a
+# swept optimum as though it were the default would overstate what the library delivers unasked.
+default_block(h, scene) = (min(max(2 * h[1], 1024), scene[2]), min(max(2 * h[2], 1024), scene[1]))
+
+function pick(rows)
+    isempty(rows) && return (nothing, :none)
+    h, sc = first(rows).halo, first(rows).scene
+    want = default_block(h, sc)
+    i = findfirst(r -> r.block == want, rows)
+    isnothing(i) || return (rows[i], :default)
+    blk = filter(r -> r.block != (0, 0), rows)
+    isempty(blk) && return (nothing, :none)
+    return (argmin(r -> r.seconds, blk), :fastest)
+end
+
+# `mem_nisar.jl` writes one file per case beside the sweep's, and the default was measured there for the
+# cases whose default is not on the sweep's ladder. Merged so the table sees every row that exists.
+function merged(dir)
+    out = Dict{String,Vector{Any}}()
+    isdir(dir) || return out
+    for f in readdir(dir)
+        endswith(f, ".jls") || continue
+        f == "block_optimum.jls" && continue
+        rows = try deserialize(joinpath(dir, f)) catch; continue end
+        rows isa Vector && !isempty(rows) && haskey(first(rows), :halo) || continue
+        out[replace(f, ".jls" => "")] = rows
+    end
+    return out
 end
 
 label(bs) = bs == (0, 0) ? "untiled" : bs[1] == bs[2] ? "$(bs[1])" : "$(bs[1])x$(bs[2])"
@@ -59,47 +86,57 @@ function main()
     i = findfirst(==("--python"), ARGS)
     pypath = isnothing(i) ? joinpath(get(ENV, "CLAUDE_JOB_DIR", tempdir()), "tmp", "golden_python.tsv") :
              ARGS[i + 1]
+    dir = dirname(OPT)
     jl = isfile(OPT) ? deserialize(OPT) : Dict{String,Any}()
+    side = merged(dir)
     py = read_python(pypath)
 
-    @printf("%-44s %9s %8s %9s %10s %8s %9s %7s\n", "case", "jl block", "jl s",
-            "jl GiB", "py s", "py GiB", "speedup", "pts jl/py")
-    nboth = 0
+    # `mem_nisar.jl` names its file from the product's first half, so a side row is attached to the case
+    # whose product it prefixes rather than by an exact key match.
+    rowsfor(k) = begin
+        base = get(jl, k, nothing)
+        base = (base === :failed || isnothing(base)) ? Any[] : Any[r for r in base]
+        for (sk, sv) in side
+            startswith(k, sk) && append!(base, sv)
+        end
+        base
+    end
+    ab(r) = (Int(r.peak) - Int(r.floor_bytes)) / 2^30
+
+    @printf("%-40s %-11s %7s %8s %7s %8s %6s %5s\n", "case", "jl block", "jl s",
+            "jl GiB↑", "py s", "py GiB", "x", "src")
     ratios = Float64[]
     for k in sort(collect(union(keys(jl), keys(py))))
-        rows = get(jl, k, nothing)
-        b = (isnothing(rows) || rows === :failed) ? nothing : pick(rows)
+        rows = rowsfor(k)
+        b, src = pick(rows)
         p = get(py, k, nothing)
         jls = isnothing(b) ? NaN : b.seconds
-        jlg = isnothing(b) ? NaN : b.peak / 2^30
+        jlg = isnothing(b) ? NaN : ab(b)
         pys = isnothing(p) ? NaN : p.seconds
         pyg = isnothing(p) ? NaN : p.peak / 2^30
         sp = (isfinite(jls) && isfinite(pys) && jls > 0) ? pys / jls : NaN
-        isfinite(sp) && (nboth += 1; push!(ratios, sp))
-        pts = (isnothing(b) || isnothing(p) || p.measured == 0) ? "—" :
-              @sprintf("%.3f", b.measured / p.measured)
-        @printf("%-44s %9s %8.1f %9.2f %10.1f %8.2f %7s %9s\n", first(k, 44),
+        isfinite(sp) && push!(ratios, sp)
+        @printf("%-40s %-11s %7.1f %8.2f %7.1f %8.2f %6s %5s\n", first(k, 40),
                 isnothing(b) ? "—" : label(b.block), jls, jlg, pys, pyg,
-                isfinite(sp) ? @sprintf("%.0fx", sp) : (isnothing(p) ? "—" : p.status),
-                pts)
+                isfinite(sp) ? @sprintf("%.0fx", sp) : "—",
+                src === :default ? "def" : src === :fastest ? "fast" : "—")
     end
     if !isempty(ratios)
         sort!(ratios)
-        @printf("\n%d cases measured on both sides: speedup median %.0fx, min %.0fx, max %.0fx\n",
-                nboth, ratios[(end + 1) ÷ 2], first(ratios), last(ratios))
+        @printf("\n%d cases on both sides: median %.0fx, min %.0fx, max %.0fx\n",
+                length(ratios), ratios[(end + 1) ÷ 2], first(ratios), last(ratios))
     end
-    # Untiled beside the optimum, since that is what a caller gets with no `process_block_size` and the
-    # gap is the whole argument for choosing one.
-    println("\nblocked against untiled, Julia:")
-    @printf("  %-44s %9s %9s %9s %9s\n", "case", "opt GiB", "unt GiB", "opt s", "unt s")
+    # Untiled beside the default, since that is what a caller gets with no `process_block_size` and the
+    # gap is the whole argument for having a default at all. Peaks are above each run's own floor.
+    println("\nat the default block against untiled, Julia:")
+    @printf("  %-40s %9s %9s %9s %9s\n", "case", "def GiB↑", "unt GiB↑", "def s", "unt s")
     for k in sort(collect(keys(jl)))
-        rows = jl[k]
-        rows === :failed && continue
-        b = pick(rows)
+        rows = rowsfor(k)
+        b, _ = pick(rows)
         u = findfirst(r -> r.block == (0, 0), rows)
         (isnothing(b) || isnothing(u)) && continue
-        @printf("  %-44s %9.2f %9.2f %9.1f %9.1f\n", first(k, 44),
-                b.peak / 2^30, rows[u].peak / 2^30, b.seconds, rows[u].seconds)
+        @printf("  %-40s %9.2f %9.2f %9.1f %9.1f\n", first(k, 40),
+                ab(b), ab(rows[u]), b.seconds, rows[u].seconds)
     end
     return nothing
 end

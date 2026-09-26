@@ -34,7 +34,12 @@ function main()
     frag = ARGS[1]
     call = parse(Int, argvalue("--run", "100"))
     stride = parse(Int, argvalue("--stride", "4"))
-    block = parse(Int, argvalue("--blocks", "0"))
+    # `WxH` as well as a scalar, because a rectangular block is what `block_size_for` returns on a
+    # geogrid — NISAR L2's default is 4432x2206 — and a gate that cannot express the default cannot
+    # check it.
+    block = let spec = argvalue("--blocks", "0")
+        occursin('x', spec) ? Tuple(parse.(Int, split(spec, 'x'))) : (v = parse(Int, spec); (v, v))
+    end
 
     c = only(cases(frag))
     k = read_capture(c; n = call, mmap = CAPTURE_IMAGERY)
@@ -48,7 +53,7 @@ function main()
 
     # A block size the halo permits, unless the caller named one. `block_size_for` is what the production
     # entry points use, so gating on its choice gates what a caller actually gets.
-    bs = block > 0 ? (block, block) : AutoRIFT.block_size_for(grid, p, scene)
+    bs = block[1] > 0 ? block : Tuple(AutoRIFT.block_size_for(grid, p, scene))
     layout = block_layout(grid, p, scene, bs)
     @printf("%s\n  scene %dx%d  grid %dx%d  halo %dx%d  stride %d  %d searchable  block %dx%d, %d blocks\n",
             c.product, scene..., size(grid)..., h.X, h.Y, stride, nsearchable(grid),

@@ -1124,3 +1124,65 @@ yet characterized.
 **Two consequences worth keeping in view.** It blocks re-fitting `block_size_for`, because the best
 candidate rule picks one of NISAR L1's failing sizes. And it caps NISAR L1's speed: 6144 is the only size
 that agrees there, and it is the one that leaves twelve threads delivering five.
+
+## The default block size, fitted to the sweep
+
+`block_size_for` now returns `BLOCK_HALO_MULTIPLE` (2) times the halo per axis, floored at
+`BLOCK_FLOOR` (1024) and clamped to the scene. It replaces "the largest block still dividing the work
+into `blocks_per_thread * nthreads` pieces", and `_block_count`, `BLOCKS_PER_THREAD` and
+`BLOCK_SIZE_STEP` are gone with it.
+
+**The count rule was not tracking anything.** At each case's measured best arm the blocks per thread run
+from 7 to 3,330 across the 22, so no single target reaches them; and the sizes it actually picked were far
+from any measured optimum — 3660x1370 on S1B where 1024-3072 wins, 6586x2422 on
+`S1A_IW_SLC__1SSV_20240618T025528`. The halo is what sets both failure modes (too small and a block reads
+mostly skirt, too large and the buffers dominate and one block becomes unbalanceable), so the halo is what
+the rule is expressed in.
+
+Scored against each case's own best arm, `2x halo / floor 1024` was the best of seven candidates under
+**both** objectives — 1.10x mean and 1.35x worst on wall clock, +0.19 and +0.65 GiB on peak — where every
+alternative was worse on at least one.
+
+**That scoring understated the cost, and the measured defaults are the figure to trust.** It scored the
+*nearest measured arm* to each rule's pick, not the pick itself. Measured directly, NISAR L2's default of
+`4432x2206` takes 363.3 s against the swept optimum's 241.4 — **1.50x**, where the scoring predicted 1.30x.
+Anyone re-fitting this rule should measure the picks rather than score against a ladder.
+
+**Agreement at the default: 21 of 22 exact.** Gated at `--stride 1` or checked by `mem_nisar.jl`'s own
+comparison. The exception is NISAR L1 at `5472x3000`, which loses **28 points of 1,799,742** — the case
+that agrees at 6144 and at no other size tried, so the default inherits that residual rather than
+introducing it.
+
+| case | default | agrees | wall untiled -> default | above-floor untiled -> default |
+|---|---|---|---|---|
+| S1A `1SSH_20151120` | 1434x1024 | yes | 25.0 -> **8.9 s** | 17.60 -> **1.69 GiB** |
+| S1A `1SSH_20170221` | 1206x1024 | yes | 24.3 -> 24.2 s | 17.81 -> **0.58** |
+| S1A `1SSV_025528` | 1224x1024 | yes | 31.7 -> 29.4 s | 17.91 -> **0.93** |
+| S1A `1SSV_025533` | 1178x1024 | yes | 13.3 -> 12.4 s | 8.69 -> **0.78** |
+| S1B `1SDH_20180809` | 1368x1024 | yes | 14.2 -> 16.1 s | 19.11 -> **0.87** |
+| NISAR L2 | 4432x2206 | yes | 228.7 -> 363.3 s | 54.32 -> **5.37** |
+| NISAR L1 | 5472x3000 | **no, 28 lost** | 549.1 -> 595.4 s | 35.07 -> **7.67** |
+
+Every case's above-floor peak at the default is **0.01-7.67 GiB**, so with a production floor near 2 GiB
+the whole set fits 16 GiB with NISAR L1 worst at about 9.7.
+
+## Julia against Python at the default, all 22 cases
+
+`tools/golden/e2e_table.jl` reports the block a caller gets rather than a swept optimum, and says which
+of the two it used per row. Both sides at 12 threads on the same captured inputs.
+
+**Median 9x faster, worst 1x, best 25x.**
+
+| case | jl block | jl s | jl GiB above floor | py s | py GiB | x |
+|---|---|---:|---:|---:|---:|---:|
+| LT05 `L1GS_001013` | 1024 | 1.5 | 0.22 | 37.8 | 1.85 | **25x** |
+| LC09 `215109` | 1024 | 4.7 | 0.46 | 77.8 | 6.35 | 16x |
+| LT04 `063018` | 1024 | 4.1 | 0.71 | 60.2 | 2.04 | 15x |
+| S1B `1SDH_20180809` | 1368x1024 | 16.1 | 0.87 | 111.1 | 14.94 | 7x |
+| NISAR L2 | 4432x2206 | 363.3 | 5.37 | 516.4 | 49.44 | **1x** |
+| NISAR L1 | 5472x3000 | 595.4 | 7.67 | 812.2 | 26.83 | **1x** |
+
+Both NISAR granules are level with the reference at the default, and L2 has slipped from 2x because the
+default costs it 1.50x against its own optimum. The L1 explanation is above: one block holding a fifth of
+the granule. Choosing for wall clock rather than peak would put L2 back at 2x and leave L1 where it is,
+since L1's only agreeing size is also its slowest.

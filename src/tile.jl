@@ -419,88 +419,64 @@ end
     AutoRIFT.block_size_for(grid::PointSet{2}, p::Params, imagesize; kw...) -> Extent
     AutoRIFT.block_size_for(p::Params, imagesize; kw...) -> Extent
 
-A `process_block_size` for this configuration: the largest block that still divides the work into
-`blocks_per_thread * nthreads` pieces, never below the halo every block must read.
+A `process_block_size` for this configuration: `AutoRIFT.BLOCK_HALO_MULTIPLE` times the halo in each
+axis, floored at `AutoRIFT.BLOCK_FLOOR` pixels and clamped to the scene.
 
-Keywords: `nthreads`, `blocks_per_thread`, `chunk` as `(rows, cols)` of the storage's own grid, and
-`floor_pixels`.
+Keywords: `chunk` as `(rows, cols)` of the storage's own grid, and `floor_pixels`.
 
-**Blocks are the unit of threaded work, and the halo is a fixed-width skirt on every one of them**,
-so the two ends of the range fail for different reasons. Too few blocks and the pool cannot balance a
-per-block cost that varies by orders of magnitude — one NISAR granule runs at 2.96 of ten threads
-busy at ten blocks per thread, and a Landsat scene at one block per thread peaks at **3.00x** its
-untiled memory because every block is in flight at once. Too many and each block reads mostly skirt.
-Between them, peak memory falls monotonically as blocks shrink and runtime does not, which is why
-this maximizes the size subject to a count rather than minimizing the size.
+**Blocks are the unit of threaded work and the halo is a fixed-width skirt on every one**, so the two
+ends of the range fail for different reasons and the best block is interior to them. Too small and a
+block reads mostly skirt: on the golden S1B case, halo 684x256, a 768x320 block costs a read
+amplification of 7.23x for a *worse* peak than 1024 — 3.24 GiB against 3.01. Too large and the buffers
+dominate, at 10.32 GiB by 2048, and one block becomes too much work to balance: on NISAR L1 at 6144 px
+a single block holds 19.8% of the granule and 2.37x what a thread should carry, so twelve threads
+deliver five.
 
-`blocks_per_thread` is calibrated against the three sweeps `docs/src/explanation/memory.md` records —
-scene areas spanning 21x and halos 40x — against each one's lowest peak within 10% of its own best
-*blocked* runtime. Those rows sit at 416 blocks per thread on the optical scene, 148 on NISAR L1 and
-230 on L2, and **150 reaches all three**: it picks the optical floor (which is that case's
-minimum-peak row), 151 per thread on L1, and 194 on L2. No single block *size* comes close on more
-than one of them — the sizes those rows name are 256 px, 4096 px and 2304x1152 px.
+**The rule is fitted to a measured sweep of every golden case**, not to a model.
+`tools/golden/block_optimum.jl` walks each case's ladder and keeps only the arms that reproduce that
+case's untiled run, so every row scored is answer-preserving. Against each case's own best arm, this
+rule costs a mean of 1.10x and a worst of 1.35x the runtime, and a mean of +0.19 GiB and a worst of
++0.65 GiB of peak — and it is the best of the rules tried under *both* objectives, which do not
+otherwise agree. A fixed size cannot do it: the per-case optima span 128 px to 6144 px and
+`2240x1152`, and the ratio of the best block to the halo runs from 1.0x to 6.1x.
 
-**The count comes from `_block_shape`, not from scene area over block area.** On a rotated grid those
-differ by a factor of eight: the coupled shrink that keeps both pixel axes inside the budget halves
-the shape twice on a NISAR L1 geogrid, so a 2816x1536 budget yields 5814 blocks where the area
-estimate predicts 693. Counting the way `block_layout` counts is the only form that is right for both.
+**Why a multiple of the halo rather than a block count.** An earlier form maximized the size subject
+to `blocks_per_thread * nthreads` pieces, and the count it produced does not track the optimum: at the
+measured best arm the blocks per thread run from 7 to 3,330 across the set. The halo is what sets both
+failure modes above, so it is what the rule is expressed in.
 
 The `Params`-only method is for a caller who has no grid yet, and assumes the grid
 [`AutoRIFT.gridpoints`](@ref) would build — uniform radii, axis-aligned, `p.grid_spacing` apart —
 exactly as [`AutoRIFT.halo(p)`](@ref) does, and for the same reason: building a grid to choose a block
 size costs 550 MiB on a Landsat-sized scene to produce two integers.
 """
-function block_size_for(grid::PointSet{2}, p::Params, imagesize::Tuple{Integer,Integer}; kw...)
-    return _block_size_for(halo(grid, p, imagesize), _index_rates(grid), size(grid), imagesize;
-                           kw...)
-end
+block_size_for(grid::PointSet{2}, p::Params, imagesize::Tuple{Integer,Integer}; kw...) =
+    _block_size_for(halo(grid, p, imagesize), imagesize; kw...)
 
-function block_size_for(p::Params, imagesize::Tuple{Integer,Integer}; kw...)
-    sx, sy = p.grid_spacing.X, p.grid_spacing.Y
-    # The rates a `gridpoints` grid has: `x` moves `spacing.X` per column and not at all down a row,
-    # and the cross terms vanish. `_block_shape` then reduces to the separable answer.
-    rates = (rxi = 0.0, rxj = Float64(sx), ryi = Float64(sy), ryj = 0.0)
-    gridsize = (cld(Int(imagesize[1]), max(sy, 1)), cld(Int(imagesize[2]), max(sx, 1)))
-    return _block_size_for(halo(p), rates, gridsize, imagesize; kw...)
-end
+block_size_for(p::Params, imagesize::Tuple{Integer,Integer}; kw...) =
+    _block_size_for(halo(p), imagesize; kw...)
 
-function _block_size_for(h::Extent, rates::NamedTuple, gridsize::Tuple{Integer,Integer},
-                         imagesize::Tuple{Integer,Integer};
-                         nthreads::Integer = Threads.nthreads(),
-                         blocks_per_thread::Real = BLOCKS_PER_THREAD,
+function _block_size_for(h::Extent, imagesize::Tuple{Integer,Integer};
                          chunk::Tuple{Integer,Integer} = (1, 1),
                          floor_pixels::Integer = 1)
     nrows, ncols = Int(imagesize[1]), Int(imagesize[2])
-    want = max(round(Int, blocks_per_thread * max(nthreads, 1)), 1)
     # `chunk` is indexed as `imagesize` is — `(rows, cols)` — while a halo and a block size are
     # `(x, y)`, so the axes cross exactly once, here.
-    snap(t) = Extent((min(_round_up(max(ceil(Int, t * h.X), h.X, floor_pixels), chunk[2]), ncols),
-                      min(_round_up(max(ceil(Int, t * h.Y), h.Y, floor_pixels), chunk[1]), nrows)))
-
-    # Grow from the floor while the count still meets the target. The count is non-increasing in `t`,
-    # so the last size that met it is the largest one that does — which is the one to take, since it
-    # reads the least skirt of the sizes with enough blocks. A floor that already falls short of the
-    # target is returned as-is: no legal block divides the work more finely.
-    best = snap(1.0)
-    t = 1.0
-    while _block_count(rates, gridsize, best.X, best.Y) >= want
-        (best.X >= ncols && best.Y >= nrows) && break
-        t *= BLOCK_SIZE_STEP
-        bs = snap(t)
-        _block_count(rates, gridsize, bs.X, bs.Y) >= want || break
-        best = bs
-    end
-    return best
+    #
+    # Clamped to the scene, since a block past it reads the whole thing once and is an untiled run
+    # wearing a block size.
+    return Extent((min(_round_up(max(BLOCK_HALO_MULTIPLE * h.X, BLOCK_FLOOR, h.X, floor_pixels),
+                                chunk[2]), ncols),
+                   min(_round_up(max(BLOCK_HALO_MULTIPLE * h.Y, BLOCK_FLOOR, h.Y, floor_pixels),
+                                chunk[1]), nrows)))
 end
 
-# Blocks per thread to aim for. See `block_size_for` for the three sweeps this is calibrated against
-# and why the target is a count rather than a size.
-const BLOCKS_PER_THREAD = 150
-
-# How fast the search grows the block. 1.15 per axis is about 1.3x in area, so the ladder lands within
-# a few percent of the largest size meeting the target while taking a few dozen steps to cross any
-# real scene — and each step costs only the shape arithmetic, since the rates are measured once.
-const BLOCK_SIZE_STEP = 1.15
+# Multiples of the halo to make a block, and the floor below which the halo stops being the binding
+# term. Both are fitted to `tools/golden/block_optimum.jl`'s sweep of all 22 golden cases, which
+# measured each case's whole block-size ladder and kept only the arms reproducing that case's untiled
+# run. See `block_size_for` for the scoring.
+const BLOCK_HALO_MULTIPLE = 2
+const BLOCK_FLOOR = 1024
 
 
 

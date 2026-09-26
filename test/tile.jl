@@ -301,55 +301,73 @@ end
     @test_throws "must be positive in both axes" AutoRIFT.block_layout(grid, p, (n, n), (8, -1))
 end
 
-@testset "block_size_for picks by block count, floored at the halo" begin
-    # The rule is the largest block that still divides the work into `blocks_per_thread * nthreads`
-    # pieces, never below the halo. Each property is asserted on the configuration that isolates it.
+@testset "block_size_for is a multiple of the halo, floored" begin
+    # The rule is `BLOCK_HALO_MULTIPLE` times the halo per axis, floored at `BLOCK_FLOOR` and clamped to
+    # the scene, fitted to `tools/golden/block_optimum.jl`'s sweep of all 22 golden cases. Each property
+    # is asserted on the configuration that isolates it.
     n = 4096
     p = params(; chip_size = 32, chip_size_max = 32, grid_spacing = 16, search_radius = 25)
     h = AutoRIFT.halo(p)
 
-    # The floor binds when the target cannot be met: no legal block divides the work more finely, so
-    # the halo itself is returned rather than something below it.
-    floored = AutoRIFT.block_size_for(p, (n, n); nthreads = 1, blocks_per_thread = 10^6)
-    @test floored.X == h.X && floored.Y == h.Y
+    # The floor binds on a narrow halo, which is every optical configuration: twice 82 px is well under
+    # 1024, so the floor is what the caller gets and it is a legal block.
+    small = AutoRIFT.block_size_for(p, (n, n))
+    @test h.X < AutoRIFT.BLOCK_FLOOR && h.Y < AutoRIFT.BLOCK_FLOOR
+    @test small.X == AutoRIFT.BLOCK_FLOOR && small.Y == AutoRIFT.BLOCK_FLOOR
     @test_nowarn AutoRIFT.block_layout(gridpoints((n, n), 16; chip_size = 32, search_radius = 25),
-                                       p, (n, n), (floored.X, floored.Y))
+                                       p, (n, n), (small.X, small.Y))
 
-    # Asking for fewer, larger blocks gives a larger block, and asking for more gives a smaller one —
-    # monotone in the target, which is what makes the target the knob.
-    few = AutoRIFT.block_size_for(p, (n, n); nthreads = 1, blocks_per_thread = 4)
-    many = AutoRIFT.block_size_for(p, (n, n); nthreads = 1, blocks_per_thread = 400)
-    @test few.X >= many.X && few.Y >= many.Y
+    # The halo binds once twice it exceeds the floor, which is the geogrid regime. Always at least the
+    # halo, or `block_layout` rejects the block outright.
+    wide = params(; chip_size = 768, chip_size_max = 768, grid_spacing = 120, search_radius = 1000)
+    hw = AutoRIFT.halo(wide)
+    bw = AutoRIFT.block_size_for(wide, (20000, 20000))
+    @test AutoRIFT.BLOCK_HALO_MULTIPLE * hw.X > AutoRIFT.BLOCK_FLOOR
+    @test bw.X >= hw.X && bw.Y >= hw.Y
+    @test bw.X == AutoRIFT.BLOCK_HALO_MULTIPLE * hw.X
+    @test bw.Y == AutoRIFT.BLOCK_HALO_MULTIPLE * hw.Y
 
     # Never larger than the scene: a block wider than the image is the untiled path wearing a label.
-    whole = AutoRIFT.block_size_for(p, (n, n); nthreads = 1, blocks_per_thread = 1)
-    @test whole.X <= n && whole.Y <= n
+    @test AutoRIFT.block_size_for(wide, (2048, 2048)).X <= 2048
 
     # Chunk alignment, so a read starts and ends where the storage does.
-    aligned = AutoRIFT.block_size_for(p, (n, n); nthreads = 4, chunk = (256, 128))
+    aligned = AutoRIFT.block_size_for(p, (n, n); chunk = (256, 128))
     @test aligned.Y % 256 == 0 && aligned.X % 128 == 0
 
     # **The block follows the halo's aspect rather than being square, and is not its transpose.** A
     # square block on a 2:1 halo clears the wide axis and over-provisions the narrow one twofold; a
     # transposed one is below the halo on the wide axis, which `block_layout` then rejects. Neither is
-    # visible on the square halo every optical configuration has, so it is asserted here.
+    # visible on the square halo every optical configuration has, so it is asserted here — on a halo wide
+    # enough that the floor does not flatten the aspect.
     aniso = params(; chip_size = (64, 16), chip_size_max = (64, 16), grid_spacing = (16, 16),
-                   search_radius = (200, 50))
+                   search_radius = (1800, 700))
     ha = AutoRIFT.halo(aniso)
     @test ha.X > 2 * ha.Y                                  # the configuration does what it claims
-    ba = AutoRIFT.block_size_for(aniso, (8192, 8192); nthreads = 2, blocks_per_thread = 50)
+    @test AutoRIFT.BLOCK_HALO_MULTIPLE * ha.Y > AutoRIFT.BLOCK_FLOOR   # both axes clear the floor
+    ba = AutoRIFT.block_size_for(aniso, (8192, 8192))
     @test ba.X > ba.Y
     @test ba.X >= ha.X && ba.Y >= ha.Y                     # a transpose would fail this
     @test isapprox(ba.X / ba.Y, ha.X / ha.Y; rtol = 0.25)
 
-    # The count comes from the same arithmetic `block_layout` uses, so the two agree on a real grid —
-    # including a coupled one, where scene area over block area is wrong by a factor of eight.
+    # **The floor applies per axis, so it flattens the aspect on a halo whose narrow axis is below it.**
+    # That is intended and not a transpose bug: the narrow axis is raised to the floor while the wide one
+    # follows the halo, because the floor exists to stop a block being small in absolute terms — where
+    # read amplification dominates — and that argument is per axis.
+    narrow = params(; chip_size = (64, 16), chip_size_max = (64, 16), grid_spacing = (16, 16),
+                    search_radius = (900, 300))
+    hn = AutoRIFT.halo(narrow)
+    bn = AutoRIFT.block_size_for(narrow, (8192, 8192))
+    @test AutoRIFT.BLOCK_HALO_MULTIPLE * hn.Y < AutoRIFT.BLOCK_FLOOR
+    @test bn.Y == AutoRIFT.BLOCK_FLOOR
+    @test bn.X == AutoRIFT.BLOCK_HALO_MULTIPLE * hn.X
+    @test bn.X / bn.Y < hn.X / hn.Y                        # flattened, deliberately
+
+    # The size it picks is one `block_layout` accepts on a real grid, and divides it into more than one
+    # block — the whole point of returning a size rather than nothing.
     grid = gridpoints((n, n), 16; chip_size = 32, search_radius = 25)
-    bs = AutoRIFT.block_size_for(grid, p, (n, n); nthreads = 2, blocks_per_thread = 25)
+    bs = AutoRIFT.block_size_for(grid, p, (n, n))
     layout = AutoRIFT.block_layout(grid, p, (n, n), (bs.X, bs.Y))
-    rates = AutoRIFT._index_rates(grid)
-    @test AutoRIFT._block_count(rates, size(grid), bs.X, bs.Y) == length(layout.blocks)
-    @test length(layout.blocks) >= 50
+    @test length(layout.blocks) > 1
 end
 
 @testset "a block size is a pair at every entry point" begin
