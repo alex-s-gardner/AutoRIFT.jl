@@ -125,9 +125,27 @@ Ruled out by measurement, each at the cost of a run:
 - **Integral-table precision.** `src/integral.jl` accumulates in `Float64`; a UInt8 scene sums to about
   3.1e10, exact in `Float64`, so a whole-scene table and a window-sized one cannot disagree.
 
-What correlates is the tile quantum, `buffer - 2 * halo - 2`: large at the default and smaller than the
-halo at the sizes that differ. `tools/golden/block_bisect.jl` localizes it to the outlier filter on `dx`,
-but with rejection off `dy` still differs at 13 points, so the seed is upstream of the filter.
+**It is not monotone in block size, which rules out "the window is simply too tight".** Swept with
+`block_gate.jl --blocks sweep --stride 1`, the golden S2A case passes at 512 and 576 px and **fails at
+768** — a larger block — while also failing at 192 and 384. S2B fails at 384 and 512 and passes at 768 and
+above; `S1A_IW_SLC__1SSH_20150828` fails only at 384x192 of eleven sizes.
+
+Two further mechanisms ruled out by that sweep:
+
+- **Alignment against the decimation strides.** S2A at 576 px and at 768 px give *identical* remainders
+  of their grid-points-per-block against every level decimation — `0/0 0/0 2/2 2/2` — and disagree about
+  the verdict. So how a block's extent divides against the strides a decimated level walks is not it.
+- **A short trailing block.** 192 px divides that grid exactly, 130 blocks by 130, and still fails; 512
+  and 1024 divide it unevenly and pass.
+
+`tools/golden/block_bisect.jl` localizes it to the outlier filter on `dx`, but with rejection off `dy`
+still differs at 13 points, so the seed is upstream of the filter. The differing points are overwhelmingly
+*positioned* rather than placeholder, and include both lost points and moved ones, so it is not confined to
+the placeholder population either.
+
+**The gate now sweeps**, so a recurrence is visible rather than latent: `--blocks sweep` walks
+`blockspec.jl`'s ladder against a single untiled run. `--blocks 0` checks what `block_size_for` returns,
+which is the size a caller actually gets and the one that must never regress.
 
 ## 2. Decimate a coarse level with the mask, not the fill value
 
