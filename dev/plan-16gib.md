@@ -1186,3 +1186,53 @@ Both NISAR granules are level with the reference at the default, and L2 has slip
 default costs it 1.50x against its own optimum. The L1 explanation is above: one block holding a fifth of
 the granule. Choosing for wall clock rather than peak would put L2 back at 2x and leave L1 where it is,
 since L1's only agreeing size is also its slowest.
+
+## Final state, on the corrected halo
+
+Everything above this section that quotes a peak or a runtime predates `_inflate_for_decimation!`. A halo
+change moves every window, so those figures describe a different library; the numbers here replace them.
+
+**The halo was short of what a decimated level reaches.** `_decimate_level` gives a coarse node
+`windowmax(radius, stride) + windowrange(prior, stride)` — the widest radius in its cell plus the spread of
+that cell's priors, since points with different priors search around different centres — and
+`_worst_level_points` carried only the grid's own radii. On NISAR L1 the grid's widest radius is 1905x830
+while the chip-768 level carries 2199x1038, a reach of 3132x1409 against a halo of 2736x1500: **396 px
+short**, so a block read padding where an untiled run read scene.
+
+That is why NISAR L1 reproduced an untiled run at 6144 px and at no smaller size tried, and the fix is a
+speed lever as well as a correctness one — L1 runs **600.5 s at its default against 773.3 s** at the only
+size that used to agree, because 3915 blocks balance where 676 could not.
+
+Halos grew with it: S2B 281x267 to 336x334, S1B 684x256 to 752x277, NISAR L2 2216x1103 to 2883x1531,
+NISAR L1 2736x1500 to 3593x1843.
+
+**`BLOCK_HALO_MULTIPLE` is 1, reversing the earlier fit.** That fit scored a multiple of 2 against the
+*broken* halo, and does not transfer: 1x of a corrected halo is a larger block than 1x of a broken one. At
+the corrected halo a multiple of 2 picks 7186x3686 on NISAR L1 — about 110 blocks, unbalanceable across
+twelve threads — where 1x gives 3915. Every non-NISAR case has a halo under 1024, so the floor binds and
+their default is 1024 either way.
+
+**All 22 cases reproduce an untiled run exactly at their default**, checked by `mem_nisar.jl`'s own
+comparison or `block_gate.jl --stride 1`.
+
+| | above-floor peak at default | wall at default | vs Python |
+|---|---:|---:|---:|
+| NISAR L1 @ 3593x1843 | 9.70 GiB | 600.5 s | 1x |
+| NISAR L2 @ 2883x1531 | 7.71 | 287.9 | 2x |
+| the twenty others @ 1024 | 0.29-1.32 | 2.7-30.0 s | 5-14x |
+
+Above-floor peak runs **0.29 to 9.70 GiB**, so with a production floor near 2 GiB the whole set fits 16 GiB
+with NISAR L1 worst at about 11.7.
+
+**Julia against Python, 22 of 22: median 8x, worst 1x, best 14x** (`e2e_table.jl`). The Python side is
+unchanged by any of this. The speedups are lower than the pre-fix table reported — median 9x, best 25x —
+and that gap is the cost of the correct halo: a wider halo is a wider window and more read amplification.
+The small cases pay most of it in relative terms because their runtime is dominated by fixed costs, and
+NISAR L1 is the one case the fix made faster.
+
+**What remains unexplained** is the small-block residual: three points on S2B at a 512 px block, and the
+equivalent on three other cases at sizes below their default. Ruled out by measurement: run-to-run
+non-determinism, read-window shortfall, filter erosion, the multi-window and tiling machinery, the halo
+shortfall above, and integral-table precision — the tables accumulate in `Float64` and a UInt8 scene sums
+to ~3.1e10, exact, so scene-versus-block accumulation cannot differ. It does not affect any case at its
+default. `dev/CORRECTNESS.md` carries it as an open item.

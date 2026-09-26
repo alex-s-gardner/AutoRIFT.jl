@@ -5,9 +5,10 @@
 # Reads what the two sweeps recorded and joins them; it measures nothing itself, so it is safe to run
 # while a sweep is still going and will simply report fewer rows.
 #
-#   * `block_optimum.jls` — `tools/golden/block_optimum.jl`'s per-case ladder. The Julia figure is the
-#     arm that minimizes peak, which is the configuration a 16 GiB instance would be given, and the
-#     untiled arm alongside it because that is what a caller gets without `process_block_size`.
+#   * the per-case files `mem_nisar.jl` writes, holding the untiled arm and the arm at the block
+#     `block_size_for` returns. The ladder sweep in `block_optimum.jls` is deliberately *not* read: it
+#     predates the halo correction, and a halo change moves every window, so its figures describe a
+#     different library.
 #   * `golden_python.tsv` — `tools/ab/golden_python_all.py`, one process per case so its peak is that
 #     case's own high-water mark.
 #
@@ -33,10 +34,10 @@ const OPT = joinpath(get(ENV, "AUTORIFT_GOLDEN_CACHE",
                      "mem", "block_optimum.jls")
 
 # The row a user actually gets: the block `AutoRIFT.block_size_for` returns, which is
-# `BLOCK_HALO_MULTIPLE` times the halo per axis floored at `BLOCK_FLOOR`. Falls back to the fastest
+# the halo per axis (`BLOCK_HALO_MULTIPLE` is 1) floored at `BLOCK_FLOOR`. Falls back to the fastest
 # blocked arm when the default was never measured on that case, and says which it used — reporting a
 # swept optimum as though it were the default would overstate what the library delivers unasked.
-default_block(h, scene) = (min(max(2 * h[1], 1024), scene[2]), min(max(2 * h[2], 1024), scene[1]))
+default_block(h, scene) = (min(max(h[1], 1024), scene[2]), min(max(h[2], 1024), scene[1]))
 
 function pick(rows)
     isempty(rows) && return (nothing, :none)
@@ -93,9 +94,12 @@ function main()
 
     # `mem_nisar.jl` names its file from the product's first half, so a side row is attached to the case
     # whose product it prefixes rather than by an exact key match.
+    # **Only the per-case files, not the ladder sweep.** `block_optimum.jls` was recorded before
+    # `_inflate_for_decimation!` corrected the halo, and a halo change moves every window, so its peaks
+    # and runtimes describe a different library. Mixing them in silently reported a stale row wherever
+    # its block happened to match the current default.
     rowsfor(k) = begin
-        base = get(jl, k, nothing)
-        base = (base === :failed || isnothing(base)) ? Any[] : Any[r for r in base]
+        base = Any[]
         for (sk, sv) in side
             startswith(k, sk) && append!(base, sv)
         end

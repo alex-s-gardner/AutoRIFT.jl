@@ -103,6 +103,32 @@ reference measures at a real position. For those a blocked window is short by te
 because `_searchable_span` reduces over each point's *own* radius, and that is an ordinary layout fix with
 bounded cost, independent of this file. It is item 3b of `dev/plan-16gib.md`.
 
+## 1b. A blocked run differs at a handful of points below the default block size
+
+**Open, cause not identified, and listed here so it is not rediscovered from scratch.** At block sizes
+*below* what `block_size_for` returns, a blocked run differs from an untiled one at a few points: three of
+843,539 on the golden S2B case at 512 px, and the equivalent on S2A, `S1A_IW_SLC__1SSH_20150828` and
+NISAR L1 at their own small sizes. Every case agrees exactly at its default, so this does not affect a
+production run; it does mean `block_gate.jl` should sweep sizes rather than test one.
+
+Ruled out by measurement, each at the cost of a run:
+
+- **Run-to-run non-determinism.** Two blocked runs at one block size differ from each other at 0 points
+  and from untiled at the same 3. That also excludes FFTW plan selection, a real candidate since
+  `src/plans.jl` plans with `MEASURE` and so chooses an algorithm by timing.
+- **Read-window shortfall.** `_block_window_shortfall` stays silent for the whole run.
+- **Filter erosion at a window edge.** The golden path runs `preprocess = :none`, so `_filter_halo` is 0.
+- **The multi-window and tiling machinery.** 2048 px uses up to 12 windows per block and agrees exactly
+  where 512 px uses 6 and does not.
+- **The halo shortfall of item 2's neighbourhood** — `_inflate_for_decimation!` fixed a genuine 396 px
+  shortfall on NISAR L1 and did not change S2B's three points.
+- **Integral-table precision.** `src/integral.jl` accumulates in `Float64`; a UInt8 scene sums to about
+  3.1e10, exact in `Float64`, so a whole-scene table and a window-sized one cannot disagree.
+
+What correlates is the tile quantum, `buffer - 2 * halo - 2`: large at the default and smaller than the
+halo at the sizes that differ. `tools/golden/block_bisect.jl` localizes it to the outlier filter on `dx`,
+but with rejection off `dy` still differs at 13 points, so the seed is upstream of the filter.
+
 ## 2. Decimate a coarse level with the mask, not the fill value
 
 Every per-point array is decimated to a coarse level by an unweighted mean over the cell, and every one
