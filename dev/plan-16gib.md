@@ -35,13 +35,15 @@ Two caveats, both load-bearing:
   item 3 and it is a correctness question, not a memory one — the figures above are what the runs cost, not
   a statement that their output is the reference's.
 
-So the remaining obstacle is not a memory lever at all. It is that **a blocked run does not reproduce an
-untiled one on a Sentinel-1 geogrid** — 5% of points lost, pre-existing, and root-caused to the grid's
-**fill** points. `_cell_max_radius!` gives a point outside the radar footprint a neighbour's search radius,
-which makes it searchable in the coarse pass though it has no real coordinate; the untiled run then
-correlates it against the scene's corner while a blocked run correctly skips it. **Blocked is the more
-nearly correct path and untiled is the one measuring something spurious**, so the fix changes the answer
-that is validated against the reference. That is item 3, and it gates items 5 onward.
+So the remaining obstacle was not a memory lever at all: **a blocked run did not reproduce an untiled one
+on a Sentinel-1 geogrid** — 5.3% of points — root-caused to the grid's placeholder coordinates, and now
+fixed. See "Step A-3" below for the fix and the gate.
+
+**Two claims in an earlier revision of this section were wrong and are corrected there.** That a blocked
+run was "the more nearly correct path" is refuted: the reference measures 25,970 of the 26,781 points a
+blocked run was losing, 97.0%, and an untiled run reproduces the reference at them to a median of 0.000 px.
+And the placeholder share of the lost set was recorded as 58% where it measures 22.7%. Step 0 has both
+measurements.
 
 **Figures measured here and figures in `memory.md` come from different trees.** Re-measured on this one,
 NISAR L2 at `2304x1152` measures 147,099 fewer points than the recorded row and L1 at `2816x1536` 2,349
@@ -967,3 +969,81 @@ absolute column stands.
 gave 1.725, 1.856 and 1.965 GiB in three processes, at allocation and wall clock agreeing to 2%. No
 conclusion above rests on a peak difference smaller than that, which is why the copy removal is argued
 from its allocation and live-peak columns rather than from its peak.
+
+## The optimal block size per case, measured — and where a blocked run still differs
+
+`tools/golden/block_optimum.jl` sweeps each case's ladder at 12 threads and keeps only the arms whose
+`dx`/`dy` are identical to that case's untiled run, so a reported row is answer-preserving by
+construction. `--report` prints the table; the rows are in `mem/block_optimum.jls`.
+
+**Read peak above the floor, not the peak.** `mem_nisar.jl` holds the capture's imagery resident, so its
+floor runs from 3.1 GiB on a Landsat case to 17.1 on NISAR L2, and the total tells you about the harness
+rather than the run. Above-floor, blocking wins on every one of the 22:
+
+| case | best block | above floor | untiled above floor |
+|---|---|---:|---:|
+| NISAR L1 | 6144 | 9.37 GiB | 30.38 |
+| NISAR L2 | 2240x1152 | 4.09 | 50.17 |
+| S1B `1SDH_20180809` | 1408x512 | 0.61 | 21.18 |
+| S1A `1SSH_20170221` | 1280x512 | 0.68 | 21.64 |
+| the ten Landsat cases | 384-768 | 0.01-0.83 | 0.91-5.43 |
+
+With a production floor near 2 GiB every case is well inside 16 GiB, NISAR L1 worst at about 11.4.
+
+**The optimum is interior in both directions.** Too small and churn dominates — the S1B arms run 3.24 GiB
+at 768x320 with a read amplification of 7.23x against 3.01 GiB at 1024 with 2.88x. Too large and the
+buffers do: 10.32 GiB at 2048. So no endpoint rule works, the halo's own shape is not the answer, and the
+ratio of chosen block to halo runs from 2.28x to 6.98x across the set — no single multiplier fits.
+
+**A default cannot yet be fitted to this, and the reason is a correctness residual rather than a
+modelling difficulty.** Scored against the measured curves, `2 x halo` per axis floored at 1024 is the
+best rule available: mean +0.19 GiB and worst +0.65 GiB above each case's own optimum at 1.02x the
+runtime, where every alternative tried is +0.76 GiB or worse. On NISAR L1 it picks `5504x3072` — and that
+is one of the sizes at which a blocked run does **not** reproduce an untiled one.
+
+**Twelve arms across four cases fail the agreement check**, and they cluster at small blocks: S2A at 192,
+384 and 768; S2B at 320, 512 and 960; `S1A_IW_SLC__1SSH_20150828` at 384x192; and NISAR L1 at every arm
+but 6144. The counts are 1 to 28 points out of 0.6-1.8 million, and `_block_window_shortfall` stays
+silent throughout — so it is not a window shortfall and the layout is covering every point's reach.
+
+It matches the padded-versus-unpadded transform switch `src/multichip.jl` already records: a point
+outside the unpadded window takes a different transform whose "peak height differs in the last bits —
+enough that a blocked run stops matching an untiled one exactly". A smaller block puts more points near a
+window edge, which is exactly the observed gradient. On S2B at 512 px it is 3 points of 843,539, one of
+them gained rather than lost.
+
+So `tools/golden/block_gate.jl` passing is weaker evidence than it looked: it was run at one block size
+per case, and those happened to be sizes that agree. The gate should sweep sizes, and the residual has to
+be understood before any default is chosen — a default that picks a wrong-answer block size is worse than
+the badly-calibrated one it would replace.
+
+## Against the Python reference, end to end
+
+`tools/ab/golden_python.py` runs `runAutorift` on the case's **own captured inputs** — the reference's
+`xGrid`, search limits and priors as it had them — so neither side re-derives the grid. One process per
+case, because `ru_maxrss` is a high-water mark. Both sides at 12 threads; OpenCV is built on GCD here so
+`cv2.setNumThreads` is a no-op and the reference uses every core regardless, which is the comparison
+wanted. `tools/golden/e2e_table.jl` joins the two.
+
+**22 of 22 cases: median 9x faster, worst 1x, best 34x.**
+
+| case | Julia | Python | speedup |
+|---|---:|---:|---:|
+| LT05 `L1GS_001013` | 1.1 s | 37.8 s | **34x** |
+| LC09 `215109` | 4.5 | 77.8 | 17x |
+| LT04 `063018` | 3.8 | 60.2 | 16x |
+| S1B `1SDH_20180809` | 15.7 | 111.1 | 7x |
+| NISAR L2 | 241.4 | 516.4 | 2x |
+| NISAR L1 | 773.3 | 812.2 | **1x** |
+
+The advantage is smallest exactly where it matters most. NISAR L1 is a dead heat, and its own untiled run
+takes 569.7 s — so the 6144 block, the only size that agrees, costs 1.36x the runtime of not blocking at
+all. Blocking that granule buys 30.38 -> 9.37 GiB above floor and pays 203 s for it.
+
+**The two peak columns are not the same measurement** and the table says so: Julia's is a sampled
+resident footprint against the harness's settled floor, Python's is whole-process `ru_maxrss` including
+the interpreter and the capture arrays. Runtimes are directly comparable; treat the peak ratio as
+indicative.
+
+Point counts agree to 0.875-1.000 of the reference's, which is the pre-existing agreement gap `GATES.md`
+tracks rather than anything this branch changed.
