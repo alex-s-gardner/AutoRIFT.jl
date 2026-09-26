@@ -72,3 +72,60 @@ function _parallel_claimed!(work!::F, slices::Vector{<:AbstractUnitRange},
     end
     return nothing
 end
+
+"""
+    _parallel_reduce(accumulate!, init, combine!, idx, cost)
+
+Reduce over slices of `idx` on several threads, and return the combined accumulator.
+
+The counterpart of [`_parallel_slices`](@ref) for a loop that produces a *value* rather than filling an
+output: `init()` builds one accumulator per slice, `accumulate!(acc, slice)` folds that slice into it,
+and `combine!(into, from)` merges two. `accumulate!` comes first so `do`-block syntax reaches it, which
+is the same reason [`_parallel_slices`](@ref) takes its loop body first.
+
+**The result does not depend on the schedule, which is what makes this usable under a bit-identity
+gate.** Each slice has its own accumulator, so no two tasks touch one; and the accumulators are
+combined in slice order rather than completion order, so the reduction sees the same sequence every
+run. What the caller must supply is a `combine!` that is exact — summing integer counts is, and
+accumulating floating-point values in a different grouping is not, so a `Float64` sum wants either an
+order-independent formulation or the serial loop.
+
+`cost` and the threshold below it behave exactly as in `_parallel_slices`.
+"""
+function _parallel_reduce(accumulate!::A, init::I, combine!::C,
+                          idx::AbstractUnitRange, cost::Real) where {A,I,C}
+    nthreads = Threads.nthreads()
+    if nthreads == 1 || cost < PARALLEL_MIN_WORK || length(idx) < 2
+        acc = init()
+        accumulate!(acc, idx)
+        return acc
+    end
+    nslices = min(length(idx), SLICES_PER_THREAD * nthreads)
+    slices = collect(Iterators.partition(idx, cld(length(idx), nslices)))
+    # One accumulator per slice, not per task: a task claims several slices, and sharing one
+    # accumulator across them would make the result depend on which task claimed what.
+    accs = [init() for _ in eachindex(slices)]
+    next = Threads.Atomic{Int}(1)
+    ntasks = min(length(slices), nthreads)
+    tasks = map(1:ntasks) do _
+        StableTasks.@spawn _parallel_reduce_claimed!(accumulate!, accs, slices, next)
+    end
+    foreach(wait, tasks)
+    out = first(accs)
+    for k in 2:lastindex(accs)
+        combine!(out, accs[k])
+    end
+    return out
+end
+
+# One task's share, folding each claimed slice into that slice's own accumulator. Named for the same
+# reason `_parallel_claimed!` is.
+function _parallel_reduce_claimed!(accumulate!::A, accs::Vector, slices::Vector{<:AbstractUnitRange},
+                                   next::Threads.Atomic{Int}) where {A}
+    while true
+        k = Threads.atomic_add!(next, 1)
+        k <= length(slices) || break
+        accumulate!(accs[k], slices[k])
+    end
+    return nothing
+end

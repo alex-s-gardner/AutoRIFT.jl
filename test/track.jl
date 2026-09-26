@@ -383,6 +383,44 @@ end
     @test !isnan(d.dx[1])
 end
 
+@testset "the validity mask pads lazily and reads as the materialized one" begin
+    # A padded pass takes `PaddedMask` where the imagery takes `_zeropad`, because the mask's one
+    # consumer short-circuits while `_zeropad` of a packed mask expands it eightfold — 3.13 GiB on a
+    # NISAR L1 scene whose mask occupies 0.39. So the lazy form has to agree with the eager one
+    # element for element, including the corners two `Bool`s of arithmetic can get wrong.
+    for (nr, nc, px, py) in ((7, 11, 3, 2), (1, 1, 4, 4), (16, 5, 0, 3), (5, 16, 3, 0))
+        src = rand(Bool, nr, nc)
+        for m in (BitMatrix(src), Matrix(src), view(BitMatrix(src), :, :))
+            lazy = AutoRIFT.PaddedMask(m, extent((px, py)))
+            eager = AutoRIFT._zeropad(Matrix{Bool}(m), extent((px, py)))
+            @test size(lazy) == size(eager)
+            @test all(lazy[i, j] == eager[i, j] for i in axes(eager, 1), j in axes(eager, 2))
+            # Nothing scene-sized is formed: the wrapper holds the parent and four integers.
+            @test Base.summarysize(lazy) < Base.summarysize(eager) + Base.summarysize(m)
+        end
+    end
+    # A zero pad is the identity, which is the case the unpadded branch would have taken.
+    m = BitMatrix(rand(Bool, 9, 4))
+    @test all(AutoRIFT.PaddedMask(m, extent(0))[i, j] == m[i, j] for i in 1:9, j in 1:4)
+
+    # And a pass that pads gives what it gave before the mask went lazy: the same points searched and
+    # the same displacements, since `false` outside is the convention both forms use.
+    n = 256
+    pair = ImagePair(synthetic_texture(n; seed = 5), synthetic_texture(n; seed = 6))
+    # Deliberately at the edge and beyond it, so the pad is real and the mask's border is read.
+    edge = pointset([6.0, 12.0, 128.0, 250.0, 260.0], [128.0, 6.0, 128.0, 250.0, 128.0];
+                    chip_size = 32, search_radius = 20)
+    p = params(; subpixel = :none)
+    d = track(pair, edge, p)
+    mask = AutoRIFT.valid(pair)
+    # The same pass with the mask materialized the old way, handed in explicitly.
+    d_eager = track(pair, edge, p; okmask = Matrix{Bool}(mask))
+    @test d.searched == d_eager.searched
+    @test all(isequal.(d.dx, d_eager.dx))
+    @test all(isequal.(d.dy, d_eager.dy))
+    @test all(isequal.(d.correlation, d_eager.correlation))
+end
+
 @testset "a subset correlates as the whole set does, given its geometry" begin
     # The property tiled processing needs. A point is correlated at its own radius bucketed to a
     # power of two and *clamped to the pass maximum*, so a point below the top bucket is unaffected
