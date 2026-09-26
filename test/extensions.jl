@@ -545,13 +545,19 @@ end
     end
 
     # More than the scene, because each block reads a halo its neighbour also reads — the cost the
-    # prefetch above exists to remove. A whole number of sweeps of the layout's windows, and no more
-    # sweeps than there are passes: `_windowed_bytes` is an upper bound, and this is what makes it one.
+    # prefetch above exists to remove. No more than one sweep of the layout's windows per pass, which is
+    # what makes `_windowed_bytes` an upper bound.
+    #
+    # **Not a whole number of sweeps.** A pass reads the windows `_read_windows` derives from the point set
+    # it is about to correlate, and those shrink to that set's own span — so a fine pass after the coarse
+    # mask has narrowed the searchable points reads less than the layout's window for that block. The
+    # layout's window is the bound the buffers are sized to, not a quantum the reads come in.
     total_window = sum(length(blk.read_rows) * length(blk.read_cols) for blk in layout.blocks)
     sweeps = 2 * length(AutoRIFT.chip_sizes(p))
     @test a.elements > n * n
-    @test a.elements % total_window == 0
     @test a.elements <= total_window * sweeps
+    # The two images of a pair are read together, window for window, so their totals cannot diverge.
+    @test a.elements == b.elements
     @test AutoRIFT._windowed_bytes(pair, layout, p) >= a.elements * sizeof(Float32) +
                                                       b.elements * sizeof(Float32)
 
@@ -858,17 +864,26 @@ end
     dims2 = (Y(1:n), X(1:n))
     ra, rb = Raster(a, dims2), Raster(b, dims2)
     @test AutoRIFT.ondisk(ra)
-    # The default is `HALO_BLOCKS` halos, rounded up to a whole number of the file's chunks: blocking at
-    # the chunk size alone reads 2x2 chunks per block because of the halo, so every chunk is decoded
-    # several times over. Measured 4.99 s at 256 against 3.48 s at 768 on real imagery.
+    # The default comes from `AutoRIFT.block_size_for`, rounded up to a whole number of the file's
+    # chunks: blocking at the chunk size alone reads 2x2 chunks per block because of the halo, so every
+    # chunk is decoded several times over. Measured 4.99 s at 256 against 3.48 s at 768 on real imagery.
+    # What this asserts is the part the extension decides — alignment, the floor, and the scene bound.
     pblk = AutoRIFT.params(; chip_size = 16, chip_size_max = 16, grid_spacing = 16, search_radius = 8)
     hx, hy = AutoRIFT.halo(AutoRIFT.gridpoints((n, n), pblk.grid_spacing;
                                                chip_size = pblk.chip_size_max,
                                                search_radius = pblk.search_radius), pblk, (n, n))
     got = ext._blocks(nothing, ra, rb, pblk)
     @test got[1] % 256 == 0 && got[2] % 256 == 0        # still chunk-aligned
-    @test got[1] >= ext.HALO_BLOCKS * hy                # and at least the halo-derived target
+    @test got[1] >= hx && got[2] >= hy                   # at least the halo, which `block_layout` demands
+    @test all(got .>= ext.MIN_BLOCK)
     @test all(got .<= n)                                 # never larger than the scene
+    # Emitted as `(X, Y)`, which is how `process_block_size` is read. Checked against `block_size_for`
+    # itself so the two cannot drift, and so a transposed pair — invisible on this square halo — fails
+    # the anisotropic assertion in `test/tile.jl` rather than nothing at all.
+    @test got == (AutoRIFT.block_size_for(pblk, (n, n); chunk = (256, 256),
+                                          floor_pixels = ext.MIN_BLOCK).X,
+                  AutoRIFT.block_size_for(pblk, (n, n); chunk = (256, 256),
+                                          floor_pixels = ext.MIN_BLOCK).Y)
     # A chunk too small to be a sensible block is raised to `MIN_BLOCK`. `Rasters.write` produces
     # *striped* GeoTIFFs, whose chunks are one row tall, and a 5-pixel block is below the halo — which
     # `block_layout` rejects outright. Bounded above by the scene, so a small image stays one block.

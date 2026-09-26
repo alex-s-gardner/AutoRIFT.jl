@@ -35,15 +35,33 @@ One unit of tiled work: the grid points it writes, and the pixels it reads to do
 `grid_rows`/`grid_cols` index the **output grid**, and every grid point belongs to exactly one
 block — so assembling results is a copy, with no point computed twice and none left out.
 
-`read_rows`/`read_cols` index the **scene**, and are the written extent grown by the layout's halo
-and clipped to the image. Neighbouring blocks' read windows overlap; that overlap is the halo doing
-its job.
+`read_rows`/`read_cols` index the **scene**: the written extent grown by the layout's halo and clipped
+to the image, over the points the block may search. Neighbouring blocks' read windows overlap, and that
+overlap is the halo doing its job.
+
+They are a **bound**, not the window a pass reads. A block's searchable coordinates need not be
+contiguous, and on a geogrid they are not, so `AutoRIFT._read_windows` derives the windows a pass
+actually reads from the point set it is about to correlate and tiles them to fit these bounds. That is
+what makes this figure the one `AutoRIFT.block_buffers` sizes from.
 """
 struct Block
     grid_rows::UnitRange{Int}
     grid_cols::UnitRange{Int}
     read_rows::UnitRange{Int}
     read_cols::UnitRange{Int}
+end
+
+"""
+    AutoRIFT.ReadWindow
+
+One window of scene pixels a block reads, as `rows` by `cols`.
+
+A block holds one per tile of its points' coordinate span — usually exactly one. See
+`AutoRIFT._read_windows`.
+"""
+struct ReadWindow
+    rows::UnitRange{Int}
+    cols::UnitRange{Int}
 end
 
 """
@@ -91,7 +109,44 @@ function halo(grid::PointSet, p::Params, imagesize::Tuple{Int,Int})
     # for the half-pixel grid offset and index truncation.
     _, _, pad, _ = _pass_geometry(_worst_level_points(grid, p), imagesize)
     ox, oy = _level_centre_offset(p)
-    return Extent((pad.X + w + ox, pad.Y + w + oy))
+    # `_pass_geometry` reduces over *searchable* points, and the coarse pass searches more than those.
+    ex, ey = _widened_prior_reach(grid, p)
+    return Extent((max(pad.X, ex) + w + ox, max(pad.Y, ey) + w + oy))
+end
+
+# The reach of the points `_cell_max_radius!` can make searchable but the grid does not, as `(x, y)`.
+#
+# Their **priors** are the reason this exists. `_pass_geometry` skips a point with a zero radius, so such a
+# point contributes nothing to the halo — yet the widening can hand it a neighbour's radius, after which
+# the pass reaches `chip/2 + radius + ceil(abs(prior))` from it. The radius it receives is bounded by one
+# already counted; its prior is not, and on a 24-day Sentinel-1 pair a prior is ~18 px of range.
+#
+# The widest radius in the grid is used rather than the one each point would actually receive: the radius
+# term is already at its maximum over the searchable points, so this cannot inflate the halo through it,
+# and it saves reproducing the neighbourhood reduction here.
+#
+# `(0, 0)` for a `PointSet{1}`, which has no grid layout for a neighbourhood to be taken over.
+_widened_prior_reach(::PointSet, ::Params) = (0, 0)
+
+function _widened_prior_reach(grid::PointSet{2}, p::Params)
+    wide = _widened_searchable(grid, _widening_reach(p))
+    mx = my = 0
+    for i in eachindex(grid)
+        issearchable(grid, i) || continue
+        mx = max(mx, grid.radius_x[i])
+        my = max(my, grid.radius_y[i])
+    end
+    (mx == 0 || my == 0) && return (0, 0)
+    mx = max(mx, p.min_search_radius)
+    my = max(my, p.min_search_radius)
+    ex = ey = 0
+    for i in eachindex(grid.x, wide)
+        (wide[i] && !issearchable(grid, i)) || continue
+        # The same arithmetic `_pass_geometry` performs, at this grid's widest chip and radius.
+        ex = max(ex, p.chip_size_max.X ÷ 2 + mx + ceil(Int, abs(grid.dx_prior[i])) + 2)
+        ey = max(ey, p.chip_size_max.Y ÷ 2 + my + ceil(Int, abs(grid.dy_prior[i])) + 2)
+    end
+    return (ex, ey)
 end
 
 """
@@ -160,10 +215,12 @@ function _worst_level_points(grid::PointSet, p::Params)
     flat = scatter(grid)
     cs = p.chip_size_max
     n = size(flat.radius_x)
-    # Copies, because `sanitize!` writes in place and `scatter` shares the grid's own arrays.
+    # Copies, because `sanitize!` writes in place and `scatter` shares the grid's own arrays. The chip
+    # sizes are constant over the set, so they are `Uniform` rather than two more grid-sized arrays — see
+    # `_level_points`, which makes the same substitution for the same reason.
     pts = rebuild(flat; radius_x = copy(flat.radius_x), radius_y = copy(flat.radius_y),
-                  chip_size_x = fill(cs.X, n),
-                  chip_size_y = fill(cs.Y, n))
+                  chip_size_x = Uniform(cs.X, n),
+                  chip_size_y = Uniform(cs.Y, n))
     # The same floor a level applies, applied by the same function, so the two cannot drift.
     sanitize!(pts, p.min_search_radius)
     return pts
@@ -223,8 +280,13 @@ from `grid_spacing`, because a caller-supplied grid need be neither uniformly sp
 a geogrid built from a rotated radar footprint moves both coordinates along both index directions. The
 trailing block in each direction is short when the grid does not divide evenly.
 
-A block's read window spans only the points it will search, so the fill coordinates a rotated grid
-carries outside its footprint cost nothing. A block with no searchable point reads nothing at all.
+A block's read window spans only the points it will search — the grid's searchable points grown by the
+reach of the coarse pass's radius widening, which is what any pass can actually reach. A block with no
+searchable point reads nothing at all.
+
+Points whose coordinate is a placeholder rather than a position get a **second** window, because a
+placeholder lies nowhere near the block's own extent and one window covering both would run from the
+block to the scene corner. See [`AutoRIFT.Block`](@ref) and `PointSet`'s `positioned`.
 
 Throws if a block would be smaller than the halo it reads, since such a block is all overlap.
 """
@@ -256,6 +318,11 @@ function block_layout(grid::PointSet{2}, p::Params, imagesize::Tuple{Int,Int},
     rowstarts = collect(1:rowpts:nr)
     colstarts = collect(1:colpts:nc)
 
+    # Which points any pass can search, once for the whole grid: the coarse pass widens a radius over a
+    # neighbourhood, so this is wider than the grid's own searchable set. Two bit arrays at 1/8 byte per
+    # point — 0.9 MiB each on the 7.5M-point NISAR grid.
+    wide = _widened_searchable(grid, _widening_reach(p))
+
     blocks = Block[]
     for (ci, c0) in pairs(colstarts), (ri, r0) in pairs(rowstarts)
         grows = r0:(ri == lastindex(rowstarts) ? nr : rowstarts[ri + 1] - 1)
@@ -263,10 +330,18 @@ function block_layout(grid::PointSet{2}, p::Params, imagesize::Tuple{Int,Int},
         # The pixel extent this block writes, from the coordinates of the points it will actually
         # correlate. Taken from the grid rather than computed from `spacing` so a caller-supplied grid
         # with its own layout still gets a correct window.
-        rlo, rhi, clo, chi = _searchable_span(grid, grows, gcols)
+        #
+        # Twice, because a block's points fall into two populations whose coordinates are nowhere near
+        # each other: those with a real position, and those whose coordinate is a placeholder for a point
+        # outside the footprint. One window spanning both runs from the block to the scene corner.
+        #
+        # Over the points with a real position only. A placeholder coordinate is excluded *here* because
+        # this figure sizes the buffers: spanning it would make the bound the whole scene, where
+        # `_read_windows` gives the placeholder population a tile of its own at run time. Sizing from the
+        # block's nominal extent instead would cost 1.9x on S1B, since a block's points rarely fill it.
+        rlo, rhi, clo, chi = _coordinate_span(grid, grows, gcols, wide, true)
         # A block with nothing to search reads nothing. `_run_one_block!` returns before any I/O for
-        # such a block, so the window only has to be empty rather than meaningful — and it must not be
-        # the whole scene, which is what a span over its fill coordinates would give.
+        # such a block, so the window only has to be empty rather than meaningful.
         rows = isnothing(rlo) ? (1:0) : max(rlo - hy, 1):min(rhi + hy, nrows)
         cols = isnothing(rlo) ? (1:0) : max(clo - hx, 1):min(chi + hx, ncols)
         push!(blocks, Block(grows, gcols, rows, cols))
@@ -298,12 +373,20 @@ end
 # On an axis-aligned grid `rxi` and `ryj` are zero, the two constraints decouple, and this reduces to
 # `py / ryi` rows by `px / rxj` columns — the separable answer, so a Landsat layout is unchanged. That
 # includes a full-width band, where `px` is the scene width and only the row count binds.
-function _block_shape(grid::PointSet{2}, px::Int, py::Int)
-    nr, nc = size(grid)
-    rxi = _index_rate(grid, grid.x, 1)
-    rxj = _index_rate(grid, grid.x, 2)
-    ryi = _index_rate(grid, grid.y, 1)
-    ryj = _index_rate(grid, grid.y, 2)
+_block_shape(grid::PointSet{2}, px::Int, py::Int) =
+    _block_shape(_index_rates(grid), size(grid), px, py)
+
+# The four rates, measured once.
+#
+# Separated from the shape because choosing a block size searches over candidate sizes, and each rate
+# is a reduction over the grid: measuring them per candidate costs more than the search it serves.
+_index_rates(grid::PointSet{2}) =
+    (rxi = _index_rate(grid, grid.x, 1), rxj = _index_rate(grid, grid.x, 2),
+     ryi = _index_rate(grid, grid.y, 1), ryj = _index_rate(grid, grid.y, 2))
+
+function _block_shape(r::NamedTuple, gridsize::Tuple{Integer,Integer}, px::Int, py::Int)
+    nr, nc = Int(gridsize[1]), Int(gridsize[2])
+    rxi, rxj, ryi, ryj = r.rxi, r.rxj, r.ryi, r.ryj
     # The separable answer, from each axis's own dominant direction. Also the starting point for the
     # coupled case, since shrinking from here can only tighten a constraint that already holds.
     rowpts = clamp(floor(Int, py / max(ryi, rxi, EPS_RATE)), 1, nr)
@@ -319,6 +402,103 @@ function _block_shape(grid::PointSet{2}, px::Int, py::Int)
     end
     return (rowpts, colpts)
 end
+
+# Blocks a `px` by `py` budget divides a grid of `gridsize` into, by the same arithmetic
+# `block_layout` uses and without building one. The count, not the shape, is what a block size is
+# chosen against.
+function _block_count(rates::NamedTuple, gridsize::Tuple{Integer,Integer}, px::Int, py::Int)
+    rowpts, colpts = _block_shape(rates, gridsize, px, py)
+    return cld(Int(gridsize[1]), rowpts) * cld(Int(gridsize[2]), colpts)
+end
+
+"""
+    AutoRIFT.block_size_for(grid::PointSet{2}, p::Params, imagesize; kw...) -> Extent
+    AutoRIFT.block_size_for(p::Params, imagesize; kw...) -> Extent
+
+A `process_block_size` for this configuration: the largest block that still divides the work into
+`blocks_per_thread * nthreads` pieces, never below the halo every block must read.
+
+Keywords: `nthreads`, `blocks_per_thread`, `chunk` as `(rows, cols)` of the storage's own grid, and
+`floor_pixels`.
+
+**Blocks are the unit of threaded work, and the halo is a fixed-width skirt on every one of them**,
+so the two ends of the range fail for different reasons. Too few blocks and the pool cannot balance a
+per-block cost that varies by orders of magnitude — one NISAR granule runs at 2.96 of ten threads
+busy at ten blocks per thread, and a Landsat scene at one block per thread peaks at **3.00x** its
+untiled memory because every block is in flight at once. Too many and each block reads mostly skirt.
+Between them, peak memory falls monotonically as blocks shrink and runtime does not, which is why
+this maximizes the size subject to a count rather than minimizing the size.
+
+`blocks_per_thread` is calibrated against the three sweeps `docs/src/explanation/memory.md` records —
+scene areas spanning 21x and halos 40x — against each one's lowest peak within 10% of its own best
+*blocked* runtime. Those rows sit at 416 blocks per thread on the optical scene, 148 on NISAR L1 and
+230 on L2, and **150 reaches all three**: it picks the optical floor (which is that case's
+minimum-peak row), 151 per thread on L1, and 194 on L2. No single block *size* comes close on more
+than one of them — the sizes those rows name are 256 px, 4096 px and 2304x1152 px.
+
+**The count comes from `_block_shape`, not from scene area over block area.** On a rotated grid those
+differ by a factor of eight: the coupled shrink that keeps both pixel axes inside the budget halves
+the shape twice on a NISAR L1 geogrid, so a 2816x1536 budget yields 5814 blocks where the area
+estimate predicts 693. Counting the way `block_layout` counts is the only form that is right for both.
+
+The `Params`-only method is for a caller who has no grid yet, and assumes the grid
+[`AutoRIFT.gridpoints`](@ref) would build — uniform radii, axis-aligned, `p.grid_spacing` apart —
+exactly as [`AutoRIFT.halo(p)`](@ref) does, and for the same reason: building a grid to choose a block
+size costs 550 MiB on a Landsat-sized scene to produce two integers.
+"""
+function block_size_for(grid::PointSet{2}, p::Params, imagesize::Tuple{Integer,Integer}; kw...)
+    return _block_size_for(halo(grid, p, imagesize), _index_rates(grid), size(grid), imagesize;
+                           kw...)
+end
+
+function block_size_for(p::Params, imagesize::Tuple{Integer,Integer}; kw...)
+    sx, sy = p.grid_spacing.X, p.grid_spacing.Y
+    # The rates a `gridpoints` grid has: `x` moves `spacing.X` per column and not at all down a row,
+    # and the cross terms vanish. `_block_shape` then reduces to the separable answer.
+    rates = (rxi = 0.0, rxj = Float64(sx), ryi = Float64(sy), ryj = 0.0)
+    gridsize = (cld(Int(imagesize[1]), max(sy, 1)), cld(Int(imagesize[2]), max(sx, 1)))
+    return _block_size_for(halo(p), rates, gridsize, imagesize; kw...)
+end
+
+function _block_size_for(h::Extent, rates::NamedTuple, gridsize::Tuple{Integer,Integer},
+                         imagesize::Tuple{Integer,Integer};
+                         nthreads::Integer = Threads.nthreads(),
+                         blocks_per_thread::Real = BLOCKS_PER_THREAD,
+                         chunk::Tuple{Integer,Integer} = (1, 1),
+                         floor_pixels::Integer = 1)
+    nrows, ncols = Int(imagesize[1]), Int(imagesize[2])
+    want = max(round(Int, blocks_per_thread * max(nthreads, 1)), 1)
+    # `chunk` is indexed as `imagesize` is — `(rows, cols)` — while a halo and a block size are
+    # `(x, y)`, so the axes cross exactly once, here.
+    snap(t) = Extent((min(_round_up(max(ceil(Int, t * h.X), h.X, floor_pixels), chunk[2]), ncols),
+                      min(_round_up(max(ceil(Int, t * h.Y), h.Y, floor_pixels), chunk[1]), nrows)))
+
+    # Grow from the floor while the count still meets the target. The count is non-increasing in `t`,
+    # so the last size that met it is the largest one that does — which is the one to take, since it
+    # reads the least skirt of the sizes with enough blocks. A floor that already falls short of the
+    # target is returned as-is: no legal block divides the work more finely.
+    best = snap(1.0)
+    t = 1.0
+    while _block_count(rates, gridsize, best.X, best.Y) >= want
+        (best.X >= ncols && best.Y >= nrows) && break
+        t *= BLOCK_SIZE_STEP
+        bs = snap(t)
+        _block_count(rates, gridsize, bs.X, bs.Y) >= want || break
+        best = bs
+    end
+    return best
+end
+
+# Blocks per thread to aim for. See `block_size_for` for the three sweeps this is calibrated against
+# and why the target is a count rather than a size.
+const BLOCKS_PER_THREAD = 150
+
+# How fast the search grows the block. 1.15 per axis is about 1.3x in area, so the ladder lands within
+# a few percent of the largest size meeting the target while taking a few dozen steps to cross any
+# real scene — and each step costs only the shape arithmetic, since the rates are measured once.
+const BLOCK_SIZE_STEP = 1.15
+
+
 
 # Halvings allowed while fitting a block to its budget. Twenty takes any grid to a single point, so the
 # loop terminates on its own rather than on this bound; it exists so a pathological rate cannot spin.
@@ -394,25 +574,31 @@ function _pixel_span(coord::AbstractMatrix, rows, cols)
     return floor(Int, lo), ceil(Int, hi)
 end
 
-# The pixel window a block must read, as `(rlo, rhi, clo, chi)`, or four `nothing`s when the block has
-# no point to search.
+# The pixel window a block must read for one of its two point populations, as `(rlo, rhi, clo, chi)`, or
+# four `nothing`s when the block has none of them.
 #
-# Reduced over the block's **searchable** points rather than all of them, which is what
-# `AutoRIFT._pixel_span` would do. A point with a zero radius is never correlated
-# (`issearchable`), so no imagery has to be read for it — and on a grid whose footprint is rotated
-# within its bounding box, those points carry a *fill* coordinate rather than a plausible one. Spanning
-# them is not merely wasteful, it is wrong by the width of the scene: a block straddling the footprint
-# edge holds fill at 0 and real coordinates in the tens of thousands, so its window becomes
-# `1:57760` — the whole scene, read once per such block. Measured on a NISAR L1 grid at an 8192-pixel
-# block, 28 of 209 blocks each read half the scene or more, for 99x the scene in total.
+# `keep` selects the points any pass can search — `AutoRIFT._widened_searchable`, not the grid's own
+# radii — and `want` picks the population by `positioned`, so the two calls per block partition its
+# points between the two read windows.
+#
+# Reduced over a subset rather than over every point, which is what `AutoRIFT._pixel_span` would do. A
+# point with a zero radius is never correlated (`issearchable`), so no imagery has to be read for it —
+# and on a grid whose footprint is rotated within its bounding box, those points carry a *placeholder*
+# coordinate rather than a plausible one. Spanning them together with the real ones is not merely
+# wasteful, it is wrong by the width of the scene: a block straddling the footprint edge holds a
+# placeholder at 0 and real coordinates in the tens of thousands, so its window becomes `1:57760` — the
+# whole scene, read once per such block. Measured on a NISAR L1 grid at an 8192-pixel block, 28 of 209
+# blocks each read half the scene or more, for 99x the scene in total. Splitting on `want` is what lets
+# the placeholder population have a window of its own instead.
 #
 # `NaN` coordinates are skipped for the same reason: they cannot bound a window, and `min`/`max` would
 # poison the whole span.
-function _searchable_span(grid::PointSet{2}, rows, cols)
+function _coordinate_span(grid::PointSet{2}, rows, cols, keep::AbstractMatrix{Bool}, want::Bool)
     rlo = clo = Inf
     rhi = chi = -Inf
-    @inbounds for j in cols, i in rows
-        issearchable(grid, CartesianIndex(i, j)) || continue
+    for j in cols, i in rows
+        keep[i, j] || continue
+        grid.positioned[i, j] == want || continue
         y, x = grid.y[i, j], grid.x[i, j]
         (isfinite(y) && isfinite(x)) || continue
         rlo = min(rlo, y); rhi = max(rhi, y)
@@ -420,6 +606,55 @@ function _searchable_span(grid::PointSet{2}, rows, cols)
     end
     isfinite(rlo) || return (nothing, nothing, nothing, nothing)
     return (floor(Int, rlo), ceil(Int, rhi), floor(Int, clo), ceil(Int, chi))
+end
+
+# Which points any pass can search: the grid's searchable points grown by `AutoRIFT._widening_reach` in
+# both index directions.
+#
+# The grid's own radii are not the answer. `_cell_max_radius!` gives a coarse node the widest radius in
+# its neighbourhood, so a point the grid marks unsearchable is searched anyway when a searchable one is
+# near enough — and a window sized from the grid's radii alone then falls short. On the golden S1B case
+# that costs 20,704 of 26,781 points a blocked run otherwise loses.
+#
+# Dilation is separable, so this is two linear sweeps per axis rather than a `(2·reach + 1)²` stencil:
+# at a reach of 32 over 7.5M points the stencil form is 7 billion writes and takes tens of seconds,
+# where this is O(points). Each axis sweeps forward tracking the last set index and backward tracking
+# the next, which is a box dilation exactly.
+#
+# The second axis reads a separate buffer rather than working in place: writing a `true` that a later
+# iteration of the same sweep then reads would let the mask grow without bound instead of by `reach`.
+function _widened_searchable(grid::PointSet{2}, reach::Int)
+    nr, nc = size(grid)
+    src = falses(nr, nc)
+    for j in 1:nc, i in 1:nr
+        src[i, j] = issearchable(grid, CartesianIndex(i, j))
+    end
+    reach <= 0 && return src
+    mid = falses(nr, nc)
+    for i in 1:nr
+        _dilate_line!(view(mid, i, :), view(src, i, :), reach)
+    end
+    out = falses(nr, nc)
+    for j in 1:nc
+        _dilate_line!(view(out, :, j), view(mid, :, j), reach)
+    end
+    return out
+end
+
+# One axis of a box dilation: `dst[k]` is true where `src` is true anywhere within `reach` of `k`.
+function _dilate_line!(dst, src, reach::Int)
+    n = length(src)
+    last = -1
+    for k in 1:n
+        src[k] && (last = k)
+        dst[k] = last >= 0 && k - last <= reach
+    end
+    next = n + reach + 1
+    for k in n:-1:1
+        src[k] && (next = k)
+        dst[k] |= next - k <= reach
+    end
+    return dst
 end
 
 """
@@ -497,18 +732,18 @@ end
 # `_read_block!` writes into a view of the buffer rather than returning a fresh array, so a run's
 # raw-read cost is one block's worth however many blocks there are. The views are what let one
 # buffer serve a short trailing block as well as a full interior one.
-function _block_pair!(buf::BlockBuffers, pair::ImagePair, b::Block)
-    nr, nc = length(b.read_rows), length(b.read_cols)
+function _block_pair!(buf::BlockBuffers, pair::ImagePair, rows, cols)
+    nr, nc = length(rows), length(cols)
     r = @view buf.reference[1:nr, 1:nc]
     s = @view buf.secondary[1:nr, 1:nc]
     rv = @view buf.reference_valid[1:nr, 1:nc]
     sv = @view buf.secondary_valid[1:nr, 1:nc]
-    _read_block!(r, pair.reference, b.read_rows, b.read_cols)
-    _read_block!(s, pair.secondary, b.read_rows, b.read_cols)
+    _read_block!(r, pair.reference, rows, cols)
+    _read_block!(s, pair.secondary, rows, cols)
     # After the imagery, because a mask derived from an image is computed from the window just read
     # rather than read again.
-    _read_mask_block!(rv, pair.reference_valid, pair.reference, r, b.read_rows, b.read_cols)
-    _read_mask_block!(sv, pair.secondary_valid, pair.secondary, s, b.read_rows, b.read_cols)
+    _read_mask_block!(rv, pair.reference_valid, pair.reference, r, rows, cols)
+    _read_mask_block!(sv, pair.secondary_valid, pair.secondary, s, rows, cols)
     return ImagePair(r, s, rv, sv)
 end
 
@@ -542,19 +777,35 @@ window from disk.
 function _read_block!(dest::AbstractMatrix, img::AbstractMatrix, rows, cols)
     size(dest) == (length(rows), length(cols)) || throw(DimensionMismatch(
         "destination is $(size(dest)) but the window is $((length(rows), length(cols)))"))
-    # `img[rows, cols]`, not `copyto!(dest, view(img, rows, cols))`. A view defers the read, so
-    # `copyto!` then walks it element by element — and for a lazy array that is one read per pixel
-    # rather than one read per window. Measured on a lazy GeoTIFF: 99.7% of a blocked run's time was a
-    # scalar `getindex` reached from here, and a 512² region with one block took 444 s against 0.6 s
-    # from memory. Indexing asks the array for the whole window, which is the operation a chunked
-    # backend is built to serve — `DiskArrays` turns it into one aligned read per touched chunk.
-    #
-    # The extra allocation is a block-sized temporary, which is the trade: `BlockBuffers` exists to
-    # keep a run's storage at one block's worth, and this adds one more of the same order while
-    # removing a per-pixel I/O call. For an in-memory input the two forms cost the same.
-    copyto!(dest, img[rows, cols])
-    return dest
+    return _read_window!(dest, img, rows, cols)
 end
+
+# The read itself, after the shape is checked.
+#
+# Split from the check so a backend can specialize the read without restating it —
+# `AutoRIFTDiskArraysExt` reads a window straight into `dest`, which is the same indexing path with
+# somewhere to put the result and no block-sized temporary.
+#
+# `img[rows, cols]`, not `copyto!(dest, view(img, rows, cols))`. A view defers the read, so `copyto!`
+# then walks it element by element — and for a lazy array that is one read per pixel rather than one
+# read per window. Measured on a lazy GeoTIFF: 99.7% of a blocked run's time was a scalar `getindex`
+# reached from here, and a 512² region with one block took 444 s against 0.6 s from memory. Indexing
+# asks the array for the whole window, which is the operation a chunked backend is built to serve.
+#
+# The extra allocation is a block-sized temporary, and a `DiskArrays` backend takes the specialized path
+# instead.
+_read_window!(dest::AbstractMatrix, img::AbstractMatrix, rows, cols) =
+    (copyto!(dest, img[rows, cols]); dest)
+
+# A strided parent has nothing to defer, so it takes the view.
+#
+# The reason the generic method above must not is that a view of a *lazy* array defers the read, and
+# `copyto!` then walks it element by element — one read per pixel rather than one per window. A
+# `StridedMatrix` is memory-backed by construction, so the temporary buys nothing and costs a
+# window-sized allocation per read. On a whole NISAR L2 grid at a 2304x1152 block that is half the run's
+# remaining allocation, and the copy is measurably faster without it.
+_read_window!(dest::AbstractMatrix, img::StridedMatrix, rows, cols) =
+    (copyto!(dest, view(img, rows, cols)); dest)
 
 # The *filtered* pair a block sees, from raw input.
 #
@@ -571,9 +822,9 @@ end
 # filter everywhere the block writes. The mask matters as much as the values, since `_filtered`
 # erodes by the filter width and that erosion must not bite at a read edge where the untiled run had
 # data.
-function _prepared_block_pair(buf::BlockBuffers, pair::ImagePair, b::Block, p::Params)
-    raw = _block_pair!(buf, pair, b)
-    return _prepare_block(buf, raw, p, p.preprocess, length(b.read_rows), length(b.read_cols))
+function _prepared_block_pair(buf::BlockBuffers, pair::ImagePair, rows, cols, p::Params)
+    raw = _block_pair!(buf, pair, rows, cols)
+    return _prepare_block(buf, raw, p, p.preprocess, length(rows), length(cols))
 end
 
 # Filtering a block into pooled storage, for the filters that have an in-place form.
@@ -602,25 +853,268 @@ function _prepare_block(buf::BlockBuffers, raw::ImagePair, p::Params, m::Highpas
     return ImagePair(fr, fs, rv, sv)
 end
 
+# No filter: the block's raw pair is already what the pass correlates.
+#
+# `_prepare` would reach it by copying twice — `preprocess` of `NoPreprocess` is `copy(img), copy(mask)`
+# and `replace_nonfinite` copies the pair again — to produce arrays `_block_pair!` has just written into
+# `buf`. Four window-sized allocations per image per block, and on a wide read window that is most of a
+# blocked run's allocation: 1282 GiB against 181 on a whole NISAR L2 grid at a 2304x1152 block.
+#
+# **The non-finite substitution still has to happen**, and skipping it is not a cosmetic difference. A
+# float pair carrying no-data — which is what reprojection to a common grid leaves — then hands `NaN` to
+# the transform: measured on a 768² pair with a no-data border and an interior hole, returning `raw`
+# unchanged loses 122 of 6843 points and changes `dx` where it does not. `replace_nonfinite!` writes into
+# the buffer instead of allocating, and is a no-op by dispatch for an integer image, which cannot hold a
+# non-finite value at all.
+function _prepare_block(::BlockBuffers, raw::ImagePair, ::Params, ::NoPreprocess, ::Int, ::Int)
+    replace_nonfinite!(raw.reference, raw.reference_valid)
+    replace_nonfinite!(raw.secondary, raw.secondary_valid)
+    return raw
+end
+
 # Every other filter: allocate, as the untiled path does. Bit-identical either way.
 _prepare_block(::BlockBuffers, raw::ImagePair, p::Params, ::PreprocessMethod, ::Int, ::Int) =
     _prepare(raw, p)
 
-# A block's points, in its read window's coordinate frame.
+# The first point of a block whose search window leaves the block's read window on a side that is not the
+# scene's own edge, or `0` when there is none.
+#
+# The halo is the maximum correlation reach over every point, and a block's window is its points' span
+# grown by it, so such a point means the pass reaches further than the layout was built from. `track!` then
+# takes its `fits = false` branch and zero-pads the shortfall, correlating against padding where a
+# whole-scene run had imagery — a different answer at a real point, and a silent one. A side clipped to the
+# scene's own edge is exempt, because a whole-scene run pads there too.
+#
+# **A point whose own coordinate lies outside the window is not reported here.** Each population is
+# correlated against the window that holds its own coordinates — a placeholder coordinate against the
+# placeholder window — so a point outside the window under test belongs to the other sub-pass and its
+# reach says nothing about this one. Mixing the two would bury a real shortfall of a few hundred pixels
+# under a spurious one of forty thousand.
+#
+# `search_bounds` rather than re-deriving the reach, so this and `inbounds` cannot disagree about what a
+# point needs. Returns an index rather than the bounds so that nothing is allocated or formatted on the
+# path that finds nothing, which is every block of a grid `gridpoints` built.
+function _block_window_shortfall(rows, cols, pts::PointSet, imagesize::Tuple{Int,Int})
+    nrows, ncols = length(rows), length(cols)
+    (nrows == 0 || ncols == 0) && return 0
+    # Sides the window was clipped on, where padding is what an untiled run does as well.
+    lo_row = first(rows) == 1
+    hi_row = last(rows) == imagesize[1]
+    lo_col = first(cols) == 1
+    hi_col = last(cols) == imagesize[2]
+    flat = scatter(pts)
+    for i in eachindex(flat)
+        issearchable(flat, i) || continue
+        inbounds(flat, i, (nrows, ncols)) && continue
+        # Positionless rather than short of halo: the coordinate disagrees with the grid index.
+        (1 <= flat.x[i] <= ncols && 1 <= flat.y[i] <= nrows) || continue
+        rows, cols = search_bounds(flat, i)
+        ((first(rows) < 1 && !lo_row) || (last(rows) > nrows && !hi_row) ||
+         (first(cols) < 1 && !lo_col) || (last(cols) > ncols && !hi_col)) || continue
+        return i
+    end
+    return 0
+end
+
+# Said once per session, not once per block: a grid that has one such point has thousands, and the finding
+# is that the configuration has them at all.
+#
+# A warning and not an error, which is a judgement rather than caution. Every geogrid case reaches this —
+# both NISAR granules and every Sentinel-1 one — so throwing would take the blocked path from quietly
+# inexact to unusable on exactly the cases that need it, and blocking is the only route that fits them in
+# 16 GiB. `_warn_coarse_fallback` is the same call made for the same reason a few lines above.
+function _warn_block_window(wrows, wcols, pts::PointSet, i::Int)
+    rows, cols = search_bounds(scatter(pts), i)
+    # Components interpolated one at a time: showing a `Tuple` reaches `Base.repeat` through `textwidth`,
+    # which `--trim` cannot resolve — the same constraint `src/track.jl` records for its messages.
+    @warn("a point reaches past its block's read window away from the scene's edge, so this blocked run " *
+          "correlates padding where a whole-scene run read imagery and its result differs there. The " *
+          "halo is the maximum reach over every point and a block's window is its points' span grown by " *
+          "it, so a pass reaching further means the layout was built from a narrower point set than the " *
+          "pass runs — on a geogrid that is the coarse pass, whose `_cell_max_radius!` gives a point the " *
+          "widest radius in its neighbourhood. See `dev/plan-16gib.md`. Reported once per session.",
+          window_rows = length(wrows), window_cols = length(wcols),
+          point_rows_from = first(rows), point_rows_to = last(rows),
+          point_cols_from = first(cols), point_cols_to = last(cols), maxlog = 1)
+    return nothing
+end
+
+# The read windows one block needs for the point set a pass is about to correlate, as
+# `(windows, assign)` — or `nothing` when one window covers everything, which is the common case and
+# every case on a grid `gridpoints` built.
+#
+# **A block's searchable coordinates need not be contiguous, and on a geogrid they are not.**
+# `_cell_means` places a decimated node at the mean coordinate over its cell and averages in the
+# placeholder that stands for a point outside the footprint, so a cell straddling the footprint edge
+# yields a node somewhere between the swath and the placeholder. The coordinates a block must read
+# therefore form a spread rather than a neighbourhood, and one window spanning them is most of the scene:
+# 1:57760 on a NISAR L1 grid, read once per such block. `dev/CORRECTNESS.md` item 2 is the defect behind
+# the spread; this covers it rather than waiting for it.
+#
+# **Clustered first, and tiled only where a cluster still does not fit the buffers.** Clustering is
+# bucketing at halo resolution and flood-filling the occupied buckets, which is linear in the point count
+# where pairwise box merging is quadratic. Two points in adjacent buckets join, so the rule over-merges by
+# up to a halo against exact single linkage — the safe direction, since it yields fewer and larger windows
+# and cannot leave a point uncovered. It is also the right rule, because a gap narrower than the halo is
+# already being read.
+#
+# Tiling a cluster is the fallback rather than the mechanism, and the order matters. Tiling everything at
+# `buffer - 2 * halo` shatters a *compact* cluster wherever the halo is a large fraction of the block: on
+# the golden S2B case the halo is 281x267 against a 650x618 block, so the tile is 56x116 and a block that
+# needs one window gets dozens. Clustering first leaves such a block at one window and splits only what is
+# genuinely spread.
+#
+# Every window still fits the buffers by construction, which is what keeps the buffer the memory bound
+# rather than the data: `process_block_size` means what it says however the coordinates are distributed,
+# and the cost of a spread is more sub-passes rather than more memory. Left unbounded the largest window on
+# NISAR L2 is 4.84x what the layout sizes for, which would not fit 16 GiB.
+function _read_windows(pts::PointSet{2}, b::Block, h::Extent, imagesize::Tuple{Int,Int},
+                       maxrows::Int, maxcols::Int)
+    # A tile is shrunk by the halo on both sides, since the window is the tile's own span grown by it, and
+    # by a further 2 for the `floor`/`ceil` that turn a fractional span into whole pixels. Without that
+    # slack a tile whose span is exactly the quantum yields a window two pixels past the buffer, which
+    # surfaces as a `BoundsError` inside a block task rather than anywhere useful.
+    prows, pcols = maxrows - 2 * h.Y - 2, maxcols - 2 * h.X - 2
+    (prows >= 1 && pcols >= 1) || throw(ArgumentError(
+        "a read buffer of $maxrows by $maxcols pixels cannot hold a window for a $(h.Y) by $(h.X) " *
+        "pixel halo; `process_block_size` must be at least the halo in each axis"))
+
+    rlo = clo = Inf
+    rhi = chi = -Inf
+    for j in b.grid_cols, i in b.grid_rows
+        issearchable(pts, CartesianIndex(i, j)) || continue
+        y, x = pts.y[i, j], pts.x[i, j]
+        (isfinite(y) && isfinite(x)) || continue
+        rlo = min(rlo, y); rhi = max(rhi, y)
+        clo = min(clo, x); chi = max(chi, x)
+    end
+    # Nothing to search. `_run_one_block!` returns before any I/O, so no window is needed at all.
+    isfinite(rlo) || return (ReadWindow[], nothing)
+
+    # The whole span fits one tile, so every point shares a window and no assignment is needed. This is
+    # the common case and the only one on a grid `gridpoints` built, and it is byte-for-byte the single
+    # window a block read before this existed.
+    if _window_fits(rlo, rhi, clo, chi, h, imagesize, maxrows, maxcols)
+        return ([ReadWindow(_clip(floor(Int, rlo) - h.Y, ceil(Int, rhi) + h.Y, imagesize[1]),
+                            _clip(floor(Int, clo) - h.X, ceil(Int, chi) + h.X, imagesize[2]))],
+                nothing)
+    end
+
+    # Bucket at halo resolution, then flood-fill to find the clusters. The bucket grid spans this block's
+    # coordinates only, so it is a few thousand entries even when those coordinates span the scene.
+    by, bx = max(h.Y, 1), max(h.X, 1)
+    nbi = fld(floor(Int, rhi - rlo), by) + 1
+    nbj = fld(floor(Int, chi - clo), bx) + 1
+    occupied = falses(nbi, nbj)
+    for j in b.grid_cols, i in b.grid_rows
+        issearchable(pts, CartesianIndex(i, j)) || continue
+        y, x = pts.y[i, j], pts.x[i, j]
+        (isfinite(y) && isfinite(x)) || continue
+        occupied[fld(floor(Int, y - rlo), by) + 1, fld(floor(Int, x - clo), bx) + 1] = true
+    end
+    comp = zeros(Int32, nbi, nbj)
+    ncomp = 0
+    stack = Tuple{Int,Int}[]
+    for bj in 1:nbj, bi in 1:nbi
+        (occupied[bi, bj] && comp[bi, bj] == 0) || continue
+        ncomp += 1
+        comp[bi, bj] = ncomp
+        push!(stack, (bi, bj))
+        while !isempty(stack)
+            ci, cj = pop!(stack)
+            for dj in -1:1, di in -1:1
+                ni, nj = ci + di, cj + dj
+                (1 <= ni <= nbi && 1 <= nj <= nbj) || continue
+                (occupied[ni, nj] && comp[ni, nj] == 0) || continue
+                comp[ni, nj] = ncomp
+                push!(stack, (ni, nj))
+            end
+        end
+    end
+
+    # Each cluster's own span, which decides whether it needs tiling at all.
+    cspan = fill((Inf, -Inf, Inf, -Inf), ncomp)
+    for j in b.grid_cols, i in b.grid_rows
+        issearchable(pts, CartesianIndex(i, j)) || continue
+        y, x = pts.y[i, j], pts.x[i, j]
+        (isfinite(y) && isfinite(x)) || continue
+        c = comp[fld(floor(Int, y - rlo), by) + 1, fld(floor(Int, x - clo), bx) + 1]
+        s = cspan[c]
+        cspan[c] = (min(s[1], y), max(s[2], y), min(s[3], x), max(s[4], x))
+    end
+
+    # Group the points by cluster, and within an oversized cluster by tile. Window numbers follow first
+    # encounter over a fixed loop order, so the result is deterministic even though the lookup is a `Dict` —
+    # a blocked run has to be reproducible to the bit, and `Dict` iteration order is not.
+    seen = Dict{Tuple{Int32,Int,Int},Int}()
+    spans = NTuple{4,Float64}[]
+    assign = zeros(Int16, length(b.grid_rows), length(b.grid_cols))
+    for (jj, j) in enumerate(b.grid_cols), (ii, i) in enumerate(b.grid_rows)
+        issearchable(pts, CartesianIndex(i, j)) || continue
+        y, x = pts.y[i, j], pts.x[i, j]
+        (isfinite(y) && isfinite(x)) || continue
+        c = comp[fld(floor(Int, y - rlo), by) + 1, fld(floor(Int, x - clo), bx) + 1]
+        s = cspan[c]
+        # A cluster that fits is one window whatever its shape; only a cluster wider than the buffers is
+        # cut, and then from its own origin so the cut does not depend on where the block starts.
+        fits = _window_fits(s[1], s[2], s[3], s[4], h, imagesize, maxrows, maxcols)
+        key = fits ? (c, 0, 0) :
+              (c, fld(floor(Int, y - s[1]), prows), fld(floor(Int, x - s[3]), pcols))
+        w = get(seen, key, 0)
+        if w == 0
+            push!(spans, (y, y, x, x))
+            w = length(spans)
+            seen[key] = w
+        else
+            t = spans[w]
+            spans[w] = (min(t[1], y), max(t[2], y), min(t[3], x), max(t[4], x))
+        end
+        assign[ii, jj] = w
+    end
+    windows = [ReadWindow(_clip(floor(Int, s[1]) - h.Y, ceil(Int, s[2]) + h.Y, imagesize[1]),
+                          _clip(floor(Int, s[3]) - h.X, ceil(Int, s[4]) + h.X, imagesize[2]))
+               for s in spans]
+    # The buffers are the memory bound, so a window past them is a defect here rather than something for
+    # `_block_pair!` to discover: it surfaces there as a `BoundsError` raised on a worker task, several
+    # frames from anything that names a window.
+    for w in windows
+        (length(w.rows) <= maxrows && length(w.cols) <= maxcols) || error(
+            "a read window of $(length(w.rows)) by $(length(w.cols)) pixels exceeds the $maxrows by " *
+            "$maxcols pixel buffers it must be read into; the tile quantum is $prows by $pcols")
+    end
+    return (windows, assign)
+end
+
+_clip(lo::Int, hi::Int, n::Int) = max(lo, 1):min(hi, n)
+
+# Whether the window a coordinate span needs fits the buffers, tested on the **window** rather than on the
+# span: the window is the span grown by the halo and snapped outward with `floor`/`ceil`, so a span two
+# pixels inside the bound can still need a window two pixels past it.
+function _window_fits(rlo, rhi, clo, chi, h::Extent, imagesize::Tuple{Int,Int},
+                      maxrows::Int, maxcols::Int)
+    rows = _clip(floor(Int, rlo) - h.Y, ceil(Int, rhi) + h.Y, imagesize[1])
+    cols = _clip(floor(Int, clo) - h.X, ceil(Int, chi) + h.X, imagesize[2])
+    return length(rows) <= maxrows && length(cols) <= maxcols
+end
+
+# A block's points, in the coordinate frame of one of its read windows.
 #
 # Grid coordinates are in scene pixels and the block holds a sub-window, so every coordinate shifts
-# by the window's origin. The shift is an **integer**, which is what makes this exact: `chip_bounds`
+# by that window's origin. The shift is an **integer**, which is what makes this exact: `chip_bounds`
 # and `search_bounds` both `floor` a coordinate, and `floor(u - k) == floor(u) - k` for integer `k`,
 # so a point lands on the same pixel of the block that it did on the scene. A fractional offset
 # would not commute with the truncation and would move every window by a pixel somewhere.
 #
 # Radii, priors and chip sizes are shared rather than copied — only the coordinates differ.
-function _block_points(pts::PointSet{2}, b::Block)
+function _block_points(pts::PointSet{2}, b::Block, rows, cols)
     sub = pts[b.grid_rows, b.grid_cols]
     return rebuild(sub;
-                   x = sub.x .- (first(b.read_cols) - 1),
-                   y = sub.y .- (first(b.read_rows) - 1))
+                   x = sub.x .- (first(cols) - 1),
+                   y = sub.y .- (first(rows) - 1))
 end
+
+# The block's own window, which is the one every point with a real position is correlated against.
+_block_points(pts::PointSet{2}, b::Block) = _block_points(pts, b, b.read_rows, b.read_cols)
 
 # ---------------------------------------------------------------------------
 # The tiled driver
@@ -792,7 +1286,8 @@ function _run_blocked(raw::ImagePair, pts::PointSet{2}, p::Params, layout::Block
         # Serial: one set serves every block, and the caller's serves every pass.
         serialbuf = isnothing(buffers) ? block_buffers(raw, layout) : buffers
         for b in blocks
-            _run_one_block!(out, serialbuf, raw, pts, serial, b, geometry, measure, subpixel)
+            _run_one_block!(out, serialbuf, raw, pts, serial, b, layout.halo, geometry, measure,
+                            subpixel)
         end
     end
     return out
@@ -818,27 +1313,107 @@ function _run_task_blocks!(out::DisplacementField, next::Threads.Atomic{Int}, ra
     while true
         k = Threads.atomic_add!(next, 1)
         k <= length(blocks) || break
-        _run_one_block!(out, buf, raw, pts, p, blocks[k], geometry, measure, subpixel)
+        _run_one_block!(out, buf, raw, pts, p, blocks[k], layout.halo, geometry, measure, subpixel)
     end
     return out
 end
 
+# A block is correlated one read window at a time, each window covering one tile of its points'
+# coordinate span. Each sub-pass writes only the points that window holds, so every point is computed
+# exactly once and assembly remains a copy.
+#
+# Usually there is one window and this is one pass over the block, byte-for-byte what it was before
+# windows were derived per pass.
 function _run_one_block!(out::DisplacementField, buf::BlockBuffers, raw::ImagePair,
-                         pts::PointSet{2}, p::Params, b::Block, geometry::PassGeometry,
-                         measure::SimilarityMeasure, subpixel::SubpixelMethod)
-    bpts = _block_points(pts, b)
+                         pts::PointSet{2}, p::Params, b::Block, halo::Extent,
+                         geometry::PassGeometry, measure::SimilarityMeasure,
+                         subpixel::SubpixelMethod)
+    windows, assign = _read_windows(pts, b, halo, size(raw),
+                                    size(buf.reference, 1), size(buf.reference, 2))
+    if isnothing(assign)
+        isempty(windows) && return out
+        w = only(windows)
+        return _run_block_window!(out, buf, raw, pts, p, b, w.rows, w.cols, nothing, 0,
+                                  geometry, measure, subpixel)
+    end
+    for (k, w) in enumerate(windows)
+        _run_block_window!(out, buf, raw, pts, p, b, w.rows, w.cols, assign, k,
+                           geometry, measure, subpixel)
+    end
+    return out
+end
+
+# One block, one read window. `assign` names which window owns each point, or `nothing` when one window
+# owns all of them — which is the same computation the untiled path performs and must stay byte-identical
+# to it.
+function _run_block_window!(out::DisplacementField, buf::BlockBuffers, raw::ImagePair,
+                            pts::PointSet{2}, p::Params, b::Block, rows, cols,
+                            assign::Union{Nothing,AbstractMatrix{Int16}}, k::Int,
+                            geometry::PassGeometry, measure::SimilarityMeasure,
+                            subpixel::SubpixelMethod)
+    bpts = _block_points(pts, b, rows, cols)
     # A block all of whose points a previous level resolved, or which the coarse mask emptied.
     # Checked before reading, so an empty block costs no I/O at all.
-    nsearchable(bpts) == 0 && return out
-    bpair = _prepared_block_pair(buf, raw, b, p)
+    #
+    # Zeroing the other windows' points rather than only skipping them at assembly: such a point's
+    # coordinate belongs to a *different* window, so searching it here would read the wrong imagery.
+    # `_block_points` re-slices the grid for each sub-pass, so mutating these radii cannot reach the
+    # caller's own.
+    n = isnothing(assign) ? nsearchable(bpts) : _keep_window!(bpts, assign, k)
+    n == 0 && return out
+    # Before any I/O: a window this pass reaches past changes this block's answer, and saying so after
+    # reading would only be slower.
+    short = _block_window_shortfall(rows, cols, bpts, size(raw))
+    short == 0 || _warn_block_window(rows, cols, bpts, short)
+    bpair = _prepared_block_pair(buf, raw, rows, cols, p)
     bout = displacement_field(bpts)
     track!(bout, bpair, bpts, p; subpixel, measure, geometry)
     # Assembly is a copy: the halo grew what this block read, never what it writes.
-    out.dx[b.grid_rows, b.grid_cols] .= bout.dx
-    out.dy[b.grid_rows, b.grid_cols] .= bout.dy
-    out.correlation[b.grid_rows, b.grid_cols] .= bout.correlation
-    out.peak_ratio[b.grid_rows, b.grid_cols] .= bout.peak_ratio
-    out.searched[b.grid_rows, b.grid_cols] .= bout.searched
+    if isnothing(assign)
+        out.dx[b.grid_rows, b.grid_cols] .= bout.dx
+        out.dy[b.grid_rows, b.grid_cols] .= bout.dy
+        out.correlation[b.grid_rows, b.grid_cols] .= bout.correlation
+        out.peak_ratio[b.grid_rows, b.grid_cols] .= bout.peak_ratio
+        out.searched[b.grid_rows, b.grid_cols] .= bout.searched
+        return out
+    end
+    return _merge_window!(out, bout, b, assign, k)
+end
+
+# Restrict a block's points to one window, returning how many are left searchable.
+#
+# Both in one pass rather than zeroing and then counting: the count decides whether any imagery is read
+# at all, and a window whose points a finer level resolved is the common case.
+function _keep_window!(pts::PointSet, assign::AbstractMatrix{Int16}, k::Int)
+    n = 0
+    for i in eachindex(pts.radius_x, assign)
+        if assign[i] == k
+            issearchable(pts, i) && (n += 1)
+        else
+            pts.radius_x[i] = 0
+            pts.radius_y[i] = 0
+        end
+    end
+    return n
+end
+
+# Write one window's results into the assembled field, leaving the other windows' points untouched for
+# the sub-passes that own them.
+function _merge_window!(out::DisplacementField, bout::DisplacementField, b::Block,
+                        assign::AbstractMatrix{Int16}, k::Int)
+    odx = view(out.dx, b.grid_rows, b.grid_cols)
+    ody = view(out.dy, b.grid_rows, b.grid_cols)
+    ocor = view(out.correlation, b.grid_rows, b.grid_cols)
+    opr = view(out.peak_ratio, b.grid_rows, b.grid_cols)
+    osr = view(out.searched, b.grid_rows, b.grid_cols)
+    for i in eachindex(assign, bout.dx, odx)
+        assign[i] == k || continue
+        odx[i] = bout.dx[i]
+        ody[i] = bout.dy[i]
+        ocor[i] = bout.correlation[i]
+        opr[i] = bout.peak_ratio[i]
+        osr[i] = bout.searched[i]
+    end
     return out
 end
 
