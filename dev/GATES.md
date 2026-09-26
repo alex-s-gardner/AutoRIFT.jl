@@ -5615,14 +5615,131 @@ is per-coordinate-system and the decimation is per-level. `Pkg.test()` passes at
 | `NISAR_L2_PR_GSLC` | 29 | **0** |
 
 The rung count varies because a rung with no input reports *skipped* rather than green, and which inputs
-a run kept differs by platform and by how the run was captured. Two deferrals are worth naming, since
-neither is a pass: **both NISAR endpoints are deferred**, not green — 5.43 GiB and 11.25 GiB of imagery is
-more than an unblocked run can hold, so the endpoint on those two is gate `3.nisar` instead. And NISAR
-L1's rung 5.3 is skipped because the pair reaching its correlator is a radar-grid mosaic, which is rung
-5.2's question.
+a run kept differs by platform and by how the run was captured. Two entries are worth naming, since
+neither is a gate: **both NISAR endpoints are reported rather than gated**, the endpoint gate on those two
+being `3.nisar` on the thinned grid. They were *deferred* when this was written — 5.43 GiB and 11.25 GiB of
+imagery is more than an unblocked run can hold — and they now run, mapped and blocked; see "both NISAR
+endpoints run" at the end of this file for what they measure. And NISAR L1's rung 5.3 is skipped because
+the pair reaching its correlator is a radar-grid mosaic, which is rung 5.2's question.
 
 An earlier attempt reported `S1A_..._20151120` and `S1A_..._20170221` as unreachable on **HTTP 502** from
 `sentinel1-burst.asf.alaska.edu`. That was a transient outage on ASF's side — not the `401` that would
 mean a bad `~/.netrc` nor the `404` that would mean a wrong burst index — and both pass on retry. Worth
 recording only because a 502 from a metadata service is indistinguishable from a broken harness until the
 status code is read.
+
+## Step: both NISAR endpoints run, and the one that could not be measured is the better of the two
+
+The two deferrals above are gone. They were a memory limit rather than a finding — `read_capture`
+materialized the captured pair and `rung_endpoint` declined any pair over 4 GiB — and two changes remove
+it: the imagery is **mapped** rather than read (`xread_mmap`, byte-identical, and the pages are file-backed
+and clean), and a pair above that threshold is **blocked** rather than declined, at a size
+`AutoRIFT.block_size_for` derives from the case's own halo.
+
+Both cases below are *reported rather than gated*, deliberately: the ledger has always named `3.nisar` on
+the thinned grid as the endpoint gate for these two, and asserting a threshold here that no entry ever
+claimed would read as a regression on first measurement. The numbers are the point.
+
+| case | imagery | block | blocks | points compared | median | bias core | p99 | exact |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| NISAR L1 RSLC | 5.43 GiB | 5504×3016 | 1508 | 1,792,503 | 0 | **+0.00065** | **0.309** | 73.45% |
+| NISAR L2 GSLC | 11.25 GiB | 2549×1269 | 1936 | 1,757,471 | 0 | +0.00100 | 3.056 | 79.81% |
+
+**L1 clears the gate's own thresholds** — median ≤ 0.0625, |bias| ≤ 0.01, p99 ≤ 1 — on the whole grid,
+which no measurement had previously shown, and its coverage is nearly balanced (6,611 jl-only against
+8,954 ref-only). L2 does not, and the per-level rows say precisely where:
+
+| level | L1 `dx` bias | L1 median | L2 `dx` bias | L2 median |
+|---|---:|---:|---:|---:|
+| chip 96 | −0.00006 | 0 | +0.00004 | 0 |
+| chip 192 | +0.00069 | 0.011 | −0.00051 | 0 |
+| chip 384 | −0.00785 | 0.017 | **+0.45926** | 0.019 |
+| chip 768 | +0.01349 | 0.076 | **+0.70683** | **1.338** |
+
+So on both cases the two measured levels agree to within 7e-4 px, and everything else is the coarse
+levels — which is the swath-edge masking item `tools/golden/README.md` opens with, not a new defect. L1's
+coarse levels are an order of magnitude better than L2's, which is the new information: the defect is not
+uniform across the two NISAR geometries, and L1 is the case to read a coarse-level fix against.
+
+L1 peak RSS 25.20 GiB at 1508 blocks, wall 784 s; the recorded sweep's comparable row is 4096 px square at
+1482 blocks, 27.7 GiB. The two harnesses differ, so that is a consistency check rather than an A/B.
+
+### A latent transposition in the automatic block size, which only an anisotropic halo could show
+
+`_blocks` derived its two numbers from `HALO_BLOCKS * hy` and `HALO_BLOCKS * hx` and emitted them in that
+order, while `_block_size` reads a pair as `(X, Y)` — so the x budget was set from the y halo. **Invisible
+on every configuration ever measured**, because an optical halo is square (69×69) and every radar and NISAR
+figure in this file was hand-specified. On a 2216×1103 halo it picks the transposed shape.
+
+It is also the wrong *magnitude* on such a case: 12 halos per block asks for `(13236, 26592)` on the L2
+grid, which is 25 blocks at 2.5 per thread — the regime this file measures at 2.96 of ten threads busy and
+3.00× untiled peak. `AutoRIFT.block_size_for` replaces both faults with the rule the guidance already
+stated: the halo as a floor, the halo's aspect as the shape, and enough blocks that every thread has a
+queue. Calibrated at 150 blocks per thread against each sweep's lowest peak within 10% of its own best
+blocked runtime, and validated against the recorded rows — `_block_count` reproduces **12 of 12** NISAR
+counts and 4 of 6 optical ones exactly, the two misses being the grid shape assumed by the check.
+
+## Step: what a whole-scene pass holds, and the third of it that was an artifact
+
+Peak on the whole NISAR L1 grid is 32 GiB against a **1.29 GiB floor** once the imagery is mapped, so
+nearly all of it is live working set rather than anything retained. Sized from the configuration rather
+than guessed, at `-t 10` on the 2328x2304 grid over the 57760x50511 scene:
+
+| term | GiB |
+|---|---:|
+| imagery, both images | 5.43 (mapped, not heap) |
+| grid arrays | 0.40 |
+| one displacement field, per level | 0.08 |
+| refinement workspaces, ten tasks | 0.04 |
+| concurrent correlation workspaces, worst level | 4.36 |
+| retained workspace pool | 1.51 |
+| **the scene pad, per pass** | **6.3** |
+
+**Every level pads.** `_pass_geometry` reports `fits = false` at all four chip sizes: a geogrid's points
+sit near the footprint edge and carry radii to 1905 px, so each pass copies the whole scene grown by its
+own halo — 2231x1149 px at the base level rising to 2567x1331 at the coarsest — and with a coarse and a
+fine pass per level that is eight copies per run. It is also what **defeats mapping the input**: 5.43 GiB
+is kept off the heap and then copied back onto it.
+
+**A third of that pad was the validity mask, and it was pure expansion.** `_zeropad` allocates
+`Matrix{T}`, while a mask arrives *packed* — `valid` returns the `BitMatrix` broadcasting produces — so
+padding it cost **3.13 GiB against the 0.39 GiB its source occupies**, once per pass. Nothing read it
+densely enough to justify that: the mask's only consumer is `_any_valid` over a chip footprint, which
+short-circuits on the first valid pixel. `AutoRIFT.PaddedMask` pads it lazily instead.
+
+Paired runs, identical wisdom, one process per arm, nothing differing but the mask:
+
+| arm | wall | CPU | occupancy | peak footprint | peak resident | allocated |
+|---|---:|---:|---:|---:|---:|---:|
+| `_zeropad`ed mask | 545.0 s | 5215.7 s | 9.57 | 38.33 GiB | 43.85 GiB | 161.5 GiB |
+| **lazy mask** | **538.7 s** | 5195.1 s | **9.64** | **31.97 GiB** | 37.49 GiB | 138.1 GiB |
+
+**Peak footprint −6.36 GiB, −16.6%, at no runtime cost.** Bit-identical: both arms measure 1,799,746
+points and give the same `dx` *and* `dy` checksum over raw bits. The allocation column checks the
+mechanism arithmetically — 23.4 GiB less against 3.1 GiB x 8 passes predicted.
+
+### Two things this ruled out, so neither is re-attempted
+
+**Hoisting the imagery pad across passes.** Eight scene-sized copies is 136-161 GiB of allocation, which
+reads as collection pressure and is not: **GC is 1.0-1.4 s, 0.2-0.3% of wall**. Large arrays are cheap to
+allocate and cheap to release, so caching one pad across passes recovers nothing measurable. The plumbing
+it would need — a per-run pad cache threaded through `track!` and both `PassRunner`s — buys a rounding
+error.
+
+**Padding per window instead of per scene.** This is the remaining ~6 GiB and the shape is known, since
+the blocked path already does it per block. Untiled it needs either a lazy padded *image*, which puts two
+comparisons per element into the loops feeding the FFT and the integral tables, or a materialized
+per-window scratch, which makes the window type a `Union` at the call site and reintroduces the dynamic
+dispatch the `_dispatch_pass!` barrier exists to prevent. Against a 16% peak win on a configuration that
+should be blocked anyway — the same granule blocked peaks at 25.2 GiB — neither is worth the hot loop.
+**Blocking is the answer to the scene pad**, and these figures are why.
+
+### Cumulative, whole-grid NISAR L1 untiled
+
+| configuration | peak footprint |
+|---|---:|
+| as the session opened | 42.06 GiB |
+| + workspace pool bounded across keys | 39.05 GiB |
+| + validity mask padded lazily | **31.97 GiB** |
+
+**−10.1 GiB, −24%**, at neutral runtime and bit-identical output throughout.
