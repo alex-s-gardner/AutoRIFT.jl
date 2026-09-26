@@ -1086,3 +1086,41 @@ Fixing the small-block residual is a memory *and* a speed lever, and it is the s
 
 Measured with `balance.jl`-style per-block work sums rather than by correlating; the numbers need no
 imagery beyond the grid.
+
+### The small-block residual: what it is not
+
+Three points on the golden S2B case at a 512 px block, and the equivalent on three other cases. It is
+worth recording what has been ruled out, because each exclusion cost a run and the remaining space is
+small.
+
+**It is systematic, not noise.** Two blocked runs at the same block size in one process differ from each
+other at **0** points and from the untiled run at the same **3**. So the blocked path is deterministic and
+the difference is reproducible — which also rules out FFTW plan selection, a real candidate given
+`src/plans.jl` plans with `MEASURE` and therefore chooses an algorithm by timing candidates.
+
+**It is not a read-window shortfall.** `_block_window_shortfall` stays silent over the whole run, so every
+point's `search_bounds` lies inside the window it was correlated against.
+
+**It is not the preprocessing filter.** The golden path runs `preprocess = :none`, so `_filter_halo` is 0
+and the halo is the correlation reach (238x224) plus the coarse level's centre offset (43x43) and nothing
+else. No filter erosion can be biting at a window edge.
+
+**It does not track how many windows a block uses.** At 2048 px, which agrees exactly, blocks use up to
+**12** windows with 35 blocks above one. At 512 px, which differs, the maximum is 6. More windows, better
+agreement — so the multi-window machinery per se is not the culprit.
+
+**What it does track is the tile quantum.** That is `buffer - 2 * halo - 2`: 1105 px at a 2048 block and
+**264 px at 512**, against a halo of 281x267. At 2048 a cluster almost always fits one tile and the extra
+windows come from genuinely separated clusters; at 512 the quantum is smaller than the halo, so any
+cluster wider than 264 px is *cut*. Tiling is the operation that distinguishes the two, and it is the same
+operation whose over-use cost 85 points on this case before clustering-first was added — that change
+reduced how often tiling happens without changing what tiling does.
+
+So the next probe is `tools/golden/block_bisect.jl` on S2B at 512 px, to find which level and which pass
+first introduces the three points. Until then the honest statement is: a blocked run reproduces an untiled
+one at the block sizes gated, every case has at least one such size, and the set of sizes that work is not
+yet characterized.
+
+**Two consequences worth keeping in view.** It blocks re-fitting `block_size_for`, because the best
+candidate rule picks one of NISAR L1's failing sizes. And it caps NISAR L1's speed: 6144 is the only size
+that agrees there, and it is the one that leaves twelve threads delivering five.
