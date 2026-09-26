@@ -1047,3 +1047,42 @@ indicative.
 
 Point counts agree to 0.875-1.000 of the reference's, which is the pre-existing agreement gap `GATES.md`
 tracks rather than anything this branch changed.
+
+### Why NISAR L1 is only level with the reference, and it is not the threading
+
+L1 is the one case where AutoRIFT.jl shows no advantage — 773.3 s against 812.2 s — where the median
+across the set is 9x. Two separate things account for it, and only one is a defect.
+
+**Per-point work on L1 really is about twice L2's.** The search-radius field runs to a p99 of 1033x582
+against L2's 1052x288, so the y extent is doubled and the search *area* with it. Untiled, L1 measures
+3,160 points/s against L2's 6,300 — the ratio the radii predict. Nothing to fix here.
+
+**The rest is load imbalance, forced by the block size.** Work scales with search area, and L1's radius
+field is extremely skewed: median 34x20, p99 1033x582, max 1905x830, so the worst point costs about
+2,300x the median one. A block is one task on one thread and cannot be subdivided, so a block holding
+the skewed region bounds the wall clock however many threads there are. Per-block work at each block
+size, with a greedy longest-processing-time schedule over 12 threads:
+
+| block | blocks | non-empty | top block's share | largest / per-thread avg | effective threads |
+|---|---:|---:|---:|---:|---:|
+| 2752x1536 | 5916 | 2246 | 2.7% | 0.32x | **12.0** |
+| 3072 | 2652 | 1029 | 5.8% | 0.70x | **12.0** |
+| 4096 | 1482 | 596 | 9.8% | 1.17x | 10.2 |
+| 5504x3072 | 1479 | 602 | 9.8% | 1.18x | 10.2 |
+| **6144** | 676 | 280 | **19.8%** | **2.37x** | **5.1** |
+
+At 6144 a single block is a fifth of the granule and 2.37x what a thread should carry, so twelve threads
+deliver five. `_run_blocked` already claims blocks off a shared atomic counter, so this is not a
+scheduling defect — the work *unit* is too coarse, and no scheduler can split one block.
+
+**And 6144 is the only block size on L1 that reproduces an untiled run.** Every smaller arm fails the
+agreement check above, so the correctness residual is what forces the coarse block that costs the
+parallelism. The discarded profiled sweep measured 3072 at 557.5 s against 6144's 773.3 s, so roughly
+1.4x is waiting behind that fix — enough to put L1 at about 1.5x the reference rather than level with it.
+
+Worth stating plainly: **untiled L1 is faster than blocked L1** — 569.7 s against 773.3 — so on this
+granule blocking currently buys 30.38 -> 9.37 GiB above floor and pays 36% of the wall clock for it.
+Fixing the small-block residual is a memory *and* a speed lever, and it is the same one item.
+
+Measured with `balance.jl`-style per-block work sums rather than by correlating; the numbers need no
+imagery beyond the grid.
