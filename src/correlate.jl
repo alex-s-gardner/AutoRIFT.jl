@@ -260,6 +260,18 @@ struct CorrelationWorkspace
     # read it via `degenerate(ws)` rather than scanning the returned surface, which would
     # be a second pass over it at every grid point.
     was_degenerate::Base.RefValue{Bool}
+
+    # Bytes of buffer above, filled once the buffers exist because the pool's byte bound reads it on
+    # every return. Deriving it there instead — `sizeof` over `fieldnames` — put **9.8% of the whole
+    # golden set's serial time** in one reflective closure holding `WORKSPACE_LOCK`, since the bound
+    # sums the whole pool and a return happens once per chunk per radius bucket. Read from here, that
+    # sum is a few hundred integer adds.
+    #
+    # A cell rather than a plain field for the same reason `was_degenerate` is one: the struct stays
+    # immutable, and the value cannot be computed before the buffers it measures are constructed.
+    # Summed over the fields rather than re-derived from the extents, so a buffer added above is
+    # counted without this having to learn about it. See `workspace_bytes`.
+    bytes::Base.RefValue{Int}
 end
 
 """
@@ -325,7 +337,7 @@ function workspace(::Type{T}, chip_size, search_radius) where {T<:ImageElement}
     rn(n) = real ? n : 0
     cn(n) = real ? 0 : n
 
-    return CorrelationWorkspace(
+    ws = CorrelationWorkspace(
         Matrix{Float32}(undef, rn(csy), rn(csx)),
         Matrix{ComplexF32}(undef, cn(csy), cn(csx)),
         Matrix{Float32}(undef, 2ry, 2rx),
@@ -352,7 +364,13 @@ function workspace(::Type{T}, chip_size, search_radius) where {T<:ImageElement}
         chip,
         rad,
         Ref(false),
+        Ref(0),
     )
+    # Measured now, once, rather than on every pool return. `bytes` is the only field that depends on
+    # the others, which is why it is filled here instead of being passed in.
+    ws.bytes[] = sum(f -> f === :bytes ? 0 : sizeof(getfield(ws, f)),
+                     fieldnames(CorrelationWorkspace))
+    return ws
 end
 
 # ---------------------------------------------------------------------------
@@ -391,12 +409,47 @@ end
 # asymmetry, since holding a 0.86 GiB buffer against a future burst that may never come is a
 # guaranteed cost against a speculative saving.
 #
-# The bound is per key rather than global because the keys are not interchangeable: a workspace built
-# for one bucket cannot serve another, so a global cap would evict entries that are about to be needed
-# while keeping ones that are not.
+# **The bound is per key and not across keys, and that is measured rather than assumed.** It does not
+# bound the number of keys, and a whole NISAR L1 grid reaches **105 keys holding 9.93 GiB** — of which
+# the top buckets are near-duplicates, since `_radius_bucket` clamps to each level's own maximum radius
+# and the levels' maxima differ (1905x830, 1918x1015, 1689x907, 1828x972). Every one of those is
+# legitimately needed by its own level, and a level that has finished cannot ask for its bucket again,
+# so the accumulation looks like pure waste.
+#
+# The per-key bound does not bound the *number* of keys, which on a skewed radius field is where the
+# memory is — hence the second bound, `WORKSPACE_POOL_BYTES`.
 const POOL_SLOTS_PER_KEY = 2
 
+"""
+    AutoRIFT.WORKSPACE_POOL_BYTES
+
+Bytes of workspace the pool may retain across every geometry. `typemax(Int)` for no bound beyond
+`POOL_SLOTS_PER_KEY`.
+
+**Why a second bound.** The per-key one keeps a geometry's retention proportional to its concurrency and
+says nothing about how many geometries a run visits. A whole NISAR L1 grid visits **105**, retaining
+**9.9 GiB**, and the widest are near-duplicates: `_radius_bucket` clamps to each level's own maximum
+radius, the levels' maxima differ (1905x830, 1918x1015, 1689x907, 1828x972), and a level that has
+finished can never ask for its bucket again.
+
+Bounding it at 2 GiB is measured as **free**: peak footprint 42.06 -> 39.05 GiB (**-7.2%**) at the same
+wall clock and the same CPU seconds to 0.1%, over interleaved runs on that grid.
+`docs/src/explanation/memory.md` has the table and the reason an earlier reading of it was wrong.
+
+Setting it cannot change an answer: a rebuilt workspace is byte-for-byte the size of the one dropped, so
+it runs the same transform. Four runs across both settings give the identical `dx` checksum over
+1,799,746 points, taken on raw bits so `-0.0` and every `NaN` payload counts.
+
+Eviction is least-recently-used by key, so the level being correlated is the last candidate; the key just
+returned is never evicted; and a single geometry whose own slots exceed the bound is kept rather than
+rebuilt per chunk. `tools/golden/pool_peak.jl --budget` is the harness.
+"""
+const WORKSPACE_POOL_BYTES = Ref(2 * 1024^3)
+
 const WORKSPACE_LOCK = ReentrantLock()
+
+# Keys in use order, least-recently-used first. Inert while the bound is `typemax`.
+const WORKSPACE_RECENCY = Tuple{Extent,Extent,Bool}[]
 # Keyed by (chip, radius, iscomplex) so a checked-out workspace is byte-for-byte what `workspace`
 # would have built. The buffers still carry no image element type — the chip is `Float32` because it
 # is stored mean-removed, the integral images are `Float64` — but `workspace` allocates only the set
@@ -409,6 +462,83 @@ const WORKSPACE_LOCK = ReentrantLock()
 # `T` would split `UInt8` from `Int16` and hold two identical workspaces per geometry.
 # `Vector` rather than a single slot because several chunks run concurrently.
 const WORKSPACE_POOL = Dict{Tuple{Extent,Extent,Bool},Vector{CorrelationWorkspace}}()
+
+"""
+    AutoRIFT.WORKSPACE_LIVE_BYTES
+
+Bytes of correlation workspace that may be **checked out at once**, across all tasks.
+`typemax(Int)` for no bound.
+
+Distinct from `AutoRIFT.WORKSPACE_POOL_BYTES`, which bounds what the pool *retains* between uses.
+This bounds what is *in use*, and on a skewed radius field that is the larger quantity: a task holds one
+workspace at a time (`src/track.jl` takes one per radius bucket inside a `try`/`finally`), so a run holds
+as many as it has tasks, each sized by whichever bucket that task happens to be in. Measured on NISAR L2
+blocked at `2304x1152`, live workspaces are about 4.5 GiB of 7.8 above the process floor — the largest
+single term left, and three times what the pool retains.
+
+**It delays, it never narrows.** A task over the bound waits for another to return its workspace; nothing
+is rebuilt at a different size and no point is correlated differently, so the result cannot change. What it
+trades is occupancy: where every task wants a wide bucket at once, some wait.
+
+**One task always proceeds**, however large its workspace. A bound below a single geometry's size would
+otherwise deadlock, and a run that needs a 4 GiB workspace holds it whatever this is set to.
+
+Sized from each geometry's own measured bytes rather than from arithmetic over its extents. `workspace`
+records `bytes` by summing its fields precisely so a buffer added there is counted without a second place
+having to learn about it, and a predictor would be that second place — the drift `pool_bytes` documents
+refusing. The cost is that the first workspace of a geometry is admitted before its size is known, so the
+bound can be exceeded by one workspace until then.
+"""
+const WORKSPACE_LIVE_BYTES = Ref(typemax(Int))
+
+# Bytes currently checked out, and the measured size of each geometry seen so far. Both are only
+# maintained while the bound is in force.
+const WORKSPACE_LIVE = Ref(0)
+const WORKSPACE_KEY_BYTES = Dict{Tuple{Extent,Extent,Bool},Int}()
+# Signalled by every return, waited on by a take that would exceed the bound. Backed by the pool lock, so
+# a waiter releases it and the returning task can make progress.
+const WORKSPACE_ROOM = Threads.Condition(WORKSPACE_LOCK)
+
+# Whether the in-use bound is in force. Unset by default, and the guard keeps its bookkeeping — a dictionary
+# lookup and a counter, both under the pool lock — off the default path entirely.
+@inline _live_bounded() = WORKSPACE_LIVE_BYTES[] != typemax(Int)
+
+# Reserve room for a workspace of this geometry, returning what was reserved. Called with the lock held.
+#
+# `get(..., 0)` for an unseen geometry, which admits it immediately: its size is unknown until one is built,
+# and waiting on an unknown would either deadlock or need a predictor.
+function _reserve_live!(key)
+    want = get(WORKSPACE_KEY_BYTES, key, 0)
+    # `WORKSPACE_LIVE[] > 0` is what guarantees progress: the first task in never waits, so a bound below a
+    # single workspace costs nothing but is not a hang.
+    while WORKSPACE_LIVE[] > 0 && WORKSPACE_LIVE[] + want > WORKSPACE_LIVE_BYTES[]
+        wait(WORKSPACE_ROOM)
+    end
+    WORKSPACE_LIVE[] += want
+    return want
+end
+
+# Correct the reservation once the workspace exists and its size is known, and learn that size for next
+# time. Reserving then correcting keeps the counter symmetric with `give_workspace!`, which subtracts the
+# same measured figure.
+function _settle_live!(ws::CorrelationWorkspace, key, reserved::Int)
+    actual = workspace_bytes(ws)
+    lock(WORKSPACE_LOCK) do
+        WORKSPACE_KEY_BYTES[key] = actual
+        WORKSPACE_LIVE[] += actual - reserved
+    end
+    return nothing
+end
+
+"""
+    AutoRIFT.live_bytes() -> Int
+
+Bytes of correlation workspace currently checked out. `0` unless
+`AutoRIFT.WORKSPACE_LIVE_BYTES` is set, since the counter is not maintained otherwise.
+"""
+live_bytes() = lock(WORKSPACE_LOCK) do
+    WORKSPACE_LIVE[]
+end
 
 """
     AutoRIFT.take_workspace!(T, chip_size, search_radius) -> CorrelationWorkspace
@@ -424,13 +554,26 @@ function take_workspace!(::Type{T}, chip_size, search_radius) where {T<:ImageEle
     # pool entry rather than three. `give_workspace!` keys on the workspace's own fields, so this has
     # to produce the same thing — including the complex flag, which it recovers from the buffers.
     key = (extent(chip_size), extent(search_radius), !(T <: Real))
+    bounded = _live_bounded()
+    reserved = 0
     ws = lock(WORKSPACE_LOCK) do
+        # Admission before the pool is consulted, because a pooled workspace occupies the same bytes as a
+        # freshly built one — what the bound limits is how many are *out*, not where they came from.
+        bounded && (reserved = _reserve_live!(key))
         pool = get(WORKSPACE_POOL, key, nothing)
-        isnothing(pool) || isempty(pool) ? nothing : pop!(pool)
+        (isnothing(pool) || isempty(pool)) && return nothing
+        taken = pop!(pool)
+        # Touched on a take as well as on a return: a key whose workspaces are all checked out is in
+        # active use, and letting it age to the front of the eviction order would drop the entry the
+        # moment one came back.
+        _pool_bounded() && _touch_workspace_key!(key)
+        return taken
     end
     # Built outside the lock: planning and allocation are slow, and holding the lock across them
     # would serialise exactly the burst of concurrent chunks this exists to serve.
-    return isnothing(ws) ? workspace(T, chip_size, search_radius) : ws
+    out = isnothing(ws) ? workspace(T, chip_size, search_radius) : ws
+    bounded && _settle_live!(out, key, reserved)
+    return out
 end
 
 """
@@ -441,17 +584,90 @@ cleared: every one is fully written before being read on the next use, which is 
 and the integral images guarantee.
 
 Dropping rather than growing the pool without limit is what bounds a run's footprint when the radius
-field is skewed — see `POOL_SLOTS_PER_KEY`. A dropped workspace is ordinary garbage, and the next
-caller needing that geometry builds one.
+field is skewed — see `POOL_SLOTS_PER_KEY`, which also records what a bound across keys was measured to
+cost. A dropped workspace is ordinary garbage, and the next caller needing that geometry builds one
+identical to it.
 """
 function give_workspace!(ws::CorrelationWorkspace)
     lock(WORKSPACE_LOCK) do
-        pool = get!(() -> CorrelationWorkspace[], WORKSPACE_POOL,
-                    (ws.max_chip, ws.max_radius, iscomplexworkspace(ws)))
-        length(pool) < POOL_SLOTS_PER_KEY && push!(pool, ws)
+        key = (ws.max_chip, ws.max_radius, iscomplexworkspace(ws))
+        if _live_bounded()
+            # The same measured figure `_settle_live!` added, so the counter cannot drift across a
+            # take/return pair however the workspace was obtained.
+            WORKSPACE_LIVE[] -= workspace_bytes(ws)
+            # Every return, not only the ones that free room: a waiter cannot tell which return was its
+            # own, and `notify` on an empty wait queue costs nothing.
+            notify(WORKSPACE_ROOM; all = true)
+        end
+        pool = get!(() -> CorrelationWorkspace[], WORKSPACE_POOL, key)
+        if length(pool) < POOL_SLOTS_PER_KEY
+            push!(pool, ws)
+            _pool_bounded() && _evict_to_budget!(key)
+        end
     end
     return nothing
 end
+
+# Whether the across-keys bound is in force. Unset by default, and the guard is what keeps its
+# bookkeeping — a recency scan and a sum over the pool, both under the pool lock — off the default path.
+@inline _pool_bounded() = WORKSPACE_POOL_BYTES[] != typemax(Int)
+
+"""
+    AutoRIFT.pool_bytes() -> Int
+
+Bytes of workspace the pool currently retains.
+
+Summed over the entries rather than tracked incrementally. A running total is cheaper and was tried, and
+it is the wrong trade here: every take, return and eviction has to adjust it, a single missed adjustment
+drifts silently, and the drift shows up as a bound that stops binding rather than as an error. Summing a
+few hundred entries under a lock already held costs nothing next to a chunk's own milliseconds, and it
+cannot disagree with the pool.
+"""
+pool_bytes() = lock(WORKSPACE_LOCK) do
+    sum(workspace_bytes, Iterators.flatten(values(WORKSPACE_POOL)); init = 0)
+end
+
+# Drop least-recently-used keys until the pool is inside its bound. Called with the lock held.
+#
+# `keep` is exempt, being the key whose workspace was just returned. Stopping when it is the only
+# candidate left is what keeps a single over-budget geometry pooled instead of rebuilt per chunk: such a
+# run holds that much whatever this does, and dropping it would add a GiB-scale allocation to every chunk.
+function _evict_to_budget!(keep)
+    _touch_workspace_key!(keep)
+    held = sum(workspace_bytes, Iterators.flatten(values(WORKSPACE_POOL)); init = 0)
+    while held > WORKSPACE_POOL_BYTES[]
+        i = findfirst(k -> k != keep && haskey(WORKSPACE_POOL, k), WORKSPACE_RECENCY)
+        isnothing(i) && break
+        victim = WORKSPACE_RECENCY[i]
+        deleteat!(WORKSPACE_RECENCY, i)
+        for w in pop!(WORKSPACE_POOL, victim)
+            held -= workspace_bytes(w)
+        end
+    end
+    return nothing
+end
+
+# Move `key` to the most-recently-used end. Linear over the distinct geometries a run reaches — a hundred
+# at worst against a chunk's hundreds of milliseconds.
+function _touch_workspace_key!(key)
+    i = findfirst(==(key), WORKSPACE_RECENCY)
+    isnothing(i) || deleteat!(WORKSPACE_RECENCY, i)
+    push!(WORKSPACE_RECENCY, key)
+    return nothing
+end
+
+"""
+    AutoRIFT.workspace_bytes(ws) -> Int
+
+Bytes of buffer `ws` holds.
+
+Read from the workspace, which recorded it at construction by summing its own fields — so a buffer
+added to `CorrelationWorkspace` is counted without this having to learn about it, and the sum is paid
+once per workspace rather than once per pool operation. `WORKSPACE_POOL_BYTES` reads this on every
+return while holding the pool lock, and computing it reflectively there cost 9.8% of the golden set's
+serial time.
+"""
+workspace_bytes(ws::CorrelationWorkspace) = ws.bytes[]
 
 """
     AutoRIFT.iscomplexworkspace(ws) -> Bool
@@ -475,6 +691,7 @@ function clear_workspaces!()
     lock(WORKSPACE_LOCK) do
         empty!(WORKSPACE_POOL)
         empty!(REFINEMENT_POOL)
+        empty!(WORKSPACE_RECENCY)
     end
     return nothing
 end
