@@ -109,7 +109,7 @@ bounded cost, independent of this file. It is item 3b of `dev/plan-16gib.md`.
 *below* what `block_size_for` returns, a blocked run differs from an untiled one at a few points: three of
 843,539 on the golden S2B case at 512 px, and the equivalent on S2A, `S1A_IW_SLC__1SSH_20150828` and
 NISAR L1 at their own small sizes. Every case agrees exactly at its default, so this does not affect a
-production run; it does mean `block_gate.jl` should sweep sizes rather than test one.
+production run.
 
 Ruled out by measurement, each at the cost of a run:
 
@@ -146,6 +146,14 @@ the placeholder population either.
 **The gate now sweeps**, so a recurrence is visible rather than latent: `--blocks sweep` walks
 `blockspec.jl`'s ladder against a single untiled run. `--blocks 0` checks what `block_size_for` returns,
 which is the size a caller actually gets and the one that must never regress.
+
+**The probe to run next, stated because eliminating mechanisms from the outside has stopped paying.** Nine
+hypotheses have been ruled out above and each cost a granule run; the tenth is not worth guessing. Take one
+of the 31 points S2A moves at 768 px, and compare the *correlation surface* blocked against untiled at that
+single point — `tools/golden/level_replay.jl` replays a level on chosen inputs, which is the machinery for
+it. That answers whether the two see different imagery, a different search window, or the same surface with
+a different peak chosen, and those three call for entirely different fixes. Doing that first would have been
+cheaper than the last four eliminations.
 
 ## 2. Decimate a coarse level with the mask, not the fill value
 
