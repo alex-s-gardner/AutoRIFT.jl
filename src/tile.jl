@@ -189,10 +189,58 @@ function _worst_level_points(grid::PointSet, p::Params)
     pts = rebuild(flat; radius_x = copy(flat.radius_x), radius_y = copy(flat.radius_y),
                   chip_size_x = Uniform(cs.X, n),
                   chip_size_y = Uniform(cs.Y, n))
+    _inflate_for_decimation!(pts, p)
     _widen_for_halo!(pts, grid, p)
     # The same floor a level applies, applied by the same function, so the two cannot drift.
     sanitize!(pts, p.min_search_radius)
     return pts
+end
+
+# Raise every radius to what a *decimated* level will carry, which is more than the grid holds.
+#
+# `_decimate_level` gives a coarse node `windowmax(radius, stride) + windowrange(prior, stride)`: a node
+# stands for a whole cell, so its window has to cover both the widest radius any point in the cell asked
+# for *and* the spread of their priors, since two points with different priors search around different
+# centres. Neither term is in the grid's own `radius_x`, so a halo derived from the grid is short by the
+# prior spread — on the golden NISAR L1 case the grid's widest radius is 1905x830 while the chip-768 level
+# carries 2199x1038, and the reach that implies is 3132x1409 against a halo of 2736x1500. A block whose
+# window is 396 px short reads padding where an untiled run read scene, and loses the points that
+# straddle it.
+#
+# Bounded rather than reproduced: a sliding window is a subset of the whole grid, so `max(radius)` plus
+# `max(prior) - min(prior)` bounds every node's value, and `+ 1` covers the `ceil` that follows the
+# bilinear resample. Reproducing the reductions here would cost four grid-sized passes to tighten a
+# figure that is taken at its maximum anyway.
+#
+# The prior *spread* and not its magnitude: `_pass_geometry` already adds `ceil(abs(prior))` per point,
+# which covers where the window is centred. This is the extra width a cell needs because its points
+# disagree about that centre.
+function _inflate_for_decimation!(pts::PointSet, p::Params)
+    # A single-level run never decimates, so nothing to cover.
+    length(chip_sizes(p)) > 1 || return nothing
+    lox = hix = loy = hiy = 0.0
+    seen = false
+    for i in eachindex(pts)
+        issearchable(pts, i) || continue
+        dx, dy = pts.dx_prior[i], pts.dy_prior[i]
+        (isfinite(dx) && isfinite(dy)) || continue
+        if seen
+            lox = min(lox, dx); hix = max(hix, dx)
+            loy = min(loy, dy); hiy = max(hiy, dy)
+        else
+            lox = hix = dx; loy = hiy = dy
+            seen = true
+        end
+    end
+    seen || return nothing
+    addx = ceil(Int, hix - lox) + 1
+    addy = ceil(Int, hiy - loy) + 1
+    for i in eachindex(pts)
+        issearchable(pts, i) || continue
+        pts.radius_x[i] += addx
+        pts.radius_y[i] += addy
+    end
+    return nothing
 end
 
 # Give the points `_cell_max_radius!` can make searchable the grid's widest radius, so `_pass_geometry`

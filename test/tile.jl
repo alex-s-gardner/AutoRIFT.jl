@@ -199,19 +199,55 @@ end
     need = widest_level_pad(grid, tight) .+ AutoRIFT.filter_reach(tight.preprocess)
     @test h.X >= need[1] && h.Y >= need[2]
 
+    # **The pads above are measured on the caller's grid, and a decimated level does not run on it.**
+    # `_decimate_level` gives a coarse node `windowmax(radius, stride) + windowrange(prior, stride)` — the
+    # widest radius in its cell plus the spread of that cell's priors, because points with different
+    # priors search around different centres. Neither term is in the grid's own `radius_x`, so a halo
+    # derived from it is short by the prior spread. On the golden NISAR L1 case that was 396 px, and a
+    # block whose window falls short reads padding where an untiled run read scene.
+    #
+    # Asserted through `_decimate_level` itself rather than against a formula, so the two cannot drift.
+    function widest_decimated_pad(grid, p)
+        worst = (0, 0)
+        for cs in AutoRIFT.chip_sizes(p)
+            dec = AutoRIFT._level_decimation(p, cs)
+            dec == 1 && continue
+            sub = AutoRIFT._decimate_level(grid, trues(size(grid)), dec, nothing)
+            isnothing(sub) && continue
+            lp = AutoRIFT._level_points(sub.grid, p, cs, sub.wanted)
+            pad = AutoRIFT._pass_geometry(scatter(lp), imagesize)[3]
+            worst = (max(worst[1], pad.X), max(worst[2], pad.Y))
+        end
+        return worst
+    end
+
+    # A grid whose priors vary across it is what makes the spread non-zero; a uniform one cannot show it.
+    nvary = 32
+    pv = params(; chip_size = 32, chip_size_max = 128, grid_spacing = 32, search_radius = 25)
+    base = gridpoints(imagesize, 32; chip_size = 32, search_radius = 25)
+    ng = size(base)
+    varied = AutoRIFT.rebuild(base;
+        dx_prior = [40.0 * sinpi(i / 7) for i in 1:ng[1], _ in 1:ng[2]],
+        dy_prior = [30.0 * cospi(j / 5) for _ in 1:ng[1], j in 1:ng[2]])
+    dneed = widest_decimated_pad(varied, pv) .+ AutoRIFT.filter_reach(pv.preprocess)
+    hv = AutoRIFT.halo(varied, pv, imagesize)
+    @test dneed[1] > widest_level_pad(varied, pv)[1]        # the decimation really does inflate
+    @test hv.X >= dneed[1] && hv.Y >= dneed[2]
+
     # The grid `autorift` builds for itself already carries the largest chip size, so the chip-size and
     # radius corrections above do not widen it — those are for caller-supplied grids. What does widen it
-    # is the cell-centre offset: a decimated level correlates half a cell past its grid point, and the
-    # halo is exactly the grid's own reach plus that.
+    # is the cell-centre offset and the decimation inflation, and the halo covers both.
     pd = params()
     gd = AutoRIFT._build_grid(imagesize, pd)
-    gpad = AutoRIFT._pass_geometry(scatter(gd), imagesize)[3]
+    hd = AutoRIFT.halo(gd, pd, imagesize)
     w = AutoRIFT.filter_reach(pd.preprocess)
     ox, oy = AutoRIFT._level_centre_offset(pd)
-    @test AutoRIFT.halo(gd, pd, imagesize) ==
-          extent((gpad.X + w + ox, gpad.Y + w + oy))
+    gpad = AutoRIFT._pass_geometry(scatter(gd), imagesize)[3]
+    @test hd.X >= gpad.X + w + ox && hd.Y >= gpad.Y + w + oy
+    dd = widest_decimated_pad(gd, pd) .+ w
+    @test hd.X >= dd[1] && hd.Y >= dd[2]
 
-    # The offset is a real widening at the defaults, not a no-op the equality above would also pass with.
+    # The offset is a real widening at the defaults, not a no-op the bounds above would also pass with.
     @test all(AutoRIFT._level_centre_offset(pd) .> 0)
 
     # A single-level run decimates nothing, so there is no offset to cover.
