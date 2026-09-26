@@ -284,6 +284,101 @@ records as costing it 1.6% of the points on a different scene.
 That set is what makes Phase 1 possible without re-deriving anything: the same filtered inputs, the
 same geogrid, and the reference's own `Dx`/`Dy` to diff AutoRIFT.jl's against directly.
 
+### Which cases fit an instance, and does blocking still give the same answer
+
+```bash
+julia --project=tools/golden tools/golden/case_peaks.jl 16      # seconds; reads the histories only
+julia --project=tools/golden -t 10,1 tools/golden/block_agreement.jl S1B_IW_SLC__1SDH_20180809 2048 --run 200
+```
+
+`case_peaks.jl` reports each case's lowest recorded peak and **how many of its rows were blocked at all**.
+That second column is the point: three Sentinel-1 cases sit at 18–19.5 GiB with *zero* blocked rows
+between them, one of them across 42 recorded rows, so the knob that would fix them has never been applied
+to them. Blocking a fourth took it from 21.96 GiB to 3.94 and ran 2.4x faster.
+
+`block_agreement.jl` answers whether a blocked run still reproduces an untiled one on a granule, and
+classifies the disagreement when it does not — seam effect against numerical drift against a localized
+defect, which want opposite responses. `test/tile.jl` asserts the same equality on synthetic grids, where
+it holds; on a Sentinel-1 geogrid it does not.
+
+```bash
+julia --project=tools/golden -t 10,1 tools/golden/block_bisect.jl S1B_IW_SLC__1SDH_20180809 2048 --run 200
+julia --project=tools/golden -t 10,1 tools/golden/coarse_span.jl  S1B_IW_SLC__1SDH_20180809 2048 --run 200
+```
+
+`block_bisect.jl` removes one stage of the level machinery at a time — the chip-size cascade, the coarse
+gate, the outlier filter — and says which one the disagreement enters at. `coarse_span.jl` then checks the
+mechanism by arithmetic alone, without correlating: whether the coarse pass has searchable points that the
+block's read window was not sized for, because `_cell_max_radius!` widens a coarse point's radius over a
+neighbourhood while `_searchable_span` reduces over each point's own. `dev/plan-16gib.md` has the numbers
+and the three candidate fixes.
+
+### Gate: a blocked run must reproduce an untiled one
+
+```bash
+julia --project=tools/golden -t 10,1 tools/golden/block_gate.jl NISAR_L2_PR_GSLC --stride 4
+julia --project=tools/golden -t 10,1 tools/golden/divergence_fate.jl S1B_IW_SLC__1SDH_20180809 2048 --run 200
+```
+
+`block_gate.jl` asserts `dx` and `dy` identical under `isequal` and exits non-zero otherwise. **It fails on
+every real captured grid today** — S1B loses 5.3% of its points, LC08 x LE07 0.37%, S2B 0.25% — which is the
+finding and not a broken harness; `dev/plan-16gib.md` step 0 has the table. `test/tile.jl` is the positive
+control, asserting the same property on the synthetic grids where it holds, which is why this went unnoticed
+through 22 green cases.
+
+A thinned run is a **detector, not a measure**: NISAR L2 at `--stride 4` loses 65% where the whole grid loses
+5.3%, because thinning zeroes most radii while `_cell_max_radius!` still widens over nine points. Quote
+`--stride 1`.
+
+`divergence_fate.jl` says what becomes of the divergent points, by reading the reference's own
+`autoRIFT_intermediate.nc` on the same grid — no coordinate mapping, and it asserts the orientation before
+reporting anything, since the intermediate is `(x, y)` where the grid is `(y, x)`. The answer on S1B is that
+the reference measured **97%** of them and an untiled run reproduces it to a median of 0.000 px, so a blocked
+run is the one that is wrong.
+
+### Sweeping the in-use workspace bound
+
+```bash
+AUTORIFT_LIVE_GIB=2 julia --project=tools/golden -t 10,1 tools/golden/live_budget.jl \
+    NISAR_L2_PR_GSLC --blocks 2304x1152 --no-profile
+```
+
+`live_budget.jl` sets `AutoRIFT.WORKSPACE_LIVE_BYTES` from `AUTORIFT_LIVE_GIB` and then runs
+`profile_nisar.jl` unchanged; unset or `0` is the baseline arm. The bound is **measured neutral** on NISAR
+L2 blocked — see `dev/plan-16gib.md` — because a blocked pass spans only its own block's radius range, so
+blocking already bounds live workspaces more tightly than a byte budget does.
+
+**Interleave the arms.** Ordered `none, none, 2, 1` this sweep reads as a 25% speed win that four
+interleaved arms show to be the cold page cache on the first process. The capture is 11 GiB memory-mapped
+and the first run of a sequence pays for it.
+
+### Measuring a candidate change to `src/` on a whole granule
+
+`with_copies.jl` drives `profile_nisar.jl` unmodified with two method overrides installed, so one row
+measures the code as it was before a change without reverting the change. `dev/plan-16gib.md` holds the
+A/B it produced.
+
+```bash
+C=$AUTORIFT_GOLDEN_CACHE/mem/prof_NISAR_L2_PR_GSLC_003_170_D_053_7700_SHNA_A_20251028T235201_20251028T235238_X05009_N_P_J_001.jls
+cp "$C" /tmp/history.jls                       # the history is append-only, and one row below is not src/
+julia --project=tools/golden -t 10,1 tools/golden/profile_nisar.jl NISAR_L2_PR_GSLC \
+    --blocks 2304x1152 --no-profile            # src/ as it stands
+julia --project=tools/golden -t 10,1 tools/golden/with_copies.jl NISAR_L2_PR_GSLC \
+    --blocks 2304x1152 --no-profile            # the per-block copies put back
+cp /tmp/history.jls "$C"                       # drop the row that describes internals not in src/
+```
+
+Two properties this measurement needs, both of which cost a wrong answer without them.
+
+**The arms must come from the same tree.** A row measured here against a figure in
+`docs/src/explanation/memory.md` is only comparable if `src/` has not moved between them — and the
+check is the point count, not the block shape. A re-measured L2 row has matched the recorded layout
+exactly (`readamp 3.30x`, the same `3336 x 6690 px` window) while measuring 147,099 fewer points.
+
+**`with_copies.jl` prints how many times each override fired.** An override whose signature does not
+match what the driver calls is a silent no-op, and the arm then reports the current code twice. Expect
+`_read_window!` to be exactly twice `_prepare_block` — one read per image per block.
+
 ## The end-to-end ladder: from the granule
 
 ```bash

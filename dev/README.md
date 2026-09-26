@@ -14,6 +14,7 @@ which is why this material is kept here rather than deleted as the port work con
 | [`GATES.md`](GATES.md) | the gate ledger: every confirmed-green measurement with the command that produced it, per golden case |
 | [`gpu-feasibility.md`](gpu-feasibility.md) | per-stage device timings behind the GPU backend, and why the correlation agrees to 1e-5 while the displacements agree exactly |
 | [`plan-tiling.md`](plan-tiling.md) | the blocked-processing design and the partition invariants it has to hold |
+| [`plan-16gib.md`](plan-16gib.md) | where a run's peak memory actually is, which of the plausible levers are real, and the order of work that fits the two NISAR cases on a 16 GiB instance |
 
 Measurements were taken on an Apple M2 Max unless a file says otherwise.
 

@@ -161,9 +161,9 @@ function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Param
         _dispatch_pass!(out, pair.reference, pair.secondary, okmask,
                         _shift_points(flat, extent(0)), chip, radius, p, measure, subpixel)
     else
-        # The mask pads to `false`, which is what distinguishes "outside the image" from "dark".
+        # The mask pads lazily and the imagery eagerly — see `PaddedMask` for why the two differ.
         _dispatch_pass!(out, _zeropad(pair.reference, pad), _zeropad(pair.secondary, pad),
-                        _zeropad(okmask, pad), _shift_points(flat, pad),
+                        PaddedMask(okmask, pad), _shift_points(flat, pad),
                         chip, radius, p, measure, subpixel)
     end
     return out
@@ -330,13 +330,59 @@ function _shift_points(pts::PointSet, pad::Extent)
     return rebuild(pts; x = pts.x .+ (px + 0.5), y = pts.y .+ (py + 0.5))
 end
 
+"""
+    AutoRIFT.PaddedMask(parent, pad)
+
+`parent` grown by `pad` on every side and reading `false` outside it, without materializing anything.
+
+**The validity mask is padded lazily where the imagery is padded eagerly, because the two are read
+differently.** A padded image is handed to the FFT and to the integral tables, which walk it densely;
+the mask has exactly one consumer, `_any_valid` over a chip footprint, which short-circuits on the
+first valid pixel. So the branch this adds is paid once or twice per point rather than per element,
+while the array it avoids is scene-sized.
+
+Avoiding it matters because `_zeropad` would *expand* it. A mask arrives packed — `valid` returns the
+`BitMatrix` broadcasting produces — and `Matrix{T}(undef, …)` of a `Bool` eltype is one byte per pixel,
+so padding a whole NISAR L1 scene's mask costs **3.13 GiB against the 0.39 GiB its source occupies**,
+a third of what a pass holds. Nothing reads it densely enough to want that.
+
+`false` outside is the same convention `_zeropad` uses, and it is what distinguishes "outside the
+image" from "dark": a chip made of padding correlates with any other such chip, so the correlator
+declines a point whose chip holds no valid pixel.
+"""
+struct PaddedMask{A<:AbstractMatrix{Bool}} <: AbstractMatrix{Bool}
+    parent::A
+    px::Int
+    py::Int
+    nrows::Int
+    ncols::Int
+end
+
+function PaddedMask(parent::AbstractMatrix{Bool}, pad::Extent)
+    Base.require_one_based_indexing(parent)
+    nr, nc = size(parent)
+    return PaddedMask(parent, pad.X, pad.Y, nr + 2pad.Y, nc + 2pad.X)
+end
+
+Base.size(m::PaddedMask) = (m.nrows, m.ncols)
+
+# Plain comparisons rather than a `@boundscheck` block, deliberately: being outside the parent *is* the
+# padding rather than an error, and a caller's `@inbounds` — which `_any_valid` has — would remove a
+# `@boundscheck` and with it the only thing that makes this a padded mask.
+@inline function Base.getindex(m::PaddedMask, i::Int, j::Int)
+    ip = i - m.py
+    jp = j - m.px
+    (1 <= ip <= size(m.parent, 1)) & (1 <= jp <= size(m.parent, 2)) || return false
+    return @inbounds m.parent[ip, jp]
+end
+
 # The border is zero and the interior is a copy, so every element is written exactly once here:
 # `zeros` would write the interior a second time, and on a whole scene that is the larger half of
 # the cost. The border loops and the interior copy cover the output exactly, which is what makes
 # `undef` safe.
 #
-# `zero(T)` for the border is what distinguishes "outside the image" from a dark pixel, and for the
-# validity mask it is the `false` the correlator tests against.
+# `zero(T)` for the border is what distinguishes "outside the image" from a dark pixel. The validity
+# mask takes `PaddedMask` instead of this, for the reason recorded there.
 function _zeropad(A::AbstractMatrix{T}, pad::Extent) where {T}
     Base.require_one_based_indexing(A)
     px, py = pad.X, pad.Y

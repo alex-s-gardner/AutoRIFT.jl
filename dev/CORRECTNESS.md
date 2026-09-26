@@ -58,6 +58,51 @@ The input already exists on both sides and is simply not consulted:
 **This subsumes much of items 2 and 3**: with edge chips declined, the cells those items are about stop
 being searched.
 
+### It also decides whether a blocked run can agree, and that is a second driver
+
+A blocked run **cannot** reproduce this defect, which makes item 1 the blocker for tiled processing rather
+than only the highest-value accuracy change.
+
+`_cell_max_radius!` gives a coarse point the widest search radius within `_sparse_filter_width` points of
+it, so a point the geogrid gave a zero radius becomes searchable in the coarse pass. On S1B
+`1SDH_20180809` that is **1,130 points at the base level, at 477 distinct coordinates**, and **58% of them
+sit within 100 px of the scene's origin** — outside the footprint, carrying the grid's fill coordinate,
+which on this grid presents as 1.5 rather than 0 because the reference's 0-based fill maps through this
+package's `+1.5` origin convention.
+
+The reference correlates them: `arImgDisp_u`/`_s` pad the whole image by
+`Px = max(ChipSize)/2 + max(SearchLimit + |Dx0|) + 2`, shift the grid by `Px + 0.5`, and call the C++ core,
+so such a point's chip lands inside the padded array straddling the padding and the scene's own edge.
+AutoRIFT.jl's untiled path reproduces that through `_zeropad` and `_shift_points`. A **blocked** run's read
+window is wherever that block's real points are — a median of 46,000 px away on a 67,945 px scene — so the
+point is wholly outside it and is skipped, which is the documented behaviour for a chip outside the image.
+
+Neither path is wrong about the block. The two are irreconcilable because the reference's answer at such a
+point is a function of the scene's *corner*, and no block that does not read the corner can produce it.
+Measured consequence on S1B at a 2048 px block: those spurious coarse measurements change
+`reject_outliers` and the dilated mask, and **5.3% of the run's points differ from an untiled run** —
+26,781 lost, 771 gained, 25,206 measured differently. `tools/golden/block_bisect.jl` isolates it to the
+coarse gate and `tools/golden/coarse_span.jl` counts the points; `dev/plan-16gib.md` has the chain.
+
+That matters because blocking is the only route that fits three Sentinel-1 cases and both NISAR granules
+into a 16 GiB instance — 21.96 GiB untiled against 3.94 GiB blocked on S1B, and 2.4x faster. So the choice
+is not "accuracy now or later": it is reproduce the reference and give up tiling on every geogrid, or
+decline these chips and gain both.
+
+**The fractional validity test this item already specifies is the fix, and it needs no new concept.** A
+chip that is mostly fill is declined, which is exactly the population above; `_any_valid` becoming a
+fraction over the chip footprint declines it in *both* paths, so untiled and blocked agree again by
+construction rather than by widening any window.
+
+**The other 77.3% are not this item**, and that share is measured rather than estimated — 20,704 of the
+26,781 lost points, against 6,077 (22.7%) carrying a placeholder coordinate (`divergence_fate.jl` on S1B at
+2048 px, whole grid). An earlier revision of this file had the two the other way round. They carry real
+coordinates — up to 36,334 px — and merely a zero
+search radius, so a fractional validity test keeps them and it should: they are legitimate points the
+reference measures at a real position. For those a blocked window is short by tens to hundreds of pixels
+because `_searchable_span` reduces over each point's *own* radius, and that is an ordinary layout fix with
+bounded cost, independent of this file. It is item 3b of `dev/plan-16gib.md`.
+
 ## 2. Decimate a coarse level with the mask, not the fill value
 
 Every per-point array is decimated to a coarse level by an unweighted mean over the cell, and every one
@@ -87,6 +132,16 @@ the captured chip-768 lattice the *plain* average differs from the reference by 
 level's pad) where a fill-excluding average gives **3,288 different offsets**. Diverging here
 desynchronizes every downstream comparison, which is exactly what a 115.5 px node offset was doing before
 `_cell_centres` was made to match.
+
+**This item is what forces blocking's multi-window read layout, and landing it will simplify that layout
+rather than complicate it.** A fill-weighted node sits at a coordinate blended between the swath and the
+fill constant, so the coordinates a block must read form a continuum rather than two clusters, and a
+block therefore carries one read window per cluster of the coordinates its passes will search
+(`AutoRIFT.Block`). Exclude the fill from the mean and every node returns to one of two places — inside
+the swath, or at the fill constant — so the clustering finds two windows and the generality goes quiet.
+Nothing has to be unwound. The layout is derived from the point set each pass actually runs, so it holds
+whatever `_cell_mean` returns: **implementing this item touches `_cell_mean` and not the blocking code.**
+`dev/plan-16gib.md` § "Step A-2" records the measurement behind that ordering.
 
 ## 3. Make one position serve both halves of a level
 

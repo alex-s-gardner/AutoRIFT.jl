@@ -105,6 +105,16 @@ filtering steps are neighbourhood operations.
   only when its chip size falls within them, so a point over thin, fast ice can be restricted to
   fine chips while smooth ice admits coarse ones. Default to zero, which means unbounded — every
   level runs everywhere, and a caller who supplies neither sees no change.
+- `positioned`: whether `x`, `y` are a real position in the images. `false` marks a point whose
+  coordinate is a **placeholder**: a geogrid marks a point outside the image footprint with a nodata
+  sentinel, and since `PointSet` has no missing value such a point is given an arbitrary coordinate
+  and a zero radius, which is what excludes it. Defaults to `true` everywhere.
+
+  It does not affect whether a point is searched — [`AutoRIFT.issearchable`](@ref) is the radius
+  alone, and the coarse pass's radius widening can make a placeholder point searchable. Blocking is
+  what needs this: a block's read window is the span of the coordinates it will search, and a
+  placeholder coordinate belongs to no block's neighbourhood, so the two populations must be spanned
+  separately. Without the distinction a block either misses those points or spans the whole scene.
 
 Every field carries its own type parameter, because a field is an `AutoRIFT.Uniform` exactly
 when the caller gave *that* field as a scalar, and callers mix freely: `chip_size_x` as a per-point
@@ -117,7 +127,8 @@ struct PointSet{N,X<:AbstractArray{Float64,N},Y<:AbstractArray{Float64,N},
                 RX<:AbstractArray{Int,N},RY<:AbstractArray{Int,N},
                 DX<:AbstractArray{Float64,N},DY<:AbstractArray{Float64,N},
                 CX<:AbstractArray{Int,N},CY<:AbstractArray{Int,N},
-                CN<:AbstractArray{Int,N},CM<:AbstractArray{Int,N}}
+                CN<:AbstractArray{Int,N},CM<:AbstractArray{Int,N},
+                PO<:AbstractArray{Bool,N}}
     x::X
     y::Y
     radius_x::RX
@@ -128,25 +139,29 @@ struct PointSet{N,X<:AbstractArray{Float64,N},Y<:AbstractArray{Float64,N},
     chip_size_y::CY
     chip_size_min_x::CN
     chip_size_max_x::CM
+    positioned::PO
 
     function PointSet(x::X, y::Y, radius_x::RX, radius_y::RY, dx_prior::DX,
                       dy_prior::DY, chip_size_x::CX, chip_size_y::CY,
                       chip_size_min_x::CN = Uniform(0, size(chip_size_x)),
-                      chip_size_max_x::CM = Uniform(0, size(chip_size_x))) where {
+                      chip_size_max_x::CM = Uniform(0, size(chip_size_x)),
+                      positioned::PO = Uniform(true, size(chip_size_x))) where {
                           N,X<:AbstractArray{Float64,N},Y<:AbstractArray{Float64,N},
                           RX<:AbstractArray{Int,N},RY<:AbstractArray{Int,N},
                           DX<:AbstractArray{Float64,N},DY<:AbstractArray{Float64,N},
                           CX<:AbstractArray{Int,N},CY<:AbstractArray{Int,N},
-                          CN<:AbstractArray{Int,N},CM<:AbstractArray{Int,N}}
+                          CN<:AbstractArray{Int,N},CM<:AbstractArray{Int,N},
+                          PO<:AbstractArray{Bool,N}}
         ax = axes(x)
         _check_axes(ax, (y = y, radius_x = radius_x, radius_y = radius_y,
                          dx_prior = dx_prior, dy_prior = dy_prior,
                          chip_size_x = chip_size_x, chip_size_y = chip_size_y,
                          chip_size_min_x = chip_size_min_x,
-                         chip_size_max_x = chip_size_max_x))
-        return new{N,X,Y,RX,RY,DX,DY,CX,CY,CN,CM}(
+                         chip_size_max_x = chip_size_max_x,
+                         positioned = positioned))
+        return new{N,X,Y,RX,RY,DX,DY,CX,CY,CN,CM,PO}(
             x, y, radius_x, radius_y, dx_prior, dy_prior,
-            chip_size_x, chip_size_y, chip_size_min_x, chip_size_max_x)
+            chip_size_x, chip_size_y, chip_size_min_x, chip_size_max_x, positioned)
     end
 end
 
@@ -225,6 +240,9 @@ julia> pts.x[2], pts.radius_x[2], pts.chip_size_x[2]
 - `chip_size_min_x = 0`, `chip_size_max_x = 0`: the chip sizes this point may be searched at,
   bounding the multi-chip-size levels. Zero means unbounded. Also accept a per-point array, which
   is how they are usually supplied — ITS_LIVE ships them as rasters.
+- `positioned = true`: whether each coordinate is a real image position rather than a placeholder
+  standing in for a point outside the footprint. A per-point array, or a scalar for the usual case
+  where every coordinate is real. See [`PointSet`](@ref).
 """
 function pointset(
     x::AbstractArray, y::AbstractArray;
@@ -238,6 +256,7 @@ function pointset(
     dy_prior = 0.0,
     chip_size_min_x = 0,
     chip_size_max_x = 0,
+    positioned = true,
 )
     size(x) == size(y) || throw(DimensionMismatch(
         "`x` and `y` must have the same shape, got $(size(x)) and $(size(y))"))
@@ -266,7 +285,11 @@ function pointset(
     cmin = _toconstfield(Int, chip_size_min_x, x, :chip_size_min_x)
     cmax = _toconstfield(Int, chip_size_max_x, x, :chip_size_max_x)
 
-    return PointSet(xs, ys, rx, ry, dx, dy, csx, csy, cmin, cmax)
+    # Also a constant field, so a caller who does not mention it pays 24 bytes rather than a
+    # grid-sized array — which is every caller but a geogrid.
+    pos = _toconstfield(Bool, positioned, x, :positioned)
+
+    return PointSet(xs, ys, rx, ry, dx, dy, csx, csy, cmin, cmax, pos)
 end
 
 # Coordinates given as points rather than as parallel arrays.
@@ -379,7 +402,8 @@ scatter(pts::PointSet) = rebuild(pts;
     dx_prior = vec(pts.dx_prior), dy_prior = vec(pts.dy_prior),
     chip_size_x = vec(pts.chip_size_x), chip_size_y = vec(pts.chip_size_y),
     chip_size_min_x = vec(pts.chip_size_min_x),
-    chip_size_max_x = vec(pts.chip_size_max_x))
+    chip_size_max_x = vec(pts.chip_size_max_x),
+    positioned = vec(pts.positioned))
 
 """
     pts[rows, cols] -> PointSet{2}
@@ -396,7 +420,8 @@ Base.getindex(pts::PointSet{2}, rows, cols) = PointSet(
     pts.radius_x[rows, cols], pts.radius_y[rows, cols],
     pts.dx_prior[rows, cols], pts.dy_prior[rows, cols],
     pts.chip_size_x[rows, cols], pts.chip_size_y[rows, cols],
-    pts.chip_size_min_x[rows, cols], pts.chip_size_max_x[rows, cols])
+    pts.chip_size_min_x[rows, cols], pts.chip_size_max_x[rows, cols],
+    pts.positioned[rows, cols])
 
 """
     rebuild(pts::PointSet; kwargs...) -> PointSet
@@ -413,9 +438,10 @@ rebuild(pts::PointSet; x = pts.x, y = pts.y,
         dx_prior = pts.dx_prior, dy_prior = pts.dy_prior,
         chip_size_x = pts.chip_size_x, chip_size_y = pts.chip_size_y,
         chip_size_min_x = pts.chip_size_min_x,
-        chip_size_max_x = pts.chip_size_max_x) =
+        chip_size_max_x = pts.chip_size_max_x,
+        positioned = pts.positioned) =
     PointSet(x, y, radius_x, radius_y, dx_prior, dy_prior, chip_size_x, chip_size_y,
-             chip_size_min_x, chip_size_max_x)
+             chip_size_min_x, chip_size_max_x, positioned)
 
 """
     sanitize!(pts::PointSet, min_radius) -> Int

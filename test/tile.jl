@@ -199,19 +199,55 @@ end
     need = widest_level_pad(grid, tight) .+ AutoRIFT.filter_reach(tight.preprocess)
     @test h.X >= need[1] && h.Y >= need[2]
 
+    # **The pads above are measured on the caller's grid, and a decimated level does not run on it.**
+    # `_decimate_level` gives a coarse node `windowmax(radius, stride) + windowrange(prior, stride)` — the
+    # widest radius in its cell plus the spread of that cell's priors, because points with different
+    # priors search around different centres. Neither term is in the grid's own `radius_x`, so a halo
+    # derived from it is short by the prior spread. On the golden NISAR L1 case that was 396 px, and a
+    # block whose window falls short reads padding where an untiled run read scene.
+    #
+    # Asserted through `_decimate_level` itself rather than against a formula, so the two cannot drift.
+    function widest_decimated_pad(grid, p)
+        worst = (0, 0)
+        for cs in AutoRIFT.chip_sizes(p)
+            dec = AutoRIFT._level_decimation(p, cs)
+            dec == 1 && continue
+            sub = AutoRIFT._decimate_level(grid, trues(size(grid)), dec, nothing)
+            isnothing(sub) && continue
+            lp = AutoRIFT._level_points(sub.grid, p, cs, sub.wanted)
+            pad = AutoRIFT._pass_geometry(scatter(lp), imagesize)[3]
+            worst = (max(worst[1], pad.X), max(worst[2], pad.Y))
+        end
+        return worst
+    end
+
+    # A grid whose priors vary across it is what makes the spread non-zero; a uniform one cannot show it.
+    nvary = 32
+    pv = params(; chip_size = 32, chip_size_max = 128, grid_spacing = 32, search_radius = 25)
+    base = gridpoints(imagesize, 32; chip_size = 32, search_radius = 25)
+    ng = size(base)
+    varied = AutoRIFT.rebuild(base;
+        dx_prior = [40.0 * sinpi(i / 7) for i in 1:ng[1], _ in 1:ng[2]],
+        dy_prior = [30.0 * cospi(j / 5) for _ in 1:ng[1], j in 1:ng[2]])
+    dneed = widest_decimated_pad(varied, pv) .+ AutoRIFT.filter_reach(pv.preprocess)
+    hv = AutoRIFT.halo(varied, pv, imagesize)
+    @test dneed[1] > widest_level_pad(varied, pv)[1]        # the decimation really does inflate
+    @test hv.X >= dneed[1] && hv.Y >= dneed[2]
+
     # The grid `autorift` builds for itself already carries the largest chip size, so the chip-size and
     # radius corrections above do not widen it — those are for caller-supplied grids. What does widen it
-    # is the cell-centre offset: a decimated level correlates half a cell past its grid point, and the
-    # halo is exactly the grid's own reach plus that.
+    # is the cell-centre offset and the decimation inflation, and the halo covers both.
     pd = params()
     gd = AutoRIFT._build_grid(imagesize, pd)
-    gpad = AutoRIFT._pass_geometry(scatter(gd), imagesize)[3]
+    hd = AutoRIFT.halo(gd, pd, imagesize)
     w = AutoRIFT.filter_reach(pd.preprocess)
     ox, oy = AutoRIFT._level_centre_offset(pd)
-    @test AutoRIFT.halo(gd, pd, imagesize) ==
-          extent((gpad.X + w + ox, gpad.Y + w + oy))
+    gpad = AutoRIFT._pass_geometry(scatter(gd), imagesize)[3]
+    @test hd.X >= gpad.X + w + ox && hd.Y >= gpad.Y + w + oy
+    dd = widest_decimated_pad(gd, pd) .+ w
+    @test hd.X >= dd[1] && hd.Y >= dd[2]
 
-    # The offset is a real widening at the defaults, not a no-op the equality above would also pass with.
+    # The offset is a real widening at the defaults, not a no-op the bounds above would also pass with.
     @test all(AutoRIFT._level_centre_offset(pd) .> 0)
 
     # A single-level run decimates nothing, so there is no offset to cover.
@@ -299,6 +335,75 @@ end
 
     @test_throws "must be positive in both axes" AutoRIFT.block_layout(grid, p, (n, n), (0, 8))
     @test_throws "must be positive in both axes" AutoRIFT.block_layout(grid, p, (n, n), (8, -1))
+end
+
+@testset "block_size_for is a multiple of the halo, floored" begin
+    # The rule is `BLOCK_HALO_MULTIPLE` times the halo per axis, floored at `BLOCK_FLOOR` and clamped to
+    # the scene, fitted to `tools/golden/block_optimum.jl`'s sweep of all 22 golden cases. Each property
+    # is asserted on the configuration that isolates it.
+    n = 4096
+    p = params(; chip_size = 32, chip_size_max = 32, grid_spacing = 16, search_radius = 25)
+    h = AutoRIFT.halo(p)
+
+    # The floor binds on a narrow halo, which is every optical configuration: twice 82 px is well under
+    # 1024, so the floor is what the caller gets and it is a legal block.
+    small = AutoRIFT.block_size_for(p, (n, n))
+    @test h.X < AutoRIFT.BLOCK_FLOOR && h.Y < AutoRIFT.BLOCK_FLOOR
+    @test small.X == AutoRIFT.BLOCK_FLOOR && small.Y == AutoRIFT.BLOCK_FLOOR
+    @test_nowarn AutoRIFT.block_layout(gridpoints((n, n), 16; chip_size = 32, search_radius = 25),
+                                       p, (n, n), (small.X, small.Y))
+
+    # The halo binds once twice it exceeds the floor, which is the geogrid regime. Always at least the
+    # halo, or `block_layout` rejects the block outright.
+    wide = params(; chip_size = 768, chip_size_max = 768, grid_spacing = 120, search_radius = 1000)
+    hw = AutoRIFT.halo(wide)
+    bw = AutoRIFT.block_size_for(wide, (20000, 20000))
+    @test AutoRIFT.BLOCK_HALO_MULTIPLE * hw.X > AutoRIFT.BLOCK_FLOOR
+    @test bw.X >= hw.X && bw.Y >= hw.Y
+    @test bw.X == AutoRIFT.BLOCK_HALO_MULTIPLE * hw.X
+    @test bw.Y == AutoRIFT.BLOCK_HALO_MULTIPLE * hw.Y
+
+    # Never larger than the scene: a block wider than the image is the untiled path wearing a label.
+    @test AutoRIFT.block_size_for(wide, (2048, 2048)).X <= 2048
+
+    # Chunk alignment, so a read starts and ends where the storage does.
+    aligned = AutoRIFT.block_size_for(p, (n, n); chunk = (256, 128))
+    @test aligned.Y % 256 == 0 && aligned.X % 128 == 0
+
+    # **The block follows the halo's aspect rather than being square, and is not its transpose.** A
+    # square block on a 2:1 halo clears the wide axis and over-provisions the narrow one twofold; a
+    # transposed one is below the halo on the wide axis, which `block_layout` then rejects. Neither is
+    # visible on the square halo every optical configuration has, so it is asserted here — on a halo wide
+    # enough that the floor does not flatten the aspect.
+    aniso = params(; chip_size = (64, 16), chip_size_max = (64, 16), grid_spacing = (16, 16),
+                   search_radius = (3000, 1100))
+    ha = AutoRIFT.halo(aniso)
+    @test ha.X > 2 * ha.Y                                  # the configuration does what it claims
+    @test AutoRIFT.BLOCK_HALO_MULTIPLE * ha.Y > AutoRIFT.BLOCK_FLOOR   # both axes clear the floor
+    ba = AutoRIFT.block_size_for(aniso, (8192, 8192))
+    @test ba.X > ba.Y
+    @test ba.X >= ha.X && ba.Y >= ha.Y                     # a transpose would fail this
+    @test isapprox(ba.X / ba.Y, ha.X / ha.Y; rtol = 0.25)
+
+    # **The floor applies per axis, so it flattens the aspect on a halo whose narrow axis is below it.**
+    # That is intended and not a transpose bug: the narrow axis is raised to the floor while the wide one
+    # follows the halo, because the floor exists to stop a block being small in absolute terms — where
+    # read amplification dominates — and that argument is per axis.
+    narrow = params(; chip_size = (64, 16), chip_size_max = (64, 16), grid_spacing = (16, 16),
+                    search_radius = (1500, 500))
+    hn = AutoRIFT.halo(narrow)
+    bn = AutoRIFT.block_size_for(narrow, (8192, 8192))
+    @test AutoRIFT.BLOCK_HALO_MULTIPLE * hn.Y < AutoRIFT.BLOCK_FLOOR
+    @test bn.Y == AutoRIFT.BLOCK_FLOOR
+    @test bn.X == AutoRIFT.BLOCK_HALO_MULTIPLE * hn.X
+    @test bn.X / bn.Y < hn.X / hn.Y                        # flattened, deliberately
+
+    # The size it picks is one `block_layout` accepts on a real grid, and divides it into more than one
+    # block — the whole point of returning a size rather than nothing.
+    grid = gridpoints((n, n), 16; chip_size = 32, search_radius = 25)
+    bs = AutoRIFT.block_size_for(grid, p, (n, n))
+    layout = AutoRIFT.block_layout(grid, p, (n, n), (bs.X, bs.Y))
+    @test length(layout.blocks) > 1
 end
 
 @testset "a block size is a pair at every entry point" begin
@@ -407,6 +512,191 @@ end
     for bs in ((480, 240), (272, 272))
         assert_same_result(untiled, AutoRIFT.correlate_tiled(raw, grid, p, bs),
                            "caller grid, block $bs")
+    end
+end
+
+@testset "a block reaching past its own read window is reported" begin
+    # `block_layout` sizes a window to cover every point's reach, so this condition means the pass reaches
+    # further than the layout was built from — which `track!` absorbs by zero-padding, correlating against
+    # padding where a whole-scene run had imagery. Silent otherwise, and wrong at a real point.
+    #
+    # A warning rather than an error, and that is a judgement: every geogrid case reaches it, so throwing
+    # would take the blocked path from inexact to unusable on exactly the cases that need it. The predicate
+    # is tested here; `_run_one_block!` is what warns, once per session.
+    pts = gridpoints((256, 256), 32; chip_size = 16, search_radius = 8)
+    scene = (256, 256)
+    shortfall(b) = AutoRIFT._block_window_shortfall(b.read_rows, b.read_cols,
+                                                    AutoRIFT._block_points(pts, b), scene)
+
+    # Reach per point is `chip ÷ 2 + radius + 2` = 18 px, and points sit at 16, 48, 80, ... so a window
+    # inset from the scene leaves the ones near its edge short.
+    inner = AutoRIFT.Block(1:size(pts, 1), 1:size(pts, 2), 100:160, 100:160)
+    @test shortfall(inner) > 0
+
+    # The same shortfall against the scene's own edge is not reported: an untiled run pads there too, so
+    # the two agree. This is what stops it firing on every edge block of every layout.
+    @test shortfall(AutoRIFT.Block(1:size(pts, 1), 1:size(pts, 2), 1:256, 1:256)) == 0
+
+    # A block with nothing to read has nothing to check.
+    @test shortfall(AutoRIFT.Block(1:1, 1:1, 1:0, 1:0)) == 0
+
+    # A point whose own coordinate is outside the window is positionless, not short of halo — the geogrid
+    # fill case `dev/plan-16gib.md` records, where skipping it is the right answer and the whole-scene run
+    # is the questionable one. Reporting those would bury a real shortfall of a few hundred pixels under a
+    # spurious one of tens of thousands, so they are excluded.
+    far = AutoRIFT.Block(1:2, 1:2, 240:256, 240:256)
+    @test shortfall(far) == 0
+
+    # Every layout this package builds is clean, which is what makes the condition a finding rather than
+    # routine — a rotated grid and a full-width band included.
+    p = params(; chip_size = 32, chip_size_max = 32, grid_spacing = 16, search_radius = 12)
+    grid = gridpoints((512, 512), 16; chip_size = 32, search_radius = 12)
+    for bs in ((320, 320), (208, 704), (128, 128))
+        layout = AutoRIFT.block_layout(grid, p, (512, 512), bs)
+        @test all(b -> AutoRIFT._block_window_shortfall(
+            b.read_rows, b.read_cols, AutoRIFT._block_points(grid, b), (512, 512)) == 0,
+            layout.blocks)
+    end
+end
+
+@testset "a blocked run equals an untiled one at preprocess = :none" begin
+    # The configuration every other equality testset here misses, and the one every golden end-to-end
+    # run uses: the reference filters before its correlator, so the comparison feeds a pair that is
+    # already high-passed and `preprocess = :none`. `NoPreprocess` is also the only method whose
+    # `_prepare_block` hands the pass its block's *raw* buffers rather than a filtered copy of them, so
+    # it is the only one where a blocked run reads and writes the same arrays.
+    #
+    # Two ways a check here passes without testing anything, and both have to be excluded:
+    #
+    #   * **`:none` over raw texture measures zero points.** Nothing high-passes it, so every level is
+    #     rejected for incoherence and two all-`NaN` fields compare equal under `isequal`. Hence the
+    #     high-pass below, and the point-count assertion.
+    #   * **A pair with no non-finite value never reaches the substitution.** `_prepare` replaces
+    #     non-finite pixels with zero and a blocked run must do the same to its buffer, which an input
+    #     carrying none cannot distinguish. Returning the raw pair without substituting passes every
+    #     other arm here and loses 122 of 6843 points on the one below.
+    n = 1024
+    ref0, sec0 = split_pair(n)
+    allvalid = trues(n, n)
+    fref, = AutoRIFT.preprocess(ref0, allvalid, Highpass(5))
+    fsec, = AutoRIFT.preprocess(sec0, allvalid, Highpass(5))
+
+    # A no-data border and an interior hole, the shape reprojection onto a common grid leaves behind.
+    # Float only: an integer image cannot carry a non-finite value at all, which is why the
+    # substitution is a no-op by dispatch for one.
+    function nodata!(A)
+        A[1:24, :] .= NaN32
+        A[:, 1:24] .= NaN32
+        A[400:440, 400:440] .= NaN32
+        return A
+    end
+
+    # High-pass output is mean-removed, so it straddles zero: an unsigned type needs an offset, and one
+    # gain serves both images. Clamping the filter output into `0:255` without either zeroes half the
+    # texture and leaves nothing to correlate.
+    gain = 100 / maximum(abs, fref)
+    arms = ("Float32" => (Float32.(fref), Float32.(fsec)),
+            "Float32 with no-data" => (nodata!(Float32.(fref)), nodata!(Float32.(fsec))),
+            "UInt8" => (round.(UInt8, clamp.(fref .* gain .+ 128, 0, 255)),
+                        round.(UInt8, clamp.(fsec .* gain .+ 128, 0, 255))),
+            "Int16" => (round.(Int16, clamp.(fref .* 64, typemin(Int16), typemax(Int16))),
+                        round.(Int16, clamp.(fsec .* 64, typemin(Int16), typemax(Int16)))))
+
+    p = params(; chip_size = 32, chip_size_max = 64, grid_spacing = 16, search_radius = 12,
+               preprocess = :none)
+    for (tag, (a, b)) in arms
+        # `correlate_tiled` takes the raw pair and prepares each block from its own window;
+        # `correlate_multichip` takes the prepared scene. That asymmetry is the feature being tested.
+        raw = ImagePair(a, b)
+        pair = AutoRIFT._prepare(raw, p)
+        grid = AutoRIFT._build_grid(size(raw), p)
+        AutoRIFT._warm_grid_plans(grid, p)
+        untiled = AutoRIFT.correlate_multichip(pair, grid, p)
+        # The floor that stops an all-`NaN` pair from satisfying every field comparison below.
+        @test count(isfinite, untiled.dx) > 1000
+        # 512 puts a block boundary on the feature seam at `n / 2`, which is where an under-computed
+        # halo fails; 272 does not divide the grid evenly.
+        for bs in ((512, 512), (272, 272))
+            assert_same_result(untiled, AutoRIFT.correlate_tiled(raw, grid, p, bs),
+                               "$tag, block $bs")
+        end
+    end
+end
+
+@testset "a blocked run equals an untiled one on a geogrid-shaped grid" begin
+    # Every other blocked-equals-untiled test here uses a grid `gridpoints` built: axis-aligned, every
+    # point searchable, every coordinate a real position. A *geogrid* is none of those, and each
+    # difference is load-bearing for blocking:
+    #
+    #   * the searchable set is sparse, so a block's window is sized from a subset of its points while
+    #     `_cell_max_radius!` gives the rest a neighbour's radius and searches them anyway;
+    #   * the points outside the image footprint carry a **placeholder** coordinate rather than a
+    #     position, which belongs to no block's neighbourhood.
+    #
+    # Neither holds on a `gridpoints` grid, which is why a blocked run lost 5% of a Sentinel-1 granule
+    # through 22 green golden cases with every test here passing. `tools/golden/block_gate.jl` is the
+    # same assertion against a real granule; this is the version that runs in the suite.
+    n = 1536
+    ref, sec = split_pair(n)
+    p = params(; chip_size = 32, chip_size_max = 64, grid_spacing = 16, search_radius = 12)
+    raw = ImagePair(ref, sec)
+    pair = AutoRIFT._prepare(raw, p)
+
+    base = gridpoints(size(raw), 16; chip_size = 32, search_radius = 12)
+    nr, nc = size(base)
+
+    # A footprint: searchable inside a diagonal band, placeholder outside it. Diagonal rather than
+    # axis-aligned so the boundary crosses both index directions, as a rotated radar footprint on a map
+    # grid does — and so the cells `_decimate_level` averages over straddle it.
+    inside = [abs(i - j) < 24 for i in 1:nr, j in 1:nc]
+    # The placeholder coordinate: one value shared by every point outside the footprint, which is what
+    # both producers do — `1.0` from `AutoRIFT.pointset(::PairGeometry)` and `0.5` from the reference's
+    # own rewritten grid. Its radius is zero, which is what marks the point skipped.
+    grid = AutoRIFT.rebuild(base;
+        x = [inside[i, j] ? base.x[i, j] : 1.0 for i in 1:nr, j in 1:nc],
+        y = [inside[i, j] ? base.y[i, j] : 1.0 for i in 1:nr, j in 1:nc],
+        radius_x = [inside[i, j] ? 12 : 0 for i in 1:nr, j in 1:nc],
+        radius_y = [inside[i, j] ? 12 : 0 for i in 1:nr, j in 1:nc],
+        positioned = inside)
+
+    AutoRIFT._warm_grid_plans(grid, p)
+    untiled = AutoRIFT.correlate_multichip(pair, grid, p)
+
+    # Non-vacuity, both parts. Without the first the comparison is over an empty field; without the
+    # second the placeholder population is never searched and the test passes for the wrong reason.
+    @test count(isfinite, untiled.dx) > 1000
+    @test count(i -> !grid.positioned[i] && isfinite(untiled.dx[i]), eachindex(untiled.dx)) > 0
+
+    # And some block really does need more than one read window, rather than the property holding
+    # because nothing exercised it.
+    #
+    # Asserted on a **decimated** level's point set, not on the caller's grid. The caller's grid needs one
+    # window per block — its placeholder points carry a zero radius, so they are not in the span at all.
+    # The spread appears only once `_cell_means` blends a straddling cell's placeholder into its mean
+    # coordinate, which is what a decimated level correlates.
+    layout = AutoRIFT.block_layout(grid, p, size(raw), (512, 512))
+    buf = AutoRIFT.block_buffers(ImagePair(ref, sec), layout)
+    bufrows, bufcols = size(buf.reference)
+    cs = AutoRIFT.extent(last(AutoRIFT.chip_sizes(p)))
+    decim = AutoRIFT._level_decimation(p, cs)
+    @test decim > 1
+    sub = AutoRIFT._decimate_level(grid, trues(size(grid)), decim, nothing)
+    lpts = AutoRIFT._level_points(sub.grid, p, cs, sub.wanted)
+    counts = map(AutoRIFT._coarse_block_layout(layout.blocks, sub)) do b
+        windows, _ = AutoRIFT._read_windows(lpts, b, layout.halo, size(raw), bufrows, bufcols)
+        # Every window fits the buffers, which is what keeps `process_block_size` a memory bound
+        # however the coordinates are spread.
+        for w in windows
+            @test length(w.rows) <= bufrows
+            @test length(w.cols) <= bufcols
+        end
+        length(windows)
+    end
+    @test maximum(counts) > 1
+
+    for bs in ((512, 512), (272, 272))
+        assert_same_result(untiled, AutoRIFT.correlate_tiled(raw, grid, p, bs),
+                           "geogrid-shaped, block $bs")
     end
 end
 
@@ -568,7 +858,10 @@ end
     # once: a block of `a` rows by `b` columns spans `a·∂x/∂i + b·∂x/∂j` pixels of `x`. Sizing each axis
     # from its own budget alone overshoots — 37% on the NISAR L1 grid at an 8192-pixel request.
     for (layout, want) in ((coarse, 2048), (fine, 1024)), b in layout.blocks
-        rlo, rhi, clo, chi = AutoRIFT._searchable_span(rot, b.grid_rows, b.grid_cols)
+        # The span the layout actually sized the window from: the searchable points grown by the reach
+        # of the coarse pass's radius widening, which on this grid is every point.
+        wide = AutoRIFT._widened_searchable(rot, AutoRIFT._widening_reach(p))
+        rlo, rhi, clo, chi = AutoRIFT._coordinate_span(rot, b.grid_rows, b.grid_cols, wide, true)
         isnothing(rlo) && continue
         @test rhi - rlo <= want
         @test chi - clo <= want

@@ -356,6 +356,46 @@ Three things it measures that a single `maxrss` cannot:
 The findings are in `docs/src/explanation/memory.md`: peak tracks a block's area rather than the block count, runtime
 tracks the halo, and both ends of the sweep are misconfigurations for opposite reasons.
 
+**The 480 MiB profile buffer does not inflate these peaks**, which is worth stating because it looks
+like it must. `PROFILE_SLOTS = 60_000_000` `UInt64` is allocated `undef`, so only the portion a run
+records is touched. Block 1024 px reproduces at 2.127 and 2.147 GiB through the unprofiled
+`mem_churn.jl` against 2140 MiB here.
+
+## What the peak is made of, and what moves it
+
+Three harnesses for the question `mem_blocks.jl` does not answer: not how large the peak is, but which
+term it is. `dev/plan-16gib.md` holds the findings and the plan they support.
+
+```bash
+# Stage by stage: runtime floor, grid, layout, field, warmup, peak, settled.
+julia --project=tools/ab -t 10,1 tools/ab/mem_stages.jl
+
+# One arm per process, since peak is a high-water mark. `dxsum` checks each arm is answer-preserving.
+julia --project=tools/ab -t 10,1 tools/ab/mem_churn.jl ~/data/autorift/bench 1024 ships
+julia --project=tools/ab -t 10,1 tools/ab/mem_churn.jl ~/data/autorift/bench 1024 oldcopies \
+      --with-prepare-copy --with-read-temp   # the per-block copies src/ no longer makes
+julia --project=tools/ab -t 10,1 --heap-size-hint=800M tools/ab/mem_churn.jl \
+      ~/data/autorift/bench 1024 tightheap --preprocess=highpass
+julia --project=tools/ab -t 4,1 tools/ab/mem_churn.jl ~/data/autorift/bench 1024 widehalo \
+      --radius=500 --chip-max=256 --spacing=64 --window=5120
+
+# Arithmetic, no imagery: the halo per level and per radius class on the NISAR L1 configuration.
+julia --project=. tools/ab/halo_terms.jl
+```
+
+Blocked-against-untiled at `preprocess = :none` used to live here and is now
+`test/tile.jl`'s "a blocked run equals an untiled one at preprocess = :none" — the suite is where a
+permanent coverage gap belongs, and that one is permanent rather than specific to any change.
+
+`mem_churn.jl`'s `--no-prepare-copy` and `--no-read-temp` override package internals from the script,
+so an arm measures a candidate change to `src/` without making it. Both are answer-preserving on this
+scene and the `dxsum` column is what checks that rather than asserting it.
+
+The wide-halo arm exists because the optical defaults give a 67x67 halo, where a block's window is
+1.32 Mpx and the per-task terms are negligible. A radar granule's halo is 2216-2736 px, where the
+window is 22-38 Mpx and the per-task terms are most of the peak — so a conclusion drawn at the optical
+geometry does not transfer, and the thread-count non-knob in `memory.md` is the case in point.
+
 ## The full scene: every configuration, end to end
 
 The tables above are a 3072² window, where nothing is large enough to force a choice. This one is the
