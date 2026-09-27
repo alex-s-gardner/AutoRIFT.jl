@@ -21,7 +21,7 @@ include(joinpath(dirname(@__DIR__), "ab", "memtrace.jl"))
 include(joinpath(@__DIR__, "blockspec.jl"))
 
 using Printf, Serialization
-using AutoRIFT: halo, block_layout, nsearchable
+using AutoRIFT: halo, block_layout, nsearchable, block_size_for
 
 const TRACE_DIR = joinpath(get(ENV, "AUTORIFT_GOLDEN_CACHE",
                                joinpath(expanduser("~/data/autorift/tests"), "golden_tests")),
@@ -35,8 +35,10 @@ argvalue(flag, default) = (i = findfirst(==(flag), ARGS);
 
 Correlate `c`'s captured grid once per entry in `blocks`, tracing resident memory throughout.
 
-`blocks` are block sizes in pixels as `(X, Y)` pairs, with `(0, 0)` for an untiled run, or `nothing` to
-take the ladder `_auto_blocks` derives from the halo. The imagery and the point set are read once and
+`blocks` are block sizes in pixels as `(X, Y)` pairs, with `(0, 0)` for an untiled run, `nothing` to
+take the ladder `_auto_blocks` derives from the halo, or `:default` for the two arms
+`tools/golden/e2e_table.jl` reads — untiled, and whatever `AutoRIFT.block_size_for` returns, which is
+what a caller gets unasked. The imagery and the point set are read once and
 shared, so the figures differ only in the block size — which is the comparison, and which a
 per-configuration subprocess would pay 5.4 GiB to reproduce.
 
@@ -46,7 +48,7 @@ the profiler off. It also risks a hang — a sampled multithreaded run can deadl
 macOS (`profiler_gc_deadlock.jl`), which is fatal to a long unattended sweep. Pass `false` when the
 question is how long a configuration takes rather than where it spends its memory.
 """
-function measure_case(c::GoldenCase; blocks::Union{Nothing,Vector{Tuple{Int,Int}}} = nothing,
+function measure_case(c::GoldenCase; blocks::Union{Nothing,Symbol,Vector{Tuple{Int,Int}}} = nothing,
                       n::Integer = 100, profile::Bool = true)
     k = read_capture(c; n)
     grid = pointset_from_capture(k)
@@ -60,7 +62,15 @@ function measure_case(c::GoldenCase; blocks::Union{Nothing,Vector{Tuple{Int,Int}
     @printf("%s\n", c.product)
     @printf("  scene %d x %d px, grid %d x %d, halo %d x %d px, %d searchable points\n",
             scene..., size(grid)..., h.X, h.Y, nsearchable(grid))
-    arms = isnothing(blocks) ? _auto_blocks(h, scene) : blocks
+    # `:default` is resolved here rather than at the command line because it needs the grid, which is
+    # read here and costs 5.4 GiB on a NISAR case.
+    arms = if isnothing(blocks)
+        _auto_blocks(h, scene)
+    elseif blocks === :default
+        [(0, 0), Tuple(block_size_for(grid, p, scene))]
+    else
+        blocks
+    end
     @printf("  arms: %s\n", join(_bslabel.(arms), ", "))
     flush(stdout)
 
@@ -153,12 +163,15 @@ function report_agreement(results)
 end
 
 function main()
-    isempty(ARGS) && error("usage: mem_nisar.jl <product-name-fragment> [--blocks a,b,c] [--run N]")
+    isempty(ARGS) && error("usage: mem_nisar.jl <product-name-fragment> [--blocks a,b,c|default] " *
+                           "[--run N] [--no-profile]")
     c = only(cases(ARGS[1]))
     n = parse(Int, argvalue("--run", "100"))
     spec = argvalue("--blocks", "auto")
-    blocks = spec == "auto" ? nothing : _parse_blocks(spec)
-    results = measure_case(c; blocks, n)
+    blocks = spec == "auto" ? nothing : spec == "default" ? :default : _parse_blocks(spec)
+    # Attribution costs the runtime it is measuring, so a row that feeds a timing comparison has to be
+    # taken without it — see `measure_case`.
+    results = measure_case(c; blocks, n, profile = !("--no-profile" in ARGS))
     report_agreement(results)
     mkpath(TRACE_DIR)
     # Without the fields, which are the bulk and which nothing downstream of the agreement check reads.
