@@ -95,31 +95,35 @@ M2 Max, one process per case. `jl block` is the `process_block_size` the library
 
 | case | jl block | Julia s | Python s | |
 |---|---|---:|---:|---:|
-| LC08 `009011` | 1024 | 20.9 | 180.3 | 9x |
-| LC08 `060018` | 1024 | 6.0 | 46.1 | 8x |
-| LC08 `062018` | 1024 | 8.7 | 86.2 | 10x |
-| LC09 `215109` | 1024 | 5.7 | 77.8 | **14x** |
-| LE07 `061018` (2012) | 1024 | 2.8 | 13.1 | 5x |
-| LE07 `061018` (2013) | 1024 | 6.0 | 51.6 | 9x |
-| LE07 `063018` | 1024 | 8.8 | 85.5 | 10x |
-| LT04 `063018` | 1024 | 5.1 | 60.2 | 12x |
-| LT05 `001013` | 1024 | 2.7 | 37.8 | **14x** |
-| LT05 `060018` | 1024 | 3.5 | 19.5 | 6x |
-| NISAR L1 RSLC | `3593x1843` | 590.2 | 812.2 | **1x** |
-| NISAR L2 GSLC | `2883x1531` | 286.4 | 516.4 | 2x |
-| S1A `1SSH_20150828` | 1024 | 15.4 | 111.0 | 7x |
-| S1A `1SSH_20151120` | 1024 | 10.3 | 86.8 | 8x |
-| S1A `1SSH_20170221` | 1024 | 26.0 | 173.6 | 7x |
-| S1A `1SSV_20240618` a | 1024 | 30.0 | 175.5 | 6x |
-| S1A `1SSV_20240618` b | 1024 | 12.5 | 63.7 | 5x |
-| S1B `1SDH_20180809` | 1024 | 16.1 | 111.1 | 7x |
-| S1C `1SDV_20250416` | 1024 | 12.7 | 115.8 | 9x |
-| S1C `1SSV_20250416` | 1024 | 4.2 | 33.4 | 8x |
+| LC08 `009011` | 1024 | 19.6 | 180.3 | 9x |
+| LC08 `060018` | 1024 | 6.1 | 46.1 | 8x |
+| LC08 `062018` | 1024 | 8.3 | 86.2 | 10x |
+| LC09 `215109` | 1024 | 6.1 | 77.8 | 13x |
+| LE07 `061018` (2012) | 1024 | 2.6 | 13.1 | 5x |
+| LE07 `061018` (2013) | 1024 | 6.1 | 51.6 | 8x |
+| LE07 `063018` | 1024 | 8.9 | 85.5 | 10x |
+| LT04 `063018` | 1024 | 5.0 | 60.2 | 12x |
+| LT05 `001013` | 1024 | 2.6 | 37.8 | **14x** |
+| LT05 `060018` | 1024 | 3.4 | 19.5 | 6x |
+| NISAR L1 RSLC | `3593x1843` | 467.2 | 812.2 | **2x** |
+| NISAR L2 GSLC | `2883x1531` | 247.3 | 516.4 | **2x** |
+| S1A `1SSH_20150828` | 1024 | 16.6 | 111.0 | 7x |
+| S1A `1SSH_20151120` | 1024 | 10.5 | 86.8 | 8x |
+| S1A `1SSH_20170221` | 1024 | 25.1 | 173.6 | 7x |
+| S1A `1SSV_20240618` a | 1024 | 30.1 | 175.5 | 6x |
+| S1A `1SSV_20240618` b | 1024 | 13.2 | 63.7 | 5x |
+| S1B `1SDH_20180809` | 1024 | 16.9 | 111.1 | 7x |
+| S1C `1SDV_20250416` | 1024 | 12.5 | 115.8 | 9x |
+| S1C `1SSV_20250416` | 1024 | 4.1 | 33.4 | 8x |
 | S2A `20200626` | 1024 | 3.7 | 30.8 | 8x |
-| S2B `20200612` | 1024 | 6.5 | 36.0 | 6x |
+| S2B `20200612` | 1024 | 5.9 | 36.0 | 6x |
 
-**Median 8x, best 14x, worst 1x.** The two NISAR granules are the worst because they are the largest:
-their runtime is dominated by transforms that no layout choice changes, and both sides spend it.
+**Median 8x, best 14x, worst 2x.** The two NISAR granules are the worst because they are the largest:
+the mean search window on the L1 grid is 115,000 px against 4,300 on a Landsat one, which puts both
+sides in the regime where the transform is the whole cost and the reference's per-point overhead no
+longer dominates. Measured over these cases AutoRIFT.jl sustains 31-41 G-butterfly/s of transform work
+where the reference reaches 2.3 on the smallest windows and 15.7 on the largest, so the ratio a case
+shows is mostly a statement about its window size.
 
 **Julia measures 0.875 to 1.000 of the reference's point count, median 0.987.** A run that measures fewer
 points did less work, so read the speedups with that in mind. The remaining differences are catalogued
@@ -132,12 +136,13 @@ process, which carries its interpreter and the inputs. Comparable within a colum
 
 | case | Julia untiled | Julia blocked | Python, whole process |
 |---|---:|---:|---:|
-| NISAR L2 GSLC | 56.4 GiB | **5.5 GiB** | 49.4 GiB |
-| NISAR L1 RSLC | 32.0 | **8.5** | 26.8 |
+| NISAR L2 GSLC | 56.5 GiB | **6.1 GiB** | 49.4 GiB |
+| NISAR L1 RSLC | 35.0 | **11.0** | 26.8 |
 | S1B `1SDH_20180809` | 18.9 | **0.4** | 14.9 |
 
-The whole set fits a 16 GiB machine at the default block, and every block size measured gives an answer
-bit-identical to the untiled one.
+Every block size measured gives an answer bit-identical to the untiled one — asserted on all 22 cases,
+`dx` and `dy` both, at equal point counts. The largest correlation footprint at the default block is
+NISAR L1's 11.0 GiB.
 
 Reproduce with `tools/golden/e2e_table.jl`; the full record, including block-size sweeps and the memory
 budget, is in [`dev/plan-16gib.md`](dev/plan-16gib.md).

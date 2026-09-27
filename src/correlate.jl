@@ -746,18 +746,48 @@ function next_fft_size(n::Integer)
 end
 
 """
+    AutoRIFT.RADIUS_BUCKET_RUNGS
+
+Rungs per octave on the ladder [`AutoRIFT._radius_bucket`](@ref) rounds a search radius up to.
+
+The ladder trades transform work against the size of the plan set. Coarse rungs waste work — a point
+is correlated through the next rung's transform, so the padding between its own radius and that rung
+is arithmetic on zeros — while fine rungs reach more distinct transform lengths, each needing its own
+`FFTW_MEASURE` plan and `WORKSPACE_POOL` entry.
+
+Four, because the waste is worst exactly where the work is. Search radius is skewed on a
+Geogrid-derived grid: on the NISAR L1 golden pair the median searched point has radius 34 against a
+maximum of 1905, and the **1% of points above 1024 carry 40% of the transform work**. One rung per
+octave sends all of them through the widest transform in the pass, a 1792x4096 for a 96x52 chip.
+
+Measured on that pair, whole grid, twelve threads, at the block `block_size_for` picks: **590.2 s at
+one rung per octave against 467.2 s at four**, the same 1,799,742 points. Modelled over all 22 golden
+cases the transform work is 0.692x, and no case rises. The cost is the plan set — 53 buckets to 388 on
+that pair — which is one-off per machine: the first run pays the extra planning, 110 s of it on that
+grid, and [`wisdom_path`](@ref) removes it from every run after.
+
+Finer rungs keep paying off in work and stop paying off in plans: eight per octave models 0.614x
+against four's 0.661x, for 996 buckets against 388.
+"""
+const RADIUS_BUCKET_RUNGS = 4
+
+"""
     AutoRIFT._radius_bucket(r, cap) -> Int
 
-The search radius a point of radius `r` is correlated at: `r` rounded up to a power of two, never
-above `cap`.
+The search radius a point of radius `r` is correlated at: `r` rounded up to the next rung of the
+`AutoRIFT.RADIUS_BUCKET_RUNGS`-per-octave ladder, never above `cap`.
+
+The rungs are the powers of two and the evenly-spaced steps between consecutive ones, so at four per
+octave they run 16, 20, 24, 28, 32, 40, 48, 56, 64. Integer arithmetic throughout: a rung is
+`h * (k + s) ÷ k` for the power of two `h` below `r`, so the ladder is exact rather than a rounding of
+a logarithm.
 
 **Why a point is not correlated at its own exact radius.** A workspace sizes its FFT buffers from its
 extents, so an exact radius would mean a distinct transform length — and therefore a distinct FFTW
 plan and a distinct pool entry — per point. `WORKSPACE_POOL` is keyed on geometry, so that defeats
 pooling entirely, and planning a size never seen before costs 116-347 ms at the sizes `plan_flags` gives
-`FFTW_PATIENT` and far more above its threshold.
-Rounding to a bounded ladder keeps both amortised: a real scene reaches a few dozen buckets, each
-reused by thousands of points.
+`FFTW_PATIENT` and far more above its threshold. A bounded ladder keeps both amortised: a real scene
+reaches a few hundred buckets, each reused by thousands of points.
 
 **Why the cap, which is the pass maximum.** Without it the rounding can land *above* the extent the
 pass was sized for — radius 1905 rounds to 2048, needing a 2304x4608 transform where the point itself
@@ -774,7 +804,16 @@ the whole set does — see [`AutoRIFT.PassGeometry`](@ref).
 @inline function _radius_bucket(r::Integer, cap::Integer)
     r <= 0 && return 0
     r >= cap && return Int(cap)
-    return min(1 << (ceil(Int, log2(r))), Int(cap))
+    ri = Int(r)
+    # The power of two at or below `r`. A radius already on a rung is its own bucket, which is what
+    # keeps the ladder from rounding a power of two up to the next step above it.
+    h = 1 << (8 * sizeof(ri) - leading_zeros(ri) - 1)
+    ri == h && return h
+    for s in 1:(RADIUS_BUCKET_RUNGS - 1)
+        m = (h * (RADIUS_BUCKET_RUNGS + s)) ÷ RADIUS_BUCKET_RUNGS
+        m >= ri && return min(m, Int(cap))
+    end
+    return min(h << 1, Int(cap))
 end
 
 # ---------------------------------------------------------------------------

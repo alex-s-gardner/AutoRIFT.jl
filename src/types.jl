@@ -828,10 +828,10 @@ The largest chip and search radius any point in a pass uses.
 Two [`AutoRIFT.Extent`](@ref)s: the largest `chip` and the largest `radius`.
 
 These **bound** the pass rather than describing every point in it. A point is correlated at its own
-radius rounded up to a power of two and clamped to `radius` (`AutoRIFT._radius_bucket`), and
-that bucket sizes the workspace it runs through — so a pass executes one transform length per bucket
-its points reach, not one for the whole pass. The `chip` extent is the transform's other dimension and
-is uniform within a level.
+radius rounded up to a rung of the ladder in `AutoRIFT.RADIUS_BUCKET_RUNGS` and clamped to
+`radius` (`AutoRIFT._radius_bucket`), and that bucket sizes the workspace it runs through — so a pass
+executes one transform length per bucket its points reach, not one for the whole pass. The `chip`
+extent is the transform's other dimension and is uniform within a level.
 
 Transform length is not free of the answer: a different length reassociates the same floating-point sum
 differently. Two lengths agree to about 1e-7 on `correlation`, and a peak's *location* almost always

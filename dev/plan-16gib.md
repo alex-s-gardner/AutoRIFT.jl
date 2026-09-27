@@ -1321,3 +1321,70 @@ non-determinism, read-window shortfall, filter erosion, the multi-window and til
 shortfall above, and integral-table precision — the tables accumulate in `Float64` and a UInt8 scene sums
 to ~3.1e10, exact, so scene-versus-block accumulation cannot differ. It does not affect any case at its
 default. `dev/CORRECTNESS.md` carries it as an open item.
+
+## A finer radius bucket: NISAR L1 590.2 -> 467.2 s
+
+`_radius_bucket` rounds a point's search radius up before it picks a workspace, so the transform a point
+executes is the rung's and not its own. Rounding to a power of two wastes the gap, and on a
+Geogrid-derived radius field that gap is where the work is: on the NISAR L1 grid the median searched
+point has radius 34 against a maximum of 1905, and **the 1.03% of points above 1024 carry 40.3% of the
+transform work**, each through a 1792x4096 transform for a 96x52 chip.
+
+| bucket X x Y | transform | points | % points | % transform work |
+|---|---|---:|---:|---:|
+| 1905x830 (the cap) | 1792x4096 | 19,329 | 1.03% | **40.3%** |
+| 1024x512 | 1152x2304 | 30,240 | 1.62% | 21.4% |
+| 256x128 | 320x640 | 232,812 | 12.44% | 10.5% |
+
+The top 5% of points carry 77%. Modelled as `3 * A * log2(A)` over each case's own radius field, a
+power-of-two ladder costs **1.73x** the work the exact radii need on that grid, and a ladder of four
+rungs per octave — the powers of two and the evenly spaced steps between them — recovers most of it:
+0.661x on NISAR L1, 0.751x on L2, 0.692x over the whole set, with no case above 1.000x.
+
+`RADIUS_BUCKET_RUNGS` is 4 rather than 8 because the work keeps improving and the plan set stops: eight
+per octave models 0.614x against four's 0.661x, for 996 buckets against 388.
+
+### Measured, all 22 cases at the default block, 12 threads
+
+The two arms `e2e_table.jl` reads, one process per case, FFTW wisdom warm on both sides of the
+comparison.
+
+| | power of two | four per octave | ratio |
+|---|---:|---:|---:|
+| NISAR L1 RSLC | 590.2 s | **467.2 s** | 0.79 |
+| NISAR L2 GSLC | 286.4 | **247.3** | 0.86 |
+| the other 20 together | 206.1 | 207.3 | 1.01 |
+| all 22 together | 1084.2 | 990.5 | 0.91 |
+
+**The win is the two NISAR cases and nothing else**, which is what the concentration above predicts: the
+twenty small cases model at 0.75-0.95x of their transform work and measure level, because at 2.6-30 s
+their wall clock is dominated by costs that do not scale with the transform. The same effect bounds the
+NISAR gain below its model — L1 measures 0.79x against a modelled 0.66x. Against the reference the set
+goes from median 8x, worst 1x to **median 8x, worst 2x**.
+
+### What it costs
+
+**Peak rises at a given block**, because a run visits more distinct workspace geometries: NISAR L1 goes
+10.99 GiB above the harness floor at its default block against 8.47, and L2 6.09 against 5.54. The
+default block itself does not move — `_block_size_for` derives it from the halo, and the halo is the pass
+maximum rather than a bucket. `block_budget.jl` has not been re-run against the raised footprint.
+
+**The plan set grows**, 53 buckets to 388 on NISAR L1. That is one-off per machine: on the whole L1 grid
+the first run after the change took 500.9 s and the second 390.9 s at 10 threads, the 110 s difference
+being `FFTW_MEASURE` on sizes no earlier run had measured, which `wisdom_path` then persists.
+
+### Agreement
+
+`dx` and `dy` are bit-identical between a blocked run and an untiled one on all 22 cases at equal point
+counts, and the point-count ratio against the reference is unchanged at 0.875 to 1.000, median 0.987.
+
+Against the *previous ladder* the answer moves only where a transform length changed and the last bits
+reached a plateau. Whole-grid NISAR L1, 1,799,746 points measured either way with no point gained or
+lost: `dx` differs on 0.055% and `dy` on 0.059%, median difference 4.3e-4 px among those, 18 and 27
+points past one refinement step, nothing past 0.5 px, `correlation` by at most 0.017.
+
+`regate.jl --all` reports 8 green and 2 red, neither red attributable to the change: `3.nisar` red on
+NISAR L2 `dy` correlation 0.97988 against a 0.99 bound, which the power-of-two ladder reproduces to every
+digit on all four gated statistics, so the bound is stale rather than crossed; and `5.e2e` red on all 15
+cases at `scene_footprint`, a GDAL open failure on native granules that are not on this machine.
+`Pkg.test()` passes at one thread and at eight.
