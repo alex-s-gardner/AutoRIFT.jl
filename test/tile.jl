@@ -59,6 +59,12 @@ using AutoRIFT: ImagePair, gridpoints, params, scatter, issearchable,
     # negative reach says "not blockwise-reproducible" rather than naming a large number that would
     # merely be less wrong.
     @test AutoRIFT.filter_reach(Deramp()) < 0
+    # `Destripe` is the same answer for the same reason, and it is the one that cannot be measured by
+    # padding: its band-reject verdict comes from the whole image's spectrum, so a window's own
+    # spectrum gives a different verdict and the output differs *everywhere*, not near an edge. A
+    # reach of 0 — which `filter_width ÷ 2` yields, since the filter has no window — would make the
+    # blocked path accept it and destripe every block against its own spectrum.
+    @test AutoRIFT.filter_reach(Destripe(; along_track = 71.6, cross_track = -20.2)) < 0
     # And every other method returns something usable as a width, so a caller checking the sign has
     # a complete answer. Asserted across the whole set rather than for `Deramp` alone: the negative
     # value is a second kind of answer from one function, and the guard below is what stops it being
@@ -121,6 +127,13 @@ using AutoRIFT: ImagePair, gridpoints, params, scatter, issearchable,
     grid = gridpoints((n, n), 32; chip_size = 32, search_radius = 25)
     @test_throws "no halo fixes that" AutoRIFT.halo(
         grid, params(; preprocess = :deramp, similarity = :coherence), (n, n))
+    # Both entry points, and for `Destripe` as well: a caller sizing a block ahead of a run asks
+    # `halo(p)`, and a reach that leaked through either form would be added to a correlation extent
+    # and silently accepted.
+    for p in (params(; preprocess = Destripe(; along_track = 71.6, cross_track = -20.2)),
+              params(; preprocess = :deramp, similarity = :coherence))
+        @test_throws "no halo fixes that" AutoRIFT.halo(p)
+    end
 end
 
 @testset "halo is the sum of the reaches, not the largest" begin
@@ -339,8 +352,9 @@ end
 
 @testset "block_size_for is a multiple of the halo, floored" begin
     # The rule is `BLOCK_HALO_MULTIPLE` times the halo per axis, floored at `BLOCK_FLOOR` and clamped to
-    # the scene, fitted to `tools/golden/block_optimum.jl`'s sweep of all 22 golden cases. Each property
-    # is asserted on the configuration that isolates it.
+    # the scene, fitted to `tools/golden/block_optimum.jl`'s sweep of all 22 golden cases under the
+    # objective `tools/golden/block_budget.jl` scores — least wall clock among the arms whose peak fits
+    # 16 GiB. Each property is asserted on the configuration that isolates it.
     n = 4096
     p = params(; chip_size = 32, chip_size_max = 32, grid_spacing = 16, search_radius = 25)
     h = AutoRIFT.halo(p)
