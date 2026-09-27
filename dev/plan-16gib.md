@@ -1224,8 +1224,93 @@ comparison or `block_gate.jl --stride 1`.
 Above-floor peak runs **0.29 to 9.70 GiB**, so with a production floor near 2 GiB the whole set fits 16 GiB
 with NISAR L1 worst at about 11.7.
 
+### Re-swept after the `fits` fix: the whole ladder is admissible
+
+`dev/CORRECTNESS.md` item 1b — `_pass_geometry` deciding `fits` one pixel short of the frame the loop
+indexes — was the reason 12 arms across four cases did not reproduce an untiled run, NISAR L1 among them
+at every arm but 6144. With it fixed, `block_optimum.jl` over all 22 cases at 12 threads measures **157
+arms, 0 disagreements, 0 failures, 0 rejections**: every size on every case now reproduces untiled
+exactly, so the whole ladder is a candidate rather than most of it.
+
+That matters because the arms that used to be struck out were the *small* ones, which is where peak is
+lowest. Choosing on peak alone now reaches 7.71 GiB above floor worst-case against the 9.70 the default
+gave.
+
+**The fix also moves the untiled baseline by a handful of points**, since a point whose window ends on the
+last row or column is now measured instead of silently dropped: `LE07_L1TP_061018_20120428` +16 and
+`S1A_IW_SLC__1SSH_20150828` +16, `LC08_L1TP_009011` -4 and `LC08_L1TP_062018` -2 — the losses being
+outlier-filter cascades from the gains. So the *reference* comparison has to be re-run; the figures below
+are blocked-against-untiled and say nothing about agreement with Python.
+
+**Two objectives, and they disagree on 20 of 22 cases.** `pick` minimizes peak and breaks ties on runtime
+within 3%; `block_budget.jl` minimizes runtime subject to a peak budget. Over the set:
+
+| objective | total wall | worst above-floor peak | in production at a 2 GiB floor |
+|---|---:|---:|---:|
+| fastest arm fitting 16 GiB | 1040 s | 8.72 GiB | ~10.7 GiB |
+| minimum peak | 1156 s | 7.71 GiB | ~9.7 GiB |
+| untiled everywhere | 1105 s | unbounded | — |
+
+So minimizing peak costs **1.11x** wall clock over the set — but the set total is dominated by the two
+NISAR cases, and per case the cost is much larger: **2.02x** on `S1A_IW_SLC__1SSV_20240618T025533`
+(10.6 s at 1.03 GiB against 21.4 s at 0.09 GiB), 2.01x on `1SSV_20240618T025528`, 1.95x on
+`1SSH_20151120`. Every one of those trades about 1 GiB of peak — against a 14 GiB allowance — for half the
+runtime. On this evidence peak is the wrong objective for any case that is not near the budget, and only
+NISAR L1 is.
+
+The binding rows:
+
+| case | fastest fitting | minimum peak |
+|---|---|---|
+| NISAR L1 | `3648x1856`, 8.72 GiB, 584.4 s | `4096`, 7.71 GiB, 591.8 s |
+| NISAR L2 | `2944x1536`, 5.84 GiB, 283.4 s | `3072`, 3.70 GiB, 312.9 s |
+| the twenty others | 0.01-1.83 GiB, 1.1-26.1 s | 0.00-0.47 GiB, 1.5-52.4 s |
+
+**A caveat on `pick`, which the fitted default rests on.** It ranks arms by *absolute* peak, and the arms
+of one case share a process whose floor grows as earlier arms' `dx`/`dy` are retained — so the absolute
+figure drifts upward through a sweep and penalizes whichever arms ran last. `block_budget.jl` ranks on
+above-floor peak in both columns for that reason. Re-fitting `BLOCK_HALO_MULTIPLE` should use the
+above-floor figure; the two rank differently on at least `LC09_L1GT_215109`, where absolute peak prefers
+768 px and above-floor prefers 512.
+
 **Julia against Python, 22 of 22: median 8x, worst 1x, best 14x** (`e2e_table.jl`). The Python side is
-unchanged by any of this. The speedups are lower than the pre-fix table reported — median 9x, best 25x —
+unchanged by any of this.
+
+### Re-measured after the `fits` fix, unprofiled
+
+Every figure in the table above was taken with the profiler on, because `mem_nisar.jl`'s entry point had
+no way to turn it off; `--no-profile` is now that way, and `--blocks default` measures the two arms this
+table reads without naming sizes per case. Re-measured on the current library, one process per case:
+
+| | above-floor peak at default | wall at default | vs Python |
+|---|---:|---:|---:|
+| NISAR L1 @ `3593x1843` | 8.47 GiB | 590.2 s | 1x |
+| NISAR L2 @ `2883x1531` | 5.54 GiB | 286.4 s | 2x |
+| the twenty others @ `1024` | -2.65 to 0.90 GiB | 2.7-30.0 s | 5-14x |
+
+**Julia against Python, 22 of 22: median 8x, min 1x, max 14x** — unchanged from the profiled table, so the
+fix costs nothing against the reference. Every row is measured at the block `block_size_for` actually
+returns, none at a fallback.
+
+**The above-floor peak of a small case is not comparable across sweeps, and this is where that shows.**
+The figure is each arm's peak less the floor sampled just before it, and that floor carries whatever the
+process already holds — so it depends on how many arms ran first. These rows come from a two-arm process
+where the table above came from a twelve-arm ladder, which is why the twenty others read -2.65 to 0.90
+here against 0.29 to 1.32 there, including values below zero when the collector returned pages during the
+run. Read the runtimes as exact, NISAR's peaks as meaningful against a large harness floor, and the small
+cases' peaks as "within about a gigabyte of the floor either way" rather than as a difference.
+
+What is comparable within one process is blocked against untiled, and it is the reason blocking exists:
+NISAR L2 peaks **56.39 GiB above floor untiled against 5.54 blocked**, L1 31.99 against 8.47, and the
+Sentinel-1 cases 5.25 to 18.86 against 0.13 to 0.90. Runtime at the default beats untiled on eighteen of
+the twenty-two and is level on the rest — NISAR L1 590.2 s blocked against 587.1 untiled, L2 286.4 against
+282.2.
+
+**Point counts move by at most 0.013%.** The `fits` fix changes the default arm's count on five of the
+twenty-two: `S1A_1SSV_20240618T025528` +19, `LC08_062018` +4, `S1A_1SSV_20240618T025533` +4,
+`LC08_009011` -4 and `S1C_1SDV_20250416` -64, against totals of 0.5 to 1.8 million. Julia measures 0.875
+to 1.000 of Python's count with a median of 0.987, and that gap is the standing items in
+`dev/CORRECTNESS.md`, not this change. The speedups are lower than the pre-fix table reported — median 9x, best 25x —
 and that gap is the cost of the correct halo: a wider halo is a wider window and more read amplification.
 The small cases pay most of it in relative terms because their runtime is dominated by fixed costs, and
 NISAR L1 is the one case the fix made faster.

@@ -487,14 +487,18 @@ case's untiled run, so every row scored is answer-preserving. A fixed size canno
 per-case optima span 128 px to 6144 px and `2240x1152`, so the rule has to be relative to something,
 and the halo is what sets both failure modes above.
 
-**A caveat on that sweep, because it is easy to over-read.** It was run before
-`_inflate_for_decimation!` corrected the halo, and a rule expressed as a multiple of a *broken* halo
-does not transfer to a corrected one — the sweep preferred a multiple of 2, which at the corrected halo
-picks about 110 blocks on NISAR L1 and cannot be balanced across twelve threads. The multiple is 1 for
-that reason, and because 1x is the configuration measured to reproduce an untiled run on NISAR L1, the
-hardest case. Re-fitting properly means re-sweeping against the corrected halo and scoring each rule's
-*actual pick* rather than the nearest measured arm — which is what understated the cost last time:
-NISAR L2's default measured 1.50x its own optimum where the score said 1.30x.
+**The objective is wall clock subject to peak memory fitting 16 GiB**, not minimum peak. Those choose
+differently: over the golden set, minimizing peak costs 1.11x the runtime, and up to 2.02x on a single
+Sentinel-1 case, for about a gigabyte against a budget with more than ten to spare. Peak is worth
+minimizing only where it binds, and on the measured set nothing binds — the widest rule tried peaks
+13.22 GiB above the harness floor and the shipped one 8.72.
+
+Scored against every arm of every case, `1x` with a `1024` floor is the optimum in both terms the rule
+has. The multiple is set by the two NISAR cases, which are 83% of the set's wall clock: 1x measures 0.99x
+of the per-case best, 2x measures 1.33x and 3x measures 1.53x, because a larger block is fewer blocks and
+twelve threads cannot balance them. The floor is set by the other twenty, whose halo it exceeds: 1.05x at
+1024 or 1536, 1.08x at 768, 1.15x at 512, 1.10x at 2048 and 1.25x at 4096. The worst single case is 1.47x,
+on one that runs in 1.6 s.
 
 **Why a multiple of the halo rather than a block count.** An earlier form maximized the size subject
 to `blocks_per_thread * nthreads` pieces, and the count it produced does not track the optimum: at the
@@ -530,16 +534,19 @@ end
 # Multiples of the halo to make a block, and the floor below which the halo stops being the binding
 # term. `tools/golden/block_optimum.jl`'s sweep of all 22 golden cases is what these are fitted to.
 #
-# **The multiple is 1, which makes the default the smallest block the halo permits**, and that is a
-# deliberate reversal. A sweep against the *old* halo preferred 2, but that halo was short of what a
-# decimated level reaches (see `_inflate_for_decimation!`), so 1x of a correct halo is a larger block
-# than 1x of a broken one and the fit does not carry over. At the corrected halo, 2x picks 7186x3686 on
-# the golden NISAR L1 case — about 110 blocks, where one block holds a large share of the granule and
-# the twelve threads cannot balance it — against 3696 blocks at 1x, which is also the configuration
-# measured to reproduce an untiled run there.
+# **The multiple is 1, which makes the default the smallest block the halo permits.** At 2x, NISAR L1's
+# default is 7186x3686 — about 110 blocks, one of which holds a large share of the granule, so twelve
+# threads cannot balance it; 1x gives 3696 blocks. Measured over the ladder, the two NISAR cases run
+# 0.99x of their own best at 1x against 1.33x at 2x and 1.53x at 3x, and they are 83% of the set's wall
+# clock.
 #
 # The floor is what stops 1x being a bad trade on a narrow halo: a block equal to a 50 px halo reads 9x
-# its own area, and on every optical case the halo is under 400 px so the floor is what binds.
+# its own area, and on every optical case the halo is under 400 px so the floor is what binds. Across
+# those twenty cases the floor measures 1.05x of their best at 1024, tying 1536, against 1.08x at 768,
+# 1.15x at 512 and 1.25x at 4096.
+#
+# Both figures are wall clock, because that is the objective: every rule tried leaves peak well inside
+# 16 GiB, so the budget selects none of them. See `block_size_for` and `tools/golden/block_budget.jl`.
 const BLOCK_HALO_MULTIPLE = 1
 const BLOCK_FLOOR = 1024
 
