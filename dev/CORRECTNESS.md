@@ -103,57 +103,132 @@ reference measures at a real position. For those a blocked window is short by te
 because `_searchable_span` reduces over each point's *own* radius, and that is an ordinary layout fix with
 bounded cost, independent of this file. It is item 3b of `dev/plan-16gib.md`.
 
-## 1b. A blocked run differs at a handful of points below the default block size
+## 1b. Closed: `fits` was decided one pixel short of the frame the loop indexes
 
-**Open, cause not identified, and listed here so it is not rediscovered from scratch.** At block sizes
-*below* what `block_size_for` returns, a blocked run differs from an untiled one at a few points: three of
-843,539 on the golden S2B case at 512 px, and the equivalent on S2A, `S1A_IW_SLC__1SSH_20150828` and
-NISAR L1 at their own small sizes. Every case agrees exactly at its default, so this does not affect a
-production run.
+**Fixed. Kept here because the mechanism is worth knowing and because nine hypotheses were ruled out
+before it, each at the cost of a granule run.**
 
-Ruled out by measurement, each at the cost of a run:
+`_pass_geometry` decides whether a pass needs zero padding at all, by testing every searchable point's
+window with `inbounds` against the array it was handed. `track!` then runs the loop on
+`_shift_points(flat, pad)`, which adds **half a pixel on both axes even when the pad is zero** — the
+offset that makes an even chip's reported position refer to its true centre. `search_bounds` truncates,
+so `floor(x + 0.5)` exceeds `floor(x)` by one whenever `x` is a half-integer, which every gridded
+coordinate is. The window the loop reads is therefore one pixel further right and down than the window
+`fits` approved.
+
+When a point's window ended exactly on the last row or column, `fits` said "in bounds", no padding was
+applied, and `_track_bucket!` then dropped the point at `checkbounds(Bool, ref, win_rows, win_cols) ||
+continue` — no measurement, no warning. On the golden S2A case at 768 px, for grid point (952, 35):
+
+| | x in the pass frame | search columns | against a 609-column frame |
+|---|---|---|---|
+| `fits` test, pre-shift | 593.5 | 575:609 | inside, so `fits = true` and nothing is padded |
+| the loop, post-shift | 594.0 | 576:**610** | outside, so the point is skipped |
+
+The `+2` slack on `pad` exists to absorb exactly this half pixel; `fits` had no equivalent. The fix
+tests `inbounds` against an image one pixel smaller on each high side, which is exactly the worst case
+of `floor(x + 0.5) - floor(x)`, and `test/track.jl` pins it with a point placed on the boundary plus a
+control one pixel inside that must still take the unpadded path.
+
+**Why it was invisible untiled and routine blocked.** A whole-scene pass is handed the scene, and
+`gridpoints` insets; more to the point, some other point in a whole-grid set is usually genuinely out of
+bounds, so `fits` is already `false` and the pad absorbs everything. A block's read window is its own
+points' span grown by the halo and **clipped to the scene**, so it ends exactly at some point's reach
+routinely — which is why the failures sat at the scene's corner, at block edges, and appeared and
+disappeared with the partition rather than monotonically with block size.
+
+**It affects the untiled path too, and recovers points there.** On
+`S1A_IW_SLC__1SSH_20150828` the untiled run measured 1,371,832 points before the fix and **1,371,848**
+after: 16 points at the scene edge that were being dropped are now measured, as the reference measures
+them. S2A (594,650) and S2B (614,195) are unchanged. So the golden set has to be re-run before this is
+believed as an agreement number — the blocked/untiled equality below is verified, the reference
+comparison is not.
+
+**Verified** with `block_gate.jl --stride 1` on every size that used to fail: S2A at 192, 384, 576, 768
+and 1024 px, S2B at 384, 512 and 768, `S1A_IW_SLC__1SSH_20150828` at 384x192 and 768x384. All pass with
+0 lost, 0 gained and 0 moved. Then over the whole set: `block_optimum.jl` across all 22 cases at 12
+threads measures **157 arms, 0 disagreements** — every size on every case reproduces an untiled run
+exactly, where 12 arms across four cases did not before. `dev/plan-16gib.md` carries what that does to the
+block-size choice.
+
+### How it was found, after two point replays failed to find it
+
+Worth recording, because probing outward from a symptom found identical inputs twice and cost two
+granule runs each time:
+
+- `block_moved.jl` asks for seam statistics on the points that **differ**. `block_agreement.jl` asks it
+  of the points that are **lost**, and S2A loses none, so that discriminator read an empty set. The 31
+  differing points turned out to have median distance 0.0 grid points to their own block's edge, 61.3%
+  exactly on an edge, against 11.4% over all 594,650 measured points — one contiguous patch at grid rows
+  949-954, columns 31-41, straddling the corner where four blocks meet.
+- Replaying one point showed the chip-24 pass receiving **bit-identical** imagery, geometry and prior in
+  both runs while still ending up with a different answer, because its `chip_size` moved from 24 to 48:
+  levels run finest-first and contribute only where no finer level succeeded, so a point changes hands
+  when a *gate* verdict moves rather than when a measurement does. That point was a consequence.
+- Replaying all 31 at once found **0 of 113** nodes with differing inputs, and both runners padding the
+  same 857 of 941 pass records, always past the scene's own edge. So the divergence was not in any data
+  the correlator receives.
+- A **stage diff** — dumping each level's assembled arrays from both runners and comparing in pipeline
+  order — put the first difference at chip 24, `07_fine_searched`, at exactly one point, which was the
+  seed. That is the measurement to take first next time: it localizes in the pipeline rather than in
+  space, and no hypothesis about where to look is needed.
+
+Ruled out along the way, each at the cost of a run, and all still true:
 
 - **Run-to-run non-determinism.** Two blocked runs at one block size differ from each other at 0 points
   and from untiled at the same 3. That also excludes FFTW plan selection, a real candidate since
   `src/plans.jl` plans with `MEASURE` and so chooses an algorithm by timing.
-- **Read-window shortfall.** `_block_window_shortfall` stays silent for the whole run.
+- **Read-window shortfall.** `_block_window_shortfall` stays silent for the whole run — and could not
+  have caught this, since it evaluates `search_bounds` on the same pre-shift coordinates `fits` does and
+  so agrees with it.
 - **Filter erosion at a window edge.** The golden path runs `preprocess = :none`, so `_filter_halo` is 0.
+- **The image the correlator sees.** Every failing case runs `preprocess = :none` over imagery the
+  reference already quantized whole-image, and on S2A that imagery is `UInt8`, for which
+  `_prepare_block`'s `replace_nonfinite!` is a no-op by dispatch. No filter and no rescaling executes
+  inside either run, so neither a windowed filter's edge nor a whole-image statistic was available as a
+  mechanism.
 - **The multi-window and tiling machinery.** 2048 px uses up to 12 windows per block and agrees exactly
   where 512 px uses 6 and does not.
 - **The halo shortfall of item 2's neighbourhood** — `_inflate_for_decimation!` fixed a genuine 396 px
   shortfall on NISAR L1 and did not change S2B's three points.
-- **Integral-table precision.** `src/integral.jl` accumulates in `Float64`; a UInt8 scene sums to about
-  3.1e10, exact in `Float64`, so a whole-scene table and a window-sized one cannot disagree.
+- **Integral-table precision.** A table is built per *point*, over that point's own search window, so
+  the origin it accumulates from is the same in both runs.
+- **Rebasing a coordinate into the block's frame.** `_block_points` subtracts an integer, and both the
+  coordinates and the priors are `Float32`-derived, so every such subtraction is exact: the cut window
+  differs at **0 of 697,765** searchable points.
+- **Alignment against the decimation strides**, and **a short trailing block** — S2A at 576 px and 768 px
+  give identical remainders of their grid-points-per-block against every level decimation and disagreed
+  about the verdict; 192 px divides the grid exactly and failed where 512 and 1024 divide it unevenly and
+  passed.
 
-**It is not monotone in block size, which rules out "the window is simply too tight".** Swept with
-`block_gate.jl --blocks sweep --stride 1`, the golden S2A case passes at 512 and 576 px and **fails at
-768** — a larger block — while also failing at 192 and 384. S2B fails at 384 and 512 and passes at 768 and
-above; `S1A_IW_SLC__1SSH_20150828` fails only at 384x192 of eleven sizes.
+## 1c. A box filter's output depends on whether its input has a gap, above `Float32`
 
-Two further mechanisms ruled out by that sweep:
+**Open, and independent of item 1b.** `_masked_boxmean!` begins `all(mask) && return windowmean!(out, img,
+w)`, handing `img` to the dense path in its own element type. The masked path below it cannot: it encodes
+invalidity as `NaN` in a `Float32` scratch, so every element is narrowed to `Float32` first. The two
+therefore form different terms — `Float64(img[i])` against `Float64(Float32(img[i]))` — and the branch is
+chosen per call, from the mask of whatever window was passed.
 
-- **Alignment against the decimation strides.** S2A at 576 px and at 768 px give *identical* remainders
-  of their grid-points-per-block against every level decimation — `0/0 0/0 2/2 2/2` — and disagree about
-  the verdict. So how a block's extent divides against the strides a decimated level walks is not it.
-- **A short trailing block.** 192 px divides that grid exactly, 130 blocks by 130, and still fails; 512
-  and 1024 divide it unevenly and pass.
+A blocked run chooses it per block. An interior block of a scene that carries no-data has a gap-free window
+and takes the dense path; the scene took the masked one. Measured on a 256² field at `width = 5` with one
+invalid pixel in a far corner, comparing interior pixels no window of which touches it:
 
-`tools/golden/block_bisect.jl` localizes it to the outlier filter on `dx`, but with rejection off `dy`
-still differs at 13 points, so the seed is upstream of the filter. The differing points are overwhelmingly
-*positioned* rather than placeholder, and include both lost points and moved ones, so it is not confined to
-the placeholder population either.
+| eltype | box mean | through `Highpass(5)` | through `Wallis(5)` |
+|---|---|---|---|
+| `Float32`, `UInt8`, `Int16`, `Int32` | 0 of 22,801 | 0 | 0 |
+| `Float64` | 987 differ, max 1.2e-4 | 1,036 differ, max 1.2e-4 | 1,036 differ, max 1.6e-4 |
 
-**The gate now sweeps**, so a recurrence is visible rather than latent: `--blocks sweep` walks
-`blockspec.jl`'s ladder against a single untiled run. `--blocks 0` checks what `block_size_for` returns,
-which is the size a caller actually gets and the one that must never regress.
+So it bites only where narrowing to `Float32` loses bits, which excludes every sensor type and the golden
+set. It is reachable through the public API — `autorift` on `Float64` imagery with the default
+`preprocess = :highpass` and a `process_block_size` — and on a 768² `Float64` synthetic with a no-data
+border and an interior hole it did **not** move a displacement at four block sizes, so what is established
+is an inconsistency in the filter rather than a changed answer.
 
-**The probe to run next, stated because eliminating mechanisms from the outside has stopped paying.** Nine
-hypotheses have been ruled out above and each cost a granule run; the tenth is not worth guessing. Take one
-of the 31 points S2A moves at 768 px, and compare the *correlation surface* blocked against untiled at that
-single point — `tools/golden/level_replay.jl` replays a level on chosen inputs, which is the machinery for
-it. That answers whether the two see different imagery, a different search window, or the same surface with
-a different peak chosen, and those three call for entirely different fixes. Doing that first would have been
-cheaper than the last four eliminations.
+`_masked_boxstd` narrows unconditionally, so within one `Wallis` call the mean and the variance already
+disagree about precision. That argues for narrowing on both paths, which also matches the reference, whose
+`loadProduct` casts to `float32` and whose every per-pixel expression is `float32` after it — at the cost of
+a window-sized `Float32` temporary for input that is not already exact in it. Preserving precision instead
+would mean the scratch and `BlockBuffers.filter_scratch` following the image's element type.
 
 ## 2. Decimate a coarse level with the mask, not the fill value
 

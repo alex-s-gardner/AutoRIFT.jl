@@ -383,6 +383,43 @@ end
     @test !isnan(d.dx[1])
 end
 
+@testset "a pass pads when the half-pixel shift moves a window off the image" begin
+    # `_pass_geometry` decides whether the pass pads at all, so its verdict has to describe the frame
+    # the loop will index. `_shift_points` adds half a pixel on both axes *even when the pad is zero*,
+    # and `search_bounds` truncates, so `floor(x + 0.5)` exceeds `floor(x)` by one whenever `x` is a
+    # half-integer — which every gridded coordinate is. A point whose unshifted window ends on the
+    # last column therefore needs one column more once shifted.
+    #
+    # Deciding from the unshifted window runs the pass unpadded and `_track_bucket!` then drops the
+    # point at `checkbounds`: a `continue`, with no measurement and no warning. That is invisible on a
+    # whole-scene pass, whose array is the scene and which usually pads for some other point anyway,
+    # and routine on a block, whose read window is its points' span grown by the halo and clipped —
+    # so it ends exactly at some point's reach. It made a blocked run disagree with an untiled one at
+    # 31 points of the golden S2A case at 768 px.
+    n = 64
+    chip, radius = 24, 6
+    reach = chip ÷ 2 + radius - 2          # how far right of the coordinate `search_bounds` extends
+    pair = ImagePair(synthetic_texture(n; seed = 3), synthetic_texture(n; seed = 4))
+    p = params(; chip_size = chip, chip_size_max = chip, search_radius = radius,
+               subpixel = :none, preprocess = :none)
+
+    # Placed so the unshifted window ends exactly on the last row and column.
+    edge = pointset([n - reach + 0.5], [n - reach + 0.5];
+                    chip_size = chip, search_radius = radius)
+    @test last(AutoRIFT.search_bounds(edge, 1)[2]) == n
+    @test !AutoRIFT._pass_geometry(edge, (n, n))[4]
+    d = track(pair, edge, p)
+    @test d.searched[1]
+    @test !isnan(d.dx[1])
+
+    # One pixel further in the shifted window is inside, and the pass must still take the unpadded
+    # path — the control that keeps the margin from becoming a blanket "always pad".
+    inside = pointset([n - reach - 0.5], [n - reach - 0.5];
+                      chip_size = chip, search_radius = radius)
+    @test AutoRIFT._pass_geometry(inside, (n, n))[4]
+    @test track(pair, inside, p).searched[1]
+end
+
 @testset "the validity mask pads lazily and reads as the materialized one" begin
     # A padded pass takes `PaddedMask` where the imagery takes `_zeropad`, because the mask's one
     # consumer short-circuits while `_zeropad` of a packed mask expands it eightfold — 3.13 GiB on a

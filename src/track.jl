@@ -305,7 +305,16 @@ function _pass_geometry(pts::PointSet, imagesize::Tuple{Int,Int})
         # Whether this point's window lies inside the unpadded image, which decides whether
         # padding is needed at all. One comparison per point, against the alternative of
         # allocating and filling three full-size copies unconditionally.
-        fits &= inbounds(pts, i, imagesize)
+        #
+        # Tested against an image one pixel smaller on each high side, because this has to describe
+        # the frame the loop will index rather than the one the coordinates are in now.
+        # `_shift_points` adds half a pixel on both axes *even when the pad is zero*, and
+        # `search_bounds` truncates, so `floor(x + 0.5)` exceeds `floor(x)` by one whenever `x` is a
+        # half-integer — which every gridded coordinate is. A window ending on the last row or column
+        # is therefore out of bounds once shifted. Testing the unshifted window instead reports "no
+        # padding needed" for a pass that then drops exactly those points at `checkbounds`, silently:
+        # a `continue` with no measurement and no warning.
+        fits &= inbounds(pts, i, (imagesize[1] - 1, imagesize[2] - 1))
     end
     # The +2 is the reference's slack: it absorbs the half-pixel grid offset and any
     # rounding in the index truncations.
