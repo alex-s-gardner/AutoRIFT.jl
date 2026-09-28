@@ -5743,3 +5743,270 @@ should be blocked anyway — the same granule blocked peaks at 25.2 GiB — neit
 | + validity mask padded lazily | **31.97 GiB** |
 
 **−10.1 GiB, −24%**, at neutral runtime and bit-identical output throughout.
+
+---
+
+# The Sentinel-1 coregistration, measured against ISCE3 for the first time
+
+`tools/golden/coreg_bench.jl` against `tools/golden/isce_offsets.py --bench`, both on
+`S1C_IW_SLC__1SSV_20250416` run 200 — a burst job over IW1, 7 bursts of 1502 x 20662. Every input is in
+the run directory: both burst2safe SAFEs, `dem.tif`, both orbit files and `secondary.tif`, so neither arm
+fetches anything.
+
+**Coregistration had a correctness record and no timing at all.** That is the gap this closes. It is the
+larger half of a radar pair: the reference spends 2,984 s coregistering a NISAR L1 pair against 812 s
+correlating it, and about thirty minutes on the 43-burst `S1C_IW_SLC__1SDV_20250416` pair whose
+`runAutorift` takes 116 s.
+
+## The two arms
+
+| | AutoRIFT.jl | ISCE3 0.25.12 |
+|---|---:|---:|
+| geometry | **0.007 s** | 65.9 s (`rdr2geo` 54.9, `geo2rdr` 11.0) |
+| deramp | 4.4 s | — (inside `ResampSlc`) |
+| resample | 6.0 s | 20.5 s |
+| **wall** | **10.3 s** | **86.4 s** |
+| cpu | 92.7 s, 9.01 of 12 threads | 551% observed on one burst |
+| peak | 2.62 GiB (1.30 above the harness floor) | 2.93 GiB `ru_maxrss` |
+| **written to disk** | **0** | **9.71 GiB** |
+
+**8.4x on wall clock, and no intermediate file.** The Julia figures are one process; the Julia per-stage
+row is one burst timed apart and multiplied by seven, and it sums to 10.4 s against the 10.3 s the whole
+function takes, so the three stages are the whole of it.
+
+## Most of the gap is algorithmic, not a faster implementation
+
+**76% of the reference's time is geometry it solves per output pixel and writes out.** `Rdr2Geo` fills
+three `Float64` rasters of the burst's full shape — 1502 x 20662 each, 248 MiB apiece — and `Geo2Rdr`
+reads them back to write `azimuth.off` and `range.off`. That is 31,034,324 solves per burst, of which its
+own log reports 30,963,344 converged.
+
+AutoRIFT.jl solves **1,050** of them: `_offset_lattice` places a node every 64 lines and 512 samples and
+interpolates bilinearly between, which `radar.jl` records as exact to about 1e-5 px on a field that moves
+0.0036 lines over 1200. So the honest comparison of the *geometry kernels* is not 65.9 s against 0.007 s
+— it is that one implementation evaluates four orders of magnitude fewer of them. The reference's topo
+rasters are also a product later stages consume, which a lattice is not.
+
+**On the resample, where both do the same work per pixel, it is 3.4x** — 20.5 s against 6.0 s.
+
+## Peak memory is not yet the win
+
+2.62 GiB against 2.93 GiB, and the two are not measured the same way: the Julia figure is a sampled
+resident footprint above the floor the harness already held, the Python one is `ru_maxrss` for a process
+carrying its interpreter and GDAL's caches. Read it as "the same order", not as a 10% saving.
+
+0.74 GiB of the Julia peak is the mosaic itself, `zeros(Float32, 9554, 20662)`, and `deramped_burst`
+holds two full-burst arrays at once on top of it. Neither is necessary: a resample that produced only the
+window a caller asked for would hold neither, and `autorift` already drives exactly that pattern through
+`process_block_size`. That is the open work, and it is also what removes the 9.71 GiB the reference
+writes — a lazily resampled secondary never becomes a file.
+
+## Agreement, and one open item
+
+The gate is the statistic `radar.jl` chose the interpolation kernel on, mean ratio and correlation against
+`secondary.tif`. Over an interior column strip the two agree at a correlation of **1.00000**. Over the
+whole mosaic, 158,581,894 comparable pixels: mean ratio **1.0007**, correlation **0.98172** — so the
+disagreement is at the burst seams rather than in the interpolation.
+
+**`secondary_swath_amplitude` is a subswath, not the mosaic, and the two differ by 19 rows on this pair.**
+It is the counterpart of the reference's `sec_swath_iw1.tif`, which places the first burst's valid region
+at row `first_valid_line` — 20 here — while `secondary.tif` is the output of `merge_swaths`, which slices
+each subswath from `slc_az_start_index = bursts[0].first_valid_line` and writes it at `az_offset`, zero for
+the first subswath. So the 19 rows are the stacking crop and not a disagreement.
+
+`_stack_swaths` already performs it: `radar_mosaic` on the reference acquisition matches `reference.tif` at
+**row lag 0, correlation 1.000000 and mean ratio 1.000000** over 158,556,780 pixels, at the full
+17606 x 20662 extent. A comparison of a subswath against a mosaic is a comparison across that crop, which
+is why `coreg_bench.jl` measures the lag rather than assuming it.
+
+The reference's raster is also about 1.8x the acquisition — `merge_swaths:437-439` adds the *merged*
+height to the last burst's start — and everything past the acquisition is zero: measured, rows 9000 and
+beyond of `secondary.tif` hold no non-zero sample. So the comparison is over the 9554 rows the
+acquisition occupies and the empty tail is not counted as agreement.
+
+## Tabulating the interpolation kernel: the resample 4.1x
+
+`sinc8` evaluates `sinpi` and `cospi` eight times per axis, so the inner loop paid **sixteen
+transcendentals per output sample** for taps that depend on nothing but the fractional offset, and then
+divided by `sum(ty) * sum(tx)`, which depends on the same thing. `SINC_TAPS` holds the kernel at 2,048
+fractional positions with the normalization folded in, and `sinc8_taps` is two lookups.
+
+| | per burst | subswath | against ISCE3's 86.4 s |
+|---|---:|---:|---:|
+| `sinc8` per pixel | 0.852 s | 10.3 s | 8.4x |
+| `SINC_TAPS` lookup | **0.210 s** | **6.5 s** | **13.3x** |
+
+**The gate does not move at all**: row lag +19, 1.00000 on the interior strip, mean ratio 1.0007 and
+correlation 0.98172 over the same 158,581,894 pixels — the same figures to every digit the harness prints.
+Quantizing the offset to 1/2048 px is 0.00024 px at worst against an offset field already interpolated to
+about 1e-5, so this is a free 4.1x rather than a trade.
+
+**The deramp is now the larger half of a burst**, 0.643 s against the resample's 0.210. It is also where
+the footprint is: `deramped_burst` reads the burst with `src = raster[rows, :]` and writes a second
+full-burst `ComplexF32` beside it, both of which a window-at-a-time resample would bound.
+
+Peak moved the wrong way, 1.30 GiB above the floor to 1.65, and the cause is the speed rather than the
+table — 131 KiB of taps against a run that now produces the same per-burst garbage in two thirds of the
+time, leaving the collector less of it to reclaim between bursts. It is a further reason the footprint
+needs the structural change and not tuning.
+
+## The resample, lazily, a window at a time
+
+`ResampledSwath` is the secondary on the reference's merged grid as an `AbstractMatrix{Float32}` whose
+`getindex` over two ranges resamples **only that window**. Nothing holds the mosaic and nothing writes it,
+which is what removes the 9.71 GiB the reference puts on disk: `secondary.tif` exists only because the
+correlator reads the secondary from a file, and a lazy secondary is read from memory a block at a time.
+
+`secondary_swath_amplitude` is now this materialized in one pass over the placements, so the two paths
+share one implementation rather than being two that agree. Three primitives took an `origin` — the
+burst-local zero-based `(line, sample)` of the array's first element — so a band of a burst carries the
+phase and the valid rectangle it has inside the whole burst: `deramped_burst`, `_zero_outside_valid!` and
+`resample_burst`. `resample_burst` also separates two bounds that were one: **a pixel whose eight-tap
+support leaves the burst is rejected, and one whose support leaves the band throws.** Conflating them is
+how a lazily resampled block would silently come to differ from the mosaic.
+
+### Reading the whole subswath in blocks, 12 threads
+
+| | wall | peak above floor | blocks | source pixels deramped | checksum |
+|---|---:|---:|---:|---:|---|
+| materialized | 5.6 s | 1.19 GiB | 1 | 1.000x | — |
+| block 4096 | **4.7 s** | 0.42 GiB | 18 | 0.971x | matches |
+| block 2048 | 5.4 s | 0.37 GiB | 55 | 0.979x | matches |
+| block 1024 | 5.4 s | **0.16 GiB** | 210 | 0.995x | matches |
+| block 512 | 5.8 s | 0.19 GiB | 779 | 1.025x | matches |
+
+**Blocked is not slower than materializing, it is faster**, and the reason is the same one that shrinks
+the footprint: the materialized path deramped each burst's full 20662-sample width, where a window
+deramps only the support its own outputs reach. The refactor took the materialized arm from 6.5 s to
+5.6 s on its own.
+
+**Read amplification is 1.0, not the 21.6x a blocked correlator reaches.** That figure is the
+*correlator's* halo, which carries the search radius; a resampler's halo is the eight-tap support and four
+pixels of margin, so even 512-pixel blocks re-deramp only 2.5% and blocks of 1024 and up deramp *less*
+than the whole burst. There is no cache to build.
+
+The absolute peak column is omitted because these arms run in a process that still holds the materialized
+mosaic for the comparison; the figure above the floor sampled just before each arm is the window's own
+footprint, and that is the one that falls 7.4x.
+
+### Equality, including the seams
+
+`coreg_bench.jl` asserts eleven windows against the materialized mosaic and all eleven are **bitwise
+equal**: one inside a burst, both corners, a single full-width row, a single column, and one across each
+of the six burst seams. The seams are the load-bearing case — consecutive placements overlap by one row,
+so which burst writes a shared row is an ordering both paths have to agree on, and a window straddling a
+seam picks up two bursts each with its own carrier and offset lattice.
+
+The gate against `secondary.tif` does not move: row lag +19, 1.00000 on the interior strip, mean ratio
+1.0007, correlation 0.98172 over the same 158,581,894 pixels.
+
+### Where this leaves the comparison
+
+| | AutoRIFT.jl | ISCE3 0.25.12 |
+|---|---:|---:|
+| wall | **4.7 s** | 86.4 s |
+| resampler footprint | **0.16 GiB** at block 1024 | 2.93 GiB `ru_maxrss` |
+| written to disk | **0** | 9.71 GiB |
+
+**18x on wall clock**, at a footprint that scales with the block rather than the scene, and with no
+intermediate raster.
+
+`ResampledSwath` is one subswath, so what a caller hands `autorift` is `ResampledMosaic`: the same laziness
+carried through the stacking `_stack_swaths` performs, on the grid the geogrid describes.
+
+## The mosaic grid, and what the 19 rows actually were
+
+The subswath a `ResampledSwath` produces is the reference's `sec_swath_iw<n>.tif`, not `secondary.tif`.
+`merge_swaths` puts the mosaic together from those with an asymmetry worth naming, because it is what a
+subswath-against-mosaic comparison trips over (`s1_isce3.py:483-500`):
+
+```python
+az_offset            = floor((sensing_starts[k] - sensing_start) / az_time_interval)   # 0 for the first
+slc_az_start_index   = bursts[0].first_valid_line
+merged_az_slice      = slice(az_offset, ...)          # azimuth is cropped and moved to the offset
+slc_az_slice         = slice(slc_az_start_index, ...)
+rng_offset           = rng_offsets[k] + bursts[0].first_valid_sample
+merged_rng_slice     = slice(rng_offset, ...)         # range is cropped and left where it is
+slc_rng_slice        = slice(first_rng_sample, ...)
+```
+
+**Azimuth is cropped and moved; range is cropped and left.** So a subswath sits `first_valid_line` rows
+below the mosaic and zero columns across — which is exactly the +19 rows and 0 columns measured on
+`S1C_IW_SLC__1SSV_20250416`, where `first_valid_line[1]` is 20.
+
+`_stack_swaths` already implemented it. On the reference acquisition, `radar_mosaic` against
+`reference.tif`: **row lag 0, mean ratio 1.000000, correlation 1.000000** over 158,556,780 pixels at
+17606 x 20662. There was nothing to fix in the merge; what was missing was a secondary and a lazy array
+*at that level*, since the mosaic grid is the one the geogrid's `window_*` rasters index and therefore the
+one a correlator's point set is expressed in.
+
+`_mosaic_layout` now returns the placements and the mosaic size, `_stack_swaths` fills from them, and
+`ResampledMosaic` reads through them — one arithmetic, three callers, so a lazy mosaic and a materialized
+one cannot disagree about an index. `secondary_mosaic` is the materialized secondary at that level.
+
+### The secondary mosaic, lazily
+
+| | wall | peak above floor | blocks | source pixels deramped | checksum |
+|---|---:|---:|---:|---:|---|
+| materialized, 17606 x 20662 | 5.7 s | — | 1 | — | — |
+| block 4096 | **4.3 s** | 0.77 GiB | 30 | 1.015x | matches |
+| block 2048 | 4.6 s | **0.33 GiB** | 99 | 1.023x | matches |
+| block 1024 | 4.8 s | 0.36 GiB | 378 | 1.039x | matches |
+
+Twelve windows read from a `ResampledMosaic` are **bitwise equal** to the materialized mosaic: mid-swath,
+both corners, a single full-width row, a single column, the data's first and last rows, and each of the
+five burst seams the stacking keeps. The sixth burst seam is not among them because the crop removes it,
+which is the arithmetic being right rather than a case going untested.
+
+The gate against `secondary.tif` is now at **row lag 0**: mean ratio 1.0007, correlation 0.98172 over
+158,581,894 pixels — the same values as the subswath comparison, since the crop moves pixels without
+changing them.
+
+### It feeds `autorift` without a file
+
+`AutoRIFT._read_window!`'s generic method indexes with ranges rather than viewing, and `src/tile.jl:841`
+says why: a view of a lazy array defers to a scalar read per pixel, measured there at 444 s against 0.6 s.
+A `ResampledMosaic` is not a `StridedMatrix`, so it takes that method — and `_read_window!` on one returns
+a window **identical** to the mosaic's, which is asserted in `coreg_bench.jl` rather than argued from the
+types.
+
+So a blocked correlation can take the coregistered secondary as its second image directly. What the
+reference needs `secondary.tif` for — 9.71 GiB across the burst set, 6.26 GiB per acquisition on a
+full-SLC pair — is a handoff between two processes that this does not have.
+
+### The correlation itself, over a secondary that is never materialized
+
+Window equality covers the reads the harness issues. This runs the correlator over the whole production
+grid and compares what comes out, which is the only statement that covers the reads the *driver* issues —
+its own halo, its own block order, one read per block per pass.
+
+`coreg_bench.jl` takes the grid and the settings from the run's capture, so neither is chosen here: chip
+56 by 16 with `ScaleChipSizeY` 0.2857, a Wallis filter 21 samples wide, and a per-point search radius from
+the geogrid reaching 75 samples in x and 13 in y. Only `preprocess` is overridden — a capture's imagery is
+already filtered and a resampled mosaic is raw amplitude, which is also what has the blocked path filter
+each block from raw input. 12 threads, `--blocks 0 --no-gate --no-check` so the figures are the
+correlation's own.
+
+| secondary | block | wall | cpu | peak | answer |
+|---|---:|---:|---:|---:|---|
+| the materialized mosaic | 2048 | 10.1 s | 76.8 s | 6.91 GiB | 41,116 of 188,805 searchable points measured |
+| `ResampledMosaic` | 2048 | 24.6 s | 230.9 s | **5.20 GiB** | `dx`, `dy`, `correlation`, `chip_size` **identical** |
+| `ResampledMosaic` | 1024 | 34.9 s | 312.5 s | **4.26 GiB** | identical |
+
+The reference resolved 41,935 points on this grid, so the two counts sit within 2% of each other. That is
+context and not an agreement: our imagery is `Float32` amplitude filtered here, the reference's is `uint8`
+filtered there, and the gate on the imagery is the amplitude comparison above.
+
+**What laziness costs is one resample per pass, not per run.** There are four chip-size levels, the driver
+reads each block once per pass, and nothing holds the result between passes — so the mosaic is resampled
+about four times, which is the whole of the 24.6 s against 10.1 s. Materializing first and correlating
+costs 5.7 s + 10.1 s = 15.8 s, so on this pair the lazy arm is 8.8 s slower and 1.71 GiB smaller, and it
+writes nothing. Resampling once per block rather than once per block per pass needs the level loop inside
+the block loop, or a block cache across passes; `cache_budget` is not that knob, since it caches
+disk-backed input and a `ResampledMosaic` is not disk-backed.
+
+**A patch of the grid is not available as a cheaper arm.** The coarse pass restricts the finer levels
+through the outlier filter's neighbourhood, so a grid shorter than that window searches every point at full
+radius and keeps none — `tile.jl:1260` warns about it. With the reference's own imagery, grid and settings
+over a 192x384 patch where the reference measured 1,640 of 73,728 points, both argument orders measure
+**0**. The whole grid is the smallest arm that measures anything.

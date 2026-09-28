@@ -551,18 +551,44 @@ end
 
 # `merge_swaths`'s swath stack, over per-subswath rasters a caller has already merged. Shared by the
 # reference and the secondary because the layout is the reference's in both cases.
-function _stack_swaths(p::Sentinel1Product, swaths, merged)
+"""
+    SwathPlacement
+
+Which window of one merged subswath goes where in the mosaic `merge_swaths` builds.
+
+**The azimuth window is cropped and moved; the range window is cropped and left where it is.** A
+subswath's first `first_valid_line` rows are dropped and what remains starts at that subswath's azimuth
+offset — zero for the first, which is why a subswath and the mosaic differ by `first_valid_line` rows —
+while the range window keeps its own column indices. The asymmetry is `merge_swaths`'s
+(`s1_isce3.py:487-500`), not a simplification.
+"""
+struct SwathPlacement
+    swath::Int
+    mosaic_rows::UnitRange{Int}
+    mosaic_cols::UnitRange{Int}
+    swath_rows::UnitRange{Int}
+    swath_cols::UnitRange{Int}
+end
+
+"""
+    _mosaic_layout(p, swaths, shapes) -> (Vector{SwathPlacement}, Tuple{Int,Int})
+
+Where each merged subswath lands in the mosaic, and the mosaic's size.
+
+`shapes[k]` is subswath `k`'s `(rows, columns)` as [`swath_amplitude`](@ref) returned it. Separated from
+the filling so a lazily resampled mosaic and a materialized one cannot disagree about an index.
+"""
+function _mosaic_layout(p::Sentinel1Product, swaths, shapes)
     sws = collect(swaths)
     ann = [annotation(p, sw) for sw in sws]
 
     dr = first(ann).range_pixel_spacing
     dt = first(ann).azimuth_time_interval
     starts = [first(a.burst_start) for a in ann]
-    stops = [last(a.burst_start) for a in ann]
     sensing_start = minimum(starts)
     # `burst_sensing_stop` spans the *merged* subswath rather than one burst, which is the 1.7x quirk.
-    span = maximum(zip(ann, merged)) do (a, m)
-        seconds_between(sensing_start, last(a.burst_start)) + (m[2] - 1) * a.azimuth_time_interval
+    span = maximum(zip(ann, shapes)) do (a, sh)
+        seconds_between(sensing_start, last(a.burst_start)) + (sh[1] - 1) * a.azimuth_time_interval
     end
     total_az = 1 + round(Int, span / dt)
 
@@ -571,12 +597,11 @@ function _stack_swaths(p::Sentinel1Product, swaths, merged)
     rng_offsets = [sw == first(sws) ? 0 :
                    floor(Int, (annotation(p, sw).starting_range - first(ann).starting_range) / dr)
                    for sw in sws]
-    total_rng = last(merged)[3] +
+    total_rng = last(shapes)[2] +
                 floor(Int, (last(ann).starting_range - first(ann).starting_range) / dr)
 
-    out = zeros(Float32, total_az, total_rng)
-    for k in eachindex(sws)
-        a, (slc, nrows, _) = ann[k], merged[k]
+    places = map(eachindex(sws)) do k
+        a, nrows = ann[k], shapes[k][1]
         fvl, lvl = a.first_valid_line[1] - 1, a.last_valid_line[1] - 1
         fvs, lvs = a.first_valid_sample[1] - 1, a.last_valid_sample[1] - 1
         az_offset = floor(Int, seconds_between(sensing_start, starts[k]) / dt)
@@ -587,18 +612,99 @@ function _stack_swaths(p::Sentinel1Product, swaths, merged)
         # region; a merged one runs to the *last* burst's last valid line counted from the end.
         slc_az_end = nbursts(a) > 1 ? nrows - (lvl_last(a)) : lvl
         merged_az_end = nbursts(a) > 1 ? az_offset + nrows - lvl_last(a) - fvl : az_offset + (lvl - fvl)
-        mrows = (az_offset + 1):merged_az_end
-        srows = (fvl + 1):slc_az_end
-        mcols = (rng_offset + 1):(rng_end - buffer)
-        scols = (fvs + 1):(lvs - buffer)
-        dst = view(out, mrows, mcols)
-        src = view(slc, srows, scols)
+        SwathPlacement(sws[k], (az_offset + 1):merged_az_end, (rng_offset + 1):(rng_end - buffer),
+                       (fvl + 1):slc_az_end, (fvs + 1):(lvs - buffer))
+    end
+    return (places, (total_az, total_rng))
+end
+
+function _stack_swaths(p::Sentinel1Product, swaths, merged)
+    places, dims = _mosaic_layout(p, swaths, [(m[2], m[3]) for m in merged])
+    out = zeros(Float32, dims)
+    for (k, q) in enumerate(places)
+        dst = view(out, q.mosaic_rows, q.mosaic_cols)
+        src = view(merged[k][1], q.swath_rows, q.swath_cols)
         for i in eachindex(dst, src)
             # First-come: `cond = merged == 0 & slc != 0`.
             (dst[i] == 0 && src[i] != 0) && (dst[i] = src[i])
         end
     end
     return out
+end
+
+"""
+    ResampledMosaic(rp, sp, swaths, dem; offsets = nothing, grid = nothing) <: AbstractMatrix{Float32}
+
+The coregistered secondary on the **mosaic** grid, resampled on demand — what a caller hands `autorift`.
+
+[`ResampledSwath`](@ref) is one subswath, which is the reference's `sec_swath_iw<n>.tif`; this is the
+`merge_swaths` step on top, so its indices are the ones the geogrid's `window_*` rasters describe. Reading
+a window resamples only the bursts that window touches, so nothing holds the mosaic and nothing writes it
+— which is the whole of why `secondary.tif` exists.
+
+Equal to `_stack_swaths` of the materialized subswaths, window for window, because both read their indices
+from [`_mosaic_layout`](@ref).
+"""
+struct ResampledMosaic{S} <: AbstractMatrix{Float32}
+    swaths::Vector{S}
+    places::Vector{SwathPlacement}
+    dims::Tuple{Int,Int}
+end
+
+function ResampledMosaic(rp::Sentinel1Product, sp::Sentinel1Product, swaths, dem;
+                         offsets = nothing, grid = nothing)
+    sws = collect(swaths)
+    lazy = [ResampledSwath(rp, sp, sw, dem;
+                           offsets = offsets === nothing ? nothing : offsets(sw),
+                           grid = grid === nothing ? nothing : grid(sw)) for sw in sws]
+    places, dims = _mosaic_layout(rp, sws, [size(r) for r in lazy])
+    return ResampledMosaic(lazy, places, dims)
+end
+
+Base.size(m::ResampledMosaic) = m.dims
+
+function Base.getindex(m::ResampledMosaic, rows::AbstractUnitRange, cols::AbstractUnitRange)
+    checkbounds(m, rows, cols)
+    out = zeros(Float32, length(rows), length(cols))
+    for (k, q) in enumerate(m.places)
+        mr = intersect(rows, q.mosaic_rows)
+        isempty(mr) && continue
+        mc = intersect(cols, q.mosaic_cols)
+        isempty(mc) && continue
+        # Positional within the placement, as in `_stack_swaths`: the mosaic window and the subswath
+        # window have equal lengths by construction.
+        r0 = first(q.swath_rows) + (first(mr) - first(q.mosaic_rows))
+        c0 = first(q.swath_cols) + (first(mc) - first(q.mosaic_cols))
+        got = m.swaths[k][r0:(r0 + length(mr) - 1), c0:(c0 + length(mc) - 1)]
+        dst = view(out, (first(mr) - first(rows) + 1):(last(mr) - first(rows) + 1),
+                   (first(mc) - first(cols) + 1):(last(mc) - first(cols) + 1))
+        for i in eachindex(dst, got)
+            # First-come, in subswath order, which is the rule and the order `_stack_swaths` applies.
+            (dst[i] == 0 && got[i] != 0) && (dst[i] = got[i])
+        end
+    end
+    return out
+end
+
+Base.getindex(m::ResampledMosaic, i::Integer, j::Integer) = m[i:i, j:j][1, 1]
+Base.getindex(m::ResampledMosaic, rows::AbstractUnitRange, j::Integer) = m[rows, j:j][:, 1]
+Base.getindex(m::ResampledMosaic, i::Integer, cols::AbstractUnitRange) = m[i:i, cols][1, :]
+Base.getindex(m::ResampledMosaic, ::Colon, ::Colon) = m[axes(m, 1), axes(m, 2)]
+
+"""
+    secondary_mosaic(rp, sp, swaths, dem; offsets = nothing, grid = nothing) -> Matrix{Float32}
+
+[`radar_mosaic`](@ref) for the secondary: each subswath resampled onto the reference's, then stacked.
+
+The materialized counterpart of [`ResampledMosaic`](@ref), and what `secondary.tif` holds.
+"""
+function secondary_mosaic(rp::Sentinel1Product, sp::Sentinel1Product, swaths, dem;
+                          offsets = nothing, grid = nothing)
+    sws = collect(swaths)
+    merged = [secondary_swath_amplitude(rp, sp, sw, dem;
+                                        offsets = offsets === nothing ? nothing : offsets(sw),
+                                        grid = grid === nothing ? nothing : grid(sw)) for sw in sws]
+    return _stack_swaths(rp, sws, merged)
 end
 
 # `bursts[-1].last_valid_line` of a subswath, 0-based. Named because the reference reaches it as a
@@ -809,6 +915,53 @@ The eight taps of a Hann-windowed sinc at fractional offset `f`, for taps at −
 end
 
 """
+    SINC_SUBDIVISIONS
+
+Fractional positions per pixel in [`SINC_TAPS`](@ref), the tabulated form of [`sinc8`](@ref).
+
+Evaluating the kernel per pixel costs sixteen transcendentals for every output sample — `sinpi` and
+`cospi` eight times each, once per axis — where the taps depend on nothing but the fractional offset. A
+table costs two lookups instead, and the quantization it introduces is bounded by `1/2 SINC_SUBDIVISIONS`
+of a pixel in interpolation position.
+
+2048, so that bound is 0.00024 px against a resample whose offset field is itself interpolated to about
+1e-5 px. Held to the amplitude gate in `tools/golden/coreg_bench.jl`.
+"""
+const SINC_SUBDIVISIONS = 2048
+
+"""
+    SINC_TAPS
+
+[`sinc8`](@ref) on a grid of `SINC_SUBDIVISIONS + 1` fractional offsets, taps down the columns.
+
+**Scaled so each column sums to one**, which is where the per-pixel `sum(ty) * sum(tx)` division goes:
+the normalization depends only on the fraction, so it belongs in the table rather than in the inner loop.
+"""
+const SINC_TAPS = let n = SINC_SUBDIVISIONS
+    T = Matrix{Float64}(undef, 8, n + 1)
+    for k in 0:n
+        t = sinc8(k / n)
+        s = sum(t)
+        for m in 1:8
+            T[m, k + 1] = t[m] / s
+        end
+    end
+    T
+end
+
+"""
+    sinc8_taps(f) -> NTuple{8,Float64}
+
+[`sinc8`](@ref) at the tabulated offset nearest `f`, already normalized to sum to one.
+
+`f` must lie in `[0, 1]`, which is what `y - floor(y)` gives.
+"""
+@inline function sinc8_taps(f::Float64)
+    k = round(Int, f * SINC_SUBDIVISIONS) + 1
+    return ntuple(m -> @inbounds(SINC_TAPS[m, k]), 8)
+end
+
+"""
     deramped_burst(raster, rows, carrier) -> Matrix{ComplexF32}
 
 One burst's samples with its azimuth carrier removed, ready to interpolate.
@@ -816,14 +969,22 @@ One burst's samples with its azimuth carrier removed, ready to interpolate.
 Done to the whole burst once rather than per interpolation chip: a chip would evaluate the carrier 64
 times per output pixel where this evaluates it once per input pixel, which is the difference between
 minutes and hours over a subswath.
+
+`rows` and `cols` index `raster`. `origin` is the burst-local zero-based `(line, sample)` of
+`raster[first(rows), first(cols)]`, which is what the carrier is a function of: a band of a burst carries
+the same phase it does inside the whole burst, so reading one must not restart the carrier at zero.
+`(0, 0)` is the whole burst, whose first row *is* its first line.
 """
-function deramped_burst(raster, rows::AbstractUnitRange, carrier)
-    nr, nc = length(rows), size(raster, 2)
+function deramped_burst(raster, rows::AbstractUnitRange, carrier;
+                        cols::AbstractUnitRange = axes(raster, 2),
+                        origin::Tuple{Integer,Integer} = (0, 0))
+    nr, nc = length(rows), length(cols)
+    l0, s0 = Int(origin[1]), Int(origin[2])
     out = Matrix{ComplexF32}(undef, nr, nc)
-    src = raster[rows, :]
+    src = raster[rows, cols]
     Threads.@threads for j in 1:nc
         for i in 1:nr
-            out[i, j] = ComplexF32(src[i, j]) * cis(-Float32(carrier(i - 1, j - 1)))
+            out[i, j] = ComplexF32(src[i, j]) * cis(-Float32(carrier(l0 + i - 1, s0 + j - 1)))
         end
     end
     return out
@@ -831,11 +992,17 @@ end
 
 # A burst's ramp margins zeroed in place, reproducing the source rectangle `slc_to_vrt_file` exposes.
 # Bounds are the annotation's, converted to 0-based by the caller, and the array is 1-based.
-function _zero_outside_valid!(A::AbstractMatrix, fvl::Integer, lvl::Integer, fvs::Integer, lvs::Integer)
+#
+# `origin` is the burst-local zero-based `(line, sample)` of `A[1, 1]`, so a band of a burst is zeroed
+# against the burst's valid rectangle rather than against its own first row.
+function _zero_outside_valid!(A::AbstractMatrix, fvl::Integer, lvl::Integer, fvs::Integer, lvs::Integer;
+                              origin::Tuple{Integer,Integer} = (0, 0))
     nr, nc = size(A)
+    oy, ox = Int(origin[1]), Int(origin[2])
     z = zero(eltype(A))
     @inbounds for j in 1:nc, i in 1:nr
-        ((i - 1) < fvl || (i - 1) > lvl || (j - 1) < fvs || (j - 1) > lvs) && (A[i, j] = z)
+        l, s = oy + i - 1, ox + j - 1
+        (l < fvl || l > lvl || s < fvs || s > lvs) && (A[i, j] = z)
     end
     return A
 end
@@ -851,12 +1018,29 @@ interpolation error is 1e-5 px.
 
 Amplitude rather than the complex value, so the reramp is omitted: it multiplies the finished sample by a
 unit phasor and cannot change a magnitude.
+
+`origin` is the burst-local zero-based `(line, sample)` of `deramped[1, 1]` and `extent` is the burst's
+own size, so `deramped` may be a band of the burst rather than all of it.
+
+**The rejection is against `extent` and the read is against the band**, and the two have to be separate
+for a windowed result to equal a whole-burst one. A pixel whose eight-tap support leaves the *burst* is
+rejected by both, and must be: the reference's resampler has no samples there either. A pixel whose
+support leaves the *band* is a band that was sized too small, which is a caller error rather than a pixel
+to drop — dropping it silently is exactly how a lazily resampled block would come to differ from the
+mosaic — so it throws.
 """
 function resample_burst(deramped, dl, ds, lines::AbstractUnitRange,
-                        samples::AbstractUnitRange, valid = nothing; doppler = nothing)
+                        samples::AbstractUnitRange, valid = nothing; doppler = nothing,
+                        origin::Tuple{Integer,Integer} = (0, 0),
+                        extent::Tuple{Integer,Integer} = size(deramped))
     out = zeros(Float32, length(lines), length(samples))
-    nr, nc = size(deramped)
-    Threads.@threads for (jj, s) in collect(enumerate(samples))
+    oy, ox = Int(origin[1]), Int(origin[2])
+    ey, ex = Int(extent[1]), Int(extent[2])
+    ny, nx = size(deramped)
+    # Over the sample axis's own indices rather than `collect(enumerate(samples))`, which materializes a
+    # vector of pairs for `@threads` to index.
+    Threads.@threads for jj in eachindex(samples)
+        s = samples[jj]
         for (ii, l) in enumerate(lines)
             # `_dopplerLUT.contains(az, rng)`, the third of `ResampSlc::_transformTile`'s five rejections
             # and the one the two bounds tests below do not cover.
@@ -877,7 +1061,7 @@ function resample_burst(deramped, dl, ds, lines::AbstractUnitRange,
             y = l + dl(l, s) + 1.0
             x = s + ds(l, s) + 1.0
             iy, ix = floor(Int, y), floor(Int, x)
-            (iy - 4 < 1 || iy + 4 > nr || ix - 4 < 1 || ix + 4 > nc) && continue
+            (iy - 4 < 1 || iy + 4 > ey || ix - 4 < 1 || ix + 4 > ex) && continue
             # The eight-tap support has to sit inside the secondary's own valid region: outside it the
             # reference's resampler has no samples either, and interpolating the zero margin invents a
             # small non-zero value where `secondary.tif` holds none.
@@ -885,17 +1069,23 @@ function resample_burst(deramped, dl, ds, lines::AbstractUnitRange,
                 (iy - 3 < valid[1] || iy + 4 > valid[2] || ix - 3 < valid[3] || ix + 4 > valid[4]) &&
                     continue
             end
-            ty = sinc8(y - iy)
-            tx = sinc8(x - ix)
+            by, bx = iy - oy, ix - ox
+            (by - 4 < 1 || by + 4 > ny || bx - 4 < 1 || bx + 4 > nx) && throw(ArgumentError(
+                "the deramped band covers burst-local lines $(oy + 1):$(oy + ny) and samples " *
+                "$(ox + 1):$(ox + nx), but output pixel ($l, $s) reads lines $(iy - 3):$(iy + 4) " *
+                "and samples $(ix - 3):$(ix + 4); the band was sized too small for the window"))
+            ty = sinc8_taps(y - iy)
+            tx = sinc8_taps(x - ix)
             acc = ComplexF64(0)
             for m in 1:8
                 row = ComplexF64(0)
                 @simd for k in 1:8
-                    row += tx[k] * ComplexF64(deramped[iy - 4 + m, ix - 4 + k])
+                    row += tx[k] * ComplexF64(deramped[by - 4 + m, bx - 4 + k])
                 end
                 acc += ty[m] * row
             end
-            out[ii, jj] = Float32(abs(acc) / (sum(ty) * sum(tx)))
+            # No tap-sum division: `SINC_TAPS` is normalized, so both axes already carry it.
+            out[ii, jj] = Float32(abs(acc))
         end
     end
     return out
@@ -917,6 +1107,72 @@ million geometry solves per burst into a few hundred.
 """
 function secondary_swath_amplitude(rp::Sentinel1Product, sp::Sentinel1Product, swath::Integer, dem;
                                    offsets = nothing, grid = nothing)
+    r = ResampledSwath(rp, sp, swath, dem; offsets, grid)
+    out = zeros(Float32, size(r))
+    for p in r.places
+        out[p.mosaic_rows, p.mosaic_cols] = _resample_piece(r, p, p.lines, p.samples)
+    end
+    return (out, size(r, 1), size(r, 2))
+end
+
+"""
+    BurstPlacement
+
+Where one burst's resampled samples go in the merged subswath, and what it takes to produce them.
+
+`lines` and `samples` are the burst's own zero-based output indices; `mosaic_rows` and `mosaic_cols` are
+the one-based rows and columns of the merged subswath they land on. The two pairs have equal lengths by
+construction, so the mapping is positional: `mosaic_rows[t]` carries `lines[t]`.
+"""
+struct BurstPlacement{C,DL,DS}
+    burst::Int
+    source_rows::UnitRange{Int}
+    carrier::C
+    dl::DL
+    ds::DS
+    # The secondary's own valid rectangle, zero-based, which bounds what the source offers.
+    svalid::NTuple{4,Int}
+    lines::UnitRange{Int}
+    samples::UnitRange{Int}
+    mosaic_rows::UnitRange{Int}
+    mosaic_cols::UnitRange{Int}
+    extent::Tuple{Int,Int}
+end
+
+"""
+    ResampledSwath(rp, sp, swath, dem; offsets = nothing, grid = nothing) <: AbstractMatrix{Float32}
+
+The secondary acquisition's amplitude on the reference's merged subswath grid, resampled on demand.
+
+`getindex` over two ranges resamples **only that window**, so nothing holds the mosaic and nothing writes
+it to a file. `secondary_swath_amplitude` is this materialized in one pass, and a window read from here
+equals the same window of that array — which is a property of sharing one implementation rather than two
+that agree.
+
+That the placement is the reference's is not a simplification — `merge_bursts_in_swath` takes
+`az_reference_offsets` from `ref_bursts` and the range window from the reference burst's valid samples,
+and applies both to the secondary. So the two mosaics share every index and differ only in pixel values.
+
+The offsets come from a lattice of [`coregistration_offset`](@ref) solves, one node every 64 lines and 512
+samples, interpolated bilinearly between. That is exact to about 1e-5 px on this field and turns 31
+million geometry solves per burst into a few hundred.
+
+**The per-burst setup is done once, at construction.** The carrier fit and the offset lattice cost about a
+millisecond each and depend on nothing a window varies, so a caller reading many windows pays for them
+once; what a window pays for is the deramp of the band it needs and its own interpolation.
+
+`deramped` counts source pixels deramped so far. Reading the mosaic in blocks deramps the eight-tap halo
+of each block twice, so this against the mosaic's area is the read amplification a block size costs.
+"""
+struct ResampledSwath{S,P} <: AbstractMatrix{Float32}
+    source::S
+    places::Vector{P}
+    dims::Tuple{Int,Int}
+    deramped::Base.RefValue{Int}
+end
+
+function ResampledSwath(rp::Sentinel1Product, sp::Sentinel1Product, swath::Integer, dem;
+                        offsets = nothing, grid = nothing)
     a = annotation(rp, swath)
     sa = annotation(sp, swath)
     n = nbursts(a)
@@ -939,9 +1195,8 @@ function secondary_swath_amplitude(rp::Sentinel1Product, sp::Sentinel1Product, s
     nlines = n == 1 ? nl :
              1 + round(Int, (seconds_between(first(a.burst_start), last(a.burst_start)) +
                              (nl - 1) * dt) / dt)
-    out = zeros(Float32, nlines, ns)
 
-    for i in 1:n
+    places = map(1:n) do i
         ss = open_slc(sp.path; orbit = sp.orbit_path, swath = swath, burst = i,
                       polarization = sp.polarization)
         cs = RadarCoordinate(ss)
@@ -953,22 +1208,6 @@ function secondary_swath_amplitude(rp::Sentinel1Product, sp::Sentinel1Product, s
         else
             offsets(i)
         end
-        deramped = deramped_burst(sraster, ((i - 1) * lpb + 1):(i * lpb), carrier)
-        # **The resampler's source is the burst zeroed outside its own valid window, not the raw burst.**
-        # `slc_to_vrt_file` writes a VRT of the burst's full shape whose `SimpleSource` covers only
-        # `first_valid_line:last_valid_line` by `first_valid_sample:last_valid_sample`, with
-        # `NoDataValue` 0, so everything outside that rectangle reads as zero
-        # (`s1_burst_slc.py:slc_to_vrt_file`). A TOPS burst's ramp-up and ramp-down margins carry small but
-        # non-zero amplitudes — a median of 2.24 against a typical 50 on this pair — so reading them fills
-        # pixels the reference leaves empty.
-        #
-        # **Zeroed rather than declined.** Rejecting an output pixel whose interpolation support straddles
-        # the boundary is a different rule and a worse one: measured on IW1 burst 1 of
-        # `S1A ... 20170221`, guarding declines 161,588 pixels the reference fills. Zeroing the source
-        # keeps them, tapered, which is what the reference's own interpolation does with a source rectangle
-        # that ends there.
-        _zero_outside_valid!(deramped, sa.first_valid_line[i] - 1, sa.last_valid_line[i] - 1,
-                             sa.first_valid_sample[i] - 1, sa.last_valid_sample[i] - 1)
 
         prev = i > 1 ? fld(lims[i - 1][2] - lims[i][1], 2) : 0
         nxt = i < n ? fld(lims[i][2] - lims[i + 1][1], 2) : 0
@@ -977,15 +1216,108 @@ function secondary_swath_amplitude(rp::Sentinel1Product, sp::Sentinel1Product, s
         # `min(lvs, ns)`: the valid-sample window is the annotation's and the raster it indexes is the
         # CSLC's, which can be the narrower of the two. NumPy's slicing truncates there in silence.
         cols = n == 1 ? (1:ns) : ((fvs[i] + 1):min(lvs[i], ns))
-        # No valid-window guard: measured, ISCE3's own criterion is the raster's bounds rather than the
-        # annotation's valid region. Guarding on the valid window declines 137,782 pixels `secondary.tif`
-        # fills, to avoid filling 2,746 it does not — fifty times the error it removes.
-        got = resample_burst(deramped, dl, ds, bstart:(bend - 1), (first(cols) - 1):(last(cols) - 1);
-                             doppler = (lpb, spb))
-        out[(mstart + 1):mend, cols] = got
+        BurstPlacement(i, ((i - 1) * lpb + 1):(i * lpb), carrier, dl, ds,
+                       (sa.first_valid_line[i] - 1, sa.last_valid_line[i] - 1,
+                        sa.first_valid_sample[i] - 1, sa.last_valid_sample[i] - 1),
+                       bstart:(bend - 1), (first(cols) - 1):(last(cols) - 1),
+                       (mstart + 1):mend, cols, (lpb, spb))
     end
-    return (out, nlines, ns)
+    return ResampledSwath(sraster, places, (nlines, ns), Ref(0))
 end
+
+Base.size(r::ResampledSwath) = r.dims
+
+# How far past a window's own indices the eight-tap support reaches, in burst-local one-based
+# coordinates.
+#
+# The offsets are sampled on a grid at most as coarse as `_offset_lattice`'s own nodes rather than at the
+# window's corners. The field is a bilinear interpolant of those nodes, so its extremes over a window can
+# fall at a node inside it and corners alone do not bound it — on this data the difference is far below a
+# pixel, but the margin is what makes that a bound rather than an observation. `resample_burst` throws if
+# a band turns out too small, so an inadequate bound is loud.
+const _BAND_MARGIN = 4
+function _support_bounds(dl, ds, lines::AbstractUnitRange, samples::AbstractUnitRange)
+    lstep = max(1, min(_LSTEP ÷ 2, length(lines) - 1))
+    sstep = max(1, min(_SSTEP ÷ 2, length(samples) - 1))
+    # The last index is visited explicitly, since a stride need not land on it, and visiting it twice
+    # costs nothing to a min and a max.
+    ls = Iterators.flatten((first(lines):lstep:last(lines), (last(lines),)))
+    ymin = xmin = Inf
+    ymax = xmax = -Inf
+    for l in ls
+        for s in Iterators.flatten((first(samples):sstep:last(samples), (last(samples),)))
+            y = l + dl(l, s) + 1.0
+            x = s + ds(l, s) + 1.0
+            ymin = min(ymin, y); ymax = max(ymax, y)
+            xmin = min(xmin, x); xmax = max(xmax, x)
+        end
+    end
+    return (ymin - _BAND_MARGIN, ymax + _BAND_MARGIN, xmin - _BAND_MARGIN, xmax + _BAND_MARGIN)
+end
+
+# One burst's contribution to a window, over the burst-local output indices `lines` x `samples`.
+#
+# The band read from the source is the support those outputs reach, clamped to the burst: a pixel whose
+# support leaves the burst is rejected by `resample_burst` and never read, so clamping cannot change an
+# answer.
+function _resample_piece(r::ResampledSwath, p::BurstPlacement, lines::AbstractUnitRange,
+                         samples::AbstractUnitRange)
+    lpb, spb = p.extent
+    ymin, ymax, xmin, xmax = _support_bounds(p.dl, p.ds, lines, samples)
+    brows = clamp(floor(Int, ymin) - 3, 1, lpb):clamp(ceil(Int, ymax) + 4, 1, lpb)
+    bcols = clamp(floor(Int, xmin) - 3, 1, spb):clamp(ceil(Int, xmax) + 4, 1, spb)
+    origin = (first(brows) - 1, first(bcols) - 1)
+
+    srows = (first(p.source_rows) - 1 + first(brows)):(first(p.source_rows) - 1 + last(brows))
+    r.deramped[] += length(brows) * length(bcols)
+    deramped = deramped_burst(r.source, srows, p.carrier; cols = bcols, origin)
+    # **The resampler's source is the burst zeroed outside its own valid window, not the raw burst.**
+    # `slc_to_vrt_file` writes a VRT of the burst's full shape whose `SimpleSource` covers only
+    # `first_valid_line:last_valid_line` by `first_valid_sample:last_valid_sample`, with
+    # `NoDataValue` 0, so everything outside that rectangle reads as zero
+    # (`s1_burst_slc.py:slc_to_vrt_file`). A TOPS burst's ramp-up and ramp-down margins carry small but
+    # non-zero amplitudes — a median of 2.24 against a typical 50 on this pair — so reading them fills
+    # pixels the reference leaves empty.
+    #
+    # **Zeroed rather than declined.** Rejecting an output pixel whose interpolation support straddles
+    # the boundary is a different rule and a worse one: measured on IW1 burst 1 of
+    # `S1A ... 20170221`, guarding declines 161,588 pixels the reference fills. Zeroing the source
+    # keeps them, tapered, which is what the reference's own interpolation does with a source rectangle
+    # that ends there.
+    _zero_outside_valid!(deramped, p.svalid...; origin)
+    # No valid-window guard: measured, ISCE3's own criterion is the raster's bounds rather than the
+    # annotation's valid region. Guarding on the valid window declines 137,782 pixels `secondary.tif`
+    # fills, to avoid filling 2,746 it does not — fifty times the error it removes.
+    return resample_burst(deramped, p.dl, p.ds, lines, samples; doppler = p.extent, origin,
+                          extent = p.extent)
+end
+
+function Base.getindex(r::ResampledSwath, rows::AbstractUnitRange, cols::AbstractUnitRange)
+    checkbounds(r, rows, cols)
+    out = zeros(Float32, length(rows), length(cols))
+    for p in r.places
+        mr = intersect(rows, p.mosaic_rows)
+        isempty(mr) && continue
+        mc = intersect(cols, p.mosaic_cols)
+        isempty(mc) && continue
+        # Positional, since a placement's mosaic range and its burst range have equal lengths.
+        t0 = first(mr) - first(p.mosaic_rows)
+        u0 = first(mc) - first(p.mosaic_cols)
+        lines = (first(p.lines) + t0):(first(p.lines) + t0 + length(mr) - 1)
+        samples = (first(p.samples) + u0):(first(p.samples) + u0 + length(mc) - 1)
+        out[(first(mr) - first(rows) + 1):(last(mr) - first(rows) + 1),
+            (first(mc) - first(cols) + 1):(last(mc) - first(cols) + 1)] =
+            _resample_piece(r, p, lines, samples)
+    end
+    return out
+end
+
+# Scalar and mixed indexing go through the range form, which is the one that does the work. A whole-array
+# read is `r[:, :]`, which materializes what `secondary_swath_amplitude` returns.
+Base.getindex(r::ResampledSwath, i::Integer, j::Integer) = r[i:i, j:j][1, 1]
+Base.getindex(r::ResampledSwath, rows::AbstractUnitRange, j::Integer) = r[rows, j:j][:, 1]
+Base.getindex(r::ResampledSwath, i::Integer, cols::AbstractUnitRange) = r[i:i, cols][1, :]
+Base.getindex(r::ResampledSwath, ::Colon, ::Colon) = r[axes(r, 1), axes(r, 2)]
 
 # The offset field on a lattice, with bilinear interpolation between nodes. Two closures rather than two
 # matrices so the caller reads a position rather than an index.

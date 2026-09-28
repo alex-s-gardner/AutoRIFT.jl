@@ -379,6 +379,51 @@ exactly (`readamp 3.30x`, the same `3336 x 6690 px` window) while measuring 147,
 match what the driver calls is a silent no-op, and the arm then reports the current code twice. Expect
 `_read_window!` to be exactly twice `_prepare_block` — one read per image per block.
 
+## What the coregistration costs
+
+```bash
+julia --project=tools/golden -t 12,1 tools/golden/coreg_bench.jl S1C_IW_SLC__1SSV_20250416
+micromamba run -n arift-ref python tools/golden/isce_offsets.py <run_dir> <out_dir> --bench
+```
+
+The two arms of the same work: the secondary acquisition put on the reference's grid, which is the whole
+of what COMPASS's per-burst `rdr2geo`/`geo2rdr`/`ResampSlc` and hyp3's `merge_swaths` produce. Every
+other harness here measures the correlator; this measures the stage in front of it, which on a radar pair
+is the larger of the two — the reference spends 2,984 s coregistering a NISAR L1 pair against 812 s
+correlating it.
+
+Both run on data the run directory already holds, so neither fetches a granule. The Python arm writes
+about 1.4 GiB per burst and keeps it, since the disk traffic is part of what is being compared; delete
+`<out_dir>` afterwards.
+
+`--blocks` reads the mosaic through `ResampledMosaic`, which resamples a window at a time rather than
+materializing it — the arrangement a correlator driving the resample through `process_block_size` uses,
+and the level a correlator's point set is expressed at, since the mosaic grid is the one the geogrid's
+`window_*` rasters index. Each block size is checked against the materialized answer, and `--no-check`
+drops the window equality assertions that precede it, including the one that reads through
+`AutoRIFT._read_window!`.
+
+**A subswath is not the mosaic.** `ResampledSwath` and `secondary_swath_amplitude` are the reference's
+`sec_swath_iw<n>.tif`; `ResampledMosaic` and `secondary_mosaic` are `secondary.tif`. `merge_swaths` crops
+each subswath from its `first_valid_line` and moves it to the subswath's azimuth offset while leaving
+range where it is, so the two levels differ by that many rows and no columns — 19 on
+`S1C_IW_SLC__1SSV_20250416`. Comparing across the two levels is what the harness's row-lag search is for.
+
+The last stage hands the lazy secondary to `autorift` itself, over the grid and settings from the run's
+capture — chip 56 by 16 behind a Wallis filter 21 samples wide, the geogrid's own per-point radii — and
+compares the result against the same correlation over the materialized mosaic. `--no-correlate` skips it
+and `--corr-blocks` sets the block sizes. **The grid is the whole production grid and cannot be thinned to
+a patch:** the coarse pass restricts the finer levels over the outlier filter's neighbourhood, so a patch
+searches every point at full radius and keeps none, measuring nothing even with the reference's own
+imagery.
+
+`dev/GATES.md` carries the measurement. In short: 4.3 s against 86.4 s, a resampler footprint of 0.33 GiB
+against 2.93, and no intermediate file against 9.71 GiB of them. Most of the time difference is that the
+reference solves the geometry per output pixel where `_offset_lattice` solves 1,050 nodes and interpolates.
+Correlating through the lazy secondary gives `dx`, `dy`, `correlation` and `chip_size` identical to
+correlating the materialized mosaic, at 5.20 GiB of peak against 6.91 and one resample per chip-size level
+in exchange.
+
 ## The end-to-end ladder: from the granule
 
 ```bash
