@@ -29,6 +29,7 @@
 # burst job's run directory holds all of them, so nothing is fetched.
 
 include("correlator.jl")   # and, through it, `manifest.jl`, `reference.jl` and `intermediate.jl`
+include("scenes.jl")       # `correlator_filter`, the filter the reference applies to this pair
 include("radar.jl")
 include(joinpath(dirname(@__DIR__), "ab", "memtrace.jl"))
 
@@ -292,9 +293,14 @@ The reference's own search grid for this pair, and the settings it was searched 
 
 **Taken from the capture rather than chosen here**, because neither the configuration nor the grid's
 extent is free. This pair is searched at chip 56 by 16 — `ChipSize0X` 56 with `ScaleChipSizeY` 0.2857 —
-behind a Wallis filter 21 samples wide, with a per-point search radius from the geogrid that reaches 75
-samples in x and 13 in y. A square chip at a default filter width measures nothing whatever on
+behind a high-pass filter 21 samples wide, with a per-point search radius from the geogrid that reaches
+75 samples in x and 13 in y. A square chip at a default filter width measures nothing whatever on
 SLC-resolution speckle, and two arms then agree on a grid of `NaN`s.
+
+The filter comes from [`correlator_filter`](@ref) rather than from the capture's `WallisFilterWidth`
+scalar: that scalar carries the *width* whichever filter the driver picked, and the method for a
+Sentinel-1 pair is the plain high-pass (`testautoRIFT.py:293-308`). Reading the name as the method puts
+a Wallis filter on a pair the reference high-passes.
 
 **And it is the whole grid, not a patch of it.** A sub-window measures nothing either: the coarse pass
 restricts the finer levels through the outlier filter's neighbourhood, so a grid shorter than that
@@ -316,8 +322,11 @@ function correlation_grid(c::GoldenCase, n::Integer, scene::Tuple{Int,Int})
         "the reference correlated a $(join(size(k.arrays["in_I1"]), "x")) image and the mosaic is " *
         "$(join(scene, "x")); the grid's coordinates do not describe this array"))
 
-    kw = merge(kwargs_from_capture(k),
-               (; preprocess = AutoRIFT.Wallis(; width = Int(k.scalars["WallisFilterWidth"]))))
+    m = correlator_filter(c)
+    isnothing(m) || AutoRIFT.filter_width(m) == Int(k.scalars["WallisFilterWidth"]) ||
+        error("`correlator_filter` gives $m but the capture recorded a filter width of " *
+              "$(Int(k.scalars["WallisFilterWidth"]))")
+    kw = merge(kwargs_from_capture(k), (; preprocess = isnothing(m) ? :none : m))
     return (pointset_from_capture(k), kw, count(isfinite, k.arrays["out_Dx"]))
 end
 

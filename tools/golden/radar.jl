@@ -1070,7 +1070,11 @@ function resample_burst(deramped, dl, ds, lines::AbstractUnitRange,
                     continue
             end
             by, bx = iy - oy, ix - ox
-            (by - 4 < 1 || by + 4 > ny || bx - 4 < 1 || bx + 4 > nx) && throw(ArgumentError(
+            # The taps below read `by - 4 + m` for `m` in `1:8`, so the support is `by - 3` through
+            # `by + 4` — which is what the band has to contain and what the message states. The extent
+            # test above is deliberately one row wider on the low side, reproducing `ResampSlc`'s own
+            # rejection rather than this stencil's true reach.
+            (by - 3 < 1 || by + 4 > ny || bx - 3 < 1 || bx + 4 > nx) && throw(ArgumentError(
                 "the deramped band covers burst-local lines $(oy + 1):$(oy + ny) and samples " *
                 "$(ox + 1):$(ox + nx), but output pixel ($l, $s) reads lines $(iy - 3):$(iy + 4) " *
                 "and samples $(ix - 3):$(ix + 4); the band was sized too small for the window"))
@@ -1227,32 +1231,31 @@ end
 
 Base.size(r::ResampledSwath) = r.dims
 
-# How far past a window's own indices the eight-tap support reaches, in burst-local one-based
-# coordinates.
+# Where a window's eight-tap support lands in the source, in burst-local one-based coordinates.
 #
-# The offsets are sampled on a grid at most as coarse as `_offset_lattice`'s own nodes rather than at the
-# window's corners. The field is a bilinear interpolant of those nodes, so its extremes over a window can
-# fall at a node inside it and corners alone do not bound it — on this data the difference is far below a
-# pixel, but the margin is what makes that a bound rather than an observation. `resample_burst` throws if
-# a band turns out too small, so an inadequate bound is loud.
-const _BAND_MARGIN = 4
+# **Every output pixel is evaluated, because a sampled bound is not a bound.** The offsets interpolate
+# bilinearly *between* lattice nodes, so a stride at half the node spacing bounds the field inside the
+# lattice — but a window reaching past the last node is extrapolated, and there the extremes are not at
+# the sampled points. Measured on `S1A_IW_SLC__1SSV_20240618` IW2, where the range offset reaches +87
+# samples: the strided bound missed the true maximum by more than a sample and
+# [`resample_burst`](@ref)'s band assertion fired.
+#
+# Exact bounds make that assertion unreachable rather than merely unlikely: `_resample_piece` reads
+# `floor(ymin) - 3` through `ceil(ymax) + 4`, and a pixel at `y` needs `floor(y) - 3` through
+# `floor(y) + 4`, which that range contains for every `y` in `ymin..ymax`.
+#
+# The cost is a second pass of the offset interpolation, against the 64 taps per pixel the resample
+# itself spends.
 function _support_bounds(dl, ds, lines::AbstractUnitRange, samples::AbstractUnitRange)
-    lstep = max(1, min(_LSTEP ÷ 2, length(lines) - 1))
-    sstep = max(1, min(_SSTEP ÷ 2, length(samples) - 1))
-    # The last index is visited explicitly, since a stride need not land on it, and visiting it twice
-    # costs nothing to a min and a max.
-    ls = Iterators.flatten((first(lines):lstep:last(lines), (last(lines),)))
     ymin = xmin = Inf
     ymax = xmax = -Inf
-    for l in ls
-        for s in Iterators.flatten((first(samples):sstep:last(samples), (last(samples),)))
-            y = l + dl(l, s) + 1.0
-            x = s + ds(l, s) + 1.0
-            ymin = min(ymin, y); ymax = max(ymax, y)
-            xmin = min(xmin, x); xmax = max(xmax, x)
-        end
+    for s in samples, l in lines
+        y = l + dl(l, s) + 1.0
+        x = s + ds(l, s) + 1.0
+        ymin = min(ymin, y); ymax = max(ymax, y)
+        xmin = min(xmin, x); xmax = max(xmax, x)
     end
-    return (ymin - _BAND_MARGIN, ymax + _BAND_MARGIN, xmin - _BAND_MARGIN, xmax + _BAND_MARGIN)
+    return (ymin, ymax, xmin, xmax)
 end
 
 # One burst's contribution to a window, over the burst-local output indices `lines` x `samples`.

@@ -1596,15 +1596,17 @@ end
 # implementation should.
 function _chop_to(pts, nr::Integer, nc::Integer)
     c(A) = A[1:nr, 1:nc]
-    # `chip_size_x`/`chip_size_y` are lazy uniform arrays carrying the grid's own axes, so they need
-    # chopping too or `PointSet` rejects the mismatch — which it does, by name, rather than broadcasting
-    # a stale shape into the correlation.
+    # **Every field, because `PointSet` requires every field to share `x`'s axes** and says so by name
+    # rather than broadcasting a stale shape into the correlation. `chip_size_x`/`chip_size_y` and
+    # `positioned` are lazy uniform arrays when a caller gave a scalar and real arrays when a geogrid
+    # supplied them per point; both carry the grid's own axes, so both need chopping.
     return AutoRIFT.rebuild(pts; x = c(pts.x), y = c(pts.y),
                             radius_x = c(pts.radius_x), radius_y = c(pts.radius_y),
                             dx_prior = c(pts.dx_prior), dy_prior = c(pts.dy_prior),
                             chip_size_x = c(pts.chip_size_x), chip_size_y = c(pts.chip_size_y),
                             chip_size_min_x = c(pts.chip_size_min_x),
-                            chip_size_max_x = c(pts.chip_size_max_x))
+                            chip_size_max_x = c(pts.chip_size_max_x),
+                            positioned = c(pts.positioned))
 end
 
 """

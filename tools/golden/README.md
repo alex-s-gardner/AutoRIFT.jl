@@ -467,6 +467,34 @@ attribution knob, not a correctness one.
 No new container run is needed for any of it. The geogrid rasters, the intermediate and the capture are
 already cached for all 22 cases.
 
+## Running the whole chain, and timing it
+
+```bash
+AWS_PROFILE=itslive julia --project=tools/golden -t 12,1 tools/golden/e2e_run.jl S2B_MSIL1C_20200612
+AWS_PROFILE=itslive julia --project=tools/golden -t 12,1 tools/golden/e2e_run.jl --all --tsv julia.tsv
+```
+
+`e2e.jl` compares each stage against the reference's artifacts; this *runs* them, in order, from the
+granule to `dx`/`dy`, and times each one — `geometry` (scenes, coregistration, geogrid), `grid`, `imagery`,
+`correlate`. It is the only harness here that measures the pipeline rather than the correlator.
+
+The scenes are copied under `<cache>/granules/` before the clock starts, and `scene_path` prefers a staged
+copy through [`STAGED`](scenes.jl) thereafter. That is the difference between timing the computation and
+timing the network: on `LC08_L1TP_062018` the `imagery` stage is 5.3 s local against 92.6 s over
+requester-pays `/vsis3`. `--stream` reads them where they lie, which is what the container does.
+
+A cold process spends its first pass compiling, so each case runs twice and the second is reported;
+`--cold` reports the first. Run one case per process when peaks matter — they are the process's own
+high-water mark, and a sweep in one process carries the previous case's floor.
+
+Fifteen of the twenty-two cases have a chain to run: all twelve optical and the three Sentinel-1 burst
+pairs. `unsupported` names what the other seven need, and `dev/GATES.md` carries the comparison against the
+reference's own logged wall clock — 4.5x on the sum, and 1.4 to 2.0x *more* peak memory, which is the
+whole-scene arrays the `imagery` stage holds rather than anything the correlator does.
+
+Landsat needs credentials that can pay for `s3://usgs-landsat`: `AWS_PROFILE` names them, as it does for
+the container.
+
 ## The correlator, on production imagery
 
 ```bash

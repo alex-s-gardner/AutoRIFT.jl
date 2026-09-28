@@ -89,9 +89,51 @@ out.vx, out.vy   # velocity in map units per year, on the input's grid and CRS
 
 ## Performance
 
-Against the Python reference (`nasa-jpl/autoRIFT` v2.1.2) on the 22 cases of the golden test set — the
-same captured inputs on both sides, so neither re-derives the grid, and the same 12 threads on an Apple
-M2 Max, one process per case. `jl block` is the `process_block_size` the library picks unasked.
+Two measurements against the Python reference (`nasa-jpl/autoRIFT` v2.1.2 inside `hyp3-autorift` 0.28.4),
+both on the golden test set, 12 threads on an Apple M2 Max, one process per case. They answer different
+questions: the first is the whole pipeline from a granule, the second is the correlator on identical
+inputs.
+
+### From the granule to `dx`/`dy`
+
+Every stage on the Julia side — geogrid, scene read, filter, coregistration, correlation — against the
+reference container's own logged wall clock from the last download to the finished product. The scenes are
+on local disk before either clock starts. The 15 cases whose Julia chain exists today; `dev/GATES.md`
+carries the per-stage breakdown and names what the other seven need.
+
+| case | Julia s | Python s | | case | Julia s | Python s | |
+|---|---:|---:|---:|---|---:|---:|---:|
+| LC08 `009011` | 54.9 | 376 | 6.8x | LT05 `001013` | 49.9 | 190 | 3.8x |
+| LC08 `060018` | 67.2 | 328 | 4.9x | LT05 `060018` | 20.7 | 118 | 5.7x |
+| LC08 `062018` | 33.0 | 289 | 8.8x | S1A `1SSV_20240618` a | 460.3 | 1536 | 3.3x |
+| LC09 `215109` | 39.9 | 327 | 8.2x | S1A `1SSV_20240618` b | 176.3 | 632 | 3.6x |
+| LE07 `061018` (2012) | 85.3 | 271 | 3.2x | S1C `1SSV_20250416` | 45.1 | 383 | 8.5x |
+| LE07 `061018` (2013) | 79.7 | 358 | 4.5x | S2A `20200626` | 14.4 | 186 | **12.9x** |
+| LE07 `063018` | 94.1 | 335 | 3.6x | S2B `20200612` | 21.0 | 187 | 8.9x |
+| LT04 `063018` | 29.4 | 195 | 6.6x | **all 15** | **1,271** | **5,711** | **4.5x** |
+
+**Median 6.6x.** Smaller than the correlator's ratio below, because the correlator is 4 to 63% of a Julia
+run here and the stages in front of it are GDAL and arithmetic on both sides.
+
+**Peak memory runs the other way on this path**, and the reason is worth stating rather than hiding: the
+chain holds the raw band, the filtered band and the crop as whole-scene `Float32` arrays where the
+reference writes its filtered scene to disk and reads back a window.
+
+| case | Julia peak | Python peak | |
+|---|---:|---:|---:|
+| S2B `20200612` | 4.09 GiB | 2.01 GiB | Julia 2.03x |
+| LC08 `062018` | 7.87 GiB | 4.42 GiB | Julia 1.78x |
+| LT05 `060018` | 8.35 GiB | 5.80 GiB | Julia 1.44x |
+
+Filtering per block would remove it — the correlator already does exactly that internally — except for the
+Landsat 4/5 pairs, whose native filter is a band-reject over the whole scene.
+
+Reproduce with `tools/golden/e2e_run.jl`.
+
+### The correlator alone
+
+The same captured inputs on both sides, so neither re-derives the grid. `jl block` is the
+`process_block_size` the library picks unasked.
 
 | case | jl block | Julia s | Python s | |
 |---|---|---:|---:|---:|
