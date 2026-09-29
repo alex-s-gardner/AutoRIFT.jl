@@ -345,9 +345,10 @@ recovers from the valid-data region's shape, and where it does not, whether the 
 the better answer. Scenes are taken in **job order**, since `apply_landsat_filtering(reference,
 secondary)` filters and logs them in that order rather than in acquisition order.
 
-Each scene's EPSG comes from its own `filtered/` raster: the two scenes of a cross-zone pair are in
-different projections, and a bearing is a grid bearing, so using one CRS for both would put the second
-scene's angles several degrees out.
+**Each scene's EPSG and spacing come from the scene itself**, one per scene: the two scenes of a
+cross-zone pair are in different projections, and a bearing is a grid bearing, so using one CRS for both
+would put the second scene's angles several degrees out. The granule rather than the run's `filtered/`
+copy, which carries the same native grid and which [`prune_run`](@ref) deletes as regenerable.
 """
 function orbit_angle_check(c::GoldenCase, run::AbstractString, cache::AbstractString)
     logged = reference_scan_angles(joinpath(run, "capture.log"))
@@ -355,11 +356,14 @@ function orbit_angle_check(c::GoldenCase, run::AbstractString, cache::AbstractSt
     length(logged) >= length(names) || error(
         "$(run)/capture.log logs $(length(logged)) angle pairs for $(length(names)) filtered " *
         "scenes; the log is truncated or this is not an L4/L5 pair")
+    # `names` is in job order and `scene_path` takes acquisition order, so the two are paired by name
+    # rather than by position.
+    early, late = acquisition_order(c)
+    paths = Dict(early => scene_path(c, :reference), late => scene_path(c, :secondary))
     out = NamedTuple[]
     for (i, name) in enumerate(names)
-        tif = joinpath(run, "filtered", name * "_B2.TIF")
-        isfile(tif) || error("no $tif; the scene EPSG and spacing are read from the filtered raster")
-        ds = ArchGDAL.read(tif)
+        haskey(paths, name) || error("\"$name\" is neither acquisition of $(c.product)")
+        ds = ArchGDAL.read(paths[name])
         epsg = parse(Int, ArchGDAL.toEPSG(ArchGDAL.importWKT(ArchGDAL.getproj(ds))) |> string)
         gt = ArchGDAL.getgeotransform(ds)
         along, cross = orbit_scan_angles(scene_ang(name, cache), epsg; spacing = (gt[2], gt[6]))

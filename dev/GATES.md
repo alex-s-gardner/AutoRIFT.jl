@@ -5615,14 +5615,548 @@ is per-coordinate-system and the decimation is per-level. `Pkg.test()` passes at
 | `NISAR_L2_PR_GSLC` | 29 | **0** |
 
 The rung count varies because a rung with no input reports *skipped* rather than green, and which inputs
-a run kept differs by platform and by how the run was captured. Two deferrals are worth naming, since
-neither is a pass: **both NISAR endpoints are deferred**, not green — 5.43 GiB and 11.25 GiB of imagery is
-more than an unblocked run can hold, so the endpoint on those two is gate `3.nisar` instead. And NISAR
-L1's rung 5.3 is skipped because the pair reaching its correlator is a radar-grid mosaic, which is rung
-5.2's question.
+a run kept differs by platform and by how the run was captured. Two entries are worth naming, since
+neither is a gate: **both NISAR endpoints are reported rather than gated**, the endpoint gate on those two
+being `3.nisar` on the thinned grid. They were *deferred* when this was written — 5.43 GiB and 11.25 GiB of
+imagery is more than an unblocked run can hold — and they now run, mapped and blocked; see "both NISAR
+endpoints run" at the end of this file for what they measure. And NISAR L1's rung 5.3 is skipped because
+the pair reaching its correlator is a radar-grid mosaic, which is rung 5.2's question.
 
 An earlier attempt reported `S1A_..._20151120` and `S1A_..._20170221` as unreachable on **HTTP 502** from
 `sentinel1-burst.asf.alaska.edu`. That was a transient outage on ASF's side — not the `401` that would
 mean a bad `~/.netrc` nor the `404` that would mean a wrong burst index — and both pass on retry. Worth
 recording only because a 502 from a metadata service is indistinguishable from a broken harness until the
 status code is read.
+
+## Step: both NISAR endpoints run, and the one that could not be measured is the better of the two
+
+The two deferrals above are gone. They were a memory limit rather than a finding — `read_capture`
+materialized the captured pair and `rung_endpoint` declined any pair over 4 GiB — and two changes remove
+it: the imagery is **mapped** rather than read (`xread_mmap`, byte-identical, and the pages are file-backed
+and clean), and a pair above that threshold is **blocked** rather than declined, at a size
+`AutoRIFT.block_size_for` derives from the case's own halo.
+
+Both cases below are *reported rather than gated*, deliberately: the ledger has always named `3.nisar` on
+the thinned grid as the endpoint gate for these two, and asserting a threshold here that no entry ever
+claimed would read as a regression on first measurement. The numbers are the point.
+
+| case | imagery | block | blocks | points compared | median | bias core | p99 | exact |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| NISAR L1 RSLC | 5.43 GiB | 5504×3016 | 1508 | 1,792,503 | 0 | **+0.00065** | **0.309** | 73.45% |
+| NISAR L2 GSLC | 11.25 GiB | 2549×1269 | 1936 | 1,757,471 | 0 | +0.00100 | 3.056 | 79.81% |
+
+**L1 clears the gate's own thresholds** — median ≤ 0.0625, |bias| ≤ 0.01, p99 ≤ 1 — on the whole grid,
+which no measurement had previously shown, and its coverage is nearly balanced (6,611 jl-only against
+8,954 ref-only). L2 does not, and the per-level rows say precisely where:
+
+| level | L1 `dx` bias | L1 median | L2 `dx` bias | L2 median |
+|---|---:|---:|---:|---:|
+| chip 96 | −0.00006 | 0 | +0.00004 | 0 |
+| chip 192 | +0.00069 | 0.011 | −0.00051 | 0 |
+| chip 384 | −0.00785 | 0.017 | **+0.45926** | 0.019 |
+| chip 768 | +0.01349 | 0.076 | **+0.70683** | **1.338** |
+
+So on both cases the two measured levels agree to within 7e-4 px, and everything else is the coarse
+levels — which is the swath-edge masking item `tools/golden/README.md` opens with, not a new defect. L1's
+coarse levels are an order of magnitude better than L2's, which is the new information: the defect is not
+uniform across the two NISAR geometries, and L1 is the case to read a coarse-level fix against.
+
+L1 peak RSS 25.20 GiB at 1508 blocks, wall 784 s; the recorded sweep's comparable row is 4096 px square at
+1482 blocks, 27.7 GiB. The two harnesses differ, so that is a consistency check rather than an A/B.
+
+### A latent transposition in the automatic block size, which only an anisotropic halo could show
+
+`_blocks` derived its two numbers from `HALO_BLOCKS * hy` and `HALO_BLOCKS * hx` and emitted them in that
+order, while `_block_size` reads a pair as `(X, Y)` — so the x budget was set from the y halo. **Invisible
+on every configuration ever measured**, because an optical halo is square (69×69) and every radar and NISAR
+figure in this file was hand-specified. On a 2216×1103 halo it picks the transposed shape.
+
+It is also the wrong *magnitude* on such a case: 12 halos per block asks for `(13236, 26592)` on the L2
+grid, which is 25 blocks at 2.5 per thread — the regime this file measures at 2.96 of ten threads busy and
+3.00× untiled peak. `AutoRIFT.block_size_for` replaces both faults with the rule the guidance already
+stated: the halo as a floor, the halo's aspect as the shape, and enough blocks that every thread has a
+queue. Calibrated at 150 blocks per thread against each sweep's lowest peak within 10% of its own best
+blocked runtime, and validated against the recorded rows — `_block_count` reproduces **12 of 12** NISAR
+counts and 4 of 6 optical ones exactly, the two misses being the grid shape assumed by the check.
+
+## Step: what a whole-scene pass holds, and the third of it that was an artifact
+
+Peak on the whole NISAR L1 grid is 32 GiB against a **1.29 GiB floor** once the imagery is mapped, so
+nearly all of it is live working set rather than anything retained. Sized from the configuration rather
+than guessed, at `-t 10` on the 2328x2304 grid over the 57760x50511 scene:
+
+| term | GiB |
+|---|---:|
+| imagery, both images | 5.43 (mapped, not heap) |
+| grid arrays | 0.40 |
+| one displacement field, per level | 0.08 |
+| refinement workspaces, ten tasks | 0.04 |
+| concurrent correlation workspaces, worst level | 4.36 |
+| retained workspace pool | 1.51 |
+| **the scene pad, per pass** | **6.3** |
+
+**Every level pads.** `_pass_geometry` reports `fits = false` at all four chip sizes: a geogrid's points
+sit near the footprint edge and carry radii to 1905 px, so each pass copies the whole scene grown by its
+own halo — 2231x1149 px at the base level rising to 2567x1331 at the coarsest — and with a coarse and a
+fine pass per level that is eight copies per run. It is also what **defeats mapping the input**: 5.43 GiB
+is kept off the heap and then copied back onto it.
+
+**A third of that pad was the validity mask, and it was pure expansion.** `_zeropad` allocates
+`Matrix{T}`, while a mask arrives *packed* — `valid` returns the `BitMatrix` broadcasting produces — so
+padding it cost **3.13 GiB against the 0.39 GiB its source occupies**, once per pass. Nothing read it
+densely enough to justify that: the mask's only consumer is `_any_valid` over a chip footprint, which
+short-circuits on the first valid pixel. `AutoRIFT.PaddedMask` pads it lazily instead.
+
+Paired runs, identical wisdom, one process per arm, nothing differing but the mask:
+
+| arm | wall | CPU | occupancy | peak footprint | peak resident | allocated |
+|---|---:|---:|---:|---:|---:|---:|
+| `_zeropad`ed mask | 545.0 s | 5215.7 s | 9.57 | 38.33 GiB | 43.85 GiB | 161.5 GiB |
+| **lazy mask** | **538.7 s** | 5195.1 s | **9.64** | **31.97 GiB** | 37.49 GiB | 138.1 GiB |
+
+**Peak footprint −6.36 GiB, −16.6%, at no runtime cost.** Bit-identical: both arms measure 1,799,746
+points and give the same `dx` *and* `dy` checksum over raw bits. The allocation column checks the
+mechanism arithmetically — 23.4 GiB less against 3.1 GiB x 8 passes predicted.
+
+### Two things this ruled out, so neither is re-attempted
+
+**Hoisting the imagery pad across passes.** Eight scene-sized copies is 136-161 GiB of allocation, which
+reads as collection pressure and is not: **GC is 1.0-1.4 s, 0.2-0.3% of wall**. Large arrays are cheap to
+allocate and cheap to release, so caching one pad across passes recovers nothing measurable. The plumbing
+it would need — a per-run pad cache threaded through `track!` and both `PassRunner`s — buys a rounding
+error.
+
+**Padding per window instead of per scene.** This is the remaining ~6 GiB and the shape is known, since
+the blocked path already does it per block. Untiled it needs either a lazy padded *image*, which puts two
+comparisons per element into the loops feeding the FFT and the integral tables, or a materialized
+per-window scratch, which makes the window type a `Union` at the call site and reintroduces the dynamic
+dispatch the `_dispatch_pass!` barrier exists to prevent. Against a 16% peak win on a configuration that
+should be blocked anyway — the same granule blocked peaks at 25.2 GiB — neither is worth the hot loop.
+**Blocking is the answer to the scene pad**, and these figures are why.
+
+### Cumulative, whole-grid NISAR L1 untiled
+
+| configuration | peak footprint |
+|---|---:|
+| as the session opened | 42.06 GiB |
+| + workspace pool bounded across keys | 39.05 GiB |
+| + validity mask padded lazily | **31.97 GiB** |
+
+**−10.1 GiB, −24%**, at neutral runtime and bit-identical output throughout.
+
+---
+
+# The Sentinel-1 coregistration, measured against ISCE3 for the first time
+
+`tools/golden/coreg_bench.jl` against `tools/golden/isce_offsets.py --bench`, both on
+`S1C_IW_SLC__1SSV_20250416` run 200 — a burst job over IW1, 7 bursts of 1502 x 20662. Every input is in
+the run directory: both burst2safe SAFEs, `dem.tif`, both orbit files and `secondary.tif`, so neither arm
+fetches anything.
+
+**Coregistration had a correctness record and no timing at all.** That is the gap this closes. It is the
+larger half of a radar pair: the reference spends 2,984 s coregistering a NISAR L1 pair against 812 s
+correlating it, and about thirty minutes on the 43-burst `S1C_IW_SLC__1SDV_20250416` pair whose
+`runAutorift` takes 116 s.
+
+## The two arms
+
+| | AutoRIFT.jl | ISCE3 0.25.12 |
+|---|---:|---:|
+| geometry | **0.007 s** | 65.9 s (`rdr2geo` 54.9, `geo2rdr` 11.0) |
+| deramp | 4.4 s | — (inside `ResampSlc`) |
+| resample | 6.0 s | 20.5 s |
+| **wall** | **10.3 s** | **86.4 s** |
+| cpu | 92.7 s, 9.01 of 12 threads | 551% observed on one burst |
+| peak | 2.62 GiB (1.30 above the harness floor) | 2.93 GiB `ru_maxrss` |
+| **written to disk** | **0** | **9.71 GiB** |
+
+**8.4x on wall clock, and no intermediate file.** The Julia figures are one process; the Julia per-stage
+row is one burst timed apart and multiplied by seven, and it sums to 10.4 s against the 10.3 s the whole
+function takes, so the three stages are the whole of it.
+
+## Most of the gap is algorithmic, not a faster implementation
+
+**76% of the reference's time is geometry it solves per output pixel and writes out.** `Rdr2Geo` fills
+three `Float64` rasters of the burst's full shape — 1502 x 20662 each, 248 MiB apiece — and `Geo2Rdr`
+reads them back to write `azimuth.off` and `range.off`. That is 31,034,324 solves per burst, of which its
+own log reports 30,963,344 converged.
+
+AutoRIFT.jl solves **1,050** of them: `_offset_lattice` places a node every 64 lines and 512 samples and
+interpolates bilinearly between, which `radar.jl` records as exact to about 1e-5 px on a field that moves
+0.0036 lines over 1200. So the honest comparison of the *geometry kernels* is not 65.9 s against 0.007 s
+— it is that one implementation evaluates four orders of magnitude fewer of them. The reference's topo
+rasters are also a product later stages consume, which a lattice is not.
+
+**On the resample, where both do the same work per pixel, it is 3.4x** — 20.5 s against 6.0 s.
+
+## Peak memory is not yet the win
+
+2.62 GiB against 2.93 GiB, and the two are not measured the same way: the Julia figure is a sampled
+resident footprint above the floor the harness already held, the Python one is `ru_maxrss` for a process
+carrying its interpreter and GDAL's caches. Read it as "the same order", not as a 10% saving.
+
+0.74 GiB of the Julia peak is the mosaic itself, `zeros(Float32, 9554, 20662)`, and `deramped_burst`
+holds two full-burst arrays at once on top of it. Neither is necessary: a resample that produced only the
+window a caller asked for would hold neither, and `autorift` already drives exactly that pattern through
+`process_block_size`. That is the open work, and it is also what removes the 9.71 GiB the reference
+writes — a lazily resampled secondary never becomes a file.
+
+## Agreement, and one open item
+
+The gate is the statistic `radar.jl` chose the interpolation kernel on, mean ratio and correlation against
+`secondary.tif`. Over an interior column strip the two agree at a correlation of **1.00000**. Over the
+whole mosaic, 158,581,894 comparable pixels: mean ratio **1.0007**, correlation **0.98172** — so the
+disagreement is at the burst seams rather than in the interpolation.
+
+**`secondary_swath_amplitude` is a subswath, not the mosaic, and the two differ by 19 rows on this pair.**
+It is the counterpart of the reference's `sec_swath_iw1.tif`, which places the first burst's valid region
+at row `first_valid_line` — 20 here — while `secondary.tif` is the output of `merge_swaths`, which slices
+each subswath from `slc_az_start_index = bursts[0].first_valid_line` and writes it at `az_offset`, zero for
+the first subswath. So the 19 rows are the stacking crop and not a disagreement.
+
+`_stack_swaths` already performs it: `radar_mosaic` on the reference acquisition matches `reference.tif` at
+**row lag 0, correlation 1.000000 and mean ratio 1.000000** over 158,556,780 pixels, at the full
+17606 x 20662 extent. A comparison of a subswath against a mosaic is a comparison across that crop, which
+is why `coreg_bench.jl` measures the lag rather than assuming it.
+
+The reference's raster is also about 1.8x the acquisition — `merge_swaths:437-439` adds the *merged*
+height to the last burst's start — and everything past the acquisition is zero: measured, rows 9000 and
+beyond of `secondary.tif` hold no non-zero sample. So the comparison is over the 9554 rows the
+acquisition occupies and the empty tail is not counted as agreement.
+
+## Tabulating the interpolation kernel: the resample 4.1x
+
+`sinc8` evaluates `sinpi` and `cospi` eight times per axis, so the inner loop paid **sixteen
+transcendentals per output sample** for taps that depend on nothing but the fractional offset, and then
+divided by `sum(ty) * sum(tx)`, which depends on the same thing. `SINC_TAPS` holds the kernel at 2,048
+fractional positions with the normalization folded in, and `sinc8_taps` is two lookups.
+
+| | per burst | subswath | against ISCE3's 86.4 s |
+|---|---:|---:|---:|
+| `sinc8` per pixel | 0.852 s | 10.3 s | 8.4x |
+| `SINC_TAPS` lookup | **0.210 s** | **6.5 s** | **13.3x** |
+
+**The gate does not move at all**: row lag +19, 1.00000 on the interior strip, mean ratio 1.0007 and
+correlation 0.98172 over the same 158,581,894 pixels — the same figures to every digit the harness prints.
+Quantizing the offset to 1/2048 px is 0.00024 px at worst against an offset field already interpolated to
+about 1e-5, so this is a free 4.1x rather than a trade.
+
+**The deramp is now the larger half of a burst**, 0.643 s against the resample's 0.210. It is also where
+the footprint is: `deramped_burst` reads the burst with `src = raster[rows, :]` and writes a second
+full-burst `ComplexF32` beside it, both of which a window-at-a-time resample would bound.
+
+Peak moved the wrong way, 1.30 GiB above the floor to 1.65, and the cause is the speed rather than the
+table — 131 KiB of taps against a run that now produces the same per-burst garbage in two thirds of the
+time, leaving the collector less of it to reclaim between bursts. It is a further reason the footprint
+needs the structural change and not tuning.
+
+## The resample, lazily, a window at a time
+
+`ResampledSwath` is the secondary on the reference's merged grid as an `AbstractMatrix{Float32}` whose
+`getindex` over two ranges resamples **only that window**. Nothing holds the mosaic and nothing writes it,
+which is what removes the 9.71 GiB the reference puts on disk: `secondary.tif` exists only because the
+correlator reads the secondary from a file, and a lazy secondary is read from memory a block at a time.
+
+`secondary_swath_amplitude` is now this materialized in one pass over the placements, so the two paths
+share one implementation rather than being two that agree. Three primitives took an `origin` — the
+burst-local zero-based `(line, sample)` of the array's first element — so a band of a burst carries the
+phase and the valid rectangle it has inside the whole burst: `deramped_burst`, `_zero_outside_valid!` and
+`resample_burst`. `resample_burst` also separates two bounds that were one: **a pixel whose eight-tap
+support leaves the burst is rejected, and one whose support leaves the band throws.** Conflating them is
+how a lazily resampled block would silently come to differ from the mosaic.
+
+### Reading the whole subswath in blocks, 12 threads
+
+| | wall | peak above floor | blocks | source pixels deramped | checksum |
+|---|---:|---:|---:|---:|---|
+| materialized | 5.6 s | 1.19 GiB | 1 | 1.000x | — |
+| block 4096 | **4.7 s** | 0.42 GiB | 18 | 0.971x | matches |
+| block 2048 | 5.4 s | 0.37 GiB | 55 | 0.979x | matches |
+| block 1024 | 5.4 s | **0.16 GiB** | 210 | 0.995x | matches |
+| block 512 | 5.8 s | 0.19 GiB | 779 | 1.025x | matches |
+
+**Blocked is not slower than materializing, it is faster**, and the reason is the same one that shrinks
+the footprint: the materialized path deramped each burst's full 20662-sample width, where a window
+deramps only the support its own outputs reach. The refactor took the materialized arm from 6.5 s to
+5.6 s on its own.
+
+**Read amplification is 1.0, not the 21.6x a blocked correlator reaches.** That figure is the
+*correlator's* halo, which carries the search radius; a resampler's halo is the eight-tap support and four
+pixels of margin, so even 512-pixel blocks re-deramp only 2.5% and blocks of 1024 and up deramp *less*
+than the whole burst. There is no cache to build.
+
+The absolute peak column is omitted because these arms run in a process that still holds the materialized
+mosaic for the comparison; the figure above the floor sampled just before each arm is the window's own
+footprint, and that is the one that falls 7.4x.
+
+### Equality, including the seams
+
+`coreg_bench.jl` asserts eleven windows against the materialized mosaic and all eleven are **bitwise
+equal**: one inside a burst, both corners, a single full-width row, a single column, and one across each
+of the six burst seams. The seams are the load-bearing case — consecutive placements overlap by one row,
+so which burst writes a shared row is an ordering both paths have to agree on, and a window straddling a
+seam picks up two bursts each with its own carrier and offset lattice.
+
+The gate against `secondary.tif` does not move: row lag +19, 1.00000 on the interior strip, mean ratio
+1.0007, correlation 0.98172 over the same 158,581,894 pixels.
+
+### Where this leaves the comparison
+
+| | AutoRIFT.jl | ISCE3 0.25.12 |
+|---|---:|---:|
+| wall | **4.7 s** | 86.4 s |
+| resampler footprint | **0.16 GiB** at block 1024 | 2.93 GiB `ru_maxrss` |
+| written to disk | **0** | 9.71 GiB |
+
+**18x on wall clock**, at a footprint that scales with the block rather than the scene, and with no
+intermediate raster.
+
+`ResampledSwath` is one subswath, so what a caller hands `autorift` is `ResampledMosaic`: the same laziness
+carried through the stacking `_stack_swaths` performs, on the grid the geogrid describes.
+
+## The mosaic grid, and what the 19 rows actually were
+
+The subswath a `ResampledSwath` produces is the reference's `sec_swath_iw<n>.tif`, not `secondary.tif`.
+`merge_swaths` puts the mosaic together from those with an asymmetry worth naming, because it is what a
+subswath-against-mosaic comparison trips over (`s1_isce3.py:483-500`):
+
+```python
+az_offset            = floor((sensing_starts[k] - sensing_start) / az_time_interval)   # 0 for the first
+slc_az_start_index   = bursts[0].first_valid_line
+merged_az_slice      = slice(az_offset, ...)          # azimuth is cropped and moved to the offset
+slc_az_slice         = slice(slc_az_start_index, ...)
+rng_offset           = rng_offsets[k] + bursts[0].first_valid_sample
+merged_rng_slice     = slice(rng_offset, ...)         # range is cropped and left where it is
+slc_rng_slice        = slice(first_rng_sample, ...)
+```
+
+**Azimuth is cropped and moved; range is cropped and left.** So a subswath sits `first_valid_line` rows
+below the mosaic and zero columns across — which is exactly the +19 rows and 0 columns measured on
+`S1C_IW_SLC__1SSV_20250416`, where `first_valid_line[1]` is 20.
+
+`_stack_swaths` already implemented it. On the reference acquisition, `radar_mosaic` against
+`reference.tif`: **row lag 0, mean ratio 1.000000, correlation 1.000000** over 158,556,780 pixels at
+17606 x 20662. There was nothing to fix in the merge; what was missing was a secondary and a lazy array
+*at that level*, since the mosaic grid is the one the geogrid's `window_*` rasters index and therefore the
+one a correlator's point set is expressed in.
+
+`_mosaic_layout` now returns the placements and the mosaic size, `_stack_swaths` fills from them, and
+`ResampledMosaic` reads through them — one arithmetic, three callers, so a lazy mosaic and a materialized
+one cannot disagree about an index. `secondary_mosaic` is the materialized secondary at that level.
+
+### The secondary mosaic, lazily
+
+| | wall | peak above floor | blocks | source pixels deramped | checksum |
+|---|---:|---:|---:|---:|---|
+| materialized, 17606 x 20662 | 7.8 s | — | 1 | — | — |
+| block 4096 | **6.2 s** | 0.74 GiB | 30 | 1.006x | matches |
+| block 2048 | 6.6 s | **0.25 GiB** | 99 | 1.010x | matches |
+| block 1024 | 6.8 s | 0.43 GiB | 378 | 1.018x | matches |
+
+The band a piece reads is bounded by evaluating the offset field at **every** output pixel rather than on
+a stride through it. A strided bound is not a bound where the window reaches past the last lattice node
+and the field is extrapolated: on `S1A_IW_SLC__1SSV_20240618` IW2, where the range offset reaches +87
+samples, it missed the true maximum by more than a sample and `resample_burst`'s band assertion fired.
+Exact bounds make that assertion unreachable, cut the re-read from 1.015-1.039x to **1.006-1.018x**, and
+cost a second pass of the offset interpolation — the materialized mosaic goes 5.7 s to 7.8 s. A bound per
+lattice cell would be exact and cheaper, since the field is bilinear within a cell.
+
+Twelve windows read from a `ResampledMosaic` are **bitwise equal** to the materialized mosaic: mid-swath,
+both corners, a single full-width row, a single column, the data's first and last rows, and each of the
+five burst seams the stacking keeps. The sixth burst seam is not among them because the crop removes it,
+which is the arithmetic being right rather than a case going untested.
+
+The gate against `secondary.tif` is now at **row lag 0**: mean ratio 1.0007, correlation 0.98172 over
+158,581,894 pixels — the same values as the subswath comparison, since the crop moves pixels without
+changing them.
+
+### It feeds `autorift` without a file
+
+`AutoRIFT._read_window!`'s generic method indexes with ranges rather than viewing, and `src/tile.jl:841`
+says why: a view of a lazy array defers to a scalar read per pixel, measured there at 444 s against 0.6 s.
+A `ResampledMosaic` is not a `StridedMatrix`, so it takes that method — and `_read_window!` on one returns
+a window **identical** to the mosaic's, which is asserted in `coreg_bench.jl` rather than argued from the
+types.
+
+So a blocked correlation can take the coregistered secondary as its second image directly. What the
+reference needs `secondary.tif` for — 9.71 GiB across the burst set, 6.26 GiB per acquisition on a
+full-SLC pair — is a handoff between two processes that this does not have.
+
+### The correlation itself, over a secondary that is never materialized
+
+Window equality covers the reads the harness issues. This runs the correlator over the whole production
+grid and compares what comes out, which is the only statement that covers the reads the *driver* issues —
+its own halo, its own block order, one read per block per pass.
+
+`coreg_bench.jl` takes the grid and the settings from the run's capture, so neither is chosen here: chip
+56 by 16 with `ScaleChipSizeY` 0.2857, a high-pass filter 21 samples wide, and a per-point search radius
+from the geogrid reaching 75 samples in x and 13 in y. Only `preprocess` is overridden — a capture's
+imagery is already filtered and a resampled mosaic is raw amplitude, which is also what has the blocked
+path filter each block from raw input. 12 threads.
+
+**The filter is `correlator_filter`'s, not the capture's scalar name.** `WallisFilterWidth` carries the
+*width* of whichever method the driver picked, and for a Sentinel-1 pair the method is the plain high-pass
+(`testautoRIFT.py:293-308`). Reading the name as the method puts a Wallis filter on a pair the reference
+high-passes, which is what an earlier run of this stage did.
+
+| secondary | block | wall | cpu | peak | answer |
+|---|---:|---:|---:|---:|---|
+| the materialized mosaic | 2048 | 7.0 s | 53.7 s | 9.73 GiB | 42,790 of 188,805 searchable points measured |
+| `ResampledMosaic` | 2048 | 21.6 s | 216.4 s | **6.63 GiB** | `dx`, `dy`, `correlation`, `chip_size` **identical** |
+| `ResampledMosaic` | 1024 | 28.2 s | 296.5 s | **4.69 GiB** | identical |
+
+The reference resolved 41,935 points on this grid, so the two counts sit within 2% of each other. That is
+context and not an agreement: our imagery is `Float32` amplitude filtered here, the reference's is `uint8`
+filtered there, and the gate on the imagery is the amplitude comparison above.
+
+**What laziness costs is one resample per pass, not per run.** There are four chip-size levels, the driver
+reads each block once per pass, and nothing holds the result between passes — so the mosaic is resampled
+about four times, which is the whole of the 21.6 s against 7.0 s. Materializing first and correlating costs
+7.8 s + 7.0 s = 14.8 s, so on this pair the lazy arm is 6.8 s slower and 3.10 GiB smaller, and it writes
+nothing. Resampling once per block rather than once per block per pass needs the level loop inside the
+block loop, or a block cache across passes; `cache_budget` is not that knob, since it caches disk-backed
+input and a `ResampledMosaic` is not disk-backed.
+
+**A patch of the grid is not available as a cheaper arm.** The coarse pass restricts the finer levels
+through the outlier filter's neighbourhood, so a grid shorter than that window searches every point at full
+radius and keeps none — `tile.jl:1260` warns about it. With the reference's own imagery, grid and settings
+over a 192x384 patch where the reference measured 1,640 of 73,728 points, both argument orders measure
+**0**. The whole grid is the smallest arm that measures anything.
+
+# From the granule to `dx`/`dy`: the first end-to-end measurement of either arm
+
+`README.md`'s performance table is a *correlator* comparison and says so — "the same captured inputs on
+both sides, so neither re-derives the grid". `e2e_table.jl` joins two sweeps that both read captures, and
+`e2e.jl` compares one stage at a time against the reference's own artifacts before correlating the
+capture's imagery. Nothing measured the chain that turns a granule into a displacement field.
+
+`tools/golden/e2e_run.jl` does, on the pieces that ladder validates separately:
+
+| stage | what it is |
+|---|---|
+| `geometry` | the scenes resolved, warped to one projection if they are not, the footprints coregistered, the parameter region looked up and the geogrid solved — `setup` |
+| `grid` | the geogrid's own point set and parameters — `AutoRIFT.pointset`/`params` of it |
+| `imagery` | the correlator's input from the granule: the overlap out of each optical scene with the filter `process.py` applies to a native scene, or the reference mosaic and a lazily resampled secondary for a radar burst pair |
+| `correlate` | `autorift` at the block `block_size_for` picks |
+
+**The scenes are staged locally before the clock starts**, since the instruction is to measure from the
+point the raw data is on disk. `--stream` leaves them where `scene_path` resolves them, which is what the
+container does — measured on `LC08_L1TP_062018`, the two differ by the `imagery` stage alone: 92.6 s
+streamed against 5.3 s local, so 87 s of a 140 s run was requester-pays egress.
+
+**A cold process spends its first pass compiling** — 9.1 s of a Sentinel-2 case's `geometry` and 0.4 s of
+its `grid` — so `run_case` runs the chain twice and reports the second. One process per case, so each peak
+is that case's own high-water mark.
+
+## The 15 cases the chain reaches
+
+12 threads on an Apple M2 Max. The Python column is the reference's own `capture.log`, from the last
+download to "Successfully created autoRIFT product" — so it excludes the granule fetch and includes
+everything else, including its `/vsis3` reads on the optical cases.
+
+| case | plat | geometry | grid | imagery | correlate | **Julia s** | **Python s** | | Julia peak | measured |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| LC08 `009011` | L8 | 11.4 | 0.2 | 5.5 | 37.8 | **54.9** | 376 | 6.8x | 11.64 GiB | 1,706,365 |
+| LC08 `060018` | L8 | 9.6 | 0.1 | 31.5 | 25.9 | **67.2** | 328 | 4.9x | 16.41 | 695,256 |
+| LC08 `062018` | L8 | 12.8 | 0.2 | 5.1 | 14.9 | **33.0** | 289 | 8.8x | 7.87 | 720,985 |
+| LC09 `215109` | L9 | 25.1 | 0.2 | 6.3 | 8.3 | **39.9** | 327 | 8.2x | 9.00 | 456,285 |
+| LE07 `061018` (2012) | L7 | 9.9 | 0.1 | 33.0 | 42.2 | **85.3** | 271 | 3.2x | 18.06 | 141,675 |
+| LE07 `061018` (2013) | L7 | 13.9 | 0.1 | 31.0 | 34.7 | **79.7** | 358 | 4.5x | 17.40 | 699,119 |
+| LE07 `063018` | L7 | 13.6 | 0.2 | 30.9 | 49.5 | **94.1** | 335 | 3.6x | 18.50 | 1,589,751 |
+| LT04 `063018` | L4 | 11.3 | 0.2 | 13.6 | 4.3 | **29.4** | 195 | 6.6x | 6.73 | 293,382 |
+| LT05 `001013` | L5 | 29.1 | 0.2 | 15.6 | 5.0 | **49.9** | 190 | 3.8x | 8.29 | 255,839 |
+| LT05 `060018` | L5 | 8.4 | 0.1 | 8.5 | 3.7 | **20.7** | 118 | 5.7x | 8.35 | 753,188 |
+| S1A `1SSV_20240618` a | S1-BURST | 25.0 | 0.3 | 9.3 | 425.6 | **460.3** | 1536 | 3.3x | 16.47 | 752,369 |
+| S1A `1SSV_20240618` b | S1-BURST | 13.8 | 0.1 | 4.0 | 158.3 | **176.3** | 632 | 3.6x | 8.59 | 254,366 |
+| S1C `1SSV_20250416` | S1-BURST | 12.9 | 0.1 | 2.4 | 29.7 | **45.1** | 383 | 8.5x | 6.40 | 43,237 |
+| S2A `20200626` | S2 | 6.0 | 0.1 | 3.5 | 4.8 | **14.4** | 186 | **12.9x** | 3.75 | 594,462 |
+| S2B `20200612` | S2 | 5.5 | 0.0 | 3.7 | 11.7 | **21.0** | 187 | 8.9x | 4.09 | 610,129 |
+| **sum** | | | | | | **1,271.4** | **5,711** | **4.5x** | | |
+
+**Median 6.6x, best 12.9x, worst 3.2x.** The ratio is smaller than the correlator-only table's because the
+correlator is where the whole advantage lives: it is 4 to 63% of a Julia run here, and the stages in front
+of it — geogrid, scene read, native filter — are GDAL and arithmetic on both sides.
+
+## Peak memory runs the other way
+
+Sampled from the container's own cgroup accounting every 3 s, on three cases re-run for the purpose. The
+Julia figure is the sampled resident footprint of the whole chain.
+
+| case | Julia peak | Python peak | |
+|---|---:|---:|---:|
+| S2B `20200612` | 4.09 GiB | 2.01 GiB | Julia **2.03x** |
+| LC08 `062018` | 7.87 GiB | 4.42 GiB | Julia **1.78x** |
+| LT05 `060018` | 8.35 GiB | 5.80 GiB | Julia **1.44x** |
+
+**So the chain is 4.5x faster and 1.4-2.0x larger, and the reason is the `imagery` stage rather than the
+correlator.** Blocked correlation already bounds the correlator's own footprint by the block — that is what
+the memory table in `README.md` measures. What this driver does not do is bound the *scene*: it holds the
+raw band, the filtered band and the crop as whole-scene `Float32` arrays, three copies of 1.1 GiB each on a
+Landsat 8 pair, where the reference writes its filtered scene to disk and reads back a window. The two L7
+cases reach 18.5 GiB for that reason, above the 16 GiB this repository elsewhere treats as the target.
+
+Filtering and cropping per block would remove it, and the machinery exists — `_prepared_block_pair` already
+filters a correlator block from raw input with the halo the filter needs. The obstacle is that `Destripe`
+is a band-reject over the whole scene, so the L4/L5 pairs cannot be filtered blockwise at all; the L7/L8
+`WallisGapfill` and the plain high-pass can.
+
+## The five the chain now also reaches
+
+Same convention as the table above: the Python column is the reference's own `capture.log` from its first
+entry to "Successfully created autoRIFT product", which reproduces the recorded 328 s for LC08 `060018`
+exactly.
+
+| case | plat | geometry | grid | imagery | correlate | **Julia s** | **Python s** | | Julia peak | measured |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| S1A `1SSH_20150828` | S1-SLC | 40.7 | 0.7 | 6.9 | 77.5 | **125.8** | 1,457 | 11.6x | 13.64 GiB | 1,028,620 |
+| S1B `1SDH_20180809` | S1-SLC | 24.0 | 0.3 | 11.9 | 126.0 | **162.1** | 2,664 | 16.4x | 17.68 | 493,166 |
+| S1C `1SDV_20250416` | S1-SLC | 25.5 | 0.4 | 11.8 | 55.1 | **92.7** | 2,252 | 24.3x | 15.73 | 524,369 |
+| NISAR L2 GSLC | NISAR-L2 | 11.2 | 0.7 | 0.9 | 1,703.3 | **1,716.1** | 2,760 | 1.6x | 29.89 | 1,682,784 |
+| NISAR L1 RSLC | NISAR-L1 | 29.8 | 0.6 | 0.4 | 4,438.6 | **4,469.5** | 4,476 | **1.0x** | 39.73 | 1,649,884 |
+
+**The three full-SLC pairs are where the ratio is largest**, for the reason the correlator-only table could
+not show: the reference spends most of a full-SLC run in COMPASS, resampling every burst of three subswaths
+onto a common grid, and this chain does that lazily inside the correlator's blocks.
+
+**NISAR L1 is a dead heat and NISAR L2 is 1.6x**, both bounded by the same thing. Their correlator input is
+read from the HDF5 product, and `H5Dread` runs the deflate filter inside the lock that a non-thread-safe
+libhdf5 forces — so `correlate` is the whole run and it cannot use the machine. Decoding a window's chunks
+outside that lock takes a 2048² amplitude read from 0.707 s to 0.029 s and occupancy from 2.6 of 10 threads
+to 9.1; the figures above are with that in place, and without it the L2 case takes 5,734 s at 100.6 GiB.
+
+The two NISAR peaks are the largest here because a geocoded overlap is billions of samples: the L2 pair's
+scene is 54,885 x 110,085 and the L1 pair's 57,760 x 50,511.
+
+## What the chain does not reach, and why
+
+| cases | why |
+|---|---|
+| `S1A ... 20151120`, `S1A ... 20170221` | their runs hold a COMPASS CSLC, so `s1_pair` takes the merged shape from it and the geogrid lands on the grid COMPASS resampled onto rather than the annotation's |
+
+Both acquisitions' CSLCs sit on that resampled grid — 1640 x 21458 on IW1 against the annotation's
+1504 x 21530, and `reference.tif` and `secondary.tif` are both 67860 x 24043 — so the *reference* mosaic is
+itself a resample there and not a merge of raw bursts. Reproducing it needs the reference's own
+coregistration target, which no rung derives. `e2e_run.jl` fails with that stated rather than correlating on
+a grid its point set is not on. The other three full-SLC pairs' runs hold no CSLC, which is why their
+annotation-derived mosaic agrees and why they are 31/31 on the ladder — it never asks the question.
+
+The reference's own wall clock for those two is 1,851 and 2,615 s, so the twenty this chain does reach
+account for 19,320 s of the reference's 23,786 s over the whole set. Against them the chain spends 7,837 s,
+a **2.5x** ratio overall — held there by the two NISAR granules, which are 6,186 s of that 7,837 and the only
+two cases the reference is not beaten on by a factor of three or more.
+
+## Two defects the sweep found
+
+**A sampled band bound is not a bound.** `_support_bounds` sampled the offset field on a stride at half the
+lattice spacing, which bounds a bilinear interpolant inside the lattice but not an extrapolation past its
+last node. On `S1A_IW_SLC__1SSV_20240618`, where the range offset reaches +87 samples, the bound missed the
+true maximum and `resample_burst`'s band assertion fired — the assertion earning its place. Now exact.
+
+**The band assertion was itself one row tight.** The taps read `by - 4 + m` for `m` in `1:8`, so the support
+is `by - 3` through `by + 4`, but the guard demanded `by - 4 >= 1`. With the old four-pixel margin it never
+fired; with exact bounds it fired immediately, on a window whose support the band did contain — which the
+error message showed, since the message stated the true range.
+
+A third failure was **not** a defect: `S1A_IW_SLC__1SSV_20240618` b died with a bus error inside Julia's
+runtime on its first attempt and completed on the second at a peak of 8.59 GiB. The machine had 15 GiB of
+disk free and 3 GiB of swap, and the case before it peaked at 16.47 GiB.

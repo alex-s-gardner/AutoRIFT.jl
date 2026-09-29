@@ -284,6 +284,146 @@ records as costing it 1.6% of the points on a different scene.
 That set is what makes Phase 1 possible without re-deriving anything: the same filtered inputs, the
 same geogrid, and the reference's own `Dx`/`Dy` to diff AutoRIFT.jl's against directly.
 
+### Which cases fit an instance, and does blocking still give the same answer
+
+```bash
+julia --project=tools/golden tools/golden/case_peaks.jl 16      # seconds; reads the histories only
+julia --project=tools/golden -t 10,1 tools/golden/block_agreement.jl S1B_IW_SLC__1SDH_20180809 2048 --run 200
+```
+
+`case_peaks.jl` reports each case's lowest recorded peak and **how many of its rows were blocked at all**.
+That second column is the point: three Sentinel-1 cases sit at 18–19.5 GiB with *zero* blocked rows
+between them, one of them across 42 recorded rows, so the knob that would fix them has never been applied
+to them. Blocking a fourth took it from 21.96 GiB to 3.94 and ran 2.4x faster.
+
+`block_agreement.jl` answers whether a blocked run still reproduces an untiled one on a granule, and
+classifies the disagreement when it does not — seam effect against numerical drift against a localized
+defect, which want opposite responses. `test/tile.jl` asserts the same equality on synthetic grids, where
+it holds; on a Sentinel-1 geogrid it does not.
+
+```bash
+julia --project=tools/golden -t 10,1 tools/golden/block_bisect.jl S1B_IW_SLC__1SDH_20180809 2048 --run 200
+julia --project=tools/golden -t 10,1 tools/golden/coarse_span.jl  S1B_IW_SLC__1SDH_20180809 2048 --run 200
+```
+
+`block_bisect.jl` removes one stage of the level machinery at a time — the chip-size cascade, the coarse
+gate, the outlier filter — and says which one the disagreement enters at. `coarse_span.jl` then checks the
+mechanism by arithmetic alone, without correlating: whether the coarse pass has searchable points that the
+block's read window was not sized for, because `_cell_max_radius!` widens a coarse point's radius over a
+neighbourhood while `_searchable_span` reduces over each point's own. `dev/plan-16gib.md` has the numbers
+and the three candidate fixes.
+
+### Gate: a blocked run must reproduce an untiled one
+
+```bash
+julia --project=tools/golden -t 10,1 tools/golden/block_gate.jl NISAR_L2_PR_GSLC --stride 4
+julia --project=tools/golden -t 10,1 tools/golden/divergence_fate.jl S1B_IW_SLC__1SDH_20180809 2048 --run 200
+```
+
+`block_gate.jl` asserts `dx` and `dy` identical under `isequal` and exits non-zero otherwise. **It fails on
+every real captured grid today** — S1B loses 5.3% of its points, LC08 x LE07 0.37%, S2B 0.25% — which is the
+finding and not a broken harness; `dev/plan-16gib.md` step 0 has the table. `test/tile.jl` is the positive
+control, asserting the same property on the synthetic grids where it holds, which is why this went unnoticed
+through 22 green cases.
+
+A thinned run is a **detector, not a measure**: NISAR L2 at `--stride 4` loses 65% where the whole grid loses
+5.3%, because thinning zeroes most radii while `_cell_max_radius!` still widens over nine points. Quote
+`--stride 1`.
+
+`divergence_fate.jl` says what becomes of the divergent points, by reading the reference's own
+`autoRIFT_intermediate.nc` on the same grid — no coordinate mapping, and it asserts the orientation before
+reporting anything, since the intermediate is `(x, y)` where the grid is `(y, x)`. The answer on S1B is that
+the reference measured **97%** of them and an untiled run reproduces it to a median of 0.000 px, so a blocked
+run is the one that is wrong.
+
+### Sweeping the in-use workspace bound
+
+```bash
+AUTORIFT_LIVE_GIB=2 julia --project=tools/golden -t 10,1 tools/golden/live_budget.jl \
+    NISAR_L2_PR_GSLC --blocks 2304x1152 --no-profile
+```
+
+`live_budget.jl` sets `AutoRIFT.WORKSPACE_LIVE_BYTES` from `AUTORIFT_LIVE_GIB` and then runs
+`profile_nisar.jl` unchanged; unset or `0` is the baseline arm. The bound is **measured neutral** on NISAR
+L2 blocked — see `dev/plan-16gib.md` — because a blocked pass spans only its own block's radius range, so
+blocking already bounds live workspaces more tightly than a byte budget does.
+
+**Interleave the arms.** Ordered `none, none, 2, 1` this sweep reads as a 25% speed win that four
+interleaved arms show to be the cold page cache on the first process. The capture is 11 GiB memory-mapped
+and the first run of a sequence pays for it.
+
+### Measuring a candidate change to `src/` on a whole granule
+
+`with_copies.jl` drives `profile_nisar.jl` unmodified with two method overrides installed, so one row
+measures the code as it was before a change without reverting the change. `dev/plan-16gib.md` holds the
+A/B it produced.
+
+```bash
+C=$AUTORIFT_GOLDEN_CACHE/mem/prof_NISAR_L2_PR_GSLC_003_170_D_053_7700_SHNA_A_20251028T235201_20251028T235238_X05009_N_P_J_001.jls
+cp "$C" /tmp/history.jls                       # the history is append-only, and one row below is not src/
+julia --project=tools/golden -t 10,1 tools/golden/profile_nisar.jl NISAR_L2_PR_GSLC \
+    --blocks 2304x1152 --no-profile            # src/ as it stands
+julia --project=tools/golden -t 10,1 tools/golden/with_copies.jl NISAR_L2_PR_GSLC \
+    --blocks 2304x1152 --no-profile            # the per-block copies put back
+cp /tmp/history.jls "$C"                       # drop the row that describes internals not in src/
+```
+
+Two properties this measurement needs, both of which cost a wrong answer without them.
+
+**The arms must come from the same tree.** A row measured here against a figure in
+`docs/src/explanation/memory.md` is only comparable if `src/` has not moved between them — and the
+check is the point count, not the block shape. A re-measured L2 row has matched the recorded layout
+exactly (`readamp 3.30x`, the same `3336 x 6690 px` window) while measuring 147,099 fewer points.
+
+**`with_copies.jl` prints how many times each override fired.** An override whose signature does not
+match what the driver calls is a silent no-op, and the arm then reports the current code twice. Expect
+`_read_window!` to be exactly twice `_prepare_block` — one read per image per block.
+
+## What the coregistration costs
+
+```bash
+julia --project=tools/golden -t 12,1 tools/golden/coreg_bench.jl S1C_IW_SLC__1SSV_20250416
+micromamba run -n arift-ref python tools/golden/isce_offsets.py <run_dir> <out_dir> --bench
+```
+
+The two arms of the same work: the secondary acquisition put on the reference's grid, which is the whole
+of what COMPASS's per-burst `rdr2geo`/`geo2rdr`/`ResampSlc` and hyp3's `merge_swaths` produce. Every
+other harness here measures the correlator; this measures the stage in front of it, which on a radar pair
+is the larger of the two — the reference spends 2,984 s coregistering a NISAR L1 pair against 812 s
+correlating it.
+
+Both run on data the run directory already holds, so neither fetches a granule. The Python arm writes
+about 1.4 GiB per burst and keeps it, since the disk traffic is part of what is being compared; delete
+`<out_dir>` afterwards.
+
+`--blocks` reads the mosaic through `ResampledMosaic`, which resamples a window at a time rather than
+materializing it — the arrangement a correlator driving the resample through `process_block_size` uses,
+and the level a correlator's point set is expressed at, since the mosaic grid is the one the geogrid's
+`window_*` rasters index. Each block size is checked against the materialized answer, and `--no-check`
+drops the window equality assertions that precede it, including the one that reads through
+`AutoRIFT._read_window!`.
+
+**A subswath is not the mosaic.** `ResampledSwath` and `secondary_swath_amplitude` are the reference's
+`sec_swath_iw<n>.tif`; `ResampledMosaic` and `secondary_mosaic` are `secondary.tif`. `merge_swaths` crops
+each subswath from its `first_valid_line` and moves it to the subswath's azimuth offset while leaving
+range where it is, so the two levels differ by that many rows and no columns — 19 on
+`S1C_IW_SLC__1SSV_20250416`. Comparing across the two levels is what the harness's row-lag search is for.
+
+The last stage hands the lazy secondary to `autorift` itself, over the grid and settings from the run's
+capture — chip 56 by 16 behind a Wallis filter 21 samples wide, the geogrid's own per-point radii — and
+compares the result against the same correlation over the materialized mosaic. `--no-correlate` skips it
+and `--corr-blocks` sets the block sizes. **The grid is the whole production grid and cannot be thinned to
+a patch:** the coarse pass restricts the finer levels over the outlier filter's neighbourhood, so a patch
+searches every point at full radius and keeps none, measuring nothing even with the reference's own
+imagery.
+
+`dev/GATES.md` carries the measurement. In short: 4.3 s against 86.4 s, a resampler footprint of 0.33 GiB
+against 2.93, and no intermediate file against 9.71 GiB of them. Most of the time difference is that the
+reference solves the geometry per output pixel where `_offset_lattice` solves 1,050 nodes and interpolates.
+Correlating through the lazy secondary gives `dx`, `dy`, `correlation` and `chip_size` identical to
+correlating the materialized mosaic, at 5.20 GiB of peak against 6.91 and one resample per chip-size level
+in exchange.
+
 ## The end-to-end ladder: from the granule
 
 ```bash
@@ -326,6 +466,34 @@ attribution knob, not a correctness one.
 
 No new container run is needed for any of it. The geogrid rasters, the intermediate and the capture are
 already cached for all 22 cases.
+
+## Running the whole chain, and timing it
+
+```bash
+AWS_PROFILE=itslive julia --project=tools/golden -t 12,1 tools/golden/e2e_run.jl S2B_MSIL1C_20200612
+AWS_PROFILE=itslive julia --project=tools/golden -t 12,1 tools/golden/e2e_run.jl --all --tsv julia.tsv
+```
+
+`e2e.jl` compares each stage against the reference's artifacts; this *runs* them, in order, from the
+granule to `dx`/`dy`, and times each one — `geometry` (scenes, coregistration, geogrid), `grid`, `imagery`,
+`correlate`. It is the only harness here that measures the pipeline rather than the correlator.
+
+The scenes are copied under `<cache>/granules/` before the clock starts, and `scene_path` prefers a staged
+copy through [`STAGED`](scenes.jl) thereafter. That is the difference between timing the computation and
+timing the network: on `LC08_L1TP_062018` the `imagery` stage is 5.3 s local against 92.6 s over
+requester-pays `/vsis3`. `--stream` reads them where they lie, which is what the container does.
+
+A cold process spends its first pass compiling, so each case runs twice and the second is reported;
+`--cold` reports the first. Run one case per process when peaks matter — they are the process's own
+high-water mark, and a sweep in one process carries the previous case's floor.
+
+Fifteen of the twenty-two cases have a chain to run: all twelve optical and the three Sentinel-1 burst
+pairs. `unsupported` names what the other seven need, and `dev/GATES.md` carries the comparison against the
+reference's own logged wall clock — 4.5x on the sum, and 1.4 to 2.0x *more* peak memory, which is the
+whole-scene arrays the `imagery` stage holds rather than anything the correlator does.
+
+Landsat needs credentials that can pay for `s3://usgs-landsat`: `AWS_PROFILE` names them, as it does for
+the container.
 
 ## The correlator, on production imagery
 

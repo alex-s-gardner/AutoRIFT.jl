@@ -29,6 +29,15 @@
 # make it negative, and `gridpoints`' margin logic sizes itself from `maximum(radius)`, so the grid
 # would be mis-sized rather than the point skipped.
 #
+# Such a point still needs a coordinate, because `PointSet` has no missing value, and it gets an
+# arbitrary one. **`positioned` records which those are, and it is not optional.** The coarse pass's
+# `_cell_max_radius!` gives a point the widest radius in its neighbourhood, so a skipped point beside a
+# searched one becomes searchable and its placeholder coordinate is then correlated — the reference does
+# the same (`testautoRIFT.py:390-391` zeroes `xGrid` there) and the two agree to a median of 0.000 px at
+# 6,015 such points on the golden S1B case, so it is matched rather than declined. Without the flag a
+# block cannot tell a placeholder from a real coordinate, and its read window either misses those points
+# or spans from its own extent to the scene corner. `dev/CORRECTNESS.md` records the encoding.
+#
 # The y sign, which is two factors and not one. `ImagePairGeometry.y_displacement_sign` answers the
 # *driver-level* question from the coordinate system — azimuth increases along the track while a north-up
 # raster's `+y` points down, so the reference negates a radar prior and not a projected one
@@ -106,7 +115,7 @@ function AutoRIFT.pointset(g::PairGeometry; chip_size = nothing, chip_size_0 = 2
 
     # `+ 1.5`: one for the index base and a half for the grid offset the reference bakes in. A skipped
     # point still needs a coordinate, since `PointSet` has no missing value — its position is arbitrary
-    # and its zero radius is what excludes it.
+    # and its zero radius is what excludes it. `positioned = valid` below is what marks it as arbitrary.
     x = [v ? Float64(l) + 1.5 : 1.0 for (v, l) in zip(valid, location_x)]
     y = [v ? Float64(l) + 1.5 : 1.0 for (v, l) in zip(valid, location_y)]
 
@@ -145,7 +154,8 @@ function AutoRIFT.pointset(g::PairGeometry; chip_size = nothing, chip_size_0 = 2
                              dx_prior = prior(g.offset_x, 1.0) .+ mis_x,
                              dy_prior = prior(g.offset_y, dy_flip) .+ mis_y,
                              chip_size_min_x = bound(g.chip_min_x),
-                             chip_size_max_x = bound(g.chip_max_x))
+                             chip_size_max_x = bound(g.chip_max_x),
+                             positioned = valid)
 end
 
 # No offset supplied: zero, so the prior is the velocity term alone and nothing changes for a caller that

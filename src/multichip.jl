@@ -518,25 +518,48 @@ end
 
 ModeCounter() = ModeCounter(Float64[], Int[], nothing)
 
-@inline function _tally!(m::ModeCounter, v::Float64)
+@inline _tally!(m::ModeCounter, v::Float64) = _tally!(m, v, 1)
+
+@inline function _tally!(m::ModeCounter, v::Float64, n::Int)
     spill = m.spill
     if isnothing(spill)
         key = m.key
         for i in eachindex(key)
             if isequal(key[i], v)
-                m.count[i] += 1
+                m.count[i] += n
                 return m
             end
         end
         if length(key) < MODE_SCAN_CAPACITY
             push!(key, v)
-            push!(m.count, 1)
+            push!(m.count, n)
             return m
         end
         spill = _spill!(m)
     end
-    spill[v] = get(spill, v, 0) + 1
+    spill[v] = get(spill, v, 0) + n
     return m
+end
+
+# Fold `src`'s tallies into `dst`, so a stream counted in pieces gives what counting it whole gives.
+#
+# Exact, because the tallies are integers: `dst` ends with the same value-to-count map whatever the
+# pieces were, and [`_mode`](@ref) breaks a tie by value rather than by arrival. That is what lets
+# `_grid_phase` count a large grid on several threads and still return one answer.
+function _merge!(dst::ModeCounter, src::ModeCounter)
+    for i in eachindex(src.key)
+        _tally!(dst, src.key[i], src.count[i])
+    end
+    spill = src.spill
+    if !isnothing(spill)
+        # Sorted, so a spilled merge is as order-independent as an inline one. `Dict` iteration order
+        # depends on insertion history, and while the *counts* would come out the same either way, the
+        # slot order inside `dst` would not — and that is observable through a later spill boundary.
+        for v in sort!(collect(keys(spill)))
+            _tally!(dst, v, spill[v])
+        end
+    end
+    return dst
 end
 
 # Move the inline slots into a `Dict` and count there from then on. Counting in both would make a spilled
@@ -649,10 +672,15 @@ _grid_phases(grid::PointSet{2}) = (_grid_phase(grid.x), _grid_phase(grid.y))
 # majority of the array — but it is one value against many, so a mode over the whole grid finds the
 # convention the real coordinates use.
 function _grid_phase(x::AbstractMatrix)
-    counts = ModeCounter()
-    for v in x
-        d = Float64(v)
-        _tally!(counts, d - floor(d))
+    # Counted a column band at a time and merged in band order. The tallies are integers and `_mode`
+    # breaks a tie by value, so the answer is the serial one — see `_merge!`. Worth splitting because
+    # this reads every point of the grid twice per run, once per axis, and a production grid is millions
+    # of points: 6.0% of the time the whole golden set spends below two working threads.
+    counts = _parallel_reduce(ModeCounter, _merge!, axes(x, 2), length(x)) do m, cols
+        for j in cols, i in axes(x, 1)
+            d = Float64(x[i, j])
+            _tally!(m, d - floor(d))
+        end
     end
     return _mode(counts, 0.0)
 end
@@ -975,8 +1003,15 @@ function _level_points(grid::PointSet{2}, p::Params, chip_size::Extent,
     end
     # Coordinates and priors are shared rather than copied: nothing below writes them, and
     # only the radii (here and by the coarse mask) and the chip sizes are level-specific.
+    #
+    # The chip sizes are `Uniform` and not `fill`: a level gives every point the same chip, so the field is
+    # a constant and `AutoRIFT.Uniform` stores it in 24 bytes. `fill` made it two grid-sized `Matrix{Int}`
+    # per level — 86 MiB each on a NISAR grid, 72 on a Landsat one — and it also *densified* a field the
+    # grid already carried as `Uniform`, which forks `PointSet`'s type parameter and specialises the whole
+    # downstream pipeline a second time. `_coarse_points` still writes its own copy through `fill!`: it
+    # takes `pts[rows, cols]`, and indexing a `Uniform` with ranges materialises an ordinary `Array`.
     pts = rebuild(grid; radius_x = rx, radius_y = ry,
-                  chip_size_x = fill(chip_size.X, n), chip_size_y = fill(chip_size.Y, n))
+                  chip_size_x = Uniform(chip_size.X, n), chip_size_y = Uniform(chip_size.Y, n))
     sanitize!(pts, p.min_search_radius)
     return pts
 end
@@ -1184,6 +1219,29 @@ function _coarse_mask(runner::PassRunner, pts::PointSet{2}, p::Params, chip_size
     return _coarse_decide(cd, coarse, p, setup.filt, size(pts), _sparse_stride(p), subpixel)
 end
 
+# How far `_cell_max_radius!` can reach, in points of the grid a caller supplies.
+#
+# It is the only thing in the pipeline that gives a point a *positive* radius where the grid had zero, so
+# it is the only reason a pass can search a coordinate that sizing a window from the grid's own searchable
+# points would miss. `AutoRIFT.block_layout` needs the figure for exactly that reason.
+#
+# Two factors. Within a level the reduction reaches `_window_margins(_sparse_filter_width(...))` points of
+# *that level's* grid; a decimated level's grid is every `_level_decimation`-th point of the caller's, and
+# both `_decimate_level` and `_coarse_points` take subsets rather than interpolating, so the level's step
+# multiplies straight through. The maximum runs over the levels rather than using `chip_size_max`,
+# because `_check_levels` need not make the coarsest level reach it.
+#
+# On the golden S1B case: stride 8, filter width 9, margin 4, decimation 8 — 32 points.
+function _widening_reach(p::Params)
+    fw = _sparse_filter_width(_sparse_stride(p))
+    lo, _, hi, _ = _window_margins(fw, fw)
+    d = 1
+    for cs in chip_sizes(p)
+        d = max(d, _level_decimation(p, extent(cs)))
+    end
+    return d * max(lo, hi)
+end
+
 # Maximum radius over each coarse cell, matching the left-biased window convention the sliding
 # reductions use so the two agree at the boundaries.
 #
@@ -1299,8 +1357,6 @@ function _fill_holes!(d::DisplacementField, p::Params)
     # strict enough that an isolated point does not seed a fill.
     needed = 2 * w^2 ÷ 3
     nr, nc = size(d.dx)
-    bufx = Vector{Float32}(undef, w * w)
-    bufy = Vector{Float32}(undef, w * w)
     # `peak_ratio` is filled alongside the displacement, so a point carrying a value always carries a
     # ratio for it — the same rule `chip_size` follows. The filled ratio is the neighbourhood's,
     # which is the honest description: the displacement came from those neighbours, so their peak
@@ -1310,7 +1366,6 @@ function _fill_holes!(d::DisplacementField, p::Params)
     # `correlation` is deliberately *not* filled, and stays `NaN` at a filled point. It is the peak
     # value of a surface this point has none of, where the median of neighbouring ratios is a
     # summary that still means something.
-    bufs = Vector{Float32}(undef, w * w)
     filled = Int[]
 
     for _ in 1:3
@@ -1327,45 +1382,20 @@ function _fill_holes!(d::DisplacementField, p::Params)
         # Two-phase: collect this pass's fills before applying any, so every point in a pass
         # sees the same field. Filling in place would let one fill seed the next within a
         # single pass, which is what the three-pass structure exists to control.
-        pending = Tuple{Int,Float32,Float32,Float32}[]
-        @inbounds for j in 1:nc, i in 1:nr
-            isnan(d.dx[i, j]) || continue
-            n = 0
-            ns = 0
-            for jj in max(j - lo, 1):min(j + hi, nc)
-                for ii in max(i - lo, 1):min(i + hi, nr)
-                    v = d.dx[ii, jj]
-                    isnan(v) && continue
-                    n += 1
-                    bufx[n] = v
-                    bufy[n] = d.dy[ii, jj]
-                    # Counted separately: a neighbour can carry a displacement with no ratio —
-                    # it may itself have been filled by an earlier pass, or its surface may have
-                    # been too small to compute one on — and mixing `NaN` into the selection would
-                    # poison the median rather than skip the neighbour. `Inf` is kept: it is an
-                    # ordered value that a median handles, and it means an unrivalled peak rather
-                    # than an absent measurement.
-                    #
-                    # `peak_ratio`'s zero-at-the-search-boundary carries through by majority, since a
-                    # median over values including zeros returns zero once half the neighbourhood is
-                    # railed. That is the correct reading: a filled displacement is only as trustworthy
-                    # as the neighbourhood behind it.
-                    s = d.peak_ratio[ii, jj]
-                    if !isnan(s)
-                        ns += 1
-                        bufs[ns] = s
-                    end
-                end
-            end
-            # Either criterion admits the point, but a median still needs something to take it
-            # over: a hole small enough to close with no measured neighbour at all stays open.
-            # That is the reference's `MM` term, which requires its 3x3 median to exist.
-            (n >= needed || (small !== nothing && small[i, j])) && n > 0 || continue
-            # `_select_median!` rather than a sort here: it picks the cheaper selection for `n`,
-            # which at the default 3-wide window is an insertion sort.
-            push!(pending, (LinearIndices(d.dx)[i, j],
-                            _select_median!(bufx, n), _select_median!(bufy, n),
-                            ns > 0 ? _select_median!(bufs, ns) : NaN32))
+        #
+        # That is also what makes the collection splittable: a band reads a window either side of its own
+        # columns and writes only its own list, so the bands share nothing but a field none of them
+        # writes. Concatenated in band order, so `pending` is the list the serial loop would build.
+        #
+        # Scratch is allocated per band rather than hoisted, because a buffer captured from the enclosing
+        # scope is one buffer shared by every task at once — `src/parallel.jl` records why that holds even
+        # when it looks per-task.
+        pending = _parallel_reduce(() -> Tuple{Int,Float32,Float32,Float32}[], append!,
+                                   1:nc, nr * nc * w * w) do out, cols
+            bufx = Vector{Float32}(undef, w * w)
+            bufy = Vector{Float32}(undef, w * w)
+            bufs = Vector{Float32}(undef, w * w)
+            _collect_fills!(out, d, cols, nr, nc, lo, hi, needed, small, bufx, bufy, bufs)
         end
         isempty(pending) && break        # nothing left that qualifies
         @inbounds for (idx, mx, my, ms) in pending
@@ -1376,6 +1406,56 @@ function _fill_holes!(d::DisplacementField, p::Params)
         end
     end
     return filled
+end
+
+# One band of a fill pass: the points in `cols` this pass would fill, appended to `out` in column order.
+#
+# Split out of `_fill_holes!` so the band runs in its own frame, which is what keeps its scratch its own
+# — see `src/parallel.jl` on the `Core.Box` a captured local would otherwise share.
+function _collect_fills!(out::Vector{Tuple{Int,Float32,Float32,Float32}}, d::DisplacementField,
+                         cols, nr::Int, nc::Int, lo::Int, hi::Int, needed::Int,
+                         small::Union{Nothing,AbstractMatrix{Bool}},
+                         bufx::Vector{Float32}, bufy::Vector{Float32}, bufs::Vector{Float32})
+    @inbounds for j in cols, i in 1:nr
+        isnan(d.dx[i, j]) || continue
+        n = 0
+        ns = 0
+        for jj in max(j - lo, 1):min(j + hi, nc)
+            for ii in max(i - lo, 1):min(i + hi, nr)
+                v = d.dx[ii, jj]
+                isnan(v) && continue
+                n += 1
+                bufx[n] = v
+                bufy[n] = d.dy[ii, jj]
+                # Counted separately: a neighbour can carry a displacement with no ratio —
+                # it may itself have been filled by an earlier pass, or its surface may have
+                # been too small to compute one on — and mixing `NaN` into the selection would
+                # poison the median rather than skip the neighbour. `Inf` is kept: it is an
+                # ordered value that a median handles, and it means an unrivalled peak rather
+                # than an absent measurement.
+                #
+                # `peak_ratio`'s zero-at-the-search-boundary carries through by majority, since a
+                # median over values including zeros returns zero once half the neighbourhood is
+                # railed. That is the correct reading: a filled displacement is only as trustworthy
+                # as the neighbourhood behind it.
+                s = d.peak_ratio[ii, jj]
+                if !isnan(s)
+                    ns += 1
+                    bufs[ns] = s
+                end
+            end
+        end
+        # Either criterion admits the point, but a median still needs something to take it
+        # over: a hole small enough to close with no measured neighbour at all stays open.
+        # That is the reference's `MM` term, which requires its 3x3 median to exist.
+        (n >= needed || (small !== nothing && small[i, j])) && n > 0 || continue
+        # `_select_median!` rather than a sort here: it picks the cheaper selection for `n`,
+        # which at the default 3-wide window is an insertion sort.
+        push!(out, (LinearIndices(d.dx)[i, j],
+                    _select_median!(bufx, n), _select_median!(bufy, n),
+                    ns > 0 ? _select_median!(bufs, ns) : NaN32))
+    end
+    return out
 end
 
 # ---------------------------------------------------------------------------

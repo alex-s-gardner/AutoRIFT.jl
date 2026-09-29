@@ -148,6 +148,13 @@ on disk.
 """
 function geometry_inputs(info, window::CartesianIndices{2})
     gdal_network_setup()
-    bands = map(p -> parameter_window(p, window), info.paths)
+    # **One task per raster, because every one of the twelve is a `/vsicurl` read.** Serially this stage
+    # spends 4.96 s of wall clock on 1.16 s of CPU — 0.23 of a thread — which is twelve round trips waiting
+    # end to end rather than at once. Each task opens its own dataset, which is how GDAL is thread-safe: it
+    # is a shared *handle* that is not, and none is shared here.
+    #
+    # `gdal_network_setup` runs before the spawn, since it sets process-wide configuration.
+    tasks = map(p -> Threads.@spawn(parameter_window(p, window)), values(info.paths))
+    bands = NamedTuple{keys(info.paths)}(map(fetch, tasks))
     return GeometryInputs(; bands...)
 end

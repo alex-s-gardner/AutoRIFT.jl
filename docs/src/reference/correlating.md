@@ -19,5 +19,6 @@ imagepair
 autorift_with_grid
 ondisk
 halo
+block_size_for
 warm_plans!
 ```

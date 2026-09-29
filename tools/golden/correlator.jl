@@ -126,12 +126,20 @@ function pointset_from_capture(k::Capture)
     # dependent bias rather than as a sign error. It is also invisible in `dy` alone: the
     # misplaced chip biases `dx` while `dy` stays near zero, because the wrong rows still
     # correlate best at a similar vertical offset.
+    #
+    # `positioned` marks the points geogrid placed outside the image. The capture holds the reference's
+    # own post-rewrite grid, where such a point is at `0.5`: `runAutorift` overwrites the `-32767`
+    # sentinel with zero (`testautoRIFT.py:390-391`) and then stores `round(xGrid) + 0.5`. A point with a
+    # real position is at `1.5` or beyond, so the threshold sits below every one of them rather than being
+    # tuned. Without this a blocked run has no way to tell a placeholder coordinate from a position and
+    # loses 5% of a Sentinel-1 granule — see `dev/plan-16gib.md` and `block_gate.jl`.
     return PointSet(
         Float64.(xg) .+ 1, Float64.(yg) .+ 1,
         rx, ry,
         Float64.(dx0), .-Float64.(dy0),
         fill(chip0, size(xg)), fill(round(Int, chip0 * scale_y), size(xg)),
         Int.(csmin), Int.(csmax),
+        [Float64(v) > 1 for v in xg],
     )
 end
 

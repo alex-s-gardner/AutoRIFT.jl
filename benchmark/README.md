@@ -75,6 +75,25 @@ point would be invisible in a microbenchmark and ruinous across millions of imag
 pairs, so it is a correctness property rather than a performance one — and it is
 asserted in the test suite as well.
 
+## A share of runtime is a property of the case, not of the code
+
+When the question is "is this function hot enough to be worth optimizing", the
+answer depends on which scene it was measured over, and on the golden set the
+spread is wide enough to invert the decision. `_decimate_level` is **26.05%** of
+`autorift` on `LT05_L1GS_001013` and **1.36%** on `LC08_L1TP_009011` — same code,
+same number of calls.
+
+`LT05_L1GS_001013` is 0.3946% valid data, so its correlator does almost no work
+while the costs that scale with grid area — the sliding-window passes in the
+decimation — are unchanged. Anything proportional to pixel count looks enormous
+there. A dense optical pair such as `LC08_L1TP_009011`, around 1.7 M correlated
+points, is where a share means what it sounds like.
+
+The two numbers straddle the usual "under ~5%, leave it alone" filter, so
+measuring the convenient case rather than the representative one is enough to
+send an optimization pass at nine sliding-window passes that do not matter. Quote
+the case alongside the share, or measure two and give the range.
+
 ## Structure
 
 Three tiers by timescale. Micro benchmarks use Chairmarks, which collects far

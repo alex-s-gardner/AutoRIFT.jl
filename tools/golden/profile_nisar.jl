@@ -559,10 +559,16 @@ The imagery and point set are read once and shared across configurations: a NISA
 through `read_capture`, and paying that per configuration costs more than the measurement. Each
 configuration's peak is reported against the trace's own settled floor before it started, which is
 what makes one process sufficient.
+
+**The imagery is mapped rather than read onto the heap**, which is what makes a peak here a statement
+about the package. Read, the pair is most of the floor — 41.8 GiB of it on NISAR L1 — and every peak
+above it is then dominated by a cost production does not pay, since a production run reads its imagery
+lazily a block at a time. Mapped, the pages are file-backed and clean. `xread_mmap` returns the
+identical array, so nothing about the correlation changes.
 """
 function measure_case(c::GoldenCase; blocks::Vector{Tuple{Int,Int}}, n::Integer = 100,
                       profile::Bool = true, stride::Integer = 1, thin_block::Integer = 128)
-    k = read_capture(c; n)
+    k = read_capture(c; n, mmap = CAPTURE_IMAGERY)
     grid = pointset_from_capture(k)
     # Thinning cuts the points searched and not the resident imagery, so a thinned row's peak is not a
     # fraction of the whole-grid one and the two are not comparable. `stride` travels into the record

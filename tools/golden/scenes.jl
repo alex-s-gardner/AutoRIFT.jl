@@ -53,6 +53,49 @@ function acquisition_order(c::GoldenCase)
 end
 
 """
+    STAGED :: Dict{String,String}
+
+Granule name to a local copy of its scene, consulted by [`scene_path`](@ref) before the object store.
+
+Empty unless a caller filled it with [`stage_scene`](@ref). What it exists for is a measurement whose
+subject is the computation: a Landsat band is 354 MB behind a requester-pays bucket, so a chain that
+reads the scene from there is timing the network as much as the filter.
+"""
+const STAGED = Dict{String,String}()
+
+"""
+    stage_scene(path) -> String
+
+Copy the object at `path` under `<cache>/granules/` and return the local path.
+
+A byte copy rather than a GDAL rewrite, so the staged file *is* the object the reference reads: a
+re-encode would turn a JP2 into a GTiff and replace decompression with plain I/O, which changes what a
+later read costs. An already-local path is returned untouched.
+
+`/vsis3` goes through `aws s3 cp --request-payer requester`, which pays with whatever `AWS_PROFILE`
+names — the same identity [`scene_path`](@ref) reads with.
+"""
+function stage_scene(path::AbstractString)
+    (startswith(path, "/vsis3/") || startswith(path, "/vsicurl/")) || return path
+    dir = joinpath(CACHE, "granules")
+    dest = joinpath(dir, basename(path))
+    isfile(dest) && return dest
+    mkpath(dir)
+    # Through a temporary, so an interrupted copy cannot leave a truncated file that the check above
+    # would then treat as staged.
+    tmp = dest * ".partial"
+    if startswith(path, "/vsis3/")
+        # `--only-show-errors`: the default progress meter writes a carriage-return line per 256 KiB,
+        # which is tens of thousands of lines in a redirected harness log.
+        run(`aws s3 cp $("s3://" * path[8:end]) $tmp --request-payer requester --only-show-errors`)
+    else
+        Downloads.download(path[10:end], tmp)
+    end
+    mv(tmp, dest; force = true)
+    return dest
+end
+
+"""
     scene_path(c::GoldenCase, which::Symbol) -> String
 
 A GDAL-openable path to `which` scene of `c`, at the band the reference correlates.
@@ -71,6 +114,7 @@ datatake identifier — so the manifest is read rather than guessed.
 function scene_path(c::GoldenCase, which::Symbol)
     early, late = acquisition_order(c)
     name = which === :reference ? early : late
+    haskey(STAGED, name) && return STAGED[name]
     c.platform == "S2" && return _s2_path(name)
     startswith(c.platform, "L") && return _landsat_path(name, scene_band(c.platform))
     throw(ArgumentError("scene_path has no route for platform \"$(c.platform)\""))
@@ -417,12 +461,30 @@ native grid instead and asks for it by name.
 function filtered_path(c::GoldenCase, run::AbstractString, name::AbstractString)
     native_filter(c, name) === nothing && return nothing
     band = scene_band(c.platform) === :green ? "B2" : "B8"
-    for dir in ("reprojected", "filtered")
-        p = joinpath(run, dir, "$(name)_$(band).TIF")
+    for r in cached_runs(c, run), dir in ("reprojected", "filtered")
+        p = joinpath(r, dir, "$(name)_$(band).TIF")
         isfile(p) && return p
     end
-    error("no filtered raster for $name under $run; `filtered/` is what " *
-          "`apply_landsat_filtering` writes and a pruned run has neither it nor `reprojected/`")
+    error("no filtered raster for $name under any cached run of $(c.product); `filtered/` is what " *
+          "`apply_landsat_filtering` writes, and a run pruned of it before " *
+          "`prune_run` kept it is restored by another container run")
+end
+
+"""
+    cached_runs(c::GoldenCase, run) -> Vector{String}
+
+`run` first, then every other cached run of `c`.
+
+**Which run holds an input need not be the run the ladder is comparing against.** `resolve_run` prefers a
+run with a capture, and a run made to restore `filtered/` has none — so a rung that looked only in its own
+run would ignore the very directory that was just rebuilt, and the advice to re-run the container would
+not work. The same holds for a full-SLC pair's `.SAFE` trees, which the driver downloads into whichever
+run it processed.
+"""
+function cached_runs(c::GoldenCase, run::AbstractString)
+    root = dirname(run)
+    isdir(root) || return [run]
+    return [run; [d for d in sort(readdir(root; join = true)) if isdir(d) && d != run]]
 end
 
 """
@@ -435,8 +497,12 @@ nodata-infill filter produces one (`process.py:275, 286`).
 """
 function native_filtered_paths(c::GoldenCase, run::AbstractString, name::AbstractString)
     band = scene_band(c.platform) === :green ? "B2" : "B8"
+    runs = cached_runs(c, run)
+    i = findfirst(r -> isfile(joinpath(r, "filtered", "$(name)_$(band).TIF")), runs)
+    isnothing(i) && error("no `filtered/$(name)_$(band).TIF` under any cached run of $(c.product); " *
+                          "rung 5.3 compares against `filtered/` on the native grid")
+    run = runs[i]
     img = joinpath(run, "filtered", "$(name)_$(band).TIF")
-    isfile(img) || error("no $img; rung 5.3 compares against `filtered/` on the native grid")
     zero = joinpath(run, "filtered", "$(name)_$(band)_zeroMask.TIF")
     return (img, isfile(zero) ? zero : nothing)
 end

@@ -592,6 +592,30 @@ autorift(pair::ImagePair, grid::PointSet, p::Params) =
     _run(pair, grid, p, _block_size(nothing), :auto)
 
 """
+    autorift(reference, secondary, grid::PointSet, p::Params, block_size, cache_budget = 0)
+        -> MultichipResult
+
+Correlate at `grid`'s points, a block at a time, with an already-resolved [`Params`](@ref).
+
+The whole production handoff in one call: a geogrid supplies `grid` and `p`, and `block_size` bounds
+the imagery held at once — which is what makes a granule larger than memory correlatable at all.
+[`AutoRIFT.block_size_for`](@ref) chooses one from `grid`, `p` and the scene size.
+
+`block_size` is `(X, Y)` pixels per block and `cache_budget` the bytes of disk-backed input this run
+may hold, as in the grid-free positional form above; both are positional for the same reason, so a
+`--trim`ed binary can reach this path.
+
+Pass an [`ImagePair`](@ref) as `reference` to supply validity masks.
+"""
+autorift(reference::AbstractMatrix, secondary::AbstractMatrix, grid::PointSet, p::Params,
+         block_size::Tuple{Int,Int}, cache_budget::Int = 0) =
+    _run(ImagePair(reference, secondary), grid, p, _block_size(block_size), cache_budget)
+
+autorift(pair::ImagePair, grid::PointSet, p::Params, block_size::Tuple{Int,Int},
+         cache_budget::Int = 0) =
+    _run(pair, grid, p, _block_size(block_size), cache_budget)
+
+"""
     autorift(reference, secondary, p::Params, block_size::Tuple{Int,Int}, cache_budget::Int) -> MultichipResult
 
 Correlate a block at a time, with an already-resolved [`Params`](@ref).

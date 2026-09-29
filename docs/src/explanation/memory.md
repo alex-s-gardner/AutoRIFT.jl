@@ -617,14 +617,154 @@ re-rounds to powers of two, so this row measures the *cost* of finer radii rathe
 real interval-4 implementation would carry. That cost is the half that matters; the plan count only gets
 worse.
 
+## What a whole-scene pass actually holds, and the one term worth removing
+
+Peak on a whole NISAR L1 grid is 32 GiB against a **1.29 GiB floor** once the imagery is mapped, so
+essentially all of it is live working set. Sizing the candidates from the configuration rather than
+guessing (`-t 10`, grid 2328×2304, scene 57760×50511):
+
+| term | GiB |
+|---|---:|
+| imagery, both images | 5.43 *(mapped, not heap)* |
+| grid arrays | 0.40 |
+| one displacement field, per level | 0.08 |
+| refinement workspaces, 10 tasks | 0.04 |
+| concurrent correlation workspaces, worst level | 4.36 |
+| retained workspace pool | 1.51 |
+| **the scene pad, per pass** | **6.3** |
+
+**Every level pads.** `_pass_geometry` reports `fits = false` at all four chip sizes on this grid — a
+geogrid's points sit near the footprint edge and carry radii up to 1905 px — so each pass copies the
+whole scene grown by its own halo (2231×1149 px at the base level, 2567×1331 at the coarsest). With a
+coarse and a fine pass per level that is eight such copies per run.
+
+That pad is also what **defeats memory-mapping the input**: 5.43 GiB is kept off the heap and then
+copied back onto it, which is why the floor is 1.29 GiB and the peak 32.
+
+### The mask was a third of it, and is now lazy
+
+`_zeropad` allocates `Matrix{T}`, and a validity mask arrives *packed* — `valid` returns the `BitMatrix`
+broadcasting produces. So padding the mask expanded it eightfold: **3.13 GiB against the 0.39 GiB its
+source occupies**, once per pass. Nothing read it densely enough to want that; the mask has exactly one
+consumer, `_any_valid` over a chip footprint, which short-circuits on the first valid pixel.
+`AutoRIFT.PaddedMask` pads it lazily instead. Paired runs, identical wisdom, one process each:
+
+| arm | wall | CPU | occupancy | peak footprint | allocated |
+|---|---:|---:|---:|---:|---:|
+| `_zeropad`ed mask | 545.0 s | 5215.7 s | 9.57 | 38.33 GiB | 161.5 GiB |
+| **lazy mask** | **538.7 s** | 5195.1 s | **9.64** | **31.97 GiB** | 138.1 GiB |
+
+**Peak footprint −6.36 GiB, −16.6%, at no runtime cost**, and bit-identical: both arms measure 1,799,746
+points and give the same `dx` *and* `dy` checksums over raw bits. The allocation column confirms the
+mechanism arithmetically — 23.4 GiB less, against 3.1 GiB × 8 passes predicted.
+
+**Hoisting the imagery pad across passes is not worth building, and the reason is the GC column.**
+Eight scene-sized copies per run is 136–161 GiB of allocation, which sounds like collection pressure
+and is not: **GC is 1.0–1.4 s, 0.2–0.3% of wall**. Large arrays are cheap to allocate and cheap to
+release, so caching one pad across passes would recover nothing measurable. Removing the copy
+altogether — padding per window rather than per scene, as the blocked path already does per block — is
+the remaining ~6 GiB, and it puts a branch in the loop that feeds the FFT and the integral tables, so it
+needs a kernel benchmark rather than an argument. Blocking is the shipping answer meanwhile: the same
+granule blocked peaked at 25.2 GiB.
+
+## The pool is bounded across keys as well as per geometry
+
+The per-key bound keeps one geometry's retention proportional to its concurrency and says nothing about
+how many geometries a run visits. Measured on a whole NISAR L1 grid, untiled at 10 threads
+(`tools/golden/pool_peak.jl`), the pool ends the run holding **9.9 GiB across 105 keys** — and the widest
+of those are near-duplicates, because `_radius_bucket` clamps to each level's own maximum radius and the
+levels' maxima differ (1905×830, 1918×1015, 1689×907, 1828×972). Each is legitimately needed by its own
+level, and a level that has finished can never ask for its own again.
+
+`AutoRIFT.WORKSPACE_POOL_BYTES` bounds the total, evicting least-recently-used by key so the level being
+correlated is the last candidate. At 2 GiB it is **free**: interleaved runs, one process each, nothing
+differing but the bound.
+
+| arm | wall | CPU | occupancy of 10 | peak footprint | peak resident | pool at end |
+|---|---:|---:|---:|---:|---:|---|
+| unbounded | *615.5*, **537.8** s | 5273, **5186** s | *8.57*, **9.64** | *42.96*, **42.06** GiB | 47.58 GiB | 105 keys, 9.87 GiB |
+| **bounded at 2 GiB** | **538.6, 535.1** s | 5193, 5179 s | **9.64, 9.68** | **39.78, 38.32** GiB | 44.57 GiB | 16 keys, 1.51 GiB |
+
+**Peak footprint 42.06 → 39.05 GiB, −7.2%, at the same wall clock and the same CPU seconds to 0.1%** —
+both bounded samples sit below both unbounded ones. All four runs measure the same 1,799,746 points and
+give the identical `dx` checksum, taken over raw bits so `-0.0` and every `NaN` payload counts, which is
+what makes the bound answer-preserving: a rebuilt workspace is the size of the one dropped, so it runs
+the same transform.
+
+*Italicised* is one anomalous run, and reporting it is the point. **Retention is not peak**, either:
+cutting 8.4 GiB of retained workspace moved peak by 3.0, because peak is set by what a pass holds live
+rather than by what it retains afterwards. The remaining question is whether a tighter bound saves more —
+2 GiB never binds at the end, since retention settles at 1.51 — or starts to churn.
+
+**The bound has to be read cheaply, and getting that wrong cost more than the bound saved.** Summing the
+pool with `sizeof` over `fieldnames` on every return — which is what keeps the figure from drifting out
+of step with the pool — put **9.8% of the whole golden set's serial time** in one reflective closure
+holding `WORKSPACE_LOCK`, since a return happens once per chunk per radius bucket and the pool reaches a
+hundred keys. `CorrelationWorkspace` now records its own byte count at construction, so the same sum is
+a few hundred integer adds. A bound whose *accounting* is O(pool) per operation is not a bound worth
+having; the fix keeps the drift-free derivation and moves the cost to where it is paid once.
+
+### Wall clock on this machine is bimodal, and peak is not
+
+Worth stating because it shaped every timing above. Identical configurations, one process each, land in
+one of two modes: **~538 s at occupancy 9.6, or ~615 s at occupancy 8.6** — a 14% split, seen in both
+arms of every comparison here and in runs where nothing changed at all. Peak footprint is stable across
+it to about 0.5 GiB.
+
+So a single-run wall-clock difference below ~15% on this granule means nothing, and the only conclusions
+drawn above from wall clock are ones where arms were interleaved and repeated. Peak, allocation and CPU
+seconds are the figures that reproduce.
+
+**`dx` is also not bit-reproducible across runs**, for a reason `src/plans.jl` already records:
+`FFTW_MEASURE` selects by measured timing, so a run can persist different wisdom and a later run then
+executes a different algorithm for the same transform size. The same case gave three different `dx`
+checksums across this session. Comparisons of *values* between two configurations are therefore only
+valid within one wisdom state — which is why the mask arms above were run back to back without anything
+in between planning a new size.
+
+### Why an earlier reading of this table rejected the change
+
+The first attempt measured the arms unpaired and recorded **wall clock only**. It drew 623.9 s and
+1268.4 s for the bounded arm against 563.3 s and 558.3 s unbounded, and concluded an erratic 11–125%
+cost for a 6–10% peak gain — a clear reject. Every number in it was real and the conclusion was wrong.
+
+Two instrument faults, both avoidable:
+
+- **No CPU seconds.** Wall alone cannot separate a run that is *waiting* from one running at a lower
+  clock. With the column added, the anomalous runs are unmistakable: 615.5 s at occupancy 8.57 against
+  537.8 s at 9.64 for the *same* configuration, at CPU seconds differing by 1.7%. The machine was
+  power-limited, and a bounded arm that happened to draw that state looked like a 2.25× regression.
+  `cpu_seconds!` in `tools/ab/memtrace.jl` exists for this, and note its units: the kernel reports
+  `ri_user_time` in 24 MHz mach ticks despite the name, so reading it as nanoseconds under-reports 42×.
+- **Unpaired arms.** Each arm ran twice in a block, so a slow period landed entirely inside one of them.
+  Interleaving A,B,A,B is what made the outlier attributable to the machine rather than to the bound.
+
+The transferable rule is the one this file already states about its own L2 sweep, in the other
+direction: **a benchmark whose arms are not interleaved measures the order, and wall clock without CPU
+seconds cannot tell you which.** Both arms were re-run interleaved on mains power before the table above
+was written.
+
 ## Practical guidance
 
 - **Batch work: one pair per process or per worker, `threaded = false`.** Also 2.7× faster than
   intra-pair threading (`benchmark/suite/throughput.jl`), so this is not a tradeoff.
-- **`process_block_size = (1024, 1024)` when peak memory matters**, and go small — but not to the floor.
-  Peak falls monotonically as blocks shrink; runtime does not. On NISAR L1 the lowest peak is
-  `(2816, 1536)` at 0.49× untiled while the fastest blocked row is `4096` square, 13% quicker for 3 GiB
-  more. Pick by which resource binds.
+- **Warm the FFTW wisdom before timing anything, and before sizing a production instance's schedule.**
+  On a production-sized grid the cold-plan cost *dominates the correlation*: the same S1A case, same
+  process shape, measured **28.8 s on the first run of a sequence against 6.5 s on the next three**, with
+  CPU seconds 71.9 against 48.3 — the extra is the planner, not the correlation. `performance.md` records
+  0.13 s against 2.35 s for a 1024² pair; at 11.5 M grid points and dozens of radius buckets it is 22
+  seconds. Two consequences: [`AutoRIFT.warm_plans!`](@ref) is worth more than its small-pair figures
+  suggest, and **a benchmark whose arms run in sequence measures the order, not the arms** — which is the
+  same trap the L2 sweep above fell into, in the opposite direction.
+- **`process_block_size` is chosen for you from the halo and the thread count** when the input is a
+  file-backed raster — see [`AutoRIFT.block_size_for`](@ref). Pass one explicitly to override. The rule
+  reproduces the sweeps above: `_block_count` gives the recorded block count exactly on 12 of 12 NISAR
+  rows and 4 of 6 optical ones, the two misses being the grid shape assumed for the check rather than the
+  arithmetic.
+- **`process_block_size = (1024, 1024)` when peak memory matters** and you are choosing by hand, and go
+  small — but not to the floor. Peak falls monotonically as blocks shrink; runtime does not. On NISAR L1
+  the lowest peak is `(2816, 1536)` at 0.49× untiled while the fastest blocked row is `4096` square, 13%
+  quicker for 3 GiB more. Pick by which resource binds.
 - **Budget for the raw pair on top of the blocks when the input is a file.** A pair cheaper to read whole
   than window is read once, which costs its own bytes of peak and buys 11% of the runtime at 512 px and
   nothing at 2048 — a large enough block gets there without the memory. Nothing to enable; `cache_budget

@@ -203,15 +203,25 @@ end
 
 
 """
-    read_capture(dir; call = 1) -> Capture
+    read_capture(dir; call = 1, mmap = ()) -> Capture
 
 Read one captured call from `dir`.
 
 A pipeline run calls `runAutorift` once, so `call = 1` is the usual case; the argument exists because
 a driver that retried would produce more, and silently reading the first of several would compare
 against the wrong one.
+
+`mmap` names the arrays to map from the file instead of reading onto the heap, and
+`("in_I1", "in_I2")` is the useful value: the imagery is almost all of a capture's bytes — 11.25 GiB
+on NISAR L2, against a few hundred MiB for every other array together — and a mapped pair is
+file-backed and clean, so the kernel can reclaim it. `xread_mmap` gives the identical array.
+
+**Named rather than a `Bool`, because a mapped array is read-only.** The mapping is opened from a
+read-only handle, so writing one is a fault rather than an error; a caller that mutates a captured
+array in place must not have that array in this list. The imagery is not mutated by anything here.
 """
-function read_capture(dir::AbstractString; call::Integer = 1)
+function read_capture(dir::AbstractString; call::Integer = 1,
+                      mmap::Tuple{Vararg{AbstractString}} = ())
     mpath = joinpath(dir, "call$call.json")
     isfile(mpath) || error("no call$call.json in $dir; captured calls: " *
                            join(filter(f -> startswith(f, "call"), readdir(dir)), ", "))
@@ -219,7 +229,8 @@ function read_capture(dir::AbstractString; call::Integer = 1)
 
     arrays = Dict{String,Matrix}()
     for (name, info) in pairs(m.arrays)
-        arrays[String(name)] = xread(joinpath(dir, String(name)))
+        path = joinpath(dir, String(name))
+        arrays[String(name)] = String(name) in mmap ? xread_mmap(path) : xread(path)
     end
     scalars = Dict{String,Any}(String(k) => v for (k, v) in pairs(m.scalars))
     skipped = Dict{String,String}(String(k) => String(v) for (k, v) in pairs(get(m, :skipped, (;))))
@@ -257,8 +268,13 @@ function read_capture(dir::AbstractString; call::Integer = 1)
     return Capture(m.call, arrays, scalars, skipped, sort!(levels, by = r -> r.seq), stages)
 end
 
-read_capture(c::GoldenCase; n::Integer = 100, call::Integer = 1) =
-    read_capture(capture_dir(c, n); call)
+read_capture(c::GoldenCase; n::Integer = 100, call::Integer = 1,
+             mmap::Tuple{Vararg{AbstractString}} = ()) =
+    read_capture(capture_dir(c, n); call, mmap)
+
+# The imagery, which is what a caller maps when it maps anything. Named here rather than spelled at
+# each call site so a capture whose imagery keys change is fixed in one place.
+const CAPTURE_IMAGERY = ("in_I1", "in_I2")
 
 function main(args)
     isempty(args) && error("usage: intermediate.jl <product-name-fragment> [--run N] [--force]")

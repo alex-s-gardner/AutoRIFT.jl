@@ -383,13 +383,95 @@ end
     @test !isnan(d.dx[1])
 end
 
+@testset "a pass pads when the half-pixel shift moves a window off the image" begin
+    # `_pass_geometry` decides whether the pass pads at all, so its verdict has to describe the frame
+    # the loop will index. `_shift_points` adds half a pixel on both axes *even when the pad is zero*,
+    # and `search_bounds` truncates, so `floor(x + 0.5)` exceeds `floor(x)` by one whenever `x` is a
+    # half-integer — which every gridded coordinate is. A point whose unshifted window ends on the
+    # last column therefore needs one column more once shifted.
+    #
+    # Deciding from the unshifted window runs the pass unpadded and `_track_bucket!` then drops the
+    # point at `checkbounds`: a `continue`, with no measurement and no warning. That is invisible on a
+    # whole-scene pass, whose array is the scene and which usually pads for some other point anyway,
+    # and routine on a block, whose read window is its points' span grown by the halo and clipped —
+    # so it ends exactly at some point's reach. It made a blocked run disagree with an untiled one at
+    # 31 points of the golden S2A case at 768 px.
+    n = 64
+    chip, radius = 24, 6
+    reach = chip ÷ 2 + radius - 2          # how far right of the coordinate `search_bounds` extends
+    pair = ImagePair(synthetic_texture(n; seed = 3), synthetic_texture(n; seed = 4))
+    p = params(; chip_size = chip, chip_size_max = chip, search_radius = radius,
+               subpixel = :none, preprocess = :none)
+
+    # Placed so the unshifted window ends exactly on the last row and column.
+    edge = pointset([n - reach + 0.5], [n - reach + 0.5];
+                    chip_size = chip, search_radius = radius)
+    @test last(AutoRIFT.search_bounds(edge, 1)[2]) == n
+    @test !AutoRIFT._pass_geometry(edge, (n, n))[4]
+    d = track(pair, edge, p)
+    @test d.searched[1]
+    @test !isnan(d.dx[1])
+
+    # One pixel further in the shifted window is inside, and the pass must still take the unpadded
+    # path — the control that keeps the margin from becoming a blanket "always pad".
+    inside = pointset([n - reach - 0.5], [n - reach - 0.5];
+                      chip_size = chip, search_radius = radius)
+    @test AutoRIFT._pass_geometry(inside, (n, n))[4]
+    @test track(pair, inside, p).searched[1]
+end
+
+@testset "the validity mask pads lazily and reads as the materialized one" begin
+    # A padded pass takes `PaddedMask` where the imagery takes `_zeropad`, because the mask's one
+    # consumer short-circuits while `_zeropad` of a packed mask expands it eightfold — 3.13 GiB on a
+    # NISAR L1 scene whose mask occupies 0.39. So the lazy form has to agree with the eager one
+    # element for element, including the corners two `Bool`s of arithmetic can get wrong.
+    for (nr, nc, px, py) in ((7, 11, 3, 2), (1, 1, 4, 4), (16, 5, 0, 3), (5, 16, 3, 0))
+        src = rand(Bool, nr, nc)
+        for m in (BitMatrix(src), Matrix(src), view(BitMatrix(src), :, :))
+            lazy = AutoRIFT.PaddedMask(m, extent((px, py)))
+            eager = AutoRIFT._zeropad(Matrix{Bool}(m), extent((px, py)))
+            @test size(lazy) == size(eager)
+            @test all(lazy[i, j] == eager[i, j] for i in axes(eager, 1), j in axes(eager, 2))
+            # Nothing scene-sized is formed: the wrapper holds the parent and four integers.
+            @test Base.summarysize(lazy) < Base.summarysize(eager) + Base.summarysize(m)
+        end
+    end
+    # A zero pad is the identity, which is the case the unpadded branch would have taken.
+    m = BitMatrix(rand(Bool, 9, 4))
+    @test all(AutoRIFT.PaddedMask(m, extent(0))[i, j] == m[i, j] for i in 1:9, j in 1:4)
+
+    # And a pass that pads gives what it gave before the mask went lazy: the same points searched and
+    # the same displacements, since `false` outside is the convention both forms use.
+    n = 256
+    pair = ImagePair(synthetic_texture(n; seed = 5), synthetic_texture(n; seed = 6))
+    # Deliberately at the edge and beyond it, so the pad is real and the mask's border is read.
+    edge = pointset([6.0, 12.0, 128.0, 250.0, 260.0], [128.0, 6.0, 128.0, 250.0, 128.0];
+                    chip_size = 32, search_radius = 20)
+    p = params(; subpixel = :none)
+    d = track(pair, edge, p)
+    mask = AutoRIFT.valid(pair)
+    # The same pass with the mask materialized the old way, handed in explicitly.
+    d_eager = track(pair, edge, p; okmask = Matrix{Bool}(mask))
+    @test d.searched == d_eager.searched
+    @test all(isequal.(d.dx, d_eager.dx))
+    @test all(isequal.(d.dy, d_eager.dy))
+    @test all(isequal.(d.correlation, d_eager.correlation))
+end
+
 @testset "a subset correlates as the whole set does, given its geometry" begin
-    # The property tiled processing needs. A point is correlated at its own radius bucketed to a
-    # power of two and *clamped to the pass maximum*, so a point below the top bucket is unaffected
-    # by which other points share the pass — but one at the top is clamped to whatever maximum its
-    # point set contains, and a subset generally has a smaller one. Here the subset's own maximum is
-    # 10, which clamps to 10, where the full grid buckets the same radius up to 16: a different
-    # transform length, agreeing only to ~1e-7 on `correlation`.
+    # The property tiled processing needs. A point is correlated at its own radius rounded up to a
+    # rung of the `RADIUS_BUCKET_RUNGS` ladder and *clamped to the pass maximum*, so a point below the
+    # top bucket is unaffected by which other points share the pass — but one at the top is clamped to
+    # whatever maximum its point set contains, and a subset generally has a smaller one. Here the
+    # subset's own maximum is 9, which clamps to 9, where the full grid rounds the same radius up to
+    # the next rung at 10 — a 50-point transform against a 56-point one, agreeing only to ~1e-7 on
+    # `correlation`.
+    #
+    # The restricted radius has to clear two hurdles for this to exhibit anything, and both are
+    # properties of the fixture rather than of the clamp. It must be *off* the ladder, since a radius
+    # that is itself a rung buckets to itself under either cap; and the two buckets must survive
+    # `next_fft_size`, which maps both 11 and 12 onto a 56-point transform and so hides the difference
+    # for those.
     #
     # Radii that vary across the grid are what expose it, and that is the realistic case: the
     # coarse pass zeroes and `sanitize!` floors radii in spatially clustered patterns.
@@ -400,7 +482,7 @@ end
     grid = gridpoints((n, n), 32; chip_size = 32, search_radius = 25)
     nr, nc = size(grid)
     for j in 1:nc, i in 1:nr
-        r = j <= nc ÷ 2 ? 25 : 10          # a coherent left half, a restricted right half
+        r = j <= nc ÷ 2 ? 25 : 9           # a coherent left half, a restricted right half
         grid.radius_x[i, j] = r
         grid.radius_y[i, j] = r
     end
@@ -416,7 +498,7 @@ end
     # A sub-block wholly inside the small-radius half, so its own maxima are genuinely smaller.
     rows, cols = 3:8, (nc ÷ 2 + 2):(nc ÷ 2 + 7)
     sub = grid[rows, cols]
-    @test AutoRIFT.pass_geometry(sub) == AutoRIFT.PassGeometry(extent(32), extent(10))
+    @test AutoRIFT.pass_geometry(sub) == AutoRIFT.PassGeometry(extent(32), extent(9))
 
     with = track(pair, sub, p; geometry = geom)
     @test all(isequal.(full.dx[rows, cols], with.dx))
@@ -430,9 +512,10 @@ end
     without = track(pair, sub, p)
     @test !all(isequal.(full.correlation[rows, cols], without.correlation))
     # The displacement is far less sensitive but not immune: a peak's location survives a ~1e-7
-    # perturbation of the surface almost everywhere, and where it does not it moves by one
-    # refinement step. Measured here: `dx` identical on all 36 points, `dy` moving on 1 by 0.015625,
-    # which is exactly `1/64`. Bounded rather than asserted equal, so a regression that moved a
+    # perturbation of the surface almost everywhere, and where it does not it moves by one refinement
+    # step. Measured here, `correlation` differs on 30 of the 36 points and neither `dx` nor `dy` moves
+    # at all. Bounded at one step rather than asserted equal, because which of the two happens is a
+    # property of this texture and not something the code guarantees — while a regression that moved a
     # displacement by a *pixel* still fails.
     dstep = 1 / 64
     for (a, b) in ((full.dx[rows, cols], without.dx), (full.dy[rows, cols], without.dy))
@@ -451,14 +534,31 @@ end
     @test AutoRIFT._radius_bucket(-3, cap) == 0
     @test AutoRIFT._radius_bucket(1, cap) == 1
     @test AutoRIFT._radius_bucket(32, cap) == 32        # a power of two is its own bucket
-    @test AutoRIFT._radius_bucket(33, cap) == 64
+    @test AutoRIFT._radius_bucket(33, cap) == 40
     @test AutoRIFT._radius_bucket(1024, cap) == 1024
-    # Clamped, never above the pass maximum: 1025 would round to 2048 and demand a wider transform
+    @test AutoRIFT._radius_bucket(1025, cap) == 1280
+    # Clamped, never above the pass maximum: 1900 would round to 2048 and demand a wider transform
     # than the pass itself was sized for.
-    @test AutoRIFT._radius_bucket(1025, cap) == cap
+    @test AutoRIFT._radius_bucket(1900, cap) == cap
     @test AutoRIFT._radius_bucket(cap, cap) == cap
     @test AutoRIFT._radius_bucket(cap + 100, cap) == cap
     @test AutoRIFT._radius_bucket(8, 8) == 8
+
+    # The whole ladder over one octave, since `RADIUS_BUCKET_RUNGS` is what sets both the transform
+    # work and the size of the plan set: the powers of two and the evenly spaced steps between them.
+    @test [AutoRIFT._radius_bucket(r, cap) for r in 16:32] ==
+          [16, 20, 20, 20, 20, 24, 24, 24, 24, 28, 28, 28, 28, 32, 32, 32, 32]
+
+    # The three properties every caller depends on, over a range covering the golden set's radii and
+    # several caps. A bucket below the point's own radius would correlate it through a transform too
+    # small for its search window; one above the cap would need a workspace wider than the pass was
+    # sized for; and non-monotonicity would let a *smaller* radius take a *larger* transform.
+    for c in (1, 2, 7, 64, 1905)
+        buckets = [AutoRIFT._radius_bucket(r, c) for r in 1:2500]
+        @test all(r -> buckets[r] >= min(r, c), 1:2500)
+        @test all(<=(c), buckets)
+        @test issorted(buckets)
+    end
 
     # The buckets a pass reaches are ascending by transform area, so the widest workspace is held
     # last and briefest.
@@ -473,7 +573,7 @@ end
         grid.radius_y[i] = r
     end
     bks = AutoRIFT._chunk_buckets(grid, AutoRIFT.pass_geometry(grid).radius, eachindex(grid))
-    @test [b.X for b in bks] == [8, 16, 32, 40]
+    @test [b.X for b in bks] == [5, 10, 20, 40]
     @test issorted([b.X * b.Y for b in bks])
 
     # A mixed-radius pass agrees with itself across thread counts: which points share a chunk must

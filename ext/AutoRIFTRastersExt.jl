@@ -252,24 +252,24 @@ AutoRIFT._chunk_rows(r::AbstractRaster) = AutoRIFT._chunk_rows(parent(r))
 # A caller's choice always wins, and an in-memory pair keeps `nothing` — the untiled path — so nothing
 # changes for callers who were already passing arrays.
 #
-# For a file-backed pair the size is set by the **halo**, not by the file's chunking, and measurement is
-# why. A block reads its own extent grown by the halo on every side, so redundancy is
-# `((block + 2*halo) / block)^2`: at the 56-pixel halo of a default Landsat configuration a block equal
-# to the 256-pixel chunk reads 369² and touches 2x2 chunks, so every chunk is decoded 3.7 times and the
-# scene is read 1.94 times over. Blocking at the chunk size sounds aligned and is the worst option
-# measured — 4.99 s against 3.48 s at 768, with 464k allocations against 66k.
+# For a file-backed pair the size is set by the **halo and the thread count**, not by the file's
+# chunking, and measurement is why. A block reads its own extent grown by the halo on every side, so
+# redundancy is `((block + 2*halo) / block)^2`: at the 56-pixel halo of a default Landsat configuration
+# a block equal to the 256-pixel chunk reads 369² and touches 2x2 chunks, so every chunk is decoded 3.7
+# times and the scene is read 1.94 times over. Blocking at the chunk size sounds aligned and is the
+# worst option measured — 4.99 s against 3.48 s at 768, with 464k allocations against 66k.
 #
-# `HALO_BLOCKS` halos per block puts redundancy at `(14/12)^2 = 1.36x`, near the measured optimum. Above
-# it the gain flattens while per-block buffers grow with the square of the block; below it the halo
-# dominates. Rounded up to a whole number of chunks so a read still starts and ends on a chunk boundary.
+# [`AutoRIFT.block_size_for`](@ref) carries the rule and the three sweeps behind it. The one thing
+# decided here is what it cannot see: the file's chunk grid, so a read starts and ends on a stored
+# boundary, and a floor for the pathological chunkings.
 #
 # The larger of the two rasters' chunk sizes, since one block size serves both: taking the smaller would
 # read a partial chunk of the coarser file for every block.
-const HALO_BLOCKS = 12
 
 # A floor for the pathological chunkings. A *striped* GeoTIFF — what `Rasters.write` produces by
-# default — reports chunks one row tall, so a 384x384 file asks for `(384, 5)`: below the halo, which
-# `block_layout` rejects outright, and nearly all overlap even if it did not.
+# default, and what the ITS_LIVE driver's own intermediates are — reports chunks one row tall, so a
+# 384x384 file asks for `(384, 5)`: below the halo, which `block_layout` rejects outright, and nearly
+# all overlap even if it did not.
 const MIN_BLOCK = 256
 
 function _blocks(supplied, reference::AbstractRaster, secondary::AbstractRaster, p)
@@ -277,17 +277,18 @@ function _blocks(supplied, reference::AbstractRaster, secondary::AbstractRaster,
     (AutoRIFT.ondisk(reference) && AutoRIFT.ondisk(secondary)) || return nothing
     cr = DiskArrays.approx_chunksize(DiskArrays.eachchunk(parent(reference)))
     cs = DiskArrays.approx_chunksize(DiskArrays.eachchunk(parent(secondary)))
-    # `approx_chunksize` reports one entry per dimension; a `Raster` here is 2-D by `check_aligned`.
+    # `approx_chunksize` reports one entry per dimension, in the array's own dimension order — which is
+    # the order `block_size_for` wants `chunk` in. A `Raster` here is 2-D by `check_aligned`.
     chunk = (max(cr[1], cs[1]), max(cr[2], cs[2]))
-    # The run's actual halo, from the run's actual parameters, so this cannot drift from the value the
-    # reads will use. The parameter-only form: the grid form would build a `PointSet` — 550 MiB and
-    # 50 ms on a Landsat-sized scene — to arrive at the same two integers.
-    hx, hy = AutoRIFT.halo(p)
-    # `halo` returns `(x, y)` while `size` is `(rows, cols)` = `(y, x)`, so the axes cross here.
-    # Never larger than the scene: a block wider than the image is one block, which is the untiled path
-    # wearing a block label, and it makes the trailing-block arithmetic do nothing useful.
-    return (min(max(AutoRIFT._round_up(HALO_BLOCKS * hy, chunk[1]), MIN_BLOCK), size(reference, 1)),
-            min(max(AutoRIFT._round_up(HALO_BLOCKS * hx, chunk[2]), MIN_BLOCK), size(reference, 2)))
+    # Sized from the array as the correlator will index it, not from the `Raster`: `parent` is what
+    # `_lazy_input` hands over, so its own `(rows, cols)` is the space the halo and the block live in.
+    # The parameter-only form of both the halo and the size: the grid form would build a `PointSet` —
+    # 550 MiB and 50 ms on a Landsat-sized scene — to arrive at the same two integers.
+    bs = AutoRIFT.block_size_for(p, size(parent(reference)); chunk, floor_pixels = MIN_BLOCK)
+    # `(X, Y)` as `process_block_size` is read, which is what `block_size_for` returns. Emitting it in
+    # the other order transposes the block, which is invisible on the square halo every optical
+    # configuration has and wrong on the 2:1 halo a radar one carries.
+    return (bs.X, bs.Y)
 end
 
 # ---------------------------------------------------------------------------

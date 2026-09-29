@@ -175,6 +175,14 @@ end
 # The sentinel every geogrid band marks a point outside the image with (`geogridOptical.cpp:1039`).
 const SENTINEL = -32767.0
 
+# Bytes of imagery above which rung 5.7 correlates a block at a time rather than in one pass.
+#
+# Not a memory limit: an unblocked pass costs several times the pair in search geometry and workspaces,
+# so the pair's own size is a proxy for the run's. Four GiB is where the two NISAR cases fall and every
+# other case does not, which is the property that matters — the twenty cases whose verdicts are already
+# recorded keep the unblocked path they were measured on, and the two that could not run at all now run.
+const UNBLOCKED_LIMIT = 4 * 2^30
+
 # The radar path's two bounds, and they share one cause.
 #
 # `ImagePairGeometry`'s `REFERENCE.md` traces the along-track float bands to the reference's own
@@ -221,7 +229,7 @@ quantity the README names as what a structured residual would move.
 preserves the shape while losing agreement would show up.
 """
 function endpoint_stage(name, ref_name, jl, ref, step; max_median = step, max_bias = 0.01,
-                        max_p99 = 1.0)
+                        max_p99 = 1.0, gated = true, why = "")
     if size(jl) != size(ref)
         return StageResult(name, ref_name, "structure", false, 0,
                            "shape $(size(jl)) against reference $(size(ref))")
@@ -261,6 +269,11 @@ function endpoint_stage(name, ref_name, jl, ref, step; max_median = step, max_bi
                        p99 %.4g (exact %.2f%%, within one step %.2f%%)",
                       both, only_j, only_r, med, bias, mean(d), p99,
                       100exact / both, 100within / both)
+    # **A case whose endpoint is gated elsewhere reports rather than gates.** Asserting a threshold here
+    # that no ledger entry ever claimed would read as a regression on first measurement; saying where the
+    # gate lives, and printing the numbers, is what the row is for. `why` names it.
+    gated || return StageResult(name, ref_name, "reported", true, both,
+                                detail * (isempty(why) ? "" : "; " * why))
     gate = @sprintf("median<=%.4g |bias|<=%.3g p99<=%.3g", max_median, max_bias, max_p99)
     return StageResult(name, ref_name, gate, passed, both, detail)
 end
@@ -387,6 +400,22 @@ function resolve_run(c::GoldenCase)
     return isempty(withcapture) ? last(complete) : last(withcapture)
 end
 
+# The geogrid, over as many threads as it has blocks.
+#
+# **`pairgeometry` is serial and `pairgeometry_blocked` is not**, and the package documents the two as
+# bit-identical at any block size and task count — each output point depends only on its own inputs.
+# Measured on the burst case's 2,835,430-point window: 6.84 s on one thread, which was over half of
+# `setup`.
+#
+# The transform is passed as a *factory* rather than as a value. A threaded run wants one transform per
+# task, because a PROJ pipeline wraps a context that is not safe to share — which is what `--proj-only`
+# selects, and what `FastGeoProjections` falls back to for a CRS pair it has no native implementation for.
+# Resolving one costs milliseconds, so paying it per task is cheaper than reasoning about which pairs are
+# safe.
+_geogrid(grid, pair, inputs, window, nd, tffactory) =
+    pairgeometry_blocked(grid, pair, InMemoryInputs(inputs, window); transform = tffactory, window,
+                         nodata = nodata_from(nd === nothing ? 0.0 : Float64(nd)))
+
 """
     setup(c::GoldenCase; n = nothing) -> Setup
 
@@ -427,8 +456,8 @@ function setup(c::GoldenCase; n::Union{Integer,Nothing} = nothing, proj_only::Bo
     # carries a different sentinel is handled, and with `nothing` becoming `0.0` because the reference
     # passes `pbSuccess = NULL` and so cannot distinguish an unset nodata from zero.
     nd = ArchGDAL.getnodatavalue(ArchGDAL.getband(ArchGDAL.read(info.paths.dem), 1))
-    g = pairgeometry(grid, pair, geometry_inputs(info, window); transform = tf, window,
-                     nodata = nodata_from(nd === nothing ? 0.0 : Float64(nd)))
+    g = _geogrid(grid, pair, geometry_inputs(info, window), window, nd,
+                 () -> grid_transform(info.epsg, epsg; proj_only))
 
     return Setup(c, run, rpath, spath, pair, epsg, info, grid, window, tf, g)
 end
@@ -471,8 +500,8 @@ function _radar_setup(c::GoldenCase, run::AbstractString, proj_only::Bool)
     window = grid_window(grid, footprint_bounds(tf, coord))
 
     nd = ArchGDAL.getnodatavalue(ArchGDAL.getband(ArchGDAL.read(info.paths.vx), 1))
-    g = pairgeometry(grid, pair, geometry_inputs(info, window); transform = tf, window,
-                     nodata = nodata_from(nd === nothing ? 0.0 : Float64(nd)))
+    g = _geogrid(grid, pair, geometry_inputs(info, window), window, nd,
+                 () -> grid_transform(info.epsg, 4326; proj_only))
 
     return Setup(c, run, joinpath(run, "reference.tif"), joinpath(run, "secondary.tif"),
                  pair, info.epsg, info, grid, window, tf, g)
@@ -741,26 +770,16 @@ function rung_endpoint(s::Setup)
     call = joinpath(s.run, "capture", "call1.json")
     isfile(call) || return [StageResult("5.7 endpoint", "capture/out_Dx", "gate", true, 0,
                                        "skipped: no capture at $call")]
-    k = read_capture(s.case; n = parse(Int, basename(s.run)))
+    # **The imagery is mapped, not read.** A NISAR L2 GSLC pair is 11.25 GiB of bytes, and holding it on
+    # the heap is what used to make this rung decline the two NISAR cases outright. Mapped, its pages are
+    # file-backed and clean, so the pair costs the run nothing it cannot give back — and `xread_mmap`
+    # returns the identical array, which `tools/ab/xchg.jl`'s selftest asserts.
+    k = read_capture(s.case; n = parse(Int, basename(s.run)), mmap = CAPTURE_IMAGERY)
 
     grid = AutoRIFT.pointset(s.geometry; pixel_size = ImagePairGeometry.xsize(s.pair.coordinate))
     p = AutoRIFT.params(s.geometry; threaded = Threads.nthreads() > 1, preprocess = :none)
 
     out = StageResult[]
-
-    # **The imagery has to fit.** A NISAR L2 GSLC is 110085 x 54885 bytes, so the pair the reference
-    # correlated is 11 GiB before the correlator's own working set — and the capture holds it as two plain
-    # arrays. Declined with the size rather than attempted: an unblocked run on that pair does not finish,
-    # and the thinned endpoint on these cases is what gate `3.nisar` already measures.
-    # From the manifest, not from the array: asking the array its size is what loads it.
-    pixels = prod(JSON3.read(read(call, String)).arrays["in_I1"].shape)
-    if 2 * pixels > 4 * 2^30
-        push!(out, StageResult("5.7 endpoint", "capture/out_Dx", "gate", true, 0,
-                               @sprintf("deferred: the pair is %.2f GiB of imagery, which an \
-                                         unblocked run cannot hold; the thinned endpoint on this case \
-                                         is gate 3.nisar", 2 * pixels / 2^30)))
-        return out
-    end
     a, b = k.arrays["in_I1"], k.arrays["in_I2"]
 
     # **The reference correlates a truncated grid, and AutoRIFT.jl does not.** `autoRIFT.py:809-819`
@@ -783,8 +802,38 @@ function rung_endpoint(s::Setup)
     # discards, and it has no imagery mask to zero a radius from.
     grid = _mask_from_capture(_chop_to(grid, predicted[1], predicted[2]), k)
 
-    @info "5.7 correlating" scene=size(a) npoints=length(grid.x) chip=p.chip_size_min threads=Threads.nthreads()
-    r = AutoRIFT.autorift(b, a, grid, p)
+    # **A pair too large for an unblocked pass is blocked rather than declined.** An unblocked pass holds
+    # its whole search geometry at once and peaks near 50 GiB on a NISAR grid, which is why this rung used
+    # to report the two NISAR cases as deferred. Blocked, it holds a block's read window per task, and
+    # `block_size_for` sizes that from this grid's own halo — 2216x1103 and 2736x1500 px on those two,
+    # against 281x267 on an optical pair.
+    #
+    # **Only above the threshold, so no case that has been gated changes path.** Blocking preserves
+    # `dx`/`dy` at a given keep mask and `dev/GATES.md` records the one way it does not: a `peak_ratio`
+    # difference of ~6e-7 landing either side of the outlier filter's threshold, which one point is
+    # enough to compound through the chip ladder. Re-deciding that for the twenty cases that already fit
+    # would move numbers this rung's recorded verdicts were taken on, to no purpose.
+    blocked = 2 * length(a) > UNBLOCKED_LIMIT
+    # **The cases this rung has never gated are the cases it still does not gate.** The two NISAR
+    # endpoints were declined outright, with `3.nisar` on a thinned grid named as their gate; they now
+    # run, and their numbers are worth having, but asserting a threshold here that no ledger entry ever
+    # claimed would read as a regression on first measurement. So the same condition that used to
+    # exclude them now marks them reported. Whether this should become a gate is a question for the
+    # coarse-level work `tools/golden/README.md` opens with, not for a threshold chosen here.
+    gated = !blocked
+    whynot = gated ? "" : "reported, not gated: the endpoint gate on this case is 3.nisar, on the \
+                          thinned grid — read the per-level row above for where the residual is"
+    block = blocked ? AutoRIFT.block_size_for(grid, p, size(a)) : nothing
+    nblocks = isnothing(block) ? 1 :
+              length(AutoRIFT.block_layout(grid, p, size(a), (block.X, block.Y)).blocks)
+    @info "5.7 correlating" scene=size(a) npoints=length(grid.x) chip=p.chip_size_min threads=Threads.nthreads() block blocks=nblocks
+    r = isnothing(block) ? AutoRIFT.autorift(b, a, grid, p) :
+        AutoRIFT.autorift(b, a, grid, p, (block.X, block.Y))
+    push!(out, StageResult("5.7 pass decomposition", "capture/in_I1", "reported", true, 1,
+                           @sprintf("%.2f GiB of imagery, %s%s", 2 * length(a) / 2^30,
+                                    blocked ? "blocked at $(block.X)x$(block.Y) px into $nblocks blocks" :
+                                    "unblocked",
+                                    blocked ? " (mapped, not resident)" : "")))
 
     rdx, rdy = k.arrays["out_Dx"], k.arrays["out_Dy"]
     ny = min(size(r.dx, 1), size(rdx, 1))
@@ -815,7 +864,7 @@ function rung_endpoint(s::Setup)
         for sgn in (1, -1)
             nm = "5.7 $axis (sign $(sgn > 0 ? '+' : '-'))"
             rn = "out_$(uppercase(String(axis)))"
-            st = quantized ? endpoint_stage(nm, rn, jl, sgn .* rf, step) :
+            st = quantized ? endpoint_stage(nm, rn, jl, sgn .* rf, step; gated, why = whynot) :
                  unquantized_stage(nm, rn, jl, sgn .* rf)
             best === nothing && (best = (sgn, st))
             best = _better_endpoint(best, (sgn, st))
@@ -1075,11 +1124,33 @@ Two filters and two different gates, because the two differ from the reference f
 input a rung is not testing — gate `5.orbit` is where the orbit-derived angles are measured against
 those, and `tools/golden/README.md` records why they are not yet the default.
 """
+# The scenes of a natively-filtered pair whose `filtered/` raster this run does not hold.
+#
+# **That directory is the only place the reference's own filter output lives** — the capture holds the
+# bytes the correlator was handed, one filter later and quantized — so rungs 5.3 and 5.4 have nothing to
+# compare against without it and report a gap instead of a verdict. [`prune_run`](@ref) keeps it; a run
+# pruned before `prune_run` kept it is restored by another container run.
+function missing_filtered(s::Setup)
+    native_filter(s.case, first(s.case.reference)) === nothing && return String[]
+    band = scene_band(s.case.platform) === :green ? "B2" : "B8"
+    runs = cached_runs(s.case, s.run)
+    return [n for n in (first(s.case.reference), first(s.case.secondary))
+            if !any(r -> isfile(joinpath(r, "filtered", "$(n)_$(band).TIF")), runs)]
+end
+
+filtered_gap_detail(s::Setup, gap) =
+    "no cached run of this case holds a `filtered/` raster for " * join(gap, " or ") *
+    "; a container run restores it, and `prune_run` keeps it"
+
 function rung_filter(s::Setup)
     native = native_filter(s.case, first(s.case.reference))
     native === nothing && return [StageResult("5.3 native filter", "filtered/", "tolerance", true, 0,
                                               "skipped: this pair is filtered inside the correlator, \
                                                which rung 5.4 covers")]
+    gap = missing_filtered(s)
+    isempty(gap) || return [StageResult("5.3 native filter", "filtered/", "tolerance", true, 0,
+                                       "skipped: " * filtered_gap_detail(s, gap))]
+
     log = joinpath(s.run, "capture.log")
     angles = native === :fft ? reference_scan_angles(log) : nothing
     fired = native === :fft ? reference_banding(log) : nothing
@@ -1435,6 +1506,9 @@ function rung_bytes(s::Setup)
                              array, so the unreproducible draw rescales every pixel — measured at \
                              1.85% exact on `LE07_L1TP_063018`")]
     end
+    gap = missing_filtered(s)
+    isempty(gap) || return [StageResult("5.4 correlator bytes", "capture/in_I1", "exact", true, 0,
+                                       "skipped: " * filtered_gap_detail(s, gap))]
     rpath = something(filtered_path(s.case, s.run, first(s.case.reference)), s.reference_path)
     spath = something(filtered_path(s.case, s.run, first(s.case.secondary)), s.secondary_path)
     # `filtered_path` resolves by name and the offsets are in acquisition order, so the two are paired
@@ -1563,15 +1637,17 @@ end
 # implementation should.
 function _chop_to(pts, nr::Integer, nc::Integer)
     c(A) = A[1:nr, 1:nc]
-    # `chip_size_x`/`chip_size_y` are lazy uniform arrays carrying the grid's own axes, so they need
-    # chopping too or `PointSet` rejects the mismatch — which it does, by name, rather than broadcasting
-    # a stale shape into the correlation.
+    # **Every field, because `PointSet` requires every field to share `x`'s axes** and says so by name
+    # rather than broadcasting a stale shape into the correlation. `chip_size_x`/`chip_size_y` and
+    # `positioned` are lazy uniform arrays when a caller gave a scalar and real arrays when a geogrid
+    # supplied them per point; both carry the grid's own axes, so both need chopping.
     return AutoRIFT.rebuild(pts; x = c(pts.x), y = c(pts.y),
                             radius_x = c(pts.radius_x), radius_y = c(pts.radius_y),
                             dx_prior = c(pts.dx_prior), dy_prior = c(pts.dy_prior),
                             chip_size_x = c(pts.chip_size_x), chip_size_y = c(pts.chip_size_y),
                             chip_size_min_x = c(pts.chip_size_min_x),
-                            chip_size_max_x = c(pts.chip_size_max_x))
+                            chip_size_max_x = c(pts.chip_size_max_x),
+                            positioned = c(pts.positioned))
 end
 
 """

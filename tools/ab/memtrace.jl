@@ -33,6 +33,14 @@ using Serialization: serialize
 const RUSAGE_INFO_V4 = Cint(4)
 const RUSAGE_RESIDENT = 9
 const RUSAGE_FOOTPRINT = 10
+# `ri_user_time` and `ri_system_time`, the first two `UInt64` fields after the uuid.
+#
+# **In mach absolute ticks, not nanoseconds, despite the field names.** Measured: burning 1.00 s of CPU
+# on one thread moves the user field by 23,866,353, which is the same 24 MHz `cntvct_el0` the profiler
+# stamps with — so `tick_rate` converts these too. Read as nanoseconds they under-report by ~42x, which
+# looks like a process that barely ran rather than like a broken unit.
+const RUSAGE_USER_TICKS = 3
+const RUSAGE_SYSTEM_TICKS = 4
 
 """
     rusage!(buf) -> (resident, footprint)
@@ -47,6 +55,29 @@ function rusage!(buf::Vector{UInt64})
                getpid(), RUSAGE_INFO_V4, buf)
     rc == 0 || error("proc_pid_rusage failed with $rc")
     return (buf[RUSAGE_RESIDENT], buf[RUSAGE_FOOTPRINT])
+end
+
+"""
+    cpu_seconds!(buf, hz) -> Float64
+
+This process's user plus system CPU time so far, in seconds, summed over every thread.
+
+`hz` is the tick rate from [`tick_rate`](@ref); the kernel reports these fields in mach absolute ticks
+rather than in the nanoseconds their names suggest.
+
+**Reported beside any wall clock that a conclusion rests on**, because the two together separate causes
+that wall alone cannot. A run that is slower at the same CPU seconds was *waiting* — on a lock, on an
+allocation, on a rebuild; a run that is slower with CPU seconds up in proportion was running at a lower
+clock, which is what a power- or thermally-limited machine does. Wall alone leaves those
+indistinguishable, and they call for opposite responses: fix the code, or fix the measurement.
+
+Same `buf` and same syscall as [`rusage!`](@ref), so a sampler already holding one pays nothing extra.
+"""
+function cpu_seconds!(buf::Vector{UInt64}, hz::Real)
+    rc = ccall(:proc_pid_rusage, Cint, (Cint, Cint, Ptr{UInt64}),
+               getpid(), RUSAGE_INFO_V4, buf)
+    rc == 0 || error("proc_pid_rusage failed with $rc")
+    return (buf[RUSAGE_USER_TICKS] + buf[RUSAGE_SYSTEM_TICKS]) / hz
 end
 
 # ---------------------------------------------------------------------------

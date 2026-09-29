@@ -373,6 +373,104 @@ end
     clear_workspaces!()
 end
 
+@testset "the pool is bounded across keys as well as per key" begin
+    # The per-key bound does not bound the number of keys, and a whole NISAR L1 grid reaches 105 of them
+    # holding 9.9 GiB. Bounding the total is measured free — peak footprint -7.2% at the same wall clock
+    # and CPU seconds — so it is on by default. `docs/src/explanation/memory.md` has the table.
+    clear_workspaces!()
+    @test AutoRIFT.WORKSPACE_POOL_BYTES[] > 0
+
+    # `workspace_bytes` is what the bound is read in, so it has to count the buffers rather than the
+    # wrapper: a wider search radius is a larger workspace.
+    b20 = AutoRIFT.workspace_bytes(workspace(Float32, 32, 20))
+    b28 = AutoRIFT.workspace_bytes(workspace(Float32, 32, 28))
+    @test b28 > b20 > sizeof(workspace(Float32, 32, 20).surface)
+
+    budget = AutoRIFT.WORKSPACE_POOL_BYTES[]
+    try
+        # A budget admitting one of the three geometries, so eviction has to happen.
+        AutoRIFT.WORKSPACE_POOL_BYTES[] = b20
+        radii = (20, 24, 28)
+        for r in radii
+            AutoRIFT.give_workspace!(AutoRIFT.take_workspace!(Float32, 32, r))
+        end
+        # **Least-recently-used, so what leaves is the geometry a finished level used.** The first is
+        # gone and the most recent is still pooled — and still handed back rather than rebuilt.
+        @test !haskey(AutoRIFT.WORKSPACE_POOL, (extent(32), extent(radii[1]), false))
+        @test haskey(AutoRIFT.WORKSPACE_POOL, (extent(32), extent(radii[3]), false))
+        @test length(AutoRIFT.WORKSPACE_POOL) < 3
+
+        # `pool_bytes` sums the entries, so it cannot disagree with what the pool holds — which a running
+        # total could, and silently, by ceasing to bind rather than by erroring.
+        @test AutoRIFT.pool_bytes() ==
+              sum(AutoRIFT.workspace_bytes, Iterators.flatten(values(AutoRIFT.WORKSPACE_POOL)))
+
+        # A single geometry whose own slots exceed the bound is kept rather than rebuilt per chunk: such
+        # a run holds that much whatever the pool does.
+        clear_workspaces!()
+        AutoRIFT.WORKSPACE_POOL_BYTES[] = 1
+        w = AutoRIFT.take_workspace!(Float32, 32, 25)
+        AutoRIFT.give_workspace!(w)
+        @test AutoRIFT.take_workspace!(Float32, 32, 25) === w
+    finally
+        AutoRIFT.WORKSPACE_POOL_BYTES[] = budget
+        clear_workspaces!()
+    end
+end
+
+@testset "the in-use bound delays and never narrows" begin
+    # `WORKSPACE_POOL_BYTES` bounds what the pool *retains*; this bounds what is *checked out*, which on a
+    # skewed radius field is the larger quantity — a task holds one workspace at a time, so a run holds as
+    # many as it has tasks. The properties that make it safe to set are that it cannot change an answer and
+    # cannot hang, and both are asserted rather than argued.
+    budget = AutoRIFT.WORKSPACE_LIVE_BYTES[]
+    try
+        @test AutoRIFT.WORKSPACE_LIVE_BYTES[] == typemax(Int)      # off by default
+        @test AutoRIFT.live_bytes() == 0
+
+        one = AutoRIFT.workspace_bytes(AutoRIFT.workspace(Float32, 32, 12))
+
+        # **A bound below a single workspace admits rather than hangs.** A run needing a workspace holds it
+        # whatever this is set to, so the first taker never waits; without that guard any bound smaller than
+        # one geometry would deadlock on its first point.
+        AutoRIFT.WORKSPACE_LIVE_BYTES[] = 1
+        ws = AutoRIFT.take_workspace!(Float32, 32, 12)
+        @test AutoRIFT.workspace_bytes(ws) > 1
+        @test AutoRIFT.live_bytes() == AutoRIFT.workspace_bytes(ws)
+        AutoRIFT.give_workspace!(ws)
+        # Symmetric: the figure a return subtracts is the one the take added, so a take/return pair leaves
+        # nothing behind. A drift here would show up as a bound that stops binding rather than as an error.
+        @test AutoRIFT.live_bytes() == 0
+
+        # Answer-preserving at every bound, including one that serialises the run completely. Threaded, so
+        # the waiting path is actually exercised: at a one-workspace bound only one task correlates at a
+        # time, and a deadlock would hang this testset rather than fail it.
+        ref, sec = split_pair(384)
+        p = params(; chip_size = 32, chip_size_max = 32, grid_spacing = 16, search_radius = 12,
+                   threaded = true)
+        AutoRIFT.WORKSPACE_LIVE_BYTES[] = typemax(Int)
+        base = autorift(ref, sec, p)
+        for b in (8 * one, one, 1)
+            AutoRIFT.WORKSPACE_LIVE_BYTES[] = b
+            got = autorift(ref, sec, p)
+            @test isequal(got.dx, base.dx)
+            @test isequal(got.dy, base.dy)
+            # Nothing checked out once the run has finished, at any bound.
+            @test AutoRIFT.live_bytes() == 0
+        end
+
+        # The blocked path takes one workspace per block task, so it reaches the same admission point.
+        AutoRIFT.WORKSPACE_LIVE_BYTES[] = typemax(Int)
+        wholeblocks = autorift(ref, sec, p, (192, 192))
+        AutoRIFT.WORKSPACE_LIVE_BYTES[] = one
+        @test isequal(autorift(ref, sec, p, (192, 192)).dx, wholeblocks.dx)
+        @test AutoRIFT.live_bytes() == 0
+    finally
+        AutoRIFT.WORKSPACE_LIVE_BYTES[] = budget
+        clear_workspaces!()
+    end
+end
+
 @testset "pooling changes no result" begin
     # The claim that matters: a pooled workspace must give bit-identical answers to a fresh one,
     # on a cold pool and a warm one, serial and threaded. Buffers are not cleared on return —
