@@ -461,7 +461,7 @@ native grid instead and asks for it by name.
 function filtered_path(c::GoldenCase, run::AbstractString, name::AbstractString)
     native_filter(c, name) === nothing && return nothing
     band = scene_band(c.platform) === :green ? "B2" : "B8"
-    for r in filtered_runs(c, run), dir in ("reprojected", "filtered")
+    for r in cached_runs(c, run), dir in ("reprojected", "filtered")
         p = joinpath(r, dir, "$(name)_$(band).TIF")
         isfile(p) && return p
     end
@@ -471,16 +471,17 @@ function filtered_path(c::GoldenCase, run::AbstractString, name::AbstractString)
 end
 
 """
-    filtered_runs(c::GoldenCase, run) -> Vector{String}
+    cached_runs(c::GoldenCase, run) -> Vector{String}
 
 `run` first, then every other cached run of `c`.
 
-**Which run holds the filter output need not be the run the ladder is comparing against.** `resolve_run`
-prefers a run with a capture, and a run made to restore `filtered/` has none — so a rung that looked only
-in its own run would ignore the very directory that was just rebuilt, and the advice to re-run the
-container would not work.
+**Which run holds an input need not be the run the ladder is comparing against.** `resolve_run` prefers a
+run with a capture, and a run made to restore `filtered/` has none — so a rung that looked only in its own
+run would ignore the very directory that was just rebuilt, and the advice to re-run the container would
+not work. The same holds for a full-SLC pair's `.SAFE` trees, which the driver downloads into whichever
+run it processed.
 """
-function filtered_runs(c::GoldenCase, run::AbstractString)
+function cached_runs(c::GoldenCase, run::AbstractString)
     root = dirname(run)
     isdir(root) || return [run]
     return [run; [d for d in sort(readdir(root; join = true)) if isdir(d) && d != run]]
@@ -496,7 +497,7 @@ nodata-infill filter produces one (`process.py:275, 286`).
 """
 function native_filtered_paths(c::GoldenCase, run::AbstractString, name::AbstractString)
     band = scene_band(c.platform) === :green ? "B2" : "B8"
-    runs = filtered_runs(c, run)
+    runs = cached_runs(c, run)
     i = findfirst(r -> isfile(joinpath(r, "filtered", "$(name)_$(band).TIF")), runs)
     isnothing(i) && error("no `filtered/$(name)_$(band).TIF` under any cached run of $(c.product); " *
                           "rung 5.3 compares against `filtered/` on the native grid")

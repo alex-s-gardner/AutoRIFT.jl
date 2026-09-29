@@ -1133,7 +1133,7 @@ those, and `tools/golden/README.md` records why they are not yet the default.
 function missing_filtered(s::Setup)
     native_filter(s.case, first(s.case.reference)) === nothing && return String[]
     band = scene_band(s.case.platform) === :green ? "B2" : "B8"
-    runs = filtered_runs(s.case, s.run)
+    runs = cached_runs(s.case, s.run)
     return [n for n in (first(s.case.reference), first(s.case.secondary))
             if !any(r -> isfile(joinpath(r, "filtered", "$(n)_$(band).TIF")), runs)]
 end

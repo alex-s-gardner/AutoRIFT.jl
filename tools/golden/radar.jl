@@ -321,37 +321,53 @@ function _burst_safes(run::AbstractString)
 end
 
 """
-    stage_safe(granule) -> String
+    stage_safe(granule; search = ()) -> String
 
-Download `granule`'s SLC from ASF, unzip it under `<cache>/granules/`, and return the `.SAFE` path.
+`granule`'s expanded `.SAFE` tree, downloading it from ASF only if no copy is already on disk.
 
 **Unzipped, because the raster cannot be read in place.** A Sentinel-1 zip stores its measurement TIFFs
 deflated, so a line is not addressable without inflating everything before it — `SLCDatasets` says so
 rather than reading part of one.
 
-The zip is deleted once it is expanded: the two together are 9 GB per acquisition and only the tree is
-read. ASF's download is a URS redirect chain, so `curl` carries `~/.netrc` through it — the same
-credential `fetch.jl --check` verifies and the container mounts.
+`search` names directories to consult before the granule cache, because the reference's own driver
+downloads a full-SLC pair into the run it processes: an acquisition is 2.5 GB zipped and 3.6 GB expanded,
+so fetching a second copy of a tree that is already there is 6 GB of disk and a quarter hour of egress for
+nothing. A tree found under `search` is returned where it lies and a zip found there is expanded into the
+granule cache, both left in place — a run directory holds reference artifacts and is not this function's
+to edit.
+
+A zip this function downloads is deleted once expanded: only the tree is read. ASF's download is a URS
+redirect chain, so `curl` carries `~/.netrc` through it — the same credential `fetch.jl --check` verifies
+and the container mounts — **and a cookie jar**, because URS hands the session back as a cookie and a
+`curl` that discards it re-authenticates at every hop until it hits the redirect limit. The symptom is
+`curl: (47) Maximum (50) redirects followed` on a URL whose `HEAD` succeeds.
 """
-function stage_safe(granule::AbstractString)
+function stage_safe(granule::AbstractString; search = String[])
+    dirs = collect(String, search)
     dir = joinpath(CACHE, "granules")
-    safe = joinpath(dir, granule * ".SAFE")
-    isdir(safe) && return safe
+    for d in [dirs; dir]
+        isdir(joinpath(d, granule * ".SAFE")) && return joinpath(d, granule * ".SAFE")
+    end
     mkpath(dir)
-    zip = joinpath(dir, granule * ".zip")
-    if !isfile(zip)
+    safe = joinpath(dir, granule * ".SAFE")
+    i = findfirst(d -> isfile(joinpath(d, granule * ".zip")), dirs)
+    staged = !isnothing(i)
+    zip = staged ? joinpath(dirs[i], granule * ".zip") : joinpath(dir, granule * ".zip")
+    if !staged && !isfile(zip)
         mission = granule[1:3]                  # `S1A`, `S1B` or `S1C`
         url = "https://sentinel1.asf.alaska.edu/SLC/S$(mission[3])/$(granule).zip"
         tmp = zip * ".partial"
         @info "downloading" granule url
-        run(`curl -sS -n -L -f -o $tmp $url`)
+        mktemp() do jar, _
+            run(`curl -sS -n -L -f -c $jar -b $jar -o $tmp $url`)
+        end
         mv(tmp, zip; force = true)
     end
     @info "expanding" zip = basename(zip)
     run(`unzip -q -o $zip -d $dir`)
     isdir(safe) || error("$(basename(zip)) expanded to no $(basename(safe)); ASF's tree is named " *
                          "`<granule>.SAFE`")
-    rm(zip)
+    staged || rm(zip)
     return safe
 end
 
@@ -499,14 +515,29 @@ function burst_offsets(dir::AbstractString)
     # An ISCE flat file is described by a sibling `.off.xml`, which GDAL only finds if it may list the
     # directory. `GDAL_DISABLE_READDIR_ON_OPEN` is `EMPTY_DIR` for the S3 reads elsewhere in these tools,
     # so it is lifted for these two opens and put back.
-    prev = ArchGDAL.getconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", "")
-    ArchGDAL.setconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", "NO")
-    try
-        return (lookup(read_off("azimuth.off")), lookup(read_off("range.off")))
-    finally
-        ArchGDAL.setconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", prev)
+    #
+    # **Under a lock, because `CPLSetConfigOption` is process-wide and these reads are concurrent.** A
+    # subswath's placements are built one task per burst, so without one a task's restore lands while another
+    # is mid-open and GDAL reports `range.off` as "not recognized as being in a supported file format" —
+    # measured at 3 failures in 10 concurrent reads where 10 serial reads all succeed.
+    #
+    # A lock rather than `CPLSetThreadLocalConfigOption`: the thread-local getter returns a pointer into
+    # GDAL's own storage, which the following set invalidates, so restoring the previous value means handing
+    # back a dangling pointer. Serializing costs little here — offsets are read only to replay the
+    # reference's own resample, never on the path a pair is actually processed by.
+    return @lock READDIR_OPTION begin
+        prev = ArchGDAL.getconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", "")
+        ArchGDAL.setconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", "NO")
+        try
+            (lookup(read_off("azimuth.off")), lookup(read_off("range.off")))
+        finally
+            ArchGDAL.setconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", prev)
+        end
     end
 end
+
+# Guards every process-wide flip of `GDAL_DISABLE_READDIR_ON_OPEN`; see [`burst_offsets`](@ref).
+const READDIR_OPTION = ReentrantLock()
 
 """
     cslc_grid(run, swaths) -> (swath -> (lines, samples)) or `nothing`
@@ -546,13 +577,17 @@ not, and every extent in the mosaic depends on this one:
 Dimensions only, so this costs a header read rather than the quarter-gigabyte the offsets themselves are.
 """
 function burst_offset_grid(dir::AbstractString)
-    prev = ArchGDAL.getconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", "")
-    ArchGDAL.setconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", "NO")
-    try
-        ds = ArchGDAL.read(joinpath(dir, "azimuth.off"))
-        return (ArchGDAL.height(ds), ArchGDAL.width(ds))
-    finally
-        ArchGDAL.setconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", prev)
+    # `READDIR_OPTION` for the same reason [`burst_offsets`](@ref) holds it: this is called once per burst
+    # from the same per-burst tasks, and the option it flips is process-wide.
+    return @lock READDIR_OPTION begin
+        prev = ArchGDAL.getconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", "")
+        ArchGDAL.setconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", "NO")
+        try
+            ds = ArchGDAL.read(joinpath(dir, "azimuth.off"))
+            (ArchGDAL.height(ds), ArchGDAL.width(ds))
+        finally
+            ArchGDAL.setconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", prev)
+        end
     end
 end
 
@@ -1308,6 +1343,11 @@ function ResampledSwath(rp::Sentinel1Product, sp::Sentinel1Product, swath::Integ
     # **The output grid is the one COMPASS resampled onto, which is the annotation's burst only sometimes.**
     # `merge_bursts_in_swath` reads its `num_az_samples`/`num_rng_samples` off the first burst's CSLC, so
     # the merged height and the merged width both follow that raster and not `lines_per_burst`.
+    #
+    # `grid` maps a **burst index** to that burst's `(lines, samples)`: the mosaic constructors resolve the
+    # per-subswath level and hand this one what is left, matching `offsets`. So a caller supplying it from
+    # outside needs two levels — `sw -> (i -> shape)` — which is what `_reference_grid` returns and is why
+    # `cslc_grid`'s per-subswath `sw -> shape` cannot be passed here.
     nl, ns = grid === nothing ? (lpb, spb) : grid(1)
     nlines = n == 1 ? nl :
              1 + round(Int, (seconds_between(first(a.burst_start), last(a.burst_start)) +

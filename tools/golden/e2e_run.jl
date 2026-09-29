@@ -72,15 +72,19 @@ Put `c`'s scenes on local disk and have [`scene_path`](@ref) resolve to the copi
 
 Called before the clock starts, which is the point: the reference streams a Landsat band from a
 requester-pays bucket and so does this chain, and 354 MB of egress inside a timed stage measures the
-network. A radar burst pair is already local — its SAFE trees are in the run directory — so there is
-nothing to stage.
+network. A full-SLC pair is 2.5 GB of ASF egress per acquisition and a `unzip` of it, so both trees are
+expanded here too. A burst pair is already local — its SAFE trees are in the run directory — and a NISAR
+pair is read from the products the driver downloaded, so neither has anything to stage.
 """
 function stage(c::GoldenCase)
+    early, late = acquisition_order(c)
+    if c.platform == "S1-SLC"
+        dirs = cached_runs(c, resolve_run(c))
+        return [stage_safe(g; search = dirs) for g in (early, late)]
+    end
     (startswith(c.platform, "L") || c.platform == "S2") || return String[]
     out = String[]
-    for which in (:reference, :secondary)
-        early, late = acquisition_order(c)
-        name = which === :reference ? early : late
+    for (which, name) in ((:reference, early), (:secondary, late))
         haskey(STAGED, name) && (push!(out, STAGED[name]); continue)
         STAGED[name] = stage_scene(scene_path(c, which))
         push!(out, STAGED[name])
@@ -288,7 +292,10 @@ function e2e_imagery(s::Setup)
         dem = joinpath(s.run, "dem.tif")
         isfile(dem) || error("no dem.tif in $(s.run); the secondary's resample solves for terrain height")
         early, late = acquisition_order(c)
-        mk(g) = Sentinel1Product(stage_safe(g); orbit = s1_orbit(s.run, g),
+        # The `.SAFE` trees are wherever the driver downloaded them, which need not be the run the ladder
+        # compares against — so every cached run of the case is searched before ASF is.
+        safes = cached_runs(c, s.run)
+        mk(g) = Sentinel1Product(stage_safe(g; search = safes); orbit = s1_orbit(s.run, g),
                                  polarization = lowercase(s1_polarization(g)), swaths = sws)
         rp, sp = mk(early), mk(late)
         ref = radar_mosaic(rp, sws)
@@ -296,9 +303,17 @@ function e2e_imagery(s::Setup)
         size(ref) == size(sec) || error("the reference mosaic is $(size(ref)) and the resampled " *
                                         "secondary $(size(sec))")
         co = s.pair.coordinate
+        # **Fail rather than correlate on a grid the point set is not on.** `s1_pair` takes the merged
+        # shape from `cslc_grid` where the run kept a CSLC, and both acquisitions' CSLCs sit on the grid
+        # COMPASS resampled onto — 1640 x 21458 against the annotation's 1504 x 21530 on IW1 — so the
+        # reference mosaic is itself a resample there and not a merge of raw bursts. Reproducing it needs
+        # the reference's own coregistration target, which no rung derives yet.
         (co.nlines, co.nsamples) == size(ref) || error(
             "the geogrid was built on a $(co.nlines) x $(co.nsamples) mosaic and the imagery is " *
-            "$(size(ref)); the point set and the pixels are on different grids")
+            "$(size(ref)); the point set and the pixels are on different grids" *
+            (isnothing(cslc_grid(s.run, sws)) ? "" :
+             ". $(basename(s.run)) holds a CSLC, so the geogrid is on the resampled grid and this " *
+             "mosaic is on the annotation's"))
         return (ref, sec)
     end
     if c.platform == "S1-BURST"
