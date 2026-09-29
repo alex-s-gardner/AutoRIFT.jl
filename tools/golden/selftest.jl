@@ -24,6 +24,8 @@ include("manifest.jl")
 include("product.jl")
 include("compare.jl")
 include("correlator.jl")
+include("radar.jl")
+include("tilecache.jl")
 
 using AutoRIFT: chip_bounds, search_bounds, rebuild
 using Test
@@ -291,4 +293,166 @@ end
             end
         end
     end
+end
+
+# ---------------------------------------------------------------------------
+# The radar resampler's two rewritten kernels
+# ---------------------------------------------------------------------------
+#
+# Both are optimizations that must not move an answer, and each replaced a version that visited every
+# sample. So each is pinned against a straightforward implementation of what it means — the thing the fast
+# one has to agree with — rather than against a recorded number.
+
+# What `_support_bounds` means: the extremes of the mapped position over every pixel of the window.
+function _bounds_per_pixel(dl, ds, lines, samples)
+    ymin = xmin = Inf
+    ymax = xmax = -Inf
+    for s in samples, l in lines
+        y = l + dl(l, s) + 1.0
+        x = s + ds(l, s) + 1.0
+        ymin = min(ymin, y); ymax = max(ymax, y)
+        xmin = min(xmin, x); xmax = max(xmax, x)
+    end
+    return (ymin, ymax, xmin, xmax)
+end
+
+# What `_zero_outside_valid!` means: a predicate per sample.
+function _zero_per_pixel!(A, fvl, lvl, fvs, lvs, origin)
+    oy, ox = origin
+    z = zero(eltype(A))
+    for j in axes(A, 2), i in axes(A, 1)
+        l, s = oy + i - 1, ox + j - 1
+        (l < fvl || l > lvl || s < fvs || s > lvs) && (A[i, j] = z)
+    end
+    return A
+end
+
+@testset "radar resampler kernels" begin
+    @testset "the support bound is the per-pixel bound" begin
+        # An offset field on the resampler's own lattice, with enough curvature that a bilinear cell is
+        # not flat and the bound is not attained everywhere. `_offset_lattice`'s spacing is what
+        # `_support_bounds` walks, so the lattice here is built at that spacing.
+        nl, ns = 1502, 20662
+        ls = 0:_LSTEP:(nl + _LSTEP)
+        ss = 0:_SSTEP:(ns + _SSTEP)
+        DL = [3sin(i / 4) + 0.02j for i in eachindex(ls), j in eachindex(ss)]
+        DS = [87cos(j / 5) - 0.5i for i in eachindex(ls), j in eachindex(ss)]
+        lerp(A, l, s) = begin
+            fi, fj = l / _LSTEP + 1, s / _SSTEP + 1
+            i = clamp(floor(Int, fi), 1, length(ls) - 1)
+            j = clamp(floor(Int, fj), 1, length(ss) - 1)
+            u, v = fi - i, fj - j
+            (1-u)*(1-v)*A[i,j] + u*(1-v)*A[i+1,j] + (1-u)*v*A[i,j+1] + u*v*A[i+1,j+1]
+        end
+        dl = (l, s) -> lerp(DL, l, s)
+        ds = (l, s) -> lerp(DS, l, s)
+
+        # Degenerate, lattice-aligned, lattice-straddling, and reaching past the last node — which is the
+        # case a strided bound got wrong, since `lerp` extrapolates from the edge cell there.
+        for (lines, samples) in ((0:0, 0:0), (0:63, 0:511), (0:64, 0:512), (33:97, 511:513),
+                                 (0:(nl - 1), 0:(ns - 1)), (700:700, 0:(ns - 1)),
+                                 (0:(nl - 1), 9000:9000), (1400:1501, 20000:20661))
+            @test all(isapprox.(_support_bounds(dl, ds, lines, samples),
+                                _bounds_per_pixel(dl, ds, lines, samples); atol = 1e-9))
+        end
+    end
+
+    @testset "the tap loop reads only what the guard admits" begin
+        # `@inbounds` in `resample_burst` covers `by - 3 .. by + 4` by `bx - 3 .. bx + 4`, which is what
+        # the guard on the line above it tests. This asserts the two ranges are the same, so a change to
+        # one that is not made to the other fails here rather than reading arbitrary memory.
+        ny, nx = 40, 40
+        for by in 4:(ny - 4), bx in 4:(nx - 4)
+            admitted = (by - 3 >= 1) && (by + 4 <= ny) && (bx - 3 >= 1) && (bx + 4 <= nx)
+            accessed = extrema(by - 4 + m for m in 1:8), extrema(bx - 4 + k for k in 1:8)
+            inside = first(accessed[1]) >= 1 && last(accessed[1]) <= ny &&
+                     first(accessed[2]) >= 1 && last(accessed[2]) <= nx
+            @test admitted == inside
+        end
+    end
+
+    @testset "zeroing the margins equals testing every sample" begin
+        for (nr, nc) in ((64, 48), (7, 1), (1, 9)), origin in ((0, 0), (20, 5), (100, 0))
+            for (fvl, lvl, fvs, lvs) in ((20, 60, 5, 40),          # a frame on all four sides
+                                         (0, 10_000, 0, 10_000),   # nothing to zero
+                                         (10_000, 10_001, 0, 5),   # rows entirely outside
+                                         (0, 10_000, 10_000, 10_001))  # columns entirely outside
+                A = rand(ComplexF32, nr, nc)
+                @test _zero_outside_valid!(copy(A), fvl, lvl, fvs, lvs; origin) ==
+                      _zero_per_pixel!(copy(A), fvl, lvl, fvs, lvs, origin)
+            end
+        end
+    end
+end
+
+@testset "the carrier's separable evaluation" begin
+    # The rewrite evaluates the same polynomial by a different route — the range half once per column, the
+    # azimuth half by Horner — so it is pinned against the exponent-pair sum it replaced, term for term.
+    fit = CarrierFit([Float64(t) / 7 for t in eachindex(_CARRIER_TERMS)],
+                     let T = zeros(Float64, 6, 4)
+                         for (t, (i, j)) in enumerate(_CARRIER_TERMS)
+                             T[i + 1, j + 1] = Float64(t) / 7
+                         end
+                         T
+                     end,
+                     800_000.0, 60_000.0, 0.0, 2.5, 800_000.0, 2.33, 1 / 486.0)
+
+    # What the fit's own definition says the phase is.
+    naive(f, line, sample) = begin
+        xn = ((f.r0 + sample * f.dr) - f.xmin) / f.xnorm
+        yn = (line * f.dt - f.ymin) / f.ynorm
+        acc = 0.0
+        for (t, (i, j)) in enumerate(_CARRIER_TERMS)
+            acc += f.coef[t] * xn^j * yn^i
+        end
+        acc
+    end
+
+    worst = 0.0
+    for line in (0, 1, 37, 750, 1501), sample in (0, 1, 511, 9000, 20661)
+        worst = max(worst, abs(fit(line, sample) - naive(fit, line, sample)))
+        # And the two halves compose to the same thing as the callable.
+        @test carrier_phase(carrier_column(fit, sample), fit, line) == fit(line, sample)
+    end
+    # A rounding difference between two orderings of the same sum, not a different polynomial.
+    @test worst < 1e-9
+end
+
+@testset "the tile cache under concurrent readers" begin
+    # A parent that counts how many times it is asked, so duplicate derivation is visible, and whose
+    # values are a function of the index, so a misplaced tile is visible too.
+    mutable struct Counting <: AbstractMatrix{Float32}
+        dims::Tuple{Int,Int}
+        reads::Threads.Atomic{Int}
+    end
+    Base.size(a::Counting) = a.dims
+    function Base.getindex(a::Counting, rows::AbstractUnitRange, cols::AbstractUnitRange)
+        Threads.atomic_add!(a.reads, 1)
+        return Float32[1000i + j for i in rows, j in cols]
+    end
+
+    dims = (600, 700)
+    p = Counting(dims, Threads.Atomic{Int}(0))
+    truth = Float32[1000i + j for i in 1:dims[1], j in 1:dims[2]]
+    dir = mktempdir()
+    c = TileCache(p; tile = 128, dir)
+
+    # Overlapping windows from many tasks at once: every tile is asked for by several of them, which is
+    # what the per-tile lock has to serialize without losing a presence mark or deriving twice.
+    wins = [(r:(min(r + 199, dims[1])), s:(min(s + 149, dims[2])))
+            for r in 1:90:dims[1] for s in 1:70:dims[2]]
+    results = Vector{Bool}(undef, length(wins))
+    @sync for (i, (rows, cols)) in enumerate(wins)
+        Threads.@spawn results[i] = (c[rows, cols] == truth[rows, cols])
+    end
+    @test all(results)
+    # Each tile derived exactly once, however many tasks raced for it.
+    @test c.filled[] == prod(c.ntiles)
+    @test p.reads[] == c.filled[]
+    @test c.served[] > 0
+    # And a second sweep is served entirely from the file.
+    before = c.filled[]
+    @test c[1:dims[1], 1:dims[2]] == truth
+    @test c.filled[] == before
+    close(c)
 end

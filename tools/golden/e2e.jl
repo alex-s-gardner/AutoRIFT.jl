@@ -400,6 +400,22 @@ function resolve_run(c::GoldenCase)
     return isempty(withcapture) ? last(complete) : last(withcapture)
 end
 
+# The geogrid, over as many threads as it has blocks.
+#
+# **`pairgeometry` is serial and `pairgeometry_blocked` is not**, and the package documents the two as
+# bit-identical at any block size and task count — each output point depends only on its own inputs.
+# Measured on the burst case's 2,835,430-point window: 6.84 s on one thread, which was over half of
+# `setup`.
+#
+# The transform is passed as a *factory* rather than as a value. A threaded run wants one transform per
+# task, because a PROJ pipeline wraps a context that is not safe to share — which is what `--proj-only`
+# selects, and what `FastGeoProjections` falls back to for a CRS pair it has no native implementation for.
+# Resolving one costs milliseconds, so paying it per task is cheaper than reasoning about which pairs are
+# safe.
+_geogrid(grid, pair, inputs, window, nd, tffactory) =
+    pairgeometry_blocked(grid, pair, InMemoryInputs(inputs, window); transform = tffactory, window,
+                         nodata = nodata_from(nd === nothing ? 0.0 : Float64(nd)))
+
 """
     setup(c::GoldenCase; n = nothing) -> Setup
 
@@ -440,8 +456,8 @@ function setup(c::GoldenCase; n::Union{Integer,Nothing} = nothing, proj_only::Bo
     # carries a different sentinel is handled, and with `nothing` becoming `0.0` because the reference
     # passes `pbSuccess = NULL` and so cannot distinguish an unset nodata from zero.
     nd = ArchGDAL.getnodatavalue(ArchGDAL.getband(ArchGDAL.read(info.paths.dem), 1))
-    g = pairgeometry(grid, pair, geometry_inputs(info, window); transform = tf, window,
-                     nodata = nodata_from(nd === nothing ? 0.0 : Float64(nd)))
+    g = _geogrid(grid, pair, geometry_inputs(info, window), window, nd,
+                 () -> grid_transform(info.epsg, epsg; proj_only))
 
     return Setup(c, run, rpath, spath, pair, epsg, info, grid, window, tf, g)
 end
@@ -484,8 +500,8 @@ function _radar_setup(c::GoldenCase, run::AbstractString, proj_only::Bool)
     window = grid_window(grid, footprint_bounds(tf, coord))
 
     nd = ArchGDAL.getnodatavalue(ArchGDAL.getband(ArchGDAL.read(info.paths.vx), 1))
-    g = pairgeometry(grid, pair, geometry_inputs(info, window); transform = tf, window,
-                     nodata = nodata_from(nd === nothing ? 0.0 : Float64(nd)))
+    g = _geogrid(grid, pair, geometry_inputs(info, window), window, nd,
+                 () -> grid_transform(info.epsg, 4326; proj_only))
 
     return Setup(c, run, joinpath(run, "reference.tif"), joinpath(run, "secondary.tif"),
                  pair, info.epsg, info, grid, window, tf, g)
@@ -1108,11 +1124,33 @@ Two filters and two different gates, because the two differ from the reference f
 input a rung is not testing — gate `5.orbit` is where the orbit-derived angles are measured against
 those, and `tools/golden/README.md` records why they are not yet the default.
 """
+# The scenes of a natively-filtered pair whose `filtered/` raster this run does not hold.
+#
+# **That directory is the only place the reference's own filter output lives** — the capture holds the
+# bytes the correlator was handed, one filter later and quantized — so rungs 5.3 and 5.4 have nothing to
+# compare against without it and report a gap instead of a verdict. [`prune_run`](@ref) keeps it; a run
+# pruned before `prune_run` kept it is restored by another container run.
+function missing_filtered(s::Setup)
+    native_filter(s.case, first(s.case.reference)) === nothing && return String[]
+    band = scene_band(s.case.platform) === :green ? "B2" : "B8"
+    runs = filtered_runs(s.case, s.run)
+    return [n for n in (first(s.case.reference), first(s.case.secondary))
+            if !any(r -> isfile(joinpath(r, "filtered", "$(n)_$(band).TIF")), runs)]
+end
+
+filtered_gap_detail(s::Setup, gap) =
+    "no cached run of this case holds a `filtered/` raster for " * join(gap, " or ") *
+    "; a container run restores it, and `prune_run` keeps it"
+
 function rung_filter(s::Setup)
     native = native_filter(s.case, first(s.case.reference))
     native === nothing && return [StageResult("5.3 native filter", "filtered/", "tolerance", true, 0,
                                               "skipped: this pair is filtered inside the correlator, \
                                                which rung 5.4 covers")]
+    gap = missing_filtered(s)
+    isempty(gap) || return [StageResult("5.3 native filter", "filtered/", "tolerance", true, 0,
+                                       "skipped: " * filtered_gap_detail(s, gap))]
+
     log = joinpath(s.run, "capture.log")
     angles = native === :fft ? reference_scan_angles(log) : nothing
     fired = native === :fft ? reference_banding(log) : nothing
@@ -1468,6 +1506,9 @@ function rung_bytes(s::Setup)
                              array, so the unreproducible draw rescales every pixel — measured at \
                              1.85% exact on `LE07_L1TP_063018`")]
     end
+    gap = missing_filtered(s)
+    isempty(gap) || return [StageResult("5.4 correlator bytes", "capture/in_I1", "exact", true, 0,
+                                       "skipped: " * filtered_gap_detail(s, gap))]
     rpath = something(filtered_path(s.case, s.run, first(s.case.reference)), s.reference_path)
     spath = something(filtered_path(s.case, s.run, first(s.case.secondary)), s.secondary_path)
     # `filtered_path` resolves by name and the offsets are in acquisition order, so the two are paired

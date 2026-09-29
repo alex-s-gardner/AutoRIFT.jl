@@ -33,6 +33,8 @@
 # therefore goes in the secondary slot, which is what rung 5.7 does and what this repeats.
 
 include("e2e.jl")
+include("nisar.jl")      # the NISAR crop and the RSLC coregistration
+include("tilecache.jl")  # a derived image kept on disk, so a later pass reads instead of re-deriving
 include(joinpath(dirname(@__DIR__), "ab", "memtrace.jl"))
 
 using Printf
@@ -41,7 +43,7 @@ argvalue(flag, default) = (i = findfirst(==(flag), ARGS);
                            isnothing(i) ? default : ARGS[i + 1])
 
 # The flags that take a value, so the value is not mistaken for a case name.
-const VALUED = ("--run", "--block", "--tsv")
+const VALUED = ("--run", "--block", "--tsv", "--tile")
 
 # The case fragments in an argument list: everything that is neither a flag nor a flag's value.
 function positional(args)
@@ -87,6 +89,64 @@ function stage(c::GoldenCase)
 end
 
 """
+    gslc_run(c::GoldenCase) -> Union{Nothing,String}
+
+The cached run holding both of `c`'s GSLC granules, or `nothing`.
+
+**Not necessarily the run the ladder compares against.** `resolve_run` prefers a run with a capture, and
+the granules live wherever the driver downloaded them — 10.3 GiB each, so they are not copied per run.
+"""
+function gslc_run(c::GoldenCase)
+    root = runs_dir(c)
+    isdir(root) || return nothing
+    want = [n * ".h5" for n in (first(c.reference), first(c.secondary))]
+    for d in sort(readdir(root; join = true); rev = true)
+        isdir(d) && all(f -> isfile(joinpath(d, f)), want) && return d
+    end
+    return nothing
+end
+
+"""
+    s1_orbit_dir(c::GoldenCase) -> Union{Nothing,String}
+
+The cached run holding an orbit file for each of `c`'s two acquisitions, or `nothing`.
+
+A full-SLC pair's annotations come from the staged SAFE and its state vectors from a `POEORB` file
+beside the reference's outputs, which is where the driver downloaded them.
+"""
+function s1_orbit_dir(c::GoldenCase)
+    root = runs_dir(c)
+    isdir(root) || return nothing
+    for d in sort(readdir(root; join = true); rev = true)
+        isdir(d) || continue
+        ok = all((first(c.reference), first(c.secondary))) do g
+            try
+                !isempty(s1_orbit(d, g))
+            catch
+                false
+            end
+        end
+        ok && return d
+    end
+    return nothing
+end
+
+"""
+    rslc_run(c::GoldenCase) -> Union{Nothing,String}
+
+The cached run holding both of `c`'s RSLC granules and the DEM the resample reads, or `nothing`.
+"""
+function rslc_run(c::GoldenCase)
+    root = runs_dir(c)
+    isdir(root) || return nothing
+    want = [[n * ".h5" for n in (first(c.reference), first(c.secondary))]; "dem.tif"]
+    for d in sort(readdir(root; join = true); rev = true)
+        isdir(d) && all(f -> isfile(joinpath(d, f)), want) && return d
+    end
+    return nothing
+end
+
+"""
     unsupported(c::GoldenCase) -> Union{Nothing,String}
 
 Why the chain from the granule does not exist for `c`, or `nothing` when it does.
@@ -95,14 +155,19 @@ Named per platform rather than discovered by failure, so a case this cannot meas
 missing instead of erroring somewhere inside a stage.
 """
 function unsupported(c::GoldenCase)
-    c.platform == "NISAR-L1" && return "an RSLC is not TOPS and needs its own azimuth resample, which \
-                                        does not exist on either side of this repository"
-    c.platform == "NISAR-L2" && return "a GSLC reaches the correlator as the driver's own \
-                                        `*_adjusted.tif`, so correlating those is not a path from the \
-                                        granule"
-    if startswith(c.platform, "S1") && c.platform != "S1-BURST"
-        return "a full-SLC pair needs the three-subswath mosaic, whose width rule is unresolved, and \
-                the granule is not staged"
+    if c.platform == "NISAR-L1"
+        run = rslc_run(c)
+        isnothing(run) && return "no cached run holds both RSLC granules and a DEM; the pair is read \
+                                  from the products themselves"
+    end
+    if c.platform == "NISAR-L2"
+        isnothing(gslc_run(c)) &&
+            return "no cached run holds both GSLC granules; a geocoded pair is read from the products \
+                    themselves rather than from the driver's cropped copies"
+    end
+    if c.platform == "S1-SLC"
+        isnothing(s1_orbit_dir(c)) &&
+            return "no cached run holds the two orbit files a full-SLC pair's geometry needs"
     end
     return nothing
 end
@@ -147,6 +212,16 @@ function native_scene(path::AbstractString, name::AbstractString, c::GoldenCase)
     return d
 end
 
+# The same crop, kept lazy: a further index shift rather than a read.
+function crop_lazy(w::LazyWindow, off::NTuple{2,Int}, want::Tuple{Int,Int})
+    nr, nc = want
+    ox, oy = off
+    size(w, 1) >= oy + nr && size(w, 2) >= ox + nc || throw(DimensionMismatch(
+        "the overlap at offset $off does not fit in a $(size(w)) grid; the crop and the geotransform " *
+        "disagree"))
+    return LazyWindow(w.parent, w.row0 + oy, w.col0 + ox, want)
+end
+
 # The overlap `coregister` found, out of a scene already on the correlation grid.
 function crop_overlap(img::AbstractMatrix, off::NTuple{2,Int}, want::Tuple{Int,Int})
     nr, nc = want
@@ -168,6 +243,64 @@ disk. An optical pair returns the two overlaps.
 """
 function e2e_imagery(s::Setup)
     c = s.case
+    if c.platform == "NISAR-L2"
+        # **Geocoded, so there is nothing to coregister**: `nisar_isce3.process_gslc` crops both products
+        # to their overlap, takes the amplitude and runs the projected geogrid over that. The crop is an
+        # index shift into each granule's own grid rather than a copy — the overlap is billions of samples
+        # — and the correlator reads its blocks straight from the HDF5 datasets.
+        #
+        # The *window* comes from the driver's `*_adjusted.tif` geotransform, six numbers naming where
+        # its crop began; every sample comes from the granule. Deriving the window instead means
+        # reproducing `crop_gslcs`' own intersection rule, which no rung checks yet.
+        run = gslc_run(c)
+        pair = map((:reference, :secondary)) do which
+            name = which === :reference ? first(acquisition_order(c)) : last(acquisition_order(c))
+            h5 = joinpath(run, name * ".h5")
+            fp = gslc_footprint(h5)
+            crop = which === :reference ? s.reference_path : s.secondary_path
+            r0, c0 = gslc_window(fp, crop)
+            ds = ArchGDAL.read(crop)
+            LazyWindow(gslc_amplitude(h5), r0, c0,
+                       (ArchGDAL.height(ds), ArchGDAL.width(ds)))
+        end
+        want = reverse(s.pair.coordinate.size)
+        return (crop_lazy(pair[1], s.pair.reference_offset, want),
+                crop_lazy(pair[2], s.pair.secondary_offset, want))
+    end
+    if c.platform == "NISAR-L1"
+        # **The reference needs no resampling**: it defines the grid everything else is put on, so its
+        # amplitude is the granule's own samples. The secondary is resampled onto it.
+        run = rslc_run(c)
+        early, late = acquisition_order(c)
+        ref = SLCDatasets.amplitude(open_slc(joinpath(run, early * ".h5")))
+        sec = ResampledRSLC(joinpath(run, early * ".h5"), joinpath(run, late * ".h5"),
+                            dem_sampler(joinpath(run, "dem.tif")))
+        size(ref) == size(sec) || error("the reference grid is $(size(ref)) and the resampled " *
+                                        "secondary $(size(sec)); they are not the same grid")
+        return (ref, sec)
+    end
+    if c.platform == "S1-SLC"
+        # The same three-subswath mosaic the burst path builds, over the real granules: `radar_mosaic` of
+        # the reference acquisition, and the secondary resampled onto it a block at a time. Its own dims
+        # are checked against the geometry's, since a disagreement puts the point set on a grid the pixels
+        # are not on.
+        sws = collect(S1_SWATHS)
+        dem = joinpath(s.run, "dem.tif")
+        isfile(dem) || error("no dem.tif in $(s.run); the secondary's resample solves for terrain height")
+        early, late = acquisition_order(c)
+        mk(g) = Sentinel1Product(stage_safe(g); orbit = s1_orbit(s.run, g),
+                                 polarization = lowercase(s1_polarization(g)), swaths = sws)
+        rp, sp = mk(early), mk(late)
+        ref = radar_mosaic(rp, sws)
+        sec = ResampledMosaic(rp, sp, sws, dem_sampler(dem))
+        size(ref) == size(sec) || error("the reference mosaic is $(size(ref)) and the resampled " *
+                                        "secondary $(size(sec))")
+        co = s.pair.coordinate
+        (co.nlines, co.nsamples) == size(ref) || error(
+            "the geogrid was built on a $(co.nlines) x $(co.nsamples) mosaic and the imagery is " *
+            "$(size(ref)); the point set and the pixels are on different grids")
+        return (ref, sec)
+    end
     if c.platform == "S1-BURST"
         rp, sp = _s1_products(c, s.run)
         sws = burst_swaths(c)
@@ -212,7 +345,7 @@ The whole chain on one case, each stage timed and the run's peak sampled.
 """
 function run_case(c::GoldenCase; n::Union{Integer,Nothing} = nothing,
                   block::Union{Integer,Nothing} = nothing, trace::Bool = true,
-                  staged::Bool = true, warm::Bool = true)
+                  staged::Bool = true, warm::Bool = true, tile::Integer = 1024)
     reason = unsupported(c)
     isnothing(reason) || error(reason)
     staged && stage(c)
@@ -220,6 +353,7 @@ function run_case(c::GoldenCase; n::Union{Integer,Nothing} = nothing,
     buf = zeros(UInt64, 64)
     hz = tick_rate()
     stages = Pair{String,Float64}[]
+    caches = TileCache[]
     out = Ref{Any}(nothing)
     shape = Ref((0, 0))
     blk = Ref((0, 0))
@@ -241,7 +375,20 @@ function run_case(c::GoldenCase; n::Union{Integer,Nothing} = nothing,
         np[] = length(grid.x)
         filt[] = string(isnothing(m) ? :none : m)
 
-        t = @elapsed (i1, i2) = e2e_imagery(s)
+        t = @elapsed begin
+            (i1, i2) = e2e_imagery(s)
+            # **Cache what is expensive to read, not what is large.** `AutoRIFT.ondisk` is the image's own
+            # answer to whether a read costs I/O or a derivation; an optical overlap is a plain array and
+            # is left alone, while a resampled mosaic or an HDF5 band is wrapped so the second pass over
+            # it reads a tile back instead of deriving it again.
+            (i1, i2) = map((i1, i2)) do img
+                (tile > 0 && AutoRIFT.ondisk(img)) || return img
+                # `tc`: assigning `c` here would rebind the case, which this closure captures.
+                tc = TileCache(img; tile, dir = joinpath(CACHE, "scratch"))
+                push!(caches, tc)
+                return tc
+            end
+        end
         push!(stages, "imagery" => t)
         shape[] = size(i1)
 
@@ -275,6 +422,12 @@ function run_case(c::GoldenCase; n::Union{Integer,Nothing} = nothing,
         last(rusage!(buf))
     end
     cpu = cpu_seconds!(buf, hz) - cpu0
+    # `tc`, not `c`: the case is captured by the closure above, so a loop variable of the same name
+    # writes into its box rather than shadowing it.
+    for tc in caches
+        @printf("    %-12s %s\n", "tile cache", cache_report(tc))
+        close(tc)
+    end
 
     return E2EResult(c.product, c.platform, stages, cpu, Int(peak), Int(floor_bytes),
                      shape[], blk[], np[], count(isfinite, out[].dx), filt[])
@@ -324,6 +477,7 @@ function main(args)
     trace = !("--no-trace" in args)
     staged = !("--stream" in args)
     warm = !("--cold" in args)
+    tile = "--no-cache" in args ? 0 : parse(Int, argvalue("--tile", "1024"))
 
     @printf("%d case(s), %d threads\n\n", length(cs), Threads.nthreads())
     rows = E2EResult[]
@@ -336,7 +490,7 @@ function main(args)
             continue
         end
         try
-            r = run_case(c; n, block, trace, staged, warm)
+            r = run_case(c; n, block, trace, staged, warm, tile)
             push!(rows, r)
             report(r)
         catch err

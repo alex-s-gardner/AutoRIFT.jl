@@ -64,9 +64,9 @@ measured — two runs of one granule differ only in the fields that cannot be de
 grid point writes a distinct output element with no reduction (`REFERENCE.md`), so this is a runtime
 choice only.
 
-`prune` deletes the regenerable filtered and reprojected scene copies once the run succeeds — see
-[`prune_run`](@ref). On by default because they are ~93% of a Landsat run's footprint and nothing
-here reads them; pass `false` to inspect what the driver handed the correlator.
+`prune` deletes the regenerable warped scene copies once the run succeeds — see [`prune_run`](@ref). On
+by default because nothing here reads them; `filtered/` is kept either way, since rungs 5.3 and 5.4
+compare against it.
 """
 function run_reference(c::GoldenCase; n::Integer = 1, threads::Integer = 8, force = false,
                        prune::Bool = true)
@@ -124,14 +124,18 @@ function last_lines(path, n)
     return join(ls[max(1, end - n + 1):end], "\n")
 end
 
-# Intermediate scene copies the driver writes beside its outputs. Landsat 4/5/7 are filtered and,
-# when the pair straddles two UTM zones, reprojected — and each copy is an uncompressed Float32
-# raster of a whole scene, so one L7 run holds ~4.9 GiB of them against ~380 MiB of everything else.
+# The warped scene copies the driver writes beside its outputs when a pair straddles two UTM zones.
+# Each is an uncompressed Float32 raster of a whole scene, ~2.5 GiB for an L7 pair against ~380 MiB of
+# everything else in the run.
 #
-# They are inputs rather than results: `process.py` rebuilds them from the requester-pays scenes on
-# the next run. Nothing in this directory reads them, and a nine-case phase would need 44 GiB to keep
-# them.
-const REGENERABLE = ("filtered", "reprojected")
+# Nothing here reads them: `aligned_scenes` builds its own under `<cache>/reprojected/`, and what the
+# rungs compare the filter against is `filtered/`, which stays.
+const REGENERABLE = ("reprojected",)
+
+# **`filtered/` is not in that list, though it is the larger of the two.** Rungs 5.3 and 5.4 compare the
+# Julia filter against the reference's own output of it, and that output is only here: the capture holds
+# the bytes the *correlator* was handed, one filter later and quantized. Deleting it costs a container
+# run to restore, so the ~4.9 GiB an L7 pair spends on it stays.
 
 # The same, for a driver that writes its scene copies as loose files beside the outputs rather than
 # into a directory. `crop_gslcs` (`nisar_isce3.py:508`) writes one uncompressed CFloat32 raster of a
@@ -145,11 +149,12 @@ const REGENERABLE_FILES = ("reference_cropped.tif", "secondary_cropped.tif")
 Delete the regenerable scene copies under `dir` and return the bytes freed.
 
 Keeps everything a comparison or a diagnosis needs: the product, `autoRIFT_intermediate.nc`, the
-geogrid rasters, `offset.tif`/`velocity.tif`, the browse images and the log. Only the scene copies go,
-and only those — a run stays fully comparable after pruning.
+geogrid rasters, `offset.tif`/`velocity.tif`, the browse images, the log, and `filtered/` — which rungs
+5.3 and 5.4 compare the Julia filter against and no other file holds. What goes is the warped copies and,
+on a NISAR L2 pair, the two cropped GSLC rasters, which are 45 GiB each.
 
-The byte images the correlator was actually handed are in the capture, not in these files, so pruning
-cannot cost a correlator comparison. What it costs is re-running the driver to inspect a scene copy.
+The byte images the correlator was handed are in the capture, so pruning cannot cost a correlator
+comparison either. What it costs is re-running the driver to inspect a warped scene.
 """
 function prune_run(dir::AbstractString; dry_run::Bool = false)
     freed = 0

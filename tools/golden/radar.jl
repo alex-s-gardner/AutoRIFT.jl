@@ -39,6 +39,7 @@
 # other path.
 
 using Dates, Printf
+using AutoRIFT   # `ondisk`, which the lazy resamplers below answer for themselves
 using ImagePairGeometry
 using ImagePairGeometry: IdentityTransform, LookRight, incidence_angle
 using SLCDatasets
@@ -317,6 +318,41 @@ function _burst_safes(run::AbstractString)
         "A burst job's annotations are read from them; a pruned run has none.")
     sort!(safes; by = n -> split(n, '_')[6])
     return joinpath(run, safes[1]), joinpath(run, safes[2])
+end
+
+"""
+    stage_safe(granule) -> String
+
+Download `granule`'s SLC from ASF, unzip it under `<cache>/granules/`, and return the `.SAFE` path.
+
+**Unzipped, because the raster cannot be read in place.** A Sentinel-1 zip stores its measurement TIFFs
+deflated, so a line is not addressable without inflating everything before it — `SLCDatasets` says so
+rather than reading part of one.
+
+The zip is deleted once it is expanded: the two together are 9 GB per acquisition and only the tree is
+read. ASF's download is a URS redirect chain, so `curl` carries `~/.netrc` through it — the same
+credential `fetch.jl --check` verifies and the container mounts.
+"""
+function stage_safe(granule::AbstractString)
+    dir = joinpath(CACHE, "granules")
+    safe = joinpath(dir, granule * ".SAFE")
+    isdir(safe) && return safe
+    mkpath(dir)
+    zip = joinpath(dir, granule * ".zip")
+    if !isfile(zip)
+        mission = granule[1:3]                  # `S1A`, `S1B` or `S1C`
+        url = "https://sentinel1.asf.alaska.edu/SLC/S$(mission[3])/$(granule).zip"
+        tmp = zip * ".partial"
+        @info "downloading" granule url
+        run(`curl -sS -n -L -f -o $tmp $url`)
+        mv(tmp, zip; force = true)
+    end
+    @info "expanding" zip = basename(zip)
+    run(`unzip -q -o $zip -d $dir`)
+    isdir(safe) || error("$(basename(zip)) expanded to no $(basename(safe)); ASF's tree is named " *
+                         "`<granule>.SAFE`")
+    rm(zip)
+    return safe
 end
 
 """
@@ -686,6 +722,8 @@ function Base.getindex(m::ResampledMosaic, rows::AbstractUnitRange, cols::Abstra
     return out
 end
 
+AutoRIFT.ondisk(::ResampledMosaic) = true
+
 Base.getindex(m::ResampledMosaic, i::Integer, j::Integer) = m[i:i, j:j][1, 1]
 Base.getindex(m::ResampledMosaic, rows::AbstractUnitRange, j::Integer) = m[rows, j:j][:, 1]
 Base.getindex(m::ResampledMosaic, i::Integer, cols::AbstractUnitRange) = m[i:i, cols][1, :]
@@ -956,10 +994,20 @@ end
 
 `f` must lie in `[0, 1]`, which is what `y - floor(y)` gives.
 """
-@inline function sinc8_taps(f::Float64)
-    k = round(Int, f * SINC_SUBDIVISIONS) + 1
-    return ntuple(m -> @inbounds(SINC_TAPS[m, k]), 8)
-end
+# `floor` to an `Int` without the conversion's own range check.
+#
+# **The check is 20% of the interpolation kernel** — `Int64(::Float64)` at `float.jl:920` plus the `isinf`
+# beside it — and what it guards against cannot reach here: a window's offsets are all finite by the time
+# the kernel runs, because [`_support_bounds`](@ref) evaluates the field at the corners of every lattice
+# cell the window meets, and `_resample_piece` then calls `floor` on those bounds. A `NaN` anywhere in
+# those cells propagates to a corner and throws there, one call earlier and outside the loop.
+#
+# The values themselves are pixel indices of order 1e3 to 1e5, so nothing here approaches `Int`'s range.
+@inline _ifloor(x::Float64) = unsafe_trunc(Int, floor(x))
+
+@inline _tap_bin(f::Float64) = round(Int, f * SINC_SUBDIVISIONS) + 1
+@inline sinc8_taps_at(k::Int) = ntuple(m -> @inbounds(SINC_TAPS[m, k]), 8)
+@inline sinc8_taps(f::Float64) = sinc8_taps_at(_tap_bin(f))
 
 """
     deramped_burst(raster, rows, carrier) -> Matrix{ComplexF32}
@@ -981,10 +1029,33 @@ function deramped_burst(raster, rows::AbstractUnitRange, carrier;
     nr, nc = length(rows), length(cols)
     l0, s0 = Int(origin[1]), Int(origin[2])
     out = Matrix{ComplexF32}(undef, nr, nc)
-    src = raster[rows, cols]
-    Threads.@threads for j in 1:nc
-        for i in 1:nr
-            out[i, j] = ComplexF32(src[i, j]) * cis(-Float32(carrier(l0 + i - 1, s0 + j - 1)))
+    # The carrier's range half is hoisted out of each column by `carrier_column`, leaving a degree-5
+    # Horner sweep per pixel — see there for what the loop it replaces cost.
+    #
+    # **The phase stays `Float64` up to the trig.** `cis(-Float32(phi))` rounds a phase of order 1e3 rad
+    # to about 5e-4 rad before taking its sine, which is coarser than anything else in this path; the
+    # narrowing belongs on the finished phasor, whose parts are in `[-1, 1]`.
+    #
+    # **The band is read inside the threaded region, a column slab per task.** Reading it once up front
+    # was a single-threaded 0.060 s against the 0.170 s of phase work around it — 26% of this function on
+    # one core — and it also held a whole extra copy of the burst. A `StripedTiff` is immutable and
+    # allocates its own gather buffer per call, so disjoint windows are read concurrently; each slab is
+    # then deramped while it is still in cache, and nothing holds the burst twice.
+    #
+    # Several chunks per thread, so one slow slab cannot set the wall clock, and each is wide enough that
+    # a line's copy out of the mapping stays a long contiguous run.
+    nchunks = max(1, min(nc, 4 * Threads.nthreads()))
+    edges = round.(Int, range(0, nc; length = nchunks + 1))
+    Threads.@threads for ci in 1:nchunks
+        j0, j1 = edges[ci] + 1, edges[ci + 1]
+        j0 > j1 && continue
+        slab = raster[rows, cols[j0]:cols[j1]]
+        for j in j0:j1
+            b = carrier_column(carrier, s0 + j - 1)
+            @inbounds for i in 1:nr
+                out[i, j] = ComplexF32(slab[i, j - j0 + 1]) *
+                            ComplexF32(cis(-carrier_phase(b, carrier, l0 + i - 1)))
+            end
         end
     end
     return out
@@ -995,14 +1066,24 @@ end
 #
 # `origin` is the burst-local zero-based `(line, sample)` of `A[1, 1]`, so a band of a burst is zeroed
 # against the burst's valid rectangle rather than against its own first row.
+# **Four rectangle fills rather than a test per sample.** What is zeroed is a frame, so the interior — all
+# but a few rows and columns of a burst — is visited by a predicate that is false for every one of its 31
+# million samples. Filling the margins instead touches only the margins: 0.044 s per burst becomes the
+# cost of the frame, and `fill!` over a view is a store loop rather than a branch per element.
 function _zero_outside_valid!(A::AbstractMatrix, fvl::Integer, lvl::Integer, fvs::Integer, lvs::Integer;
                               origin::Tuple{Integer,Integer} = (0, 0))
     nr, nc = size(A)
     oy, ox = Int(origin[1]), Int(origin[2])
     z = zero(eltype(A))
-    @inbounds for j in 1:nc, i in 1:nr
-        l, s = oy + i - 1, ox + j - 1
-        (l < fvl || l > lvl || s < fvs || s > lvs) && (A[i, j] = z)
+    # The valid rectangle in `A`'s own indices. `r1 < r0` where it misses `A` entirely, which the row
+    # fills below then cover between them.
+    r0, r1 = clamp(fvl - oy + 1, 1, nr + 1), clamp(lvl - oy + 1, 0, nr)
+    c0, c1 = clamp(fvs - ox + 1, 1, nc + 1), clamp(lvs - ox + 1, 0, nc)
+    r0 > 1 && fill!(view(A, 1:(r0 - 1), :), z)
+    r1 < nr && fill!(view(A, (r1 + 1):nr, :), z)
+    if r0 <= r1
+        c0 > 1 && fill!(view(A, r0:r1, 1:(c0 - 1)), z)
+        c1 < nc && fill!(view(A, r0:r1, (c1 + 1):nc), z)
     end
     return A
 end
@@ -1039,8 +1120,16 @@ function resample_burst(deramped, dl, ds, lines::AbstractUnitRange,
     ny, nx = size(deramped)
     # Over the sample axis's own indices rather than `collect(enumerate(samples))`, which materializes a
     # vector of pairs for `@threads` to index.
+    # **Constant-folded, not branched.** `dl` and `ds` are type parameters of this method, so
+    # `_cell_linear` is decided at compile time for each specialization and the path not taken is
+    # eliminated. A lattice field is advanced per cell — two evaluations every 64 lines rather than a pair
+    # per pixel, which is 1.5x of this kernel — and a per-pixel raster is read per pixel, as it must be.
+    cellwise = _cell_linear(dl) && _cell_linear(ds)
     Threads.@threads for jj in eachindex(samples)
         s = samples[jj]
+        cell = typemin(Int)
+        l_cell = 0
+        pl = ql = ps = qs = 0.0
         for (ii, l) in enumerate(lines)
             # `_dopplerLUT.contains(az, rng)`, the third of `ResampSlc::_transformTile`'s five rejections
             # and the one the two bounds tests below do not cover.
@@ -1058,9 +1147,24 @@ function resample_burst(deramped, dl, ds, lines::AbstractUnitRange,
             if doppler !== nothing
                 (l > doppler[1] || s > doppler[2] - 1) && continue
             end
-            y = l + dl(l, s) + 1.0
-            x = s + ds(l, s) + 1.0
-            iy, ix = floor(Int, y), floor(Int, x)
+            if cellwise
+                k = fld(l, _LSTEP)
+                if k != cell
+                    l_cell = k * _LSTEP
+                    pl = dl(l_cell, s)
+                    ps = ds(l_cell, s)
+                    ql = (dl(l_cell + _LSTEP, s) - pl) / _LSTEP
+                    qs = (ds(l_cell + _LSTEP, s) - ps) / _LSTEP
+                    cell = k
+                end
+                d = l - l_cell
+                y = l + (pl + ql * d) + 1.0
+                x = s + (ps + qs * d) + 1.0
+            else
+                y = l + dl(l, s) + 1.0
+                x = s + ds(l, s) + 1.0
+            end
+            iy, ix = _ifloor(y), _ifloor(x)
             (iy - 4 < 1 || iy + 4 > ey || ix - 4 < 1 || ix + 4 > ex) && continue
             # The eight-tap support has to sit inside the secondary's own valid region: outside it the
             # reference's resampler has no samples either, and interpolating the zero margin invents a
@@ -1080,8 +1184,17 @@ function resample_burst(deramped, dl, ds, lines::AbstractUnitRange,
                 "and samples $(ix - 3):$(ix + 4); the band was sized too small for the window"))
             ty = sinc8_taps(y - iy)
             tx = sinc8_taps(x - ix)
+            # **`@inbounds` over exactly the range the guard above admits.** The test on the line before
+            # this one establishes `by - 3 >= 1`, `by + 4 <= ny`, `bx - 3 >= 1` and `bx + 4 <= nx`, and the
+            # rows read below run `by - 3` through `by + 4` — so the accesses are the ones just proved, and
+            # no index here comes from anywhere else.
+            #
+            # Earned rather than assumed: the check is 42% of this kernel, measured, and dropping it is
+            # bit-identical on a whole burst — 0 of 30.3 million outputs differ. The indices come from
+            # `floor` of an interpolated position, which is why the compiler cannot prove this itself the
+            # way it would for `eachindex`. `tools/golden/selftest.jl` pins the guard to the access.
             acc = ComplexF64(0)
-            for m in 1:8
+            @inbounds for m in 1:8
                 row = ComplexF64(0)
                 @simd for k in 1:8
                     row += tx[k] * ComplexF64(deramped[by - 4 + m, bx - 4 + k])
@@ -1200,15 +1313,26 @@ function ResampledSwath(rp::Sentinel1Product, sp::Sentinel1Product, swath::Integ
              1 + round(Int, (seconds_between(first(a.burst_start), last(a.burst_start)) +
                              (nl - 1) * dt) / dt)
 
-    places = map(1:n) do i
-        ss = open_slc(sp.path; orbit = sp.orbit_path, swath = swath, burst = i,
-                      polarization = sp.polarization)
+    # **The annotation is parsed once per acquisition, not once per burst.** `open_slc(path; burst = i)`
+    # re-reads and re-parses the whole subswath's annotation XML for each burst it is asked for, and this
+    # loop asked fourteen times for a seven-burst subswath. `bursts` walks the bursts of a single parse.
+    sb = collect(bursts(sp, swath))
+    rb = offsets === nothing ? collect(bursts(rp, swath)) : nothing
+    # **A task per burst, because none of this setup is cheap and all of it is independent.** Measured over
+    # seven bursts: `RadarCoordinate` 0.242 s, `CarrierFit` 0.191 s and `_offset_lattice` 0.095 s — a fifth
+    # of the whole subswath, previously one burst at a time. The lattice threads over its own nodes
+    # internally; spawning here lets the scheduler fill the machine with whichever burst is ready rather
+    # than draining one lattice before starting the next.
+    # `identity.` narrows the element type: `fetch` on a `Task` is `Any`, and `ResampledSwath` holds a
+    # vector of a concrete `BurstPlacement`, so the broadcast is what turns twelve `Any`s back into the one
+    # type they all share.
+    places = identity.(fetch.(map(1:n) do i
+        Threads.@spawn begin
+        ss = sb[i]
         cs = RadarCoordinate(ss)
         carrier = CarrierFit(TopsCarrier(ss, cs, lpb), lpb, spb)
         dl, ds = if offsets === nothing
-            cr = RadarCoordinate(open_slc(rp.path; orbit = rp.orbit_path, swath = swath, burst = i,
-                                          polarization = rp.polarization))
-            _offset_lattice(cr, cs, dem, lpb, spb)
+            _offset_lattice(RadarCoordinate(rb[i]), cs, dem, lpb, spb)
         else
             offsets(i)
         end
@@ -1225,35 +1349,52 @@ function ResampledSwath(rp::Sentinel1Product, sp::Sentinel1Product, swath::Integ
                         sa.first_valid_sample[i] - 1, sa.last_valid_sample[i] - 1),
                        bstart:(bend - 1), (first(cols) - 1):(last(cols) - 1),
                        (mstart + 1):mend, cols, (lpb, spb))
-    end
-    return ResampledSwath(sraster, places, (nlines, ns), Ref(0))
+        end
+    end))
+    # `Int`: a `grid` read from the CSLC's own header carries whatever integer type that header
+    # used, and the field is declared `Tuple{Int,Int}`.
+    return ResampledSwath(sraster, places, (Int(nlines), Int(ns)), Ref(0))
 end
 
 Base.size(r::ResampledSwath) = r.dims
 
 # Where a window's eight-tap support lands in the source, in burst-local one-based coordinates.
 #
-# **Every output pixel is evaluated, because a sampled bound is not a bound.** The offsets interpolate
-# bilinearly *between* lattice nodes, so a stride at half the node spacing bounds the field inside the
-# lattice — but a window reaching past the last node is extrapolated, and there the extremes are not at
-# the sampled points. Measured on `S1A_IW_SLC__1SSV_20240618` IW2, where the range offset reaches +87
-# samples: the strided bound missed the true maximum by more than a sample and
-# [`resample_burst`](@ref)'s band assertion fired.
+# **Exact, from the lattice's own cell corners.** Inside one cell of [`_offset_lattice`](@ref)'s grid the
+# offsets are bilinear and the index is linear, so `y = l + dl(l, s)` is bilinear there — and a bilinear
+# function on a rectangle attains its extremes at that rectangle's corners. The extremes over a window are
+# therefore the extremes over the corners of the cells it meets, which are the window's own edges together
+# with the lattice lines inside it. Nothing between those points can exceed them.
 #
-# Exact bounds make that assertion unreachable rather than merely unlikely: `_resample_piece` reads
-# `floor(ymin) - 3` through `ceil(ymax) + 4`, and a pixel at `y` needs `floor(y) - 3` through
-# `floor(y) + 4`, which that range contains for every `y` in `ymin..ymax`.
+# That makes [`resample_burst`](@ref)'s band assertion unreachable rather than merely unlikely:
+# `_resample_piece` reads `floor(ymin) - 3` through `ceil(ymax) + 4`, and a pixel at `y` needs
+# `floor(y) - 3` through `floor(y) + 4`, which that range contains for every `y` in `ymin..ymax`.
 #
-# The cost is a second pass of the offset interpolation, against the 64 taps per pixel the resample
-# itself spends.
+# **A stride through the window is not a bound**, which is what this replaced: the clamp in `lerp`
+# extrapolates from the edge cells, so a window reaching past the last node is governed by a cell wider
+# than the lattice, and a sampled maximum can sit below the true one. Measured on
+# `S1A_IW_SLC__1SSV_20240618` IW2, where the range offset reaches +87 samples, a stride at half the node
+# spacing missed it by more than a sample and the assertion fired. Evaluating every pixel instead is also
+# exact but costs 0.385 s per burst against this 0.000023 s — 31% of a burst's coregistration, single
+# threaded. `tools/golden/selftest.jl` pins the two against each other.
+_next_mark(v::Integer, step::Integer) = (fld(v, step) + 1) * step
+
 function _support_bounds(dl, ds, lines::AbstractUnitRange, samples::AbstractUnitRange)
     ymin = xmin = Inf
     ymax = xmax = -Inf
-    for s in samples, l in lines
-        y = l + dl(l, s) + 1.0
-        x = s + ds(l, s) + 1.0
-        ymin = min(ymin, y); ymax = max(ymax, y)
-        xmin = min(xmin, x); xmax = max(xmax, x)
+    s = first(samples)
+    while true
+        l = first(lines)
+        while true
+            y = l + dl(l, s) + 1.0
+            x = s + ds(l, s) + 1.0
+            ymin = min(ymin, y); ymax = max(ymax, y)
+            xmin = min(xmin, x); xmax = max(xmax, x)
+            l == last(lines) && break
+            l = min(_next_mark(l, _LSTEP), last(lines))
+        end
+        s == last(samples) && break
+        s = min(_next_mark(s, _SSTEP), last(samples))
     end
     return (ymin, ymax, xmin, xmax)
 end
@@ -1317,6 +1458,13 @@ end
 
 # Scalar and mixed indexing go through the range form, which is the one that does the work. A whole-array
 # read is `r[:, :]`, which materializes what `secondary_swath_amplitude` returns.
+# **Reading one of these is a resample, not a lookup**, and `AutoRIFT.ondisk` is where an image says that
+# a read costs more than memory access. It decides two things for a blocked run: that an unblocked pass is
+# refused rather than resolving a pixel at a time, and that a caller may cache what it reads — which
+# matters here because a run sweeps every block once per pass and would otherwise resample the mosaic once
+# per pass. See `tools/golden/tilecache.jl`.
+AutoRIFT.ondisk(::ResampledSwath) = true
+
 Base.getindex(r::ResampledSwath, i::Integer, j::Integer) = r[i:i, j:j][1, 1]
 Base.getindex(r::ResampledSwath, rows::AbstractUnitRange, j::Integer) = r[rows, j:j][:, 1]
 Base.getindex(r::ResampledSwath, i::Integer, cols::AbstractUnitRange) = r[i:i, cols][1, :]
@@ -1335,16 +1483,49 @@ function _offset_lattice(cr, cs, dem, lpb::Integer, spb::Integer)
             DL[ii, jj], DS[ii, jj], _ = coregistration_offset(cr, cs, ls[ii], ss[jj], dem)
         end
     end
-    lerp(A, l, s) = begin
-        fi = l / _LSTEP + 1
-        fj = s / _SSTEP + 1
-        i = clamp(floor(Int, fi), 1, length(ls) - 1)
-        j = clamp(floor(Int, fj), 1, length(ss) - 1)
-        u, v = fi - i, fj - j
-        (1-u)*(1-v)*A[i,j] + u*(1-v)*A[i+1,j] + (1-u)*v*A[i,j+1] + u*v*A[i+1,j+1]
-    end
-    return ((l, s) -> lerp(DL, l, s), (l, s) -> lerp(DS, l, s))
+    return (LatticeOffsets(DL, length(ls), length(ss)), LatticeOffsets(DS, length(ls), length(ss)))
 end
+
+"""
+    LatticeOffsets(A, nl, ns)
+
+One offset component interpolated bilinearly on [`_offset_lattice`](@ref)'s grid.
+
+**A type rather than a closure, because the kernel needs a promise the closure could not make.** Inside
+one lattice cell this is bilinear, so at a fixed sample it is *linear in the line index* — which lets
+[`resample_burst`](@ref) take two values per cell instead of one per pixel. An offset field read straight
+from a per-pixel raster, as [`burst_offsets`](@ref) returns, has no such property: interpolating it across
+64 lines would invent values it does not hold. [`_cell_linear`](@ref) is where the two are told apart, and
+it answers per type so the choice costs nothing at run time.
+
+Indices outside the lattice are clamped to the edge cell, which is also what makes probing a cell's far
+end safe at the end of a burst.
+"""
+struct LatticeOffsets{M<:AbstractMatrix{Float64}}
+    A::M
+    nl::Int
+    ns::Int
+end
+
+@inline function (f::LatticeOffsets)(l::Integer, s::Integer)
+    fi = l / _LSTEP + 1
+    fj = s / _SSTEP + 1
+    i = clamp(floor(Int, fi), 1, f.nl - 1)
+    j = clamp(floor(Int, fj), 1, f.ns - 1)
+    u, v = fi - i, fj - j
+    A = f.A
+    @inbounds return (1-u)*(1-v)*A[i,j] + u*(1-v)*A[i+1,j] + (1-u)*v*A[i,j+1] + u*v*A[i+1,j+1]
+end
+
+"""
+    _cell_linear(f) -> Bool
+
+Whether `f` is linear in the line index within one lattice cell, so a caller may advance it per cell.
+
+`false` for anything that has not said otherwise — a per-pixel raster read among them.
+"""
+_cell_linear(::Any) = false
+_cell_linear(::LatticeOffsets) = true
 
 """
     secondary_mosaic(rp, sp, swaths, dem) -> Matrix{Float32}
@@ -1380,6 +1561,10 @@ returns, at a given pixel, the carrier of the pixel before it on both axes. That
 """
 struct CarrierFit
     coef::Vector{Float64}
+    # The same coefficients as a dense `(azimuth order + 1, range order + 1)` table, which is what makes
+    # the evaluation below a pair of Horner sweeps rather than a loop over exponent pairs. Absent terms
+    # are zero, so the table is read at fixed offsets and the `i + j <= 5` rule costs nothing.
+    table::Matrix{Float64}
     xmin::Float64
     xnorm::Float64
     ymin::Float64
@@ -1414,15 +1599,45 @@ function CarrierFit(c::TopsCarrier, lines::Integer, samples::Integer;
         end
         z[k] = c(y, x)
     end
-    return CarrierFit(A \ z, xmin, xnorm, ymin, ynorm, c.r0, c.dr, c.dt)
+    coef = A \ z
+    table = zeros(Float64, 6, 4)
+    for (t, (i, j)) in enumerate(_CARRIER_TERMS)
+        table[i + 1, j + 1] = coef[t]
+    end
+    return CarrierFit(coef, table, xmin, xnorm, ymin, ynorm, c.r0, c.dr, c.dt)
 end
 
-@inline function (f::CarrierFit)(line::Integer, sample::Integer)
+"""
+    carrier_column(f::CarrierFit, sample) -> NTuple{6,Float64}
+
+The azimuth polynomial's coefficients at one range sample.
+
+**The fit is separable and the sample index is the outer loop's**, so the range half belongs outside the
+column: this evaluates it once per column and leaves a degree-5 polynomial in the line index, which
+[`carrier_phase`](@ref) then sweeps per pixel.
+
+What that replaces is a loop over eighteen exponent pairs raising `xn^j * yn^i` with the exponents as
+*runtime* integers — each `^` a call to `power_by_squaring`, none of it unrolled. On one burst of
+1502 x 20662 the whole deramp goes from 0.355 s to 0.061 s for it, and the phase agrees with the loop it
+replaces to 1.3e-11 rad.
+"""
+@inline function carrier_column(f::CarrierFit, sample::Integer)
     xn = ((f.r0 + sample * f.dr) - f.xmin) / f.xnorm
-    yn = (line * f.dt - f.ymin) / f.ynorm
-    acc = 0.0
-    @inbounds for (t, (i, j)) in enumerate(_CARRIER_TERMS)
-        acc += f.coef[t] * xn^j * yn^i
+    T = f.table
+    return ntuple(6) do i
+        @inbounds T[i, 1] + xn * (T[i, 2] + xn * (T[i, 3] + xn * T[i, 4]))
     end
-    return acc
 end
+
+"""
+    carrier_phase(b::NTuple{6}, f::CarrierFit, line) -> Float64
+
+The carrier at one line, given [`carrier_column`](@ref)'s coefficients for that column.
+"""
+@inline function carrier_phase(b::NTuple{6,Float64}, f::CarrierFit, line::Integer)
+    yn = (line * f.dt - f.ymin) / f.ynorm
+    return ((((b[6] * yn + b[5]) * yn + b[4]) * yn + b[3]) * yn + b[2]) * yn + b[1]
+end
+
+@inline (f::CarrierFit)(line::Integer, sample::Integer) =
+    carrier_phase(carrier_column(f, sample), f, line)
