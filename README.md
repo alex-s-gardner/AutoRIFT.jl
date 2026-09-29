@@ -98,8 +98,13 @@ inputs.
 
 Every stage on the Julia side — geogrid, scene read, filter, coregistration, correlation — against the
 reference container's own logged wall clock from the last download to the finished product. The scenes are
-on local disk before either clock starts. The 15 cases whose Julia chain exists today; `dev/GATES.md`
-carries the per-stage breakdown and names what the other seven need.
+on local disk before either clock starts. The 15 optical and burst cases are below; the three Sentinel-1
+full-SLC pairs and two NISAR granules the chain also reaches are in `dev/GATES.md`, which carries the
+per-stage breakdown for all twenty and names what the remaining two need.
+
+Over those twenty the chain spends 7,837 s against the reference's 19,320 s, **2.5x** — a smaller ratio than
+the table below because the two NISAR granules are 79% of the Julia total and are the only cases the
+reference is not beaten on threefold.
 
 | case | Julia s | Python s | | case | Julia s | Python s | |
 |---|---:|---:|---:|---|---:|---:|---:|

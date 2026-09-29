@@ -6100,17 +6100,50 @@ filters a correlator block from raw input with the halo the filter needs. The ob
 is a band-reject over the whole scene, so the L4/L5 pairs cannot be filtered blockwise at all; the L7/L8
 `WallisGapfill` and the plain high-pass can.
 
+## The five the chain now also reaches
+
+Same convention as the table above: the Python column is the reference's own `capture.log` from its first
+entry to "Successfully created autoRIFT product", which reproduces the recorded 328 s for LC08 `060018`
+exactly.
+
+| case | plat | geometry | grid | imagery | correlate | **Julia s** | **Python s** | | Julia peak | measured |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| S1A `1SSH_20150828` | S1-SLC | 40.7 | 0.7 | 6.9 | 77.5 | **125.8** | 1,457 | 11.6x | 13.64 GiB | 1,028,620 |
+| S1B `1SDH_20180809` | S1-SLC | 24.0 | 0.3 | 11.9 | 126.0 | **162.1** | 2,664 | 16.4x | 17.68 | 493,166 |
+| S1C `1SDV_20250416` | S1-SLC | 25.5 | 0.4 | 11.8 | 55.1 | **92.7** | 2,252 | 24.3x | 15.73 | 524,369 |
+| NISAR L2 GSLC | NISAR-L2 | 11.2 | 0.7 | 0.9 | 1,703.3 | **1,716.1** | 2,760 | 1.6x | 29.89 | 1,682,784 |
+| NISAR L1 RSLC | NISAR-L1 | 29.8 | 0.6 | 0.4 | 4,438.6 | **4,469.5** | 4,476 | **1.0x** | 39.73 | 1,649,884 |
+
+**The three full-SLC pairs are where the ratio is largest**, for the reason the correlator-only table could
+not show: the reference spends most of a full-SLC run in COMPASS, resampling every burst of three subswaths
+onto a common grid, and this chain does that lazily inside the correlator's blocks.
+
+**NISAR L1 is a dead heat and NISAR L2 is 1.6x**, both bounded by the same thing. Their correlator input is
+read from the HDF5 product, and `H5Dread` runs the deflate filter inside the lock that a non-thread-safe
+libhdf5 forces — so `correlate` is the whole run and it cannot use the machine. Decoding a window's chunks
+outside that lock takes a 2048² amplitude read from 0.707 s to 0.029 s and occupancy from 2.6 of 10 threads
+to 9.1; the figures above are with that in place, and without it the L2 case takes 5,734 s at 100.6 GiB.
+
+The two NISAR peaks are the largest here because a geocoded overlap is billions of samples: the L2 pair's
+scene is 54,885 x 110,085 and the L1 pair's 57,760 x 50,511.
+
 ## What the chain does not reach, and why
 
 | cases | why |
 |---|---|
-| 5 Sentinel-1 full SLC | the three-subswath mosaic's width rule is unresolved, and the granules are not staged |
-| NISAR L1 RSLC | not TOPS: it needs its own azimuth resample, which exists on neither side of this repository |
-| NISAR L2 GSLC | its correlator input is the driver's own `*_adjusted.tif`, so correlating those is not a path from the granule |
+| `S1A ... 20151120`, `S1A ... 20170221` | their runs hold a COMPASS CSLC, so `s1_pair` takes the merged shape from it and the geogrid lands on the grid COMPASS resampled onto rather than the annotation's |
 
-The reference's own post-download wall clock for those seven is 1,247 + 1,766 + 2,379 + 2,262 + 1,852 s for
-the Sentinel-1 pairs and 4,476 + 2,817 s for the two NISAR granules: **16,799 s**, nearly three times the
-15 cases measured here put together.
+Both acquisitions' CSLCs sit on that resampled grid — 1640 x 21458 on IW1 against the annotation's
+1504 x 21530, and `reference.tif` and `secondary.tif` are both 67860 x 24043 — so the *reference* mosaic is
+itself a resample there and not a merge of raw bursts. Reproducing it needs the reference's own
+coregistration target, which no rung derives. `e2e_run.jl` fails with that stated rather than correlating on
+a grid its point set is not on. The other three full-SLC pairs' runs hold no CSLC, which is why their
+annotation-derived mosaic agrees and why they are 31/31 on the ladder — it never asks the question.
+
+The reference's own wall clock for those two is 1,851 and 2,615 s, so the twenty this chain does reach
+account for 19,320 s of the reference's 23,786 s over the whole set. Against them the chain spends 7,837 s,
+a **2.5x** ratio overall — held there by the two NISAR granules, which are 6,186 s of that 7,837 and the only
+two cases the reference is not beaten on by a factor of three or more.
 
 ## Two defects the sweep found
 
