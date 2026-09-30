@@ -908,3 +908,92 @@ end
         @test isempty(b.read_cols)
     end
 end
+
+@testset "FilterTileCache matches a whole-image filter, on a miss and a hit" begin
+    # A hole large enough that erosion actually removes points, not just a scattering of pixels a
+    # width-5 filter's margin would absorb — the case that exercises `_filtered!`'s mask bookkeeping
+    # rather than only `highpass!`'s values.
+    rng = MersenneTwister(3)
+    img = rand(rng, Float32, 300, 260)
+    img[50:58, 60:68] .= NaN32
+    mask = isfinite.(img)
+    ref, sec = copy(img), img .+ 0.1f0
+    sec[mask] .+= 0.05f0 .* rand(rng, Float32, count(mask))
+    pair = ImagePair(ref, sec; reference_valid = mask, secondary_valid = mask)
+    m = Highpass(5)
+    w = AutoRIFT.filter_width(m)
+
+    # Ground truth: the same two calls `_prepare_block`'s `Highpass` branch makes, over the whole
+    # image at once rather than a block's read window.
+    truth_fr = similar(img); truth_fs = similar(img)
+    truth_rv = similar(mask); truth_sv = similar(mask)
+    AutoRIFT.highpass!(truth_fr, pair.reference, pair.reference_valid, w)
+    AutoRIFT.highpass!(truth_fs, pair.secondary, pair.secondary_valid, w)
+    AutoRIFT._filtered!(truth_fr, truth_rv, pair.reference_valid, w)
+    AutoRIFT._filtered!(truth_fs, truth_sv, pair.secondary_valid, w)
+
+    c = AutoRIFT.FilterTileCache(size(img), w; tile = 64)
+    rows, cols = 30:200, 40:220
+    fr = Matrix{Float32}(undef, length(rows), length(cols))
+    fs = similar(fr)
+    rv = Matrix{Bool}(undef, size(fr))
+    sv = similar(rv)
+
+    AutoRIFT._cached_filtered_window!(fr, rv, fs, sv, c, pair, m, rows, cols)
+    @test isequal(fr, truth_fr[rows, cols])
+    @test isequal(fs, truth_fs[rows, cols])
+    @test rv == truth_rv[rows, cols]
+    @test sv == truth_sv[rows, cols]
+    @test c.filled[] > 0
+    @test c.served[] == 0
+
+    # The same window again: every tile it touches is now a hit, and the answer must not move.
+    fr2 = similar(fr); fs2 = similar(fs); rv2 = similar(rv); sv2 = similar(sv)
+    AutoRIFT._cached_filtered_window!(fr2, rv2, fs2, sv2, c, pair, m, rows, cols)
+    @test isequal(fr2, fr)
+    @test isequal(fs2, fs)
+    @test rv2 == rv
+    @test sv2 == sv
+    filled_after_first = c.filled[]
+    @test c.filled[] == filled_after_first
+    @test c.served[] > 0
+
+    # A window offset by less than a tile: some of its tiles are hits (shared with the first window),
+    # some are misses (never touched before) — the case a single hit-only or miss-only call cannot
+    # catch.
+    rows2, cols2 = 90:260, 100:260
+    fr3 = Matrix{Float32}(undef, length(rows2), length(cols2))
+    fs3 = similar(fr3)
+    rv3 = Matrix{Bool}(undef, size(fr3))
+    sv3 = similar(rv3)
+    AutoRIFT._cached_filtered_window!(fr3, rv3, fs3, sv3, c, pair, m, rows2, cols2)
+    @test isequal(fr3, truth_fr[rows2, cols2])
+    @test isequal(fs3, truth_fs[rows2, cols2])
+    @test rv3 == truth_rv[rows2, cols2]
+    @test sv3 == truth_sv[rows2, cols2]
+    @test c.filled[] > filled_after_first
+
+    close(c)
+    @test !isfile(c.path)
+end
+
+@testset "a filter-tile-cached blocked run equals an untiled one" begin
+    # The same gate `correlate_tiled` is held to without a filter cache, now with one — caching the
+    # filtered result must not change it, only how many times it is computed.
+    n = 1536
+    ref, sec = split_pair(n)
+    p = params(; chip_size = 32, chip_size_max = 64, grid_spacing = 16, search_radius = 12)
+    raw = ImagePair(ref, sec)
+    pair = AutoRIFT._prepare(raw, p)
+    grid = AutoRIFT._build_grid(size(raw), p)
+    AutoRIFT._warm_grid_plans(grid, p)
+    untiled = AutoRIFT.correlate_multichip(pair, grid, p)
+
+    # `128` is smaller than every block below, forcing several tiles per block and, since the coarse
+    # and fine passes of two chip-size levels all read the same tiles, real reuse rather than only a
+    # miss per block. `512` is larger than the smaller block, so some blocks fit inside one tile.
+    for bs in ((320, 320), (208, 704)), tile in (128, 512)
+        assert_same_result(untiled, AutoRIFT.correlate_tiled(raw, grid, p, bs, tile),
+                           "block $bs, filter tile $tile")
+    end
+end
