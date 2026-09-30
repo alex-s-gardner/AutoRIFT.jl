@@ -118,6 +118,7 @@ include("track.jl")
 include("multichip.jl")
 include("tile.jl")
 include("api.jl")
+include("itslive.jl")
 
 # Import this machine's saved FFTW wisdom, so a fresh process does not re-measure plans it has
 # already measured. Measured cost of not doing this: 822 ms for the three sizes a default run
@@ -149,6 +150,8 @@ function __init__()
 end
 
 export autorift, autorift!, reinit!
+export GeogridCoefficients, ReferenceVelocity, ItsLiveGeoref, ImagePairInfo, ItsLiveInput,
+       SwathOffsetBias
 export SimilarityMeasure, ZNCC, NCC, Coherence
 export PreprocessMethod, Highpass, Wallis, WallisGapfill, Sobel, Laplacian,
        Destripe, Decibel, Deramp, NoPreprocess
@@ -184,10 +187,20 @@ const PUBLIC_NAMES = (
     # The grid, which is how per-point fields reach the correlator.
     :PointSet, :pointset, :gridpoints, :scatter, :rebuild, :sanitize!,
     :npoints, :nsearchable, :issearchable, :chip_bounds, :search_bounds,
-    # Removing a geometric misregistration from a measured displacement. Defined only when
-    # `ImagePairGeometry` is loaded, since that is what computes the offset field — the method lives in
-    # the extension, and the name is declared here so the extension has something to extend.
-    :remove_misregistration,
+    # Removing a geometric misregistration from a measured displacement, and building the ITS_LIVE
+    # packaging inputs `GeogridCoefficients`/`ReferenceVelocity` derive from a geogrid result. Defined
+    # only when `ImagePairGeometry` is loaded, since that is what computes the offset field and the
+    # scene geometry — the methods live in the extension, and the names are declared here so it has
+    # something to extend.
+    :remove_misregistration, :coefficients, :reference_velocity, :image_location,
+    # Packaging an ITS_LIVE product netCDF. Defined only when `NCDatasets` is loaded, in the
+    # `ItsLiveAutoRIFT` extension. Not exported: `write` would otherwise shadow `Base.write` for any
+    # caller who does `using AutoRIFT`.
+    :write,
+    # The CF grid-mapping attributes `ItsLiveGeoref` needs, from a CRS. Defined only when
+    # `Rasters`/`ArchGDAL` are loaded, in `AutoRIFTRastersExt` — the method lives there so it has
+    # something to extend.
+    :cf_grid_mapping,
     # Running it, and the results.
     :init, :autorift_with_grid, :Cache, :imagepair, :MultichipResult, :nmeasured,
     :DisplacementField, :displacement_field, :track, :track!,
