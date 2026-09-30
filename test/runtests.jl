@@ -86,6 +86,12 @@ include("utils.jl")
         include("extensions.jl")
     end
 
+    # `NCDatasets`/`Statistics` are core test deps (unlike `ImagePairGeometry` below), so this needs
+    # no availability guard.
+    @testset "ITS_LIVE packaging" begin
+        include("itsliveautorift.jl")
+    end
+
     # The device correlator, after the extension load above and skipped without a functional GPU.
     # Last for the same reason `realdata.jl` is late: it compares the device against the CPU path,
     # so a failure here should read as "the device disagrees" rather than as a broken correlator —
