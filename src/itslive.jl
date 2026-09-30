@@ -218,8 +218,8 @@ Not included, and not computed here:
   - **Filename.** `write`'s first argument is the destination path.
   - **The `error_vector` dt-error model.** The reference hardcodes it (`[25.5, 25.5]` for optical; a
     fixed 2×6 table for radar, of which only the four columns feeding `vx`/`vy`/`vr`/`va` are ever
-    read — see [`ItsLiveAutoRIFT`](@ref)'s module docstring) rather than deriving it from anything in
-    a run — `write` hardcodes the same constants.
+    read — see the `ItsLiveAutoRIFT` extension's module docstring) rather than deriving it from
+    anything in a run — `write` hardcodes the same constants.
 """
 struct ItsLiveInput
     pair_type::Symbol
@@ -248,10 +248,10 @@ end
     write(path, input::ItsLiveInput)
 
 Compute velocity, stable-shift correction, error estimates, and the radar conversion matrix from
-`input`, and write the result to `path` as an ITS_LIVE product netCDF — the 12-variable optical
-schema, the 16-variable radar schema (`input.pair_type == :radar`), or the 11-variable uncropped
-schema `input.img_pair_info.roi_valid_percentage` rounding down to `0` gets (see [`ImagePairInfo`](@ref)),
-matching `tools/golden/product.jl`'s reader.
+`input`, and write the result to `path` as an ITS_LIVE product netCDF, matching
+`tools/golden/product.jl`'s reader. Three schemas: the 12-variable optical one, the 16-variable radar
+one (`input.pair_type == :radar`), or the 11-variable uncropped one. `ImagePairInfo` says what selects
+that last one.
 
 The reference implementation (`hyp3-autorift`'s `testautoRIFT.py` + `netcdf_output.py` + `crop.py`)
 computes this across three files and writes it in two passes — an uncropped file, then a full reopen

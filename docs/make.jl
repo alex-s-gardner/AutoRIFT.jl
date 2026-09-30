@@ -42,7 +42,8 @@ const REFERENCE = ["Overview" => "reference/index.md",
                    "Preprocessing" => "reference/preprocessing.md",
                    "Results" => "reference/results.md",
                    "First guess" => "reference/first-guess.md",
-                   "Geospatial" => "reference/geospatial.md"]
+                   "Geospatial" => "reference/geospatial.md",
+                   "ITS_LIVE packaging" => "reference/itslive.md"]
 
 # No scheme: `MarkdownVitepress` prepends `https://` when it writes the edit-link pattern into
 # `config.mts`, so a scheme here yields `https://https://github.com/...` and every edit link 404s.

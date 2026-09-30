@@ -74,6 +74,7 @@ Rasters = "0.14, 0.15"
 Scratch = "1"
 Serialization = "1"
 StableTasks = "0.1"
+StaticArrays = "1"
 Statistics = "1"
 Test = "1"
 julia = "1.10"
@@ -96,8 +97,9 @@ NearestNeighbors = "b8a86587-4115-5ab1-83bc-aa920d37bbce"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Rasters = "a3a2b9e3-a471-40c9-b274-f788e487c689"
 Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test", "Aqua", "ArchGDAL", "JET", "JSON3", "Random", "Statistics", "Rasters", "DimensionalData", "DiskArrays", "ImageFeatures", "ImageCore", "NearestNeighbors", "NCDatasets", "Serialization", "Metal", "KernelAbstractions", "ImagePairGeometry", "FastGeoProjections"]
+test = ["Test", "Aqua", "ArchGDAL", "JET", "JSON3", "Random", "Statistics", "Rasters", "DimensionalData", "DiskArrays", "ImageFeatures", "ImageCore", "NearestNeighbors", "NCDatasets", "Serialization", "Metal", "KernelAbstractions", "ImagePairGeometry", "FastGeoProjections", "StaticArrays"]
