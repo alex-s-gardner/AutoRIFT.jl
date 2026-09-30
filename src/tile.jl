@@ -981,6 +981,13 @@ Close the scratch file and delete it.
 """
 function Base.close(c::FilterTileCache)
     close(c.io)
+    # `close(c.io)` releases the file handle the mapping was built from, not the mapping itself —
+    # that lives behind `c.mapped`'s own finalizer (`Mmap.jl`'s `munmap`/`UnmapViewOfFile`), which GC
+    # would otherwise run at some later, unspecified time. Windows refuses to delete a file with an
+    # active mapping (measured: `rm` below throws `EACCES`), where POSIX allows it; finalizing here
+    # makes the two platforms agree, at the cost of one `munmap` happening a little earlier than GC
+    # would have run it anyway — this function runs once per cache, not per tile.
+    finalize(c.mapped)
     isfile(c.path) && rm(c.path)
     return nothing
 end

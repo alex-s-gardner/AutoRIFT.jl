@@ -94,6 +94,11 @@ Close the scratch file and delete it.
 """
 function Base.close(c::TileCache)
     close(c.io)
+    # See the identical note on `FilterTileCache`'s `close` in `src/tile.jl`: the mapping behind
+    # `c.mapped` outlives `close(c.io)` until GC finalizes it, and Windows refuses to delete a file
+    # with an active mapping where POSIX allows it. Finalizing explicitly here costs one `munmap`
+    # slightly earlier than GC would have, once per cache.
+    finalize(c.mapped)
     isfile(c.path) && rm(c.path)
     return nothing
 end
