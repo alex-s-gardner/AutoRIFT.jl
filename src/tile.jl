@@ -1577,6 +1577,22 @@ function correlate_tiled(raw::ImagePair, grid::PointSet{2}, p::Params, block_siz
     return r
 end
 
+# A block's relative cost, for ordering how threads claim them — not to skip anything.
+#
+# Proportional to total correlation-surface area (`surface_size` is `2radius_y × 2radius_x`), which
+# a block's own point count does not track: a search radius grows with how far a prior level's
+# estimate says a point has moved, so a block sitting over a fast-moving or still-unresolved patch
+# can cost far more per point than one sitting over a slow, already-resolved one. `radius_x`/
+# `radius_y` are read directly off `pts` rather than through `_block_points`, since only the sum is
+# needed and building a sliced `PointSet` would copy every field for that.
+_block_cost(pts::PointSet{2}, b::Block) =
+    @views sum(pts.radius_x[b.grid_rows, b.grid_cols] .* pts.radius_y[b.grid_rows, b.grid_cols])
+
+# Heaviest first. A copy, not `sort!`: `blocks` is `layout`'s own partition, shared across every
+# pass and every level, so mutating it in place would reorder it for every other caller too.
+_cost_ordered_blocks(blocks::Vector{Block}, pts::PointSet{2}) =
+    sort(blocks; by = b -> _block_cost(pts, b), rev = true)
+
 # Correlate `pts` block by block, writing into one field.
 #
 # `blocks` partitions `pts`'s index space; `geometry` is the whole set's, so every block runs the
@@ -1606,6 +1622,12 @@ function _run_blocked(raw::ImagePair, pts::PointSet{2}, p::Params, layout::Block
         # per-block cost varies by orders of magnitude — a block whose points a finer level already
         # resolved returns before any I/O, so a static split would leave tasks idle.
         #
+        # Claimed largest search window first (`_cost_ordered_blocks`), not in grid order: the
+        # points a block still has to search vary in window size as much as in count, and the
+        # expensive ones cluster spatially, so claiming in grid order can leave a handful of them
+        # to finish alone once every cheap block is gone. Claiming the heaviest first keeps cheap
+        # work in reserve to fill every thread while the tail is still being decided.
+        #
         # Dynamic claiming cannot change the result: each block writes a disjoint slice of `out`, so
         # the field is assembled rather than reduced and block order is not an input.
         #
@@ -1621,9 +1643,10 @@ function _run_blocked(raw::ImagePair, pts::PointSet{2}, p::Params, layout::Block
         # run to run and concentrated in the blocks claimed second or later. A separate function has
         # its own frame, so the local cannot be captured or shared.
         next = Threads.Atomic{Int}(1)
-        ntasks = min(length(blocks), Threads.nthreads())
+        ordered = _cost_ordered_blocks(blocks, pts)
+        ntasks = min(length(ordered), Threads.nthreads())
         tasks = map(1:ntasks) do _
-            StableTasks.@spawn _run_task_blocks!(out, next, raw, pts, serial, blocks, layout,
+            StableTasks.@spawn _run_task_blocks!(out, next, raw, pts, serial, ordered, layout,
                                                  geometry, measure, subpixel, cache)
         end
         foreach(wait, tasks)
