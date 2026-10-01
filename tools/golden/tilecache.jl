@@ -93,7 +93,7 @@ Base.size(c::TileCache) = c.dims
 # newer layout.
 function _finalize_mapping!(mapped)
     finalize(mapped)
-    hasproperty(mapped, :ref) && finalize(mapped.ref.mem)
+    hasfield(typeof(mapped), :ref) && finalize(mapped.ref.mem)
     return nothing
 end
 

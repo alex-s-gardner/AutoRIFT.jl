@@ -979,11 +979,17 @@ end
 # itself no longer carries one — confirmed by reading both, not assumed from one. `finalize(arr)`
 # alone is therefore a silent no-op on 1.11+: it runs whatever finalizers are attached to `arr`
 # itself, which on those versions is none, so the mapping survives until GC gets to it regardless.
-# Guarded by `hasproperty` rather than a `VERSION` check, so a future internal change that moves the
-# finalizer again is more likely to keep working than a version cutoff frozen at today's Julia.
+#
+# `hasfield`, not `hasproperty`: `Array` has no custom `getproperty`, so `arr.ref` works through the
+# default fallback to `getfield` — but `propertynames(arr)` is `()` regardless, so `hasproperty`
+# reports `:ref` absent even though `arr.ref` is live and `fieldnames` lists it. Measured directly,
+# after `hasproperty` passed every local check here and then changed nothing in CI.
+#
+# Checked by field presence rather than a `VERSION` cutoff, so a future internal change that moves
+# the finalizer again is more likely to keep working than a version number frozen at today's Julia.
 function _finalize_mapping!(mapped)
     finalize(mapped)
-    hasproperty(mapped, :ref) && finalize(mapped.ref.mem)
+    hasfield(typeof(mapped), :ref) && finalize(mapped.ref.mem)
     return nothing
 end
 
