@@ -124,7 +124,7 @@ include("api.jl")
 # needs, against 158 ms for the correlation itself — paid on every process launch, which for a
 # driver that runs one pair per process is every pair.
 #
-# `load_wisdom!` never throws and never blocks on anything but a small file read, which is what
+# `load_fftw_wisdom!` never throws and never blocks on anything but a small file read, which is what
 # makes it safe here: an `__init__` that can fail makes the package unloadable, and one that can
 # hang makes it unloadable in practice. See `src/plans.jl`.
 function __init__()
@@ -143,8 +143,8 @@ function __init__()
     # need not be the machine that loads it — a relocated depot or a different CPU would otherwise
     # inherit the builder's path and read wisdom measured for the wrong microarchitecture. Cheap to
     # re-resolve: once per process.
-    reset_wisdom_path!()
-    load_wisdom!()
+    reset_fftw_wisdom_path!()
+    load_fftw_wisdom!()
     return nothing
 end
 
@@ -206,8 +206,9 @@ const PUBLIC_NAMES = (
     # Blocked processing: `halo` says how much overlap a block size costs. The layout types are
     # deliberately absent — they are the part free to change.
     :halo,
-    # FFT plan warming, for a driver that wants it off the hot path.
-    :warm_plans!,
+    # FFT plan warming, for a driver that wants it off the hot path, and the wisdom file it persists
+    # to — which a deployment whose process filesystem is discarded between jobs has to redirect.
+    :warm_plans!, :precompute_fftw_wisdom, :fftw_wisdom_path,
     # First-guess plumbing the extensions build on.
     :consistent_matches, :required_package,
 )

@@ -141,7 +141,7 @@ const FFTW_VERSION = string(pkgversion(FFTW))
 #
 # What is given up is only garbage collection of the directory: `Pkg.gc()` may delete a wisdom file
 # that has not been used in a while, and the next run measures its plans again and rewrites it. That
-# is precisely the degradation `load_wisdom!` already tolerates for a read-only depot. Deleting a
+# is precisely the degradation `load_fftw_wisdom!` already tolerates for a read-only depot. Deleting a
 # cache is a cost of milliseconds; not trimming costs 450 MiB of resident memory.
 const PKG_UUID = Base.UUID("52cb0ed0-aa80-430c-bd04-c52888a79add")
 
@@ -150,25 +150,47 @@ const WISDOM_LOADED = Ref(false)
 # Sizes planned since the last export, so an export only happens when there is something new.
 const WISDOM_DIRTY = Ref(false)
 
+# Set when `load_fftw_wisdom!` actually imported a file, so the first size measured can tell a machine
+# with no FFTW wisdom at all from one whose FFTW wisdom simply does not hold that size.
+const WISDOM_IMPORTED = Ref(false)
+
+# Whether the cold-start warning has been emitted in this process. Like `WISDOM_FILENAME`, both of
+# these are reset by `reset_fftw_wisdom_path!` in `__init__`: a `Ref` set during precompilation would
+# otherwise be serialised into the image and inherited by every process that loads it.
+const WISDOM_WARNED = Ref(false)
+
 # The filename component, cached because it is the expensive part and the only part that cannot
 # change while the process runs. `Sys.cpu_info()` allocates a vector of per-core structs and the
 # regex over its model string costs another 6 us — 12.3 of the 9.6 us a full uncached resolution
-# takes. The *directory* is deliberately not cached; see `wisdom_path`.
+# takes. The *directory* is deliberately not cached; see `fftw_wisdom_path`.
 #
 # `Ref` rather than a `const` binding because `__init__` must be able to re-resolve it: a value
 # computed during precompilation would be serialised into the image and inherited by whatever
 # machine loads it, which for a CPU-keyed filename is exactly wrong.
 const WISDOM_FILENAME = Ref("")
 
-"""
-    AutoRIFT.wisdom_path() -> String or nothing
+# The directory override, for a deployment whose per-process filesystem does not outlive the process.
+# Named for what it holds rather than for the package, since `wisdom` alone names nothing in
+# particular.
+const FFTW_WISDOM_DIR_VAR = "AUTORIFT_FFTW_WISDOM_DIR"
 
-Path to this machine's FFTW wisdom file, or `nothing` if no scratch space is available.
+"""
+    AutoRIFT.fftw_wisdom_path() -> String or nothing
+
+Path to this machine's FFTW wisdom file, or `nothing` if no directory is available to hold it.
 
 Keyed by CPU model and FFTW version: wisdom is portable across neither, and importing another
-machine's would produce plans tuned for the wrong cache hierarchy.
+machine's would produce plans tuned for the wrong cache hierarchy. The file name carries both, so a
+directory may hold one file per machine type and each process reads only its own.
+
+The directory is a scratch space inside the depot, which on a workstation already outlives any
+process — the first run on a machine measures its plans and every run after reads them. Set
+`AUTORIFT_FFTW_WISDOM_DIR` to override it, which is what a deployment wants when the process
+filesystem is discarded between jobs: pointing it at shared storage turns "measure once per machine"
+back into the truth it is on a workstation. Writes there are safe from several processes at once —
+see `AutoRIFT.save_fftw_wisdom!`.
 """
-function wisdom_path()
+function fftw_wisdom_path()
     try
         # `Sys.cpu_info()` can report a model string with spaces and slashes ("Apple M2 Max",
         # "Intel(R) Xeon(R) Gold 6248R CPU @ 3.00GHz"), none of which belong in a filename. Cached:
@@ -184,7 +206,9 @@ function wisdom_path()
         # passing while writing into the developer's own scratch space and asserting against the
         # wrong directory. A test that passes for the wrong reason is worse than the 2.3 us this
         # costs (`scratch_dir` 1.0 us, `mkpath` 1.3 us).
-        dir = scratch_dir(string(PKG_UUID), "fftw_wisdom")
+        # The override first, so a deployment never depends on where the depot happens to be.
+        dir = get(ENV, FFTW_WISDOM_DIR_VAR, "")
+        isempty(dir) && (dir = scratch_dir(string(PKG_UUID), "fftw_wisdom"))
         mkpath(dir)
         return joinpath(dir, WISDOM_FILENAME[])
     catch
@@ -194,30 +218,69 @@ function wisdom_path()
 end
 
 """
-    AutoRIFT.reset_wisdom_path!()
+    AutoRIFT.reset_fftw_wisdom_path!()
 
-Forget the cached wisdom filename, so the next [`wisdom_path`](@ref) re-derives it.
+Forget the cached FFTW wisdom filename and this process's FFTW wisdom state, so the next
+[`fftw_wisdom_path`](@ref) re-derives the path and a cold process warns again if it measures.
 
 Called from `__init__`: a filename derived from the CPU model while *precompiling* would otherwise be
 serialised into the image and inherited by a machine with a different one.
 """
-function reset_wisdom_path!()
+function reset_fftw_wisdom_path!()
     WISDOM_FILENAME[] = ""
+    # The per-process FFTW wisdom state goes with it: whether a file was imported and whether the
+    # cold-start warning has been given are both properties of this process, and a value left over
+    # from precompilation would make a fresh process silent about measuring everything.
+    WISDOM_IMPORTED[] = false
+    WISDOM_WARNED[] = false
+    return nothing
+end
+
+# Called by every plan constructor on a cache miss, where a size is about to be measured.
+#
+# Measuring *some* sizes is normal and unavoidable: a pass's widest bucket is the grid's own maximum
+# rather than a rung of the ladder, so no precomputed file can hold it. What is worth saying out loud is
+# measuring with **no FFTW wisdom at all**, which means either a machine that has not run this package
+# before or a deployment whose FFTW wisdom is not being found — a container that discards its
+# filesystem, or `AUTORIFT_FFTW_WISDOM_DIR` pointing somewhere unwritable.
+#
+# It is worth a warning rather than a log line because of what it does to measurement. Plan measurement
+# is `PLAN_FLAGS` timing candidate algorithms, which on a real image pair reaches minutes, and it lands
+# inside whatever the caller is timing — so a benchmark or a profile taken from a run without FFTW
+# wisdom describes planning rather than correlation, with nothing in the output to say so.
+#
+# Once per process: the condition cannot change mid-run, and a correlation visits this path thousands of
+# times.
+function _measuring_new_size!()
+    WISDOM_DIRTY[] = true
+    (WISDOM_IMPORTED[] || WISDOM_WARNED[]) && return nothing
+    WISDOM_WARNED[] = true
+    path = fftw_wisdom_path()
+    @warn """
+          No FFTW wisdom for this machine, so FFTW wisdom is being measured now. This run is slower \
+          than a steady-state one, and any benchmark or profile taken from it includes plan \
+          measurement rather than only correlation.
+
+          FFTW wisdom is written when the run finishes and read by later processes, so this is a \
+          once-per-machine cost — unless the file below does not persist between runs, which is the \
+          usual case in a container. Set `AUTORIFT_FFTW_WISDOM_DIR` to a directory that outlives the \
+          process, and `AutoRIFT.precompute_fftw_wisdom` to populate it ahead of the first real job.
+          """ fftw_wisdom_file = isnothing(path) ? "none: no writable directory for FFTW wisdom" : path AUTORIFT_FFTW_WISDOM_DIR = get(ENV, FFTW_WISDOM_DIR_VAR, "unset")
     return nothing
 end
 
 """
-    AutoRIFT.load_wisdom!()
+    AutoRIFT.load_fftw_wisdom!()
 
 Import this machine's saved FFTW wisdom, if any. Idempotent and never throws.
 
 Called from `__init__`. A missing, unreadable, or corrupt file is not an error — it means the
 next plan is measured from scratch, which is what would happen without any of this.
 """
-function load_wisdom!()
+function load_fftw_wisdom!()
     WISDOM_LOADED[] && return nothing
     WISDOM_LOADED[] = true
-    path = wisdom_path()
+    path = fftw_wisdom_path()
     isnothing(path) && return nothing
     try
         # Raw `ccall` rather than `FFTW.import_wisdom`, for the same reason the plans are raw
@@ -229,7 +292,11 @@ function load_wisdom!()
             f = ccall(:fopen, Ptr{Cvoid}, (Cstring, Cstring), path, "r")
             f == C_NULL && return nothing
             try
-                ccall((:fftwf_import_wisdom_from_file, LIBFFTW3F), Cint, (Ptr{Cvoid},), f)
+                # Nonzero is FFTW accepting the file. A corrupt one returns zero, which must leave
+                # `WISDOM_IMPORTED` false so the warning fires — silently planning everything from
+                # scratch because a cache file is damaged is exactly what it exists to surface.
+                ok = ccall((:fftwf_import_wisdom_from_file, LIBFFTW3F), Cint, (Ptr{Cvoid},), f)
+                WISDOM_IMPORTED[] = ok != 0
             finally
                 ccall(:fclose, Cint, (Ptr{Cvoid},), f)
             end
@@ -241,14 +308,14 @@ function load_wisdom!()
 end
 
 """
-    AutoRIFT.save_wisdom!()
+    AutoRIFT.save_fftw_wisdom!()
 
 Write this machine's FFTW wisdom, if any new size has been planned. Never throws.
 
 Called after [`warm_plans!`](@ref) rather than at exit: an `atexit` hook would miss a process
 killed by a scheduler, which for batch work is the normal way for a process to end.
 """
-function save_wisdom!()
+function save_fftw_wisdom!()
     WISDOM_DIRTY[] || return nothing
     # Cleared up front, on every exit path rather than only the successful one. The distinction that
     # matters is not success versus failure but "worth retrying" versus not, and none of the ways
@@ -264,7 +331,7 @@ function save_wisdom!()
     # retried until some new size is planned. That is the right trade: wisdom is an optimization, and
     # the next process picks it up anyway.
     WISDOM_DIRTY[] = false
-    path = wisdom_path()
+    path = fftw_wisdom_path()
     isnothing(path) && return nothing
     try
         # Write to a unique temporary and rename, so two processes exporting at once cannot
@@ -307,7 +374,7 @@ function fft_plan(ny::Int, nx::Int)
             # per process and reused across every grid point, so the extra planning time
             # is recovered immediately. Wisdom persistence (see `__init__`) removes even
             # that cost on subsequent runs.
-            WISDOM_DIRTY[] = true
+            _measuring_new_size!()
             # FFTW is row-major and Julia column-major, so an `ny`-by-`nx` Julia array is an
             # `nx`-by-`ny` C array — the dimensions go in reversed. Getting this backwards
             # transposes every transform, which for a symmetric test size looks like it works.
@@ -353,7 +420,7 @@ function ifft_plan(ny::Int, nx::Int)
     p === C_NULL || return p
     return lock(PLAN_LOCK) do
         get!(IRFFT_PLANS, key) do
-            WISDOM_DIRTY[] = true
+            _measuring_new_size!()
             inb = Matrix{ComplexF32}(undef, ny ÷ 2 + 1, nx)
             outb = Matrix{Float32}(undef, ny, nx)
             plan = ccall((:fftwf_plan_dft_c2r_2d, LIBFFTW3F), Ptr{Cvoid},
@@ -384,7 +451,7 @@ function cfft_plan(ny::Int, nx::Int)
     p === C_NULL || return p
     return lock(PLAN_LOCK) do
         get!(CFFT_PLANS, key) do
-            WISDOM_DIRTY[] = true
+            _measuring_new_size!()
             inb = Matrix{ComplexF32}(undef, ny, nx)
             outb = Matrix{ComplexF32}(undef, ny, nx)
             plan = ccall((:fftwf_plan_dft_2d, LIBFFTW3F), Ptr{Cvoid},
@@ -403,7 +470,7 @@ function icfft_plan(ny::Int, nx::Int)
     p === C_NULL || return p
     return lock(PLAN_LOCK) do
         get!(ICFFT_PLANS, key) do
-            WISDOM_DIRTY[] = true
+            _measuring_new_size!()
             inb = Matrix{ComplexF32}(undef, ny, nx)
             outb = Matrix{ComplexF32}(undef, ny, nx)
             plan = ccall((:fftwf_plan_dft_2d, LIBFFTW3F), Ptr{Cvoid},
@@ -487,9 +554,123 @@ function warm_plans!(sizes; complex::Bool = false)
     end
     # Persist whatever was measured, so the next process starts warm. Only writes if a plan was
     # actually created — the common case after the first run is that this does nothing.
-    save_wisdom!()
+    save_fftw_wisdom!()
     return nothing
 end
+
+# Every bucket the ladder can produce for a radius in `1:rmax`.
+#
+# Data-independent, which is the whole point: `_radius_bucket` quantizes a radius onto a fixed ladder,
+# so this is the complete set of buckets reachable by *any* image pair, whatever its time separation.
+# A cap of `rmax + 1` is passed so no radius in the range clamps — the clamped bucket is the one case
+# this cannot enumerate, and [`precompute_fftw_wisdom`](@ref) says so.
+function _bucket_rungs(rmax::Integer)
+    out = Set{Int}()
+    for r in 1:Int(rmax)
+        push!(out, _radius_bucket(r, Int(rmax) + 1))
+    end
+    return sort!(collect(out))
+end
+
+# The transform sizes one chip extent reaches over a set of buckets, in both axes independently.
+function _ladder_sizes(chip, rungs)
+    out = Set{Tuple{Int,Int}}()
+    for by in rungs, bx in rungs
+        push!(out, (next_fft_size(chip.Y + 2by - 1), next_fft_size(chip.X + 2bx - 1)))
+    end
+    return out
+end
+
+"""
+    precompute_fftw_wisdom(p::Params; max_search_radius) -> Int
+
+Measure and persist the FFTW plans `p` can reach at any search radius up to `max_search_radius`, and
+return how many distinct transform sizes were planned.
+
+**What this is for.** A plan is measured on first use and persisted by
+[`AutoRIFT.fftw_wisdom_path`](@ref), so a process that finds wisdom on disk starts at full speed and
+one that does not pays `PLAN_FLAGS` planning for every size its grid happens to reach. Left to
+discover sizes as jobs arrive, a shared wisdom file warms up raggedly — whichever pairs run first
+contribute their sizes and the rest keep paying. This plans the whole reachable set up front, so the
+first real job is as warm as the thousandth.
+
+**Why a radius bound is the only thing it needs.** A point is correlated at its radius rounded up to a
+rung of the `AutoRIFT._radius_bucket` ladder, and the rungs are fixed rather than derived from
+the data. So although search radius grows with a pair's time separation, that only changes *which*
+rungs are reached, never what they are: one precomputation covers every time separation up to the
+bound. Pass the widest radius the deployment can produce.
+
+**The one size it cannot cover.** `_radius_bucket` returns the pass maximum verbatim for a radius at or
+above it, and that maximum is a property of the grid rather than of the ladder. Sizes involving it are
+left to be measured on first use — measured at 10-15% of the sizes a real optical pair reaches.
+
+Costs what it saves: planning is 116-347 ms at the sizes an optical pair reaches and 8.2 s at the
+widest a NISAR pair with an 8 km search would, so a few hundred sizes is minutes and a few thousand is
+tens of minutes — once per machine type. `max_search_radius` is required because no default is right for
+every sensor.
+
+Reports progress no more often than every `progress_interval` seconds, and persists what it has measured
+at the same time, so a long precomputation can be interrupted without losing its work and resumed by
+running it again.
+"""
+function precompute_fftw_wisdom(p::Params; max_search_radius::Integer,
+                                progress_interval::Real = 10.0)
+    max_search_radius >= 1 || throw(ArgumentError(
+        "max_search_radius must be at least 1, got $max_search_radius"))
+    rungs = _bucket_rungs(max_search_radius)
+    levels = chip_sizes(p)
+    # Split by plan kind rather than planned per level, because a size reached by two levels is one
+    # plan, and warming the wrong kind pays full planning for a plan that is never executed.
+    real_sizes = Set{Tuple{Int,Int}}()
+    complex_sizes = Set{Tuple{Int,Int}}()
+    for k in eachindex(levels)
+        dest = _wants_complex_plans(measure_at(p, k)) ? complex_sizes : real_sizes
+        union!(dest, _ladder_sizes(levels[k], rungs))
+    end
+
+    # Ascending by transform area: the cheap sizes land first, so an operator sees progress early, and
+    # the expensive tail is where a report matters most.
+    work = vcat([(sz, false) for sz in real_sizes], [(sz, true) for sz in complex_sizes])
+    sort!(work; by = w -> prod(first(w)))
+    total = length(work)
+    total_cost = sum(_plan_cost_weight(first(w)) for w in work; init = 0.0)
+
+    @info "precomputing FFTW wisdom" sizes = total rungs = length(rungs) levels = length(levels) fftw_wisdom_file = fftw_wisdom_path()
+    started = time()
+    last_report = started
+    done_cost = 0.0
+    for (i, (sz, complex)) in enumerate(work)
+        ny, nx = sz
+        # The plan constructors directly rather than `warm_plans!`, which exports FFTW wisdom on every
+        # call: per size that would rewrite a growing file once per plan instead of once per report.
+        if complex
+            cfft_plan(ny, nx)
+            icfft_plan(ny, nx)
+        else
+            fft_plan(ny, nx)
+            ifft_plan(ny, nx)
+        end
+        done_cost += _plan_cost_weight(sz)
+        now = time()
+        if i < total && now - last_report >= progress_interval
+            save_fftw_wisdom!()
+            elapsed = now - started
+            @info "precomputing FFTW wisdom" progress = "$i/$total sizes" elapsed_s = round(elapsed; digits = 1) remaining_s = round(elapsed * (total_cost - done_cost) / max(done_cost, eps()); digits = 1)
+            last_report = now
+        end
+    end
+    save_fftw_wisdom!()
+    @info "FFTW wisdom precomputed" sizes = total seconds = round(time() - started; digits = 1) fftw_wisdom_file = fftw_wisdom_path()
+    return total
+end
+
+# What one size is expected to cost to plan, relative to the others, for the remaining-time estimate.
+#
+# The square root of the transform area, which is a measurement rather than a guess: on this package's
+# own sizes `FFTW_MEASURE` took 1.52 s at 2.0 Mpt and 8.16 s at 49.5 Mpt, so 25x the area for 5.4x the
+# time — an exponent of 0.52. Weighting by count instead would underestimate badly, since the sizes are
+# planned cheapest-first and the tail is where the time is.
+_plan_cost_weight(sz::Tuple{Int,Int}) = sqrt(float(sz[1]) * float(sz[2]))
 
 """
     clear_plans!()

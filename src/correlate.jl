@@ -764,7 +764,7 @@ Measured on that pair, whole grid, twelve threads, at the block `block_size_for`
 one rung per octave against 467.2 s at four**, the same 1,799,742 points. Modelled over all 22 golden
 cases the transform work is 0.692x, and no case rises. The cost is the plan set — 53 buckets to 388 on
 that pair — which is one-off per machine: the first run pays the extra planning, 110 s of it on that
-grid, and [`wisdom_path`](@ref) removes it from every run after.
+grid, and [`fftw_wisdom_path`](@ref) removes it from every run after.
 
 Finer rungs keep paying off in work and stop paying off in plans: eight per octave models 0.614x
 against four's 0.661x, for 996 buckets against 388.

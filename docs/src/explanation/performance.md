@@ -75,8 +75,8 @@ grid, untiled at 10 threads, four fresh processes in sequence:
 the extra is 24 CPU-seconds of real work, not a stretched wall clock. The planner, not the correlator.
 
 **Nothing is missing from the package — this is a deployment property.** `__init__` calls
-`AutoRIFT.load_wisdom!` so every process imports what is on disk, and
-[`AutoRIFT.warm_plans!`](@ref) calls `AutoRIFT.save_wisdom!` so every pass persists what it measured.
+`AutoRIFT.load_fftw_wisdom!` so every process imports what is on disk, and
+[`AutoRIFT.warm_plans!`](@ref) calls `AutoRIFT.save_fftw_wisdom!` so every pass persists what it measured.
 The file is keyed by CPU model and FFTW version and lives in a Julia depot scratchspace — 84 KiB here.
 
 What that means for a batch driver is the part worth stating plainly: **a process-per-pair driver in a
