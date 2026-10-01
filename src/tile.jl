@@ -974,6 +974,19 @@ function FilterTileCache(dims::Tuple{Int,Int}, width::Integer;
                            zeros(Bool, prod(nt)), Threads.Atomic{Int}(0), Threads.Atomic{Int}(0))
 end
 
+# `Mmap.jl` attaches the `munmap`/`UnmapViewOfFile` finalizer directly to the array it returns on
+# Julia 1.10, and to that array's underlying `Memory` (`arr.ref.mem`) from 1.11 on, where `Array`
+# itself no longer carries one — confirmed by reading both, not assumed from one. `finalize(arr)`
+# alone is therefore a silent no-op on 1.11+: it runs whatever finalizers are attached to `arr`
+# itself, which on those versions is none, so the mapping survives until GC gets to it regardless.
+# Guarded by `hasproperty` rather than a `VERSION` check, so a future internal change that moves the
+# finalizer again is more likely to keep working than a version cutoff frozen at today's Julia.
+function _finalize_mapping!(mapped)
+    finalize(mapped)
+    hasproperty(mapped, :ref) && finalize(mapped.ref.mem)
+    return nothing
+end
+
 """
     close(c::FilterTileCache)
 
@@ -981,13 +994,13 @@ Close the scratch file and delete it.
 """
 function Base.close(c::FilterTileCache)
     close(c.io)
-    # `close(c.io)` releases the file handle the mapping was built from, not the mapping itself —
-    # that lives behind `c.mapped`'s own finalizer (`Mmap.jl`'s `munmap`/`UnmapViewOfFile`), which GC
-    # would otherwise run at some later, unspecified time. Windows refuses to delete a file with an
-    # active mapping (measured: `rm` below throws `EACCES`), where POSIX allows it; finalizing here
-    # makes the two platforms agree, at the cost of one `munmap` happening a little earlier than GC
-    # would have run it anyway — this function runs once per cache, not per tile.
-    finalize(c.mapped)
+    # `close(c.io)` releases the file handle the mapping was built from, not the mapping itself,
+    # which otherwise lives until GC finalizes it at some later, unspecified time. Windows refuses to
+    # delete a file with an active mapping (measured: `rm` below throws `EACCES`), where POSIX
+    # allows it; finalizing here makes the two platforms agree, at the cost of one `munmap` happening
+    # a little earlier than GC would have run it anyway — this function runs once per cache, not per
+    # tile.
+    _finalize_mapping!(c.mapped)
     isfile(c.path) && rm(c.path)
     return nothing
 end
