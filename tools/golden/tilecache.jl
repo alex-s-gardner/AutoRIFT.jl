@@ -87,6 +87,16 @@ end
 
 Base.size(c::TileCache) = c.dims
 
+# See the identical helper on `FilterTileCache` in `src/tile.jl`: `Mmap.jl` attaches its
+# `munmap`/`UnmapViewOfFile` finalizer to the array itself on Julia 1.10, and to that array's
+# underlying `Memory` (`arr.ref.mem`) from 1.11 on — `finalize(arr)` alone is a silent no-op on the
+# newer layout.
+function _finalize_mapping!(mapped)
+    finalize(mapped)
+    hasfield(typeof(mapped), :ref) && finalize(mapped.ref.mem)
+    return nothing
+end
+
 """
     close(c::TileCache)
 
@@ -94,6 +104,10 @@ Close the scratch file and delete it.
 """
 function Base.close(c::TileCache)
     close(c.io)
+    # The mapping behind `c.mapped` outlives `close(c.io)` until GC finalizes it, and Windows
+    # refuses to delete a file with an active mapping where POSIX allows it. Finalizing explicitly
+    # here costs one `munmap` slightly earlier than GC would have, once per cache.
+    _finalize_mapping!(c.mapped)
     isfile(c.path) && rm(c.path)
     return nothing
 end
