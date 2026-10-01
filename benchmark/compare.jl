@@ -55,18 +55,30 @@ const MIN_CENTERING_POPULATION = 20
 # so `--screen` fails instead of writing a list that long.
 const MAX_CONFIRMABLE = 25
 
-# A ratio needs a baseline long enough to time reliably. Below a microsecond a shared
-# runner's variation exceeds `REGRESSION_THRESHOLD` on its own: `points/sanitize!` has
-# read 1.03x, 1.11x and 1.18x across three runs of identical code, and
-# `points/surface_size` clears the threshold on a 0.8 ns difference. A ratio there
-# reports the runner, not the code.
+# A ratio needs a baseline long enough to time reliably. Below ten microseconds a shared
+# runner's variation exceeds `REGRESSION_THRESHOLD` on its own, in both directions:
+# `points/sanitize!` has read 1.03x, 1.11x and 1.18x across three runs of identical code, and
+# `points/surface_size` clears the threshold on a 0.8 ns difference. A ratio there reports the
+# runner, not the code.
 #
-# Around fifteen of the suite's timed benchmarks fall below this. They are still measured,
-# printed, and listed when they slow down — they just do not fail the build. Allocation
-# counts are exact at any duration and stay enforced at every scale, which is what keeps
-# those entries meaningful: for the per-point paths, allocating at all is the regression
-# that matters, and that is caught however short the benchmark.
-const MIN_GATED_NS = 1_000
+# **A microsecond was not far enough.** `correlate/peak r25` is 1.5 us, so it gated, and it
+# failed a pull request at 1.32x — *confirmed*, on the second measurement of both revisions —
+# whose diff touched no file reachable from `peak_index`. Measured again locally on the same two
+# revisions it read 1.00x. The six other names re-measured beside it all moved 0.90-0.91x
+# together, which is a runner that changed speed between the two halves of the job; at 1.5 us the
+# noise is large enough to land the other way by chance, and centering cannot help because
+# dividing by a median of 0.91 moves it further out rather than back.
+#
+# Twenty-two of the suite's eighty-seven timed benchmarks fall below this: the small `correlate/`
+# primitives (`peak`, `pyrup`, `integral`, `integral_sq`) and most of the `points/` group. They are
+# still measured, printed, and listed when they slow down; they just do not fail the build. The
+# four `correlate/` ones are additionally covered by a gated benchmark: `correlate/point` and
+# `correlate/surface` reach them through `correlate!` and `peak_offset`, at tens of microseconds
+# where a ratio means something. Allocation counts are exact at any duration and
+# stay enforced at every scale, which is what keeps those entries meaningful: for the per-point
+# paths, allocating at all is the regression that matters, and that is caught however short the
+# benchmark.
+const MIN_GATED_NS = 10_000
 
 # Benchmarks whose names match these are expected to be allocation-free, so any
 # allocation at all is a failure rather than a slowdown. The per-point correlation
@@ -193,7 +205,10 @@ function main()
     memory_regressions = String[]
     ungated = String[]
 
-    if drift == 1.0
+    # Branch on the population, not on `drift == 1.0`: a suite that genuinely measured a median of
+    # exactly 1.0 is the common case on an unchanged revision, and testing the value reported it as
+    # "too few" over a population of 65.
+    if npeers < MIN_CENTERING_POPULATION
         println("Time ratios are raw: at $npeers gated, there are too few to locate a runner " *
                 "shift against.\n")
     else
