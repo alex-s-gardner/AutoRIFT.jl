@@ -33,6 +33,9 @@ module AutoRIFT
 # it is ours and is exported.
 using CommonSolve: CommonSolve, init
 using LinearAlgebra: LinearAlgebra
+# `Mmap` backs `FilterTileCache`'s scratch file: a shared mapping needs no lock around a transfer to
+# disjoint bytes, where a shared `IOStream`'s current position does.
+using Mmap: Mmap
 # `WallisGapfill` fills gaps with noise, and `Params.rng_seed` is what makes that reproducible.
 using Random: Random
 using StableTasks: StableTasks

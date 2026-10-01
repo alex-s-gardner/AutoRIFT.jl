@@ -622,6 +622,17 @@ filter_width(m::Union{Highpass,Wallis,WallisGapfill,Sobel,Laplacian}) = m.width
 filter_width(::Destripe) = 0
 
 """
+    AutoRIFT._poolable(method::PreprocessMethod) -> Bool
+
+Whether `_prepare_block` pools its buffers for `method`, and so whether a [`FilterTileCache`](@ref) can
+cache its output — the two are the same question, since both exist for the one filter the production
+driver runs inside the correlator. Every other method still allocates per block (`_prepare_block`'s
+generic fallback) and is not covered.
+"""
+_poolable(::PreprocessMethod) = false
+_poolable(::Highpass) = true
+
+"""
     AutoRIFT.filter_reach(method::PreprocessMethod) -> Int
 
 How many pixels beyond a region must be supplied for the filter's output *inside* that region to

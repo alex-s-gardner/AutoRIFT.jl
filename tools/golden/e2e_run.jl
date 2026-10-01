@@ -360,7 +360,8 @@ The whole chain on one case, each stage timed and the run's peak sampled.
 """
 function run_case(c::GoldenCase; n::Union{Integer,Nothing} = nothing,
                   block::Union{Integer,Nothing} = nothing, trace::Bool = true,
-                  staged::Bool = true, warm::Bool = true, tile::Integer = 1024)
+                  staged::Bool = true, warm::Bool = true, tile::Integer = 1024,
+                  filter_cache::Bool = true)
     reason = unsupported(c)
     isnothing(reason) || error(reason)
     staged && stage(c)
@@ -390,12 +391,26 @@ function run_case(c::GoldenCase; n::Union{Integer,Nothing} = nothing,
         np[] = length(grid.x)
         filt[] = string(isnothing(m) ? :none : m)
 
+        # `filter_cache_tile` caches each tile's *filtered* result across the coarse and fine passes of
+        # every chip-size level — see `AutoRIFT.FilterTileCache`. Only `Highpass` is covered, which is
+        # what both NISAR cases use; every other platform's filter (`Wallis`, `WallisGapfill`) has no
+        # such cache and still wants the `TileCache` wrap below, which caches the *raw* read instead.
+        fct = (filter_cache && m isa AutoRIFT.Highpass) ? 1024 : nothing
+
         t = @elapsed begin
             (i1, i2) = e2e_imagery(s)
-            # **Cache what is expensive to read, not what is large.** `AutoRIFT.ondisk` is the image's own
-            # answer to whether a read costs I/O or a derivation; an optical overlap is a plain array and
-            # is left alone, while a resampled mosaic or an HDF5 band is wrapped so the second pass over
-            # it reads a tile back instead of deriving it again.
+            # **Cache what is expensive to read, not what is large.** `AutoRIFT.ondisk` is the image's
+            # own answer to whether a read costs I/O or a derivation; an optical overlap is a plain array
+            # and is left alone, while a resampled mosaic or an HDF5 band is wrapped so the second pass
+            # over it reads a tile back instead of deriving it again.
+            #
+            # Kept even when `fct` is set. `FilterTileCache`'s own tiles are padded by
+            # `filter_reach(m)` on every side, so two adjacent filter tiles' padded reads overlap by a
+            # few pixels — and each spans more than one of this cache's own tiles, since a NISAR HDF5
+            # chunk is 512 px against this cache's 1024. Without `TileCache` here, that overlap and that
+            # straddling both cost a fresh decode every time; measured removing it, CPU time rose 949 s
+            # to 1457 s on the same 800-row crop. Both caches now memory-map rather than share one
+            # locked `IOStream`, so stacking them costs no more contention than either alone would.
             (i1, i2) = map((i1, i2)) do img
                 (tile > 0 && AutoRIFT.ondisk(img)) || return img
                 # `tc`: assigning `c` here would rebind the case, which this closure captures.
@@ -408,10 +423,15 @@ function run_case(c::GoldenCase; n::Union{Integer,Nothing} = nothing,
         shape[] = size(i1)
 
         # The reference acquisition takes the secondary slot; see the note at the top of this file.
-        b = isnothing(block) ? AutoRIFT.block_size_for(grid, p, size(i1)) :
+        #
+        # NISAR RSLC bands are stored in 512x512 HDF5 chunks (`SLCDatasets/src/nisar.jl`), and
+        # `block_size_for`'s `chunk` keyword exists to round the block up to a multiple of that rather
+        # than pick a size that straddles chunk boundaries on every read.
+        chunk = startswith(c.platform, "NISAR") ? (512, 512) : (1, 1)
+        b = isnothing(block) ? AutoRIFT.block_size_for(grid, p, size(i1); chunk) :
             (; X = Int(block), Y = Int(block))
         blk[] = (b.X, b.Y)
-        t = @elapsed out[] = AutoRIFT.autorift(i2, i1, grid, p, (b.X, b.Y))
+        t = @elapsed out[] = AutoRIFT.autorift(i2, i1, grid, p, (b.X, b.Y), 0, fct)
         push!(stages, "correlate" => t)
         return nothing
     end
@@ -484,7 +504,8 @@ const TSV_HEADER = join(["case", "platform", "geometry_s", "grid_s", "imagery_s"
 
 function main(args)
     isempty(args) && error("usage: e2e_run.jl <product-name-fragment>... | --all " *
-                           "[--run N] [--block N] [--no-trace] [--stream] [--cold] [--tsv FILE]")
+                           "[--run N] [--block N] [--no-trace] [--stream] [--cold] [--tsv FILE] " *
+                           "[--no-filter-cache]")
     cs = "--all" in args ? cases() : vcat((cases(a) for a in positional(args))...)
     n = "--run" in args ? parse(Int, argvalue("--run", "0")) : nothing
     block = "--block" in args ? parse(Int, argvalue("--block", "0")) : nothing
@@ -493,6 +514,7 @@ function main(args)
     staged = !("--stream" in args)
     warm = !("--cold" in args)
     tile = "--no-cache" in args ? 0 : parse(Int, argvalue("--tile", "1024"))
+    filter_cache = !("--no-filter-cache" in args)
 
     @printf("%d case(s), %d threads\n\n", length(cs), Threads.nthreads())
     rows = E2EResult[]
@@ -505,7 +527,7 @@ function main(args)
             continue
         end
         try
-            r = run_case(c; n, block, trace, staged, warm, tile)
+            r = run_case(c; n, block, trace, staged, warm, tile, filter_cache)
             push!(rows, r)
             report(r)
         catch err

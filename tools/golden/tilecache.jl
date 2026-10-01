@@ -15,17 +15,28 @@
 # **What this does instead.** Persist each tile the first time it is asked for. The first pass pays the
 # resample or the decompression; every later pass reads an uncompressed tile back. Resident memory stays
 # proportional to the window being served rather than to the scene, because the tiles live in a scratch
-# file and are read with ordinary `read`/`write` rather than mapped — the kernel's page cache holds them
-# outside the process's own footprint, where it can reclaim them under pressure.
+# file and are read through a memory mapping rather than `read`/`write`, so the kernel's page cache holds
+# them outside the process's own footprint, where it can reclaim them under pressure.
 #
 # **Tiles rather than windows, because the windows change.** Each pass reads a block grown by that level's
 # halo, so no two passes ask for the same rectangle. A cache keyed on the request would miss every time;
 # one keyed on a fixed tile grid hits whatever the request's shape.
+#
+# **Memory-mapped, not a shared `IOStream`.** An earlier version held one lock around every tile's
+# `seek` plus transfer, on the reasoning that a tile's own derivation is the expensive part and the
+# transfer is not. That is true of the transfer alone, but the lock does not serialize only the transfer
+# — it serializes every task's *turn* at the one shared file position, and at the request rates a
+# blocked NISAR run reaches, that queuing is the cost, not the few blocked microseconds a single `seek`
+# takes. A memory mapping has no shared position: each tile owns disjoint bytes of it, so two tasks
+# filling different tiles never contend, and a repeat read is the kernel's own page cache rather than a
+# lock's queue.
+
+using Mmap
 
 """
     TileCache(parent; tile = 512, dir) <: AbstractMatrix{Float32}
 
-`parent`'s values, computed a tile at a time and cached in a scratch file.
+`parent`'s values, computed a tile at a time and cached in a memory-mapped scratch file.
 
 Reads the same values `parent` would return — assert it on a window if you want that checked; nothing
 about the tiling reaches the result, since a tile is filled by asking `parent` for exactly that tile.
@@ -44,18 +55,14 @@ struct TileCache{P<:AbstractMatrix} <: AbstractMatrix{Float32}
     ntiles::Tuple{Int,Int}
     io::IOStream
     path::String
-    # `Vector{Bool}`, not `BitVector`: the presence marks are written from whichever task derived the
-    # tile, and a `BitVector` packs 64 of them into one word, so two tiles marked at once are a
-    # read-modify-write race that silently loses one. A byte per tile is 12 KB on the largest grid here.
-    present::Vector{Bool}
-    # **A lock per tile, and one more for the file.** Deriving a tile is a resample or a decompression —
-    # seconds of work in the large — so holding a single lock across it serializes the very thing a
-    # blocked run parallelizes. The per-tile lock is what stops two tasks deriving the same tile and makes
-    # the second wait for the first; the file lock is held only around a seek and a transfer, because an
-    # `IOStream`'s position is shared state. Taken in that order always — tile, then file — so there is no
-    # cycle to deadlock on.
+    # The whole file, mapped once. Every tile is a disjoint `Float32` range of this one array, so
+    # filling it is an ordinary array write with no file-position state to contend over.
+    mapped::Vector{UInt8}
+    # One lock per tile: two tasks must not derive the same absent tile at once, and a `ReentrantLock`'s
+    # release is what makes a later reader see the write rather than a stale or torn one. No lock is
+    # taken for a read once a tile is present — see the header note above this struct.
     tiles::Vector{ReentrantLock}
-    io_lock::ReentrantLock
+    present::Vector{Bool}
     # Atomic because tiles now fill concurrently: these are diagnostics, but a lost count would
     # misreport the reuse the cache is here to deliver.
     filled::Threads.Atomic{Int}
@@ -66,16 +73,29 @@ function TileCache(parent::AbstractMatrix; tile::Integer = 512,
                    dir::AbstractString = mktempdir(; cleanup = false))
     tile > 0 || throw(ArgumentError("`tile` must be positive, got $tile"))
     dims = size(parent)
-    nt = (cld(dims[1], tile), cld(dims[2], tile))
+    nt = AutoRIFT._tile_grid(dims, tile)
+    nbytes = prod(nt) * tile * tile * sizeof(Float32)
     mkpath(dir)
     path = joinpath(dir, "tilecache_$(dims[1])x$(dims[2])_$(tile).bin")
     io = open(path, "w+")
-    return TileCache(parent, Int(tile), dims, nt, io, path, zeros(Bool, prod(nt)),
-                     [ReentrantLock() for _ in 1:prod(nt)], ReentrantLock(),
+    truncate(io, nbytes)
+    mapped = Mmap.mmap(io, Vector{UInt8}, nbytes)
+    return TileCache(parent, Int(tile), dims, nt, io, path, mapped,
+                     [ReentrantLock() for _ in 1:prod(nt)], zeros(Bool, prod(nt)),
                      Threads.Atomic{Int}(0), Threads.Atomic{Int}(0))
 end
 
 Base.size(c::TileCache) = c.dims
+
+# See the identical helper on `FilterTileCache` in `src/tile.jl`: `Mmap.jl` attaches its
+# `munmap`/`UnmapViewOfFile` finalizer to the array itself on Julia 1.10, and to that array's
+# underlying `Memory` (`arr.ref.mem`) from 1.11 on — `finalize(arr)` alone is a silent no-op on the
+# newer layout.
+function _finalize_mapping!(mapped)
+    finalize(mapped)
+    hasfield(typeof(mapped), :ref) && finalize(mapped.ref.mem)
+    return nothing
+end
 
 """
     close(c::TileCache)
@@ -84,6 +104,10 @@ Close the scratch file and delete it.
 """
 function Base.close(c::TileCache)
     close(c.io)
+    # The mapping behind `c.mapped` outlives `close(c.io)` until GC finalizes it, and Windows
+    # refuses to delete a file with an active mapping where POSIX allows it. Finalizing explicitly
+    # here costs one `munmap` slightly earlier than GC would have, once per cache.
+    _finalize_mapping!(c.mapped)
     isfile(c.path) && rm(c.path)
     return nothing
 end
@@ -91,57 +115,52 @@ end
 # Bytes per tile, and where a tile starts. Every tile is stored at full size even where the image ends
 # inside it, so the offset is arithmetic rather than a lookup; the file is sparse, so the padding of the
 # last row and column of tiles occupies nothing.
+#
+# The grid arithmetic itself (`_tile_span`/`_tile_extent`/the offset formula) depends only on `dims` and
+# `tile`, never on what a tile holds, so it lives once in `AutoRIFT._tile_grid_span` etc. — shared with
+# `FilterTileCache`, the same cache one layer down, for filtered results instead of raw reads.
 _tile_bytes(c::TileCache) = c.tile * c.tile * sizeof(Float32)
 _tile_offset(c::TileCache, ti::Integer, tj::Integer) =
-    ((tj - 1) * c.ntiles[1] + (ti - 1)) * _tile_bytes(c)
+    AutoRIFT._tile_grid_offset(c.ntiles, _tile_bytes(c), ti, tj)
+_tile_span(c::TileCache, r::AbstractUnitRange) = AutoRIFT._tile_grid_span(c.tile, r)
+_tile_extent(c::TileCache, ti::Integer, tj::Integer) = AutoRIFT._tile_grid_extent(c.dims, c.tile, ti, tj)
 
-# The tile indices covering an index range.
-_tile_span(c::TileCache, r::AbstractUnitRange) = (fld(first(r) - 1, c.tile) + 1):(fld(last(r) - 1, c.tile) + 1)
-
-# One tile's rows and columns, clipped to the image.
-function _tile_extent(c::TileCache, ti::Integer, tj::Integer)
-    rows = ((ti - 1) * c.tile + 1):min(ti * c.tile, c.dims[1])
-    cols = ((tj - 1) * c.tile + 1):min(tj * c.tile, c.dims[2])
-    return (rows, cols)
+# The `c.tile`-square plane backing one tile, as a view into the mapping — reading or writing through
+# it reads or writes the file directly, with no separate transfer step.
+function _tile_array(c::TileCache, ti::Integer, tj::Integer)
+    off = _tile_offset(c, ti, tj)
+    n = c.tile * c.tile
+    return reshape(reinterpret(Float32, view(c.mapped, (off + 1):(off + 4n))), c.tile, c.tile)
 end
 
-# A tile's values: from the file when it is already there, from `parent` when it is not — and written on
-# the way through, so the next pass reads it back.
+# Make tile `(ti, tj)` present, deriving it from `c.parent` if it is not already.
 #
-# **The derivation happens outside the file lock**, so two tiles are derived at once while only their
-# transfers serialize. The tile's own lock is held across the whole of its fill, which is what makes a
-# second asker wait for the first rather than derive the same tile again.
-function _tile!(buf::Matrix{Float32}, c::TileCache, ti::Integer, tj::Integer)
+# **The derivation happens under this tile's own lock, and only this tile's.** Two tasks deriving
+# different tiles never contend — they take different locks and write disjoint bytes of the mapping —
+# which is what makes a blocked run's concurrent misses actually run concurrently.
+function _ensure_tile!(c::TileCache, ti::Integer, tj::Integer)
     k = (tj - 1) * c.ntiles[1] + ti
     @lock c.tiles[k] begin
         if c.present[k]
-            @lock c.io_lock begin
-                seek(c.io, _tile_offset(c, ti, tj))
-                read!(c.io, buf)
-            end
             Threads.atomic_add!(c.served, 1)
-        else
-            rows, cols = _tile_extent(c, ti, tj)
-            fill!(buf, 0.0f0)
-            # `view` into the buffer: an edge tile is narrower than the grid, and the padding stays zero.
-            copyto!(view(buf, 1:length(rows), 1:length(cols)), c.parent[rows, cols])
-            @lock c.io_lock begin
-                seek(c.io, _tile_offset(c, ti, tj))
-                write(c.io, buf)
-            end
-            c.present[k] = true
-            Threads.atomic_add!(c.filled, 1)
+            return nothing
         end
+        buf = _tile_array(c, ti, tj)
+        rows, cols = _tile_extent(c, ti, tj)
+        fill!(buf, 0.0f0)
+        copyto!(view(buf, 1:length(rows), 1:length(cols)), c.parent[rows, cols])
+        c.present[k] = true
+        Threads.atomic_add!(c.filled, 1)
     end
-    return buf
+    return nothing
 end
 
 function Base.getindex(c::TileCache, rows::AbstractUnitRange, cols::AbstractUnitRange)
     checkbounds(c, rows, cols)
     out = Matrix{Float32}(undef, length(rows), length(cols))
-    buf = Matrix{Float32}(undef, c.tile, c.tile)
     for tj in _tile_span(c, cols), ti in _tile_span(c, rows)
-        _tile!(buf, c, ti, tj)
+        _ensure_tile!(c, ti, tj)
+        buf = _tile_array(c, ti, tj)
         trows, tcols = _tile_extent(c, ti, tj)
         # The part of this tile the request wants, in the tile's own indices and in the output's.
         wr = intersect(rows, trows)
@@ -164,12 +183,9 @@ AutoRIFT.ondisk(::TileCache) = true
 """
     cache_report(c::TileCache) -> String
 
-How many tiles were derived and how many were served from the file.
+How many tiles were derived and how many were served from the mapping.
 
 The ratio is what the cache bought: a run that swept the grid `n` times reads `n` tiles for every one it
 derives, so `served / filled` approaching `2 * levels - 1` is the multiplicity removed.
 """
-cache_report(c::TileCache) =
-    string(c.filled[], " tiles derived, ", c.served[], " served from disk (",
-           c.filled[] == 0 ? "-" : string(round(c.served[] / c.filled[]; digits = 2)), "x reuse), ",
-           round(c.filled[] * _tile_bytes(c) / 2^30; digits = 2), " GiB written")
+cache_report(c::TileCache) = AutoRIFT._tile_cache_report(c.filled[], c.served[], _tile_bytes(c))

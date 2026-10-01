@@ -1,6 +1,6 @@
 using AutoRIFT: autorift, autorift!, reinit!, init, Cache, MultichipResult, nmeasured,
                 pointset, gridpoints, params, Params, ZNCC, Highpass,
-                PyramidRefine, GardnerFilter
+                PyramidRefine, GardnerFilter, ImagePair
 
 med(v) = (s = sort(collect(v)); isempty(s) ? NaN : s[(length(s) + 1) ÷ 2])
 motion(r) = (med(filter(!isnan, -r.dx)), med(filter(!isnan, -r.dy)))
@@ -105,6 +105,49 @@ end
     before = AutoRIFT.imagepair(c2)
     @test reinit!(c2) === c2
     @test AutoRIFT.imagepair(c2) === before
+end
+
+# Files `FilterTileCache` is currently holding open, anywhere under `tempdir()` — a one-shot call must
+# leave this at zero, and `reinit!` must not accumulate one per pair. `onerror` skips a directory this
+# process cannot list (macOS keeps a few under `/tmp` it refuses even the owning user) rather than
+# failing the count over directories no cache would ever be written into.
+scratch_files() = sum(count(f -> startswith(f, "filtertilecache_"), files)
+                      for (_, _, files) in walkdir(tempdir(); onerror = _ -> nothing); init = 0)
+
+@testset "filter_cache_tile matches the uncached run, and leaks no scratch file" begin
+    ref, sec = shifted_pair(512, (6, -4); T = Float32)
+    kw = (; chip_size = 32, search_radius = 25, process_block_size = (160, 160))
+
+    plain = autorift(ref, sec; kw...)
+    cached = autorift(ref, sec; kw..., filter_cache_tile = 64)
+    @test all(isequal.(plain.dx, cached.dx))
+    @test all(isequal.(plain.dy, cached.dy))
+    @test plain.chip_size == cached.chip_size
+    @test plain.interpolated == cached.interpolated
+
+    before = scratch_files()
+    autorift(ref, sec; kw..., filter_cache_tile = 64)
+    @test scratch_files() == before
+
+    # Through the positional entry point too — the one `tools/golden/e2e_run.jl` actually calls.
+    grid = gridpoints(size(ref), 24; chip_size = 32, search_radius = 25)
+    p = params(; chip_size = 32, search_radius = 25)
+    direct = AutoRIFT.autorift(ImagePair(ref, sec), grid, p, (160, 160), 0, 64)
+    @test scratch_files() == before
+
+    # Through `init`/`reinit!`: the cache must be rebuilt for the new pair, not answer from the old
+    # one's tiles, and the count must still not grow after two pairs through one cache.
+    b_ref, b_sec = shifted_pair(512, (-9, 3); T = Float32)
+    c = init(ref, sec; kw..., filter_cache_tile = 64)
+    first = autorift!(c)
+    @test all(isequal.(first.dx, cached.dx))
+    reinit!(c; reference = b_ref, secondary = b_sec)
+    second = autorift!(c)
+    fresh = autorift(b_ref, b_sec; kw...)
+    @test all(isequal.(second.dx, fresh.dx))
+    @test all(isequal.(second.dy, fresh.dy))
+    close(c)
+    @test scratch_files() == before
 end
 
 @testset "repeated runs do not recompute" begin
