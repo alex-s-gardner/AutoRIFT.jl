@@ -200,12 +200,17 @@ function aligned_scenes(c::GoldenCase)
     rpath, spath = scene_path(c, :reference), scene_path(c, :secondary)
     rfp, sfp = scene_footprint(rpath), scene_footprint(spath)
     target = footprint_epsg(rfp)
-    target == footprint_epsg(sfp) && return (rpath, spath)
+    # The footprints come back with the paths. Reading one is a remote open, and the caller needs exactly
+    # these two; recomputing them there cost four opens per run where two will do.
+    target == footprint_epsg(sfp) && return (rpath, spath, rfp, sfp)
 
     dir = joinpath(CACHE, "reprojected", c.product)
     mkpath(dir)
     @info "reprojecting a cross-projection pair" product=c.product target reference=footprint_epsg(rfp) secondary=footprint_epsg(sfp) dir
-    return (_warp_to(rpath, rfp, target, dir), _warp_to(spath, rfp, target, dir))
+    # A warped scene has its own geotransform and extent, so its footprint is the warped file's rather
+    # than the one measured above.
+    wr, ws = _warp_to(rpath, rfp, target, dir), _warp_to(spath, rfp, target, dir)
+    return (wr, ws, scene_footprint(wr), scene_footprint(ws))
 end
 
 # `reference` supplies the resolution for both scenes, since that is what the reference warps to.

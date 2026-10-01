@@ -144,8 +144,14 @@ end
 # Every pixel within `r` of a set one. Separable: one sweep along each axis carrying the distance since the
 # last set pixel, rather than a window per pixel — a 21x21 window over half a billion pixels does not
 # finish.
+#
+# **The buffer is `Matrix{Bool}`, not `BitMatrix`, and that is a correctness requirement.** The row sweep
+# writes `out[i, :]` from several tasks at once, and a `BitMatrix` packs 64 elements into a word, so rows
+# that share a word lose each other's updates — the hazard `src/parallel.jl` records. One byte per element
+# gives every task its own addressable memory. It costs one byte per pixel where a bitmap costs one bit;
+# `BitMatrix` here would be eight times smaller and sometimes wrong.
 function _dilate(src::AbstractMatrix{Bool}, r::Integer)
-    out = BitMatrix(src)
+    out = Matrix{Bool}(src)
     nr, nc = size(out)
     sweep!(get, set, n) = begin
         d = r + 1
@@ -372,6 +378,9 @@ struct Setup
     window::CartesianIndices{2}
     transform::Any
     geometry::Any
+    # The twelve parameter windows the geogrid was solved from, kept rather than refetched: each is a
+    # `/vsicurl` read, and a caller converting the result to a velocity needs `vx`/`vy`/`ssm` again.
+    inputs::Any
 end
 
 """
@@ -440,9 +449,12 @@ function setup(c::GoldenCase; n::Union{Integer,Nothing} = nothing, proj_only::Bo
     #
     # A NISAR L2 GSLC is geocoded and its two amplitude rasters are already on one map grid, so the pair
     # is read from the run directory instead — see `gslc_amplitude_paths` on why they are not rebuilt.
-    rpath, spath = c.platform == "NISAR-L2" ? gslc_amplitude_paths(c, run) : aligned_scenes(c)
-    rfp = scene_footprint(rpath)
-    sfp = scene_footprint(spath)
+    rpath, spath, rfp, sfp = if c.platform == "NISAR-L2"
+        gp, gs = gslc_amplitude_paths(c, run)
+        (gp, gs, scene_footprint(gp), scene_footprint(gs))
+    else
+        aligned_scenes(c)
+    end
     pair = coregister(rfp, sfp; dt = geogrid_seconds(c))
 
     epsg = footprint_epsg(rfp)
@@ -456,10 +468,11 @@ function setup(c::GoldenCase; n::Union{Integer,Nothing} = nothing, proj_only::Bo
     # carries a different sentinel is handled, and with `nothing` becoming `0.0` because the reference
     # passes `pbSuccess = NULL` and so cannot distinguish an unset nodata from zero.
     nd = ArchGDAL.getnodatavalue(ArchGDAL.getband(ArchGDAL.read(info.paths.dem), 1))
-    g = _geogrid(grid, pair, geometry_inputs(info, window), window, nd,
+    inputs = geometry_inputs(info, window)
+    g = _geogrid(grid, pair, inputs, window, nd,
                  () -> grid_transform(info.epsg, epsg; proj_only))
 
-    return Setup(c, run, rpath, spath, pair, epsg, info, grid, window, tf, g)
+    return Setup(c, run, rpath, spath, pair, epsg, info, grid, window, tf, g, inputs)
 end
 
 """
@@ -500,11 +513,12 @@ function _radar_setup(c::GoldenCase, run::AbstractString, proj_only::Bool)
     window = grid_window(grid, footprint_bounds(tf, coord))
 
     nd = ArchGDAL.getnodatavalue(ArchGDAL.getband(ArchGDAL.read(info.paths.vx), 1))
-    g = _geogrid(grid, pair, geometry_inputs(info, window), window, nd,
+    inputs = geometry_inputs(info, window)
+    g = _geogrid(grid, pair, inputs, window, nd,
                  () -> grid_transform(info.epsg, 4326; proj_only))
 
     return Setup(c, run, joinpath(run, "reference.tif"), joinpath(run, "secondary.tif"),
-                 pair, info.epsg, info, grid, window, tf, g)
+                 pair, info.epsg, info, grid, window, tf, g, inputs)
 end
 
 """
