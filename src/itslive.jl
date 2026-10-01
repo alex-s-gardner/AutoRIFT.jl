@@ -72,6 +72,24 @@ way costs no second fetch. See `ext/AutoRIFTImagePairGeometryExt.jl`.
 function reference_velocity end
 
 """
+    chip_size_scale(g) -> Float64
+
+The y:x chip-size ratio `g` implies, which is [`ItsLiveInput`](@ref)'s `scale_chip_size_y`.
+
+The median of `chip_min_y / chip_min_x` over the points carrying both bounds. Because the parameter
+chip sizes are square on the ground, that ratio is the y:x *pixel size* ratio — `1.0` wherever the
+pixel is square, and about `0.25` on a Sentinel-1 pair, varying per acquisition with the
+azimuth:range ratio.
+
+[`params`](@ref) derives the base level's chip extent from this same value, but rounds it to an even
+pixel count on the way; a product needs the unrounded ratio, because it is re-applied to every chip
+size rather than to the base alone.
+
+Defined when `ImagePairGeometry` is loaded, for `g::ImagePairGeometry.PairGeometry`.
+"""
+function chip_size_scale end
+
+"""
     ItsLiveGeoref
 
 The output grid and its CF grid-mapping metadata.
@@ -158,6 +176,28 @@ struct ImagePairInfo
     longitude::Float64
     extra::Dict{String,Any}
 end
+
+"""
+    roi_valid_percentage(chip_size_x, search_limit_x) -> Float64
+
+The percentage of searched grid points the correlator resolved, which is [`ImagePairInfo`](@ref)'s
+`roi_valid_percentage`.
+
+The denominator counts every point with a nonzero search limit — the points a search was attempted at,
+which is what "ROI" names here — and the numerator every point the correlator returned a chip size for.
+Both arrays cover the whole grid before cropping, and both must already carry the no-data exclusions:
+a point no search was attempted at belongs to neither count. `search_limit_x` is therefore the limit
+the correlator was given with the dilated no-data mask applied over it, not the geogrid's raw band.
+
+The ratio is quantized to three decimals before being scaled, so the result is a whole number of tenths
+of a percent. It carries more than the attribute: a value that floors to `0` selects the uncropped
+schema, which [`ImagePairInfo`](@ref) describes.
+
+Throws when no point was searched, since a ratio over an empty ROI has no value to report.
+
+Requires `using NCDatasets`; the method is defined in the `ItsLiveAutoRIFT` package extension.
+"""
+function roi_valid_percentage end
 
 """
     SwathOffsetBias

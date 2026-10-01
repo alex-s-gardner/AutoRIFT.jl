@@ -536,6 +536,22 @@ end
 
 const MISSION_NAMES = Dict("L" => "Landsat ", "S" => "Sentinel-", "N" => "NISAR")
 
+# `testautoRIFT.py:1366`. The ratio is quantized to three decimals as a *fraction* and only then scaled
+# to a percentage, so `0.784` becomes `78.4` — quantizing the percentage instead would keep a digit the
+# reference discards. `round` is half-to-even on both sides.
+function AutoRIFT.roi_valid_percentage(chip_size_x::AbstractArray,
+                                        search_limit_x::AbstractArray)
+    axes(chip_size_x) == axes(search_limit_x) || throw(DimensionMismatch(
+        "chip_size_x and search_limit_x must cover the same grid: $(axes(chip_size_x)) vs " *
+        "$(axes(search_limit_x))"))
+    searched = count(!iszero, search_limit_x)
+    searched == 0 && throw(ArgumentError(
+        "every search limit is zero, so no point was searched and the valid fraction has no " *
+        "denominator"))
+    resolved = count(!iszero, chip_size_x)
+    return round(Int, resolved / searched * 1000) / 1000 * 100
+end
+
 function _satellite_attribute(info::ImagePairInfo)
     haskey(MISSION_NAMES, info.mission_img1) ||
         throw(ArgumentError("unrecognized mission code $(info.mission_img1)"))

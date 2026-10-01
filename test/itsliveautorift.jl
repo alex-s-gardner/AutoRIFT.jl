@@ -243,3 +243,27 @@ end
                                   falses(n, n))
     @test_throws "requires swath_bias to be nothing" AutoRIFT.write(tempname() * ".nc", input)
 end
+
+@testset "roi_valid_percentage quantizes the fraction, not the percentage" begin
+    # The reference quantizes to three decimals as a *fraction* and only then scales by 100
+    # (`testautoRIFT.py:1366`), so the result lands on a whole tenth of a percent. 8 of 9 is
+    # 0.8888…, which quantizes to 0.889 and scales to 88.9; quantizing the percentage instead would
+    # keep 88.889.
+    search = UInt8[1 1 1; 1 1 1; 1 1 1]
+    chip = UInt16[16 16 16; 16 16 16; 16 16 0]
+    @test AutoRIFT.roi_valid_percentage(chip, search) == 88.9
+
+    # A point outside the ROI is in neither count, so zeroing it in both arrays raises the fraction.
+    search2 = UInt8[1 1 1; 1 1 1; 1 1 0]
+    @test AutoRIFT.roi_valid_percentage(chip, search2) == 100.0
+
+    # Every point resolved, and none.
+    @test AutoRIFT.roi_valid_percentage(fill(UInt16(16), 4, 4), fill(UInt8(1), 4, 4)) == 100.0
+    @test AutoRIFT.roi_valid_percentage(zeros(UInt16, 4, 4), fill(UInt8(1), 4, 4)) == 0.0
+
+    # An empty ROI has no denominator, and a mismatched grid is a caller error rather than a ratio.
+    @test_throws "no point was searched" AutoRIFT.roi_valid_percentage(zeros(UInt16, 2, 2),
+                                                                      zeros(UInt8, 2, 2))
+    @test_throws DimensionMismatch AutoRIFT.roi_valid_percentage(zeros(UInt16, 2, 2),
+                                                                 ones(UInt8, 3, 3))
+end

@@ -293,6 +293,25 @@ function AutoRIFT.image_location(g::PairGeometry)
 end
 
 """
+    AutoRIFT.chip_size_scale(g::PairGeometry) -> Float64
+
+The median of `chip_min_y / chip_min_x` over the points carrying both bounds.
+
+Over the points where *both* bounds are present, which is the reference's own condition: a point
+missing either would contribute a ratio of zero or a division by zero.
+"""
+function AutoRIFT.chip_size_scale(g::PairGeometry)
+    sentinel = Int32(g.nodata.output)
+    ratios = [Float64(y) / Float64(x)
+              for (x, y) in zip(g.chip_min_x, g.chip_min_y)
+              if x != sentinel && y != sentinel && x > 0 && y > 0]
+    isempty(ratios) && throw(ArgumentError(
+        "the geometry carries no point with both chip-size minima present, so the y:x chip ratio " *
+        "cannot be derived. It was computed without `csminx`/`csminy`."))
+    return _median!(ratios)
+end
+
+"""
     AutoRIFT.params(g::PairGeometry; chip_size_0 = 240.0, optical, kwargs...) -> Params
 
 The correlator settings the ITS_LIVE driver derives from a geogrid result.
@@ -342,15 +361,7 @@ function AutoRIFT.params(g::PairGeometry; chip_size_0 = 240.0,
     # spacing would make it too small by `1 / sin(incidence)`.
     chip_x = chip_size_pixels(chip_size_0, xsize(g.coordinate))
 
-    # Over the points where *both* bounds are present, which is the reference's own condition. A
-    # point missing either would contribute a ratio of zero or a division by zero.
-    ratios = [Float64(y) / Float64(x)
-              for (x, y) in zip(g.chip_min_x, g.chip_min_y)
-              if x != sentinel && y != sentinel && x > 0 && y > 0]
-    isempty(ratios) && throw(ArgumentError(
-        "the geometry carries no point with both chip-size minima present, so the y:x chip ratio " *
-        "cannot be derived. It was computed without `csminx`/`csminy`."))
-    scale_y = _median!(ratios)
+    scale_y = AutoRIFT.chip_size_scale(g)
 
     max_x = maximum(x -> x == sentinel ? Int32(0) : x, g.chip_max_x)
     max_x > 0 || throw(ArgumentError(
