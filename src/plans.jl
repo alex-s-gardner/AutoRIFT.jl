@@ -256,7 +256,9 @@ function _measuring_new_size!()
     (WISDOM_IMPORTED[] || WISDOM_WARNED[]) && return nothing
     WISDOM_WARNED[] = true
     path = fftw_wisdom_path()
-    @warn """
+    # The parenthesised call form, because a bare `@warn msg key = val` cannot span lines: a field on
+    # its own line parses as a *separate assignment* and silently vanishes from the record.
+    @warn("""
           No FFTW wisdom for this machine, so FFTW wisdom is being measured now. This run is slower \
           than a steady-state one, and any benchmark or profile taken from it includes plan \
           measurement rather than only correlation.
@@ -265,7 +267,9 @@ function _measuring_new_size!()
           once-per-machine cost — unless the file below does not persist between runs, which is the \
           usual case in a container. Set `AUTORIFT_FFTW_WISDOM_DIR` to a directory that outlives the \
           process, and `AutoRIFT.precompute_fftw_wisdom` to populate it ahead of the first real job.
-          """ fftw_wisdom_file = isnothing(path) ? "none: no writable directory for FFTW wisdom" : path AUTORIFT_FFTW_WISDOM_DIR = get(ENV, FFTW_WISDOM_DIR_VAR, "unset")
+          """,
+          fftw_wisdom_file = isnothing(path) ? "none: no writable directory" : path,
+          AUTORIFT_FFTW_WISDOM_DIR = get(ENV, FFTW_WISDOM_DIR_VAR, "unset"))
     return nothing
 end
 
@@ -533,6 +537,10 @@ Without this, every task racing to correlate its first point would contend on th
 planner lock and serialise — turning the most parallel part of the run into its
 most serial. Called once per pass, where the set of sizes is known in advance.
 
+`persist` writes the FFTW wisdom measured here when the call finishes. Pass `false` from a caller
+that warms many sizes in sequence and persists on its own schedule: FFTW's export has no incremental
+form, so every call rewrites the whole accumulated file.
+
 `complex` selects the complex-to-complex pair that [`Coherence`](@ref) executes instead of the
 real-to-complex pair the real measures use. It must match the measure the pass will actually run:
 warming the wrong kind is doubly wrong, since it pays full `PLAN_FLAGS` planning — hundreds of
@@ -542,7 +550,7 @@ function exists to prevent. Verified
 against a coherence pass before this argument existed: it warmed `RFFT_PLANS[(72,72)]`, never used
 it, and built `CFFT_PLANS[(72,72)]` lazily under the lock.
 """
-function warm_plans!(sizes; complex::Bool = false)
+function warm_plans!(sizes; complex::Bool = false, persist::Bool = true)
     for (ny, nx) in sizes
         if complex
             cfft_plan(ny, nx)
@@ -554,7 +562,7 @@ function warm_plans!(sizes; complex::Bool = false)
     end
     # Persist whatever was measured, so the next process starts warm. Only writes if a plan was
     # actually created — the common case after the first run is that this does nothing.
-    save_fftw_wisdom!()
+    persist && save_fftw_wisdom!()
     return nothing
 end
 
@@ -576,7 +584,7 @@ end
 function _ladder_sizes(chip, rungs)
     out = Set{Tuple{Int,Int}}()
     for by in rungs, bx in rungs
-        push!(out, (next_fft_size(chip.Y + 2by - 1), next_fft_size(chip.X + 2bx - 1)))
+        push!(out, _padded_fft_size(chip, by, bx))
     end
     return out
 end
@@ -640,16 +648,9 @@ function precompute_fftw_wisdom(p::Params; max_search_radius::Integer,
     last_report = started
     done_cost = 0.0
     for (i, (sz, complex)) in enumerate(work)
-        ny, nx = sz
-        # The plan constructors directly rather than `warm_plans!`, which exports FFTW wisdom on every
-        # call: per size that would rewrite a growing file once per plan instead of once per report.
-        if complex
-            cfft_plan(ny, nx)
-            icfft_plan(ny, nx)
-        else
-            fft_plan(ny, nx)
-            ifft_plan(ny, nx)
-        end
+        # `persist = false`: this loop writes FFTW wisdom on its own schedule below, where
+        # `warm_plans!` would otherwise rewrite the whole accumulated file once per size.
+        warm_plans!((sz,); complex, persist = false)
         done_cost += _plan_cost_weight(sz)
         now = time()
         if i < total && now - last_report >= progress_interval

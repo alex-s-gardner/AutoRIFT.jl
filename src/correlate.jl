@@ -745,6 +745,21 @@ function next_fft_size(n::Integer)
     return best
 end
 
+# The transform a chip of extent `chip` searched at radius `(ry, rx)` is correlated through.
+#
+# One home for the mapping, because three callers need it and they must agree exactly: the plan warmed
+# ahead of a pass (`_warm_pass_plans`), the plan warmed for a whole grid (`_warm_grid_plans`), and the
+# set `precompute_fftw_wisdom` measures up front. A padding convention that differs between them builds
+# a plan at a size nothing ever executes, which costs the measurement it was meant to save and raises
+# no error.
+#
+# `2r - 1` is the full cross-correlation support: a chip of `n` against a window reaching `r` either
+# side overlaps at `n + 2r - 1` positions. The result is `(row, column)` because an FFT buffer is a
+# matrix, where the extent is x-first — naming both axes at every call site is what keeps that
+# transposition visible.
+_padded_fft_size(chip, ry::Integer, rx::Integer) =
+    (next_fft_size(chip.Y + 2ry - 1), next_fft_size(chip.X + 2rx - 1))
+
 """
     AutoRIFT.RADIUS_BUCKET_RUNGS
 
