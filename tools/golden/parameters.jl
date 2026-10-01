@@ -15,9 +15,62 @@
 
 using ArchGDAL, NetworkOptions, ImagePairGeometry
 using GeoFormatTypes: EPSG
+using Printf: @sprintf
+using Serialization: serialize, deserialize
 
 const PARAMETER_SHAPEFILE =
     "/vsicurl/https://its-live-data.s3.amazonaws.com/autorift_parameters/v001/autorift_landice_0120m.shp"
+
+
+# ---------------------------------------------------------------------------
+# A local cache for the remote parameter reads
+# ---------------------------------------------------------------------------
+#
+# The twelve parameter rasters are hemisphere tiles at 120 m on a public bucket, read over `/vsicurl`
+# by grid window. Nothing about them changes between runs — the URL is pinned to `v001` — but every run
+# paid for them again. Measured on the golden Landsat 8 case: `geometry_inputs` 7.07 s and
+# `parameter_info` 2.11 s, which was most of the geometry stage.
+#
+# Keyed by what the answer depends on and nothing else: a window by its raster's file name and its own
+# offset and extent, a region by the coordinate looked up. Two cases sharing a region and window share
+# the entry.
+#
+# Set `AUTORIFT_PARAM_CACHE` to an empty string to bypass the cache, which is what a measurement of the
+# uncached cost wants.
+
+param_cache_dir() = get(ENV, "AUTORIFT_PARAM_CACHE", joinpath(CACHE, "autorift_params"))
+
+_cache_enabled() = !isempty(param_cache_dir())
+
+# Written through a temporary and renamed, so an entry is either absent or complete. A half-written
+# entry that still deserialized would be the worst case: silently wrong numbers rather than a miss.
+function _cache_put(path::AbstractString, value)
+    _cache_enabled() || return value
+    try
+        mkpath(dirname(path))
+        tmp = path * ".partial"
+        open(io -> serialize(io, value), tmp, "w")
+        mv(tmp, path; force = true)
+    catch e
+        # A cache that cannot be written is a slow run, not a wrong one.
+        @warn "could not write a parameter cache entry" path exception = e
+    end
+    return value
+end
+
+# `nothing` for a miss. A corrupt or Julia-version-stale entry is reported and removed rather than
+# passed on: the authoritative read follows, so the run is still correct, but silence here would hide a
+# cache that never hits.
+function _cache_get(path::AbstractString)
+    (_cache_enabled() && isfile(path)) || return nothing
+    try
+        return open(deserialize, path)
+    catch e
+        @warn "discarding an unreadable parameter cache entry" path exception = e
+        rm(path; force = true)
+        return nothing
+    end
+end
 
 """
     gdal_network_setup()
@@ -39,6 +92,19 @@ function gdal_network_setup()
         haskey(ENV, var) || (ENV[var] = NetworkOptions.ca_roots_path())
     end
     ArchGDAL.setconfigoption("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
+    # Transport settings for the `/vsicurl` and `/vsis3` reads. The default read chunk is 16 KiB, which
+    # turns one band into thousands of round trips on a link whose cost is latency rather than bandwidth.
+    # Measured on a 338 MiB Landsat band: these take a parallel read from 37.1 s to 32.3 s, and a serial
+    # one is 54.9 s. Modest, which is itself the finding — `aws s3 cp`, which uses no GDAL, manages
+    # 8.7 MB/s on the same object, so the transport and not the client is the limit.
+
+    for (key, value) in ("CPL_VSIL_CURL_CHUNK_SIZE" => "1048576",
+                         "CPL_VSIL_CURL_CACHE_SIZE" => "268435456",
+                         "GDAL_HTTP_MULTIPLEX" => "YES",
+                         "GDAL_HTTP_VERSION" => "2",
+                         "VSI_CACHE" => "TRUE")
+        ArchGDAL.setconfigoption(key, value)
+    end
     return nothing
 end
 
@@ -72,6 +138,11 @@ Throws if no feature contains the point, since a pair outside the parameter cove
 processed at all and silently falling back to a region would compare against the wrong rasters.
 """
 function parameter_info(lon::Real, lat::Real)
+    # Four decimals of degree is about ten metres, far finer than a region polygon's edge, so this keys
+    # the lookup exactly for a given pair without two pairs colliding across a boundary.
+    key = joinpath(param_cache_dir(), "regions", @sprintf("%.4f_%.4f.jls", lon, lat))
+    hit = _cache_get(key)
+    hit === nothing || return hit
     gdal_network_setup()
     ds = ArchGDAL.read(PARAMETER_SHAPEFILE)
     layer = ArchGDAL.getlayer(ds, 0)
@@ -94,7 +165,7 @@ function parameter_info(lon::Real, lat::Real)
     end
     hit === nothing && error("no ITS_LIVE parameter region contains ($lon, $lat); the pair is " *
                              "outside the coverage of $PARAMETER_SHAPEFILE")
-    return hit
+    return _cache_put(key, hit)
 end
 
 # The shapefile stores plain HTTPS URLs; GDAL needs the `/vsicurl/` prefix to read one as a raster.
@@ -133,8 +204,13 @@ one, by whole steps of whatever the raster quantizes to.
 """
 function parameter_window(path::AbstractString, window::CartesianIndices{2})
     xs, ys = window.indices
+    xoff, yoff, nx, ny = first(xs) - 1, first(ys) - 1, length(xs), length(ys)
+    key = joinpath(param_cache_dir(), "windows",
+                   "$(basename(path))_$(xoff)_$(yoff)_$(nx)x$(ny).jls")
+    hit = _cache_get(key)
+    hit === nothing || return hit
     ds = ArchGDAL.read(path)
-    return Float64.(ArchGDAL.read(ds, 1, first(xs) - 1, first(ys) - 1, length(xs), length(ys)))
+    return _cache_put(key, Float64.(ArchGDAL.read(ds, 1, xoff, yoff, nx, ny)))
 end
 
 """
