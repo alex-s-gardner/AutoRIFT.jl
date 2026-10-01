@@ -1004,7 +1004,7 @@ function _warm_grid_plans(grid::PointSet{2}, p::Params)
     csizes = chip_sizes(p)
     for k in eachindex(csizes)
         cs = csizes[k]
-        sz = (next_fft_size(cs.Y + 2ry - 1), next_fft_size(cs.X + 2rx - 1))
+        sz = _padded_fft_size(cs, ry, rx)
         if _wants_complex_plans(measure_at(p, k))
             warm_plans!((sz,); complex = true)
         else

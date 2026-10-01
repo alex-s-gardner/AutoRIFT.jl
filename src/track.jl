@@ -440,9 +440,8 @@ function _warm_pass_plans(chip::Extent, radius::Extent, pts::PointSet,
         # `(fy, fx)` and not `(fx, fy)`: an FFT buffer is a matrix, so its size follows Julia's
         # row-first convention rather than the extent's x-first one. Naming the axes on the way in is
         # what makes that transposition visible here instead of silent.
-        fy = next_fft_size(chip.Y + 2b.Y - 1)
-        fx = next_fft_size(chip.X + 2b.X - 1)
-        (fy, fx) in sizes || push!(sizes, (fy, fx))
+        sz = _padded_fft_size(chip, b.Y, b.X)
+        sz in sizes || push!(sizes, sz)
     end
     warm_plans!(sizes; complex = _wants_complex_plans(measure))
     return nothing
