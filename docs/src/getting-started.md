@@ -20,17 +20,31 @@ is loaded by you rather than installed as a dependency:
 
 ## One correlation
 
-You need two images of the same scene, on the same grid, differing by motion. Here they are synthetic so
-the example is self-contained:
+You need two images of the same scene, on the same grid, differing by motion. A photograph makes the
+motion something you can see, so that is what this page uses — warped here rather than photographed
+twice, so the answer is known:
 
 ```@example start
 using AutoRIFT
-include("../figures.jl")  # plotting helpers and the synthetic scenes; see [Plotting](@ref)
+include("../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 
-# A texture, and a copy of it whose features moved 6 pixels left and 2 pixels down.
-reference, secondary, _, _ = warped_pair(512, (row, col) -> (6.0, -2.0); seed = 13)
+# The surface slid sideways, fastest down the middle and slowing to the top and bottom edges, with a
+# slight downward drift everywhere. Ice in a valley moves like this.
+flow(row, col) = (4.0 + 12.0 * sin(pi * row / 512), -2.0)
+
+reference, secondary, true_dx, true_dy = warped_pair(photo(), 512, flow)
 
 image_panels(reference, secondary)
+```
+
+Look at the two panels before reading on. The crowd across the middle has shifted noticeably to the
+left; Ali's shoulders at the top have barely moved. That difference *is* the measurement — a single
+number for the whole frame would throw it away.
+
+Here is the field that was applied, which the result below should reproduce:
+
+```@example start
+field_panels(true_dx, true_dy; titles = ("true dx (px)", "true dy (px)"))
 ```
 
 That is the whole input. The call:
@@ -63,7 +77,13 @@ using Statistics: median
 (median_dx = median(filter(isfinite, out.dx)), median_dy = median(filter(isfinite, out.dy)))
 ```
 
-Six pixels in x and minus two in y, which is what the scene was built with.
+`dy` comes back at the −2 the whole scene was given. The median `dx` is less interesting, and that is
+the point: `dx` is not one number here, it runs from about 4 at the edges to 16 down the middle, so
+summarizing it with a median describes no part of the scene. Compare the `dx` panel above against the
+true field rather than reducing it.
+
+The grid is coarser than the image — 11×11 points by default, which is why the panels look blocky
+beside the 512×512 input. `grid_spacing` sets that, and [A guided walkthrough](@ref) measures what it costs.
 
 !!! note "The sign is the offset, not the motion"
     `dx`/`dy` point from the secondary image back to the reference, which is the *opposite* of how the
@@ -89,7 +109,7 @@ than `peak_ratio`.
 
 ## Where to go next
 
-- **[A guided walkthrough](@ref)** — the same scene through eight steps, adding one capability at a time:
+- **[A guided walkthrough](@ref)** — a scene with a decorrelating shear band, through eight steps that add one capability at a time:
   chip size, grid spacing, multiple chip sizes, priors, and settings that vary across the scene. This is
   the page to read next.
 - **[Geospatial data](@ref)** — if your images are rasters, what changes: `vx`/`vy` in map orientation,

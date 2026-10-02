@@ -6,6 +6,7 @@
 # produced — a wrong figure then requires a wrong package, which a stored array would not.
 
 using CairoMakie
+import FileIO
 using Random: MersenneTwister, randn
 using Statistics: quantile
 
@@ -49,22 +50,29 @@ function symlimits(fields...)
 end
 
 """
-    image_panels(images...; titles) -> Figure
+    image_panels(images...; titles, shared = true) -> Figure
 
 A row of input images on a shared grayscale.
+
+`shared = false` scales each panel to its own range instead, and drops the colorbar — for comparing
+images whose units differ, where one shared scale would crush every panel but the widest-ranging one.
+A shared scale is the default because for two images of the same scene a brightness difference between
+them is a real difference the figure should show.
 """
-function image_panels(images...; titles = ("reference", "secondary"), size = (900, 420))
+function image_panels(images...; titles = ("reference", "secondary"), size = (900, 420),
+                      shared::Bool = true)
     fig = Figure(; size, figure_padding = 10)
     # A percentile range rather than the extremes: added noise puts a few pixels far outside the
     # surface's own range, and scaling to those flattens the features the figure exists to show.
-    vals = mapreduce(vec, vcat, images)
-    lim = (quantile(vals, 0.01), quantile(vals, 0.99))
+    span(vals) = (quantile(vals, 0.01), quantile(vals, 0.99))
+    lim = shared ? span(mapreduce(vec, vcat, images)) : nothing
     local hm
     for (i, (img, title)) in enumerate(zip(images, titles))
         hm = heatmap!(panel(fig, (1, i), title), mapshow(Float64.(img));
-                      colormap = :grays, colorrange = lim)
+                      colormap = :grays,
+                      colorrange = isnothing(lim) ? span(vec(Float64.(img))) : lim)
     end
-    Colorbar(fig[1, length(images) + 1], hm)
+    shared && Colorbar(fig[1, length(images) + 1], hm)
     return fig
 end
 
@@ -148,6 +156,23 @@ function surface_panels(chip, window, surface; size = (1200, 400))
     scatter!(ax, [Float64(pj)], [Float64(Base.size(surface, 1) - pi_ + 1)];
              marker = :cross, markersize = 18, color = :cyan, strokewidth = 0)
     Colorbar(fig[1, 4], hm)
+    return fig
+end
+
+"""
+    mask_panels(masks...; titles) -> Figure
+
+A row of boolean per-point masks on a fixed two-level scale, so `true` reads identically in every panel
+and the eye compares the pattern rather than a shade.
+
+Each title carries its own `count`, so the figure and the number the page quotes cannot drift apart.
+"""
+function mask_panels(masks...; titles, size = (1100, 400))
+    fig = Figure(; size, figure_padding = 10)
+    for (i, (m, title)) in enumerate(zip(masks, titles))
+        ax = panel(fig, (1, i), "$title — $(count(m)) points")
+        heatmap!(ax, mapshow(Float64.(m)); colormap = [:gainsboro, :black], colorrange = (0, 1))
+    end
     return fig
 end
 
@@ -242,7 +267,35 @@ artificial edge inside a search window would make the correlation there a measur
 rather than of the motion.
 """
 function warped_pair(sz::Tuple{Int,Int}, offset; seed::Integer = 0, pad::Integer = 48)
-    big = texture((sz[1] + 2pad, sz[2] + 2pad); seed)
+    return _warp(texture((sz[1] + 2pad, sz[2] + 2pad); seed), sz, offset, pad)
+end
+
+warped_pair(n::Integer, offset; kw...) = warped_pair((Int(n), Int(n)), offset; kw...)
+
+"""
+    warped_pair(source::AbstractMatrix, sz, offset; pad) -> (reference, secondary, truth_dx, truth_dy)
+
+[`warped_pair`](@ref) over a supplied image rather than generated texture.
+
+`source` must be at least `sz .+ 2pad` in each dimension, and is center-cropped to exactly that; the
+margin is what the warp samples from, so a displacement near the edge still reads real image data.
+"""
+function warped_pair(source::AbstractMatrix, sz::Tuple{Int,Int}, offset; pad::Integer = 48)
+    need = (sz[1] + 2pad, sz[2] + 2pad)
+    all(size(source) .>= need) || throw(ArgumentError(
+        "source is $(size(source)) but a $(sz[1])x$(sz[2]) pair with pad=$pad needs at least " *
+        "$(need[1])x$(need[2]) — lower `pad` or supply a larger image"))
+    off = (size(source) .- need) .÷ 2
+    big = source[(off[1] + 1):(off[1] + need[1]), (off[2] + 1):(off[2] + need[2])]
+    return _warp(big, sz, offset, pad)
+end
+
+warped_pair(source::AbstractMatrix, n::Integer, offset; kw...) =
+    warped_pair(source, (Int(n), Int(n)), offset; kw...)
+
+# The crop-and-warp both `warped_pair` methods share: `big` is the oversized field, and the returned
+# pair is its centre with `offset` applied to the secondary.
+function _warp(big, sz::Tuple{Int,Int}, offset, pad::Integer)
     rows, cols = (pad + 1):(pad + sz[1]), (pad + 1):(pad + sz[2])
     reference = big[rows, cols]
     secondary = similar(reference)
@@ -255,7 +308,17 @@ function warped_pair(sz::Tuple{Int,Int}, offset; seed::Integer = 0, pad::Integer
     return Float32.(reference), Float32.(secondary), tdx, tdy
 end
 
-warped_pair(n::Integer, offset; kw...) = warped_pair((Int(n), Int(n)), offset; kw...)
+"""
+    photo() -> Matrix{Float64}
+
+The documentation's example photograph, as a 640x640 grey field in `[0, 1]`.
+
+A real photograph rather than generated texture for the pages whose point is that a reader can *see*
+the displacement: a recognizable subject moving against a fixed crowd is legible at a glance, where
+two panels of noise are not. `docs/src/assets/ali_liston.png` — Muhammad Ali over Sonny Liston,
+John Rooney / AP, 1965, public domain (published in the US without a copyright notice).
+"""
+photo() = Float64.(FileIO.load(joinpath(@__DIR__, "src", "assets", "ali_liston.png")))
 
 """
     decorrelate(img, weight; amplitude, seed) -> Matrix

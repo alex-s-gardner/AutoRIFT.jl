@@ -33,9 +33,11 @@ Two images of the same scene, differing by motion, in. A grid of sub-pixel displ
 
 ```@example home
 using AutoRIFT
-include("../figures.jl")  # plotting helpers and the synthetic scenes; see [Plotting](@ref)
+include("../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 
-reference, secondary, _, _ = warped_pair(512, (row, col) -> (6.0, -2.0); seed = 13)
+# A surface sliding sideways, fastest down the middle: the crowd shifts left, Ali's shoulders barely do.
+reference, secondary, _, _ =
+    warped_pair(photo(), 512, (row, col) -> (4.0 + 12.0 * sin(pi * row / 512), -2.0))
 out = autorift(reference, secondary)
 
 image_panels(reference, secondary)

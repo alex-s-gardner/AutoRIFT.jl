@@ -42,8 +42,9 @@ surface = AutoRIFT.correlate!(ws, window, chip, radius)
 surface_panels(chip, window, surface)
 ```
 
-The bright spot in the third panel is the answer. Its offset from the surface's centre is the
-displacement:
+The bright spot in the third panel is the answer. The surface is `2 * radius` across in each direction
+with zero displacement at its centre, so a spot one cell right of centre means `dx = 1`, and the panel's
+corners are displacements of ±`radius`. Its offset from the centre is therefore the displacement itself:
 
 ```@example tracking
 AutoRIFT.peak_offset(surface, (radius, radius))
