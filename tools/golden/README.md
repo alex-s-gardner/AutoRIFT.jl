@@ -6,6 +6,15 @@ ITS_LIVE granules built by `hyp3_autorift` 0.28.4 from the job list in
 publicly readable, each with `ncdump`, STAC, browse and metadata sidecars. Matching them is what
 makes AutoRIFT.jl production-ready.
 
+**The ITS_LIVE product scripts live in
+[`ItsLiveOffsetProduction.jl`](https://github.com/alex-s-gardner/ItsLiveOffsetProduction.jl)**, under
+its own `tools/golden/`: `julia_e2e.jl` (granule to product netCDF), `validate_itslive_write.jl` and
+`run_all_golden.jl` (the writer against a captured `netCDF_packaging` call), `capture_packaging.jl`,
+`run.jl` (product-level comparison and the reproducibility measurement), and
+`metadata_combination_check.jl`. What remains here is the correlator half: the stage ladder, the
+block-size and profiling tools, and the figures. `product.jl` and `compare.jl` stay in both, because
+`selftest.jl` gates them alongside the correlator stack.
+
 This is a larger target than the correlator. A golden `.nc` is `vx`/`vy`/`v`/`v_error` in m/yr as
 `int16`, plus chip sizes, an interpolation mask, a CRS variable, an image-pair metadata variable and
 fifteen global attributes, on a 120 m grid cropped to the valid-data extent. Producing one means
@@ -72,7 +81,7 @@ uncropped path, and its missing time coordinate is the observable difference.
 julia --project=tools/golden -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
 julia --project=tools/golden tools/golden/fetch.jl              # 22 products + sidecars, 140 MiB
 julia --project=tools/golden tools/golden/fetch.jl --check      # can inputs be reached? no downloads
-julia --project=tools/golden tools/golden/run.jl --status       # what is cached
+# `run.jl --status` (what is cached) is in ItsLiveOffsetProduction.jl
 ```
 
 Data lives outside the repository, under `~/data/autorift/tests/golden_tests` — override with
@@ -169,7 +178,8 @@ unmodified.
 
 ```bash
 docker pull --platform linux/arm64 ghcr.io/asfhyp3/hyp3-autorift:0.28.4
-julia --project=tools/golden tools/golden/run.jl --reproducibility S2B_MSIL1C_20200612
+# in ItsLiveOffsetProduction.jl:
+#   julia --project=tools/golden tools/golden/run.jl --reproducibility S2B_MSIL1C_20200612
 ```
 
 Run twice on one granule, the two products differ only in the `time` jitter. That is the

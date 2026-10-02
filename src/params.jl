@@ -474,3 +474,21 @@ function params(;
         back,
     )
 end
+
+"""
+    chip_size_scale(g) -> Float64
+
+The y:x chip-size ratio `g` implies.
+
+The median of `chip_min_y / chip_min_x` over the points carrying both bounds. Because the parameter
+chip sizes are square on the ground, that ratio is the y:x *pixel size* ratio — `1.0` wherever the
+pixel is square, and about `0.25` on a Sentinel-1 pair, varying per acquisition with the
+azimuth:range ratio.
+
+[`params`](@ref) derives the base level's chip extent from this same value, but rounds it to an even
+pixel count on the way. The unrounded ratio is exposed separately because a caller re-applying the
+scale to every chip size, rather than to the base alone, needs it unrounded.
+
+Defined when `ImagePairGeometry` is loaded, for `g::ImagePairGeometry.PairGeometry`.
+"""
+function chip_size_scale end

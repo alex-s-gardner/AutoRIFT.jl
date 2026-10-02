@@ -25,11 +25,9 @@ ImageFeatures = "92ff4b2b-8094-53d3-b29d-97f740f06cef"
 ImagePairGeometry = "7d3defa8-4bb6-45cf-b5d0-7628f127c0fd"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
-NCDatasets = "85f8d34a-cbdd-5861-8df4-14fed0d494ab"
 NearestNeighbors = "b8a86587-4115-5ab1-83bc-aa920d37bbce"
 Rasters = "a3a2b9e3-a471-40c9-b274-f788e487c689"
 Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
-Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 
 [sources]
 FastGeoProjections = {rev = "main", url = "https://github.com/alex-s-gardner/FastGeoProjections.jl"}
@@ -44,7 +42,6 @@ AutoRIFTImagePairGeometryExt = "ImagePairGeometry"
 AutoRIFTMetalExt = ["Metal", "KernelAbstractions"]
 AutoRIFTNearestNeighborsExt = "NearestNeighbors"
 AutoRIFTRastersExt = ["Rasters", "DimensionalData", "ArchGDAL", "DiskArrays"]
-ItsLiveAutoRIFT = ["NCDatasets", "Statistics"]
 
 [compat]
 AkazeFeatures = "0.1"
@@ -66,16 +63,15 @@ KernelAbstractions = "0.9"
 LinearAlgebra = "1"
 Metal = "1.10"
 Mmap = "1"
-NCDatasets = "0.13, 0.14"
 NearestNeighbors = "0.4"
 PrecompileTools = "1"
 Random = "1"
 Rasters = "0.14, 0.15"
+Statistics = "1"
 Scratch = "1"
 Serialization = "1"
 StableTasks = "0.1"
 StaticArrays = "1"
-Statistics = "1"
 Test = "1"
 julia = "1.10"
 
@@ -92,7 +88,6 @@ JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
-NCDatasets = "85f8d34a-cbdd-5861-8df4-14fed0d494ab"
 NearestNeighbors = "b8a86587-4115-5ab1-83bc-aa920d37bbce"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Rasters = "a3a2b9e3-a471-40c9-b274-f788e487c689"
@@ -102,4 +97,4 @@ Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test", "Aqua", "ArchGDAL", "JET", "JSON3", "Random", "Statistics", "Rasters", "DimensionalData", "DiskArrays", "ImageFeatures", "ImageCore", "NearestNeighbors", "NCDatasets", "Serialization", "Metal", "KernelAbstractions", "ImagePairGeometry", "FastGeoProjections", "StaticArrays"]
+test = ["Test", "Aqua", "ArchGDAL", "JET", "JSON3", "Random", "Statistics", "Rasters", "DimensionalData", "DiskArrays", "ImageFeatures", "ImageCore", "NearestNeighbors", "Serialization", "Metal", "KernelAbstractions", "ImagePairGeometry", "FastGeoProjections", "StaticArrays"]
