@@ -6,6 +6,7 @@
 # produced — a wrong figure then requires a wrong package, which a stored array would not.
 
 using CairoMakie
+import FileIO
 using Random: MersenneTwister, randn
 using Statistics: quantile
 
@@ -242,7 +243,35 @@ artificial edge inside a search window would make the correlation there a measur
 rather than of the motion.
 """
 function warped_pair(sz::Tuple{Int,Int}, offset; seed::Integer = 0, pad::Integer = 48)
-    big = texture((sz[1] + 2pad, sz[2] + 2pad); seed)
+    return _warp(texture((sz[1] + 2pad, sz[2] + 2pad); seed), sz, offset, pad)
+end
+
+warped_pair(n::Integer, offset; kw...) = warped_pair((Int(n), Int(n)), offset; kw...)
+
+"""
+    warped_pair(source::AbstractMatrix, sz, offset; pad) -> (reference, secondary, truth_dx, truth_dy)
+
+[`warped_pair`](@ref) over a supplied image rather than generated texture.
+
+`source` must be at least `sz .+ 2pad` in each dimension, and is center-cropped to exactly that; the
+margin is what the warp samples from, so a displacement near the edge still reads real image data.
+"""
+function warped_pair(source::AbstractMatrix, sz::Tuple{Int,Int}, offset; pad::Integer = 48)
+    need = (sz[1] + 2pad, sz[2] + 2pad)
+    all(size(source) .>= need) || throw(ArgumentError(
+        "source is $(size(source)) but a $(sz[1])x$(sz[2]) pair with pad=$pad needs at least " *
+        "$(need[1])x$(need[2]) — lower `pad` or supply a larger image"))
+    off = (size(source) .- need) .÷ 2
+    big = source[(off[1] + 1):(off[1] + need[1]), (off[2] + 1):(off[2] + need[2])]
+    return _warp(big, sz, offset, pad)
+end
+
+warped_pair(source::AbstractMatrix, n::Integer, offset; kw...) =
+    warped_pair(source, (Int(n), Int(n)), offset; kw...)
+
+# The crop-and-warp both `warped_pair` methods share: `big` is the oversized field, and the returned
+# pair is its centre with `offset` applied to the secondary.
+function _warp(big, sz::Tuple{Int,Int}, offset, pad::Integer)
     rows, cols = (pad + 1):(pad + sz[1]), (pad + 1):(pad + sz[2])
     reference = big[rows, cols]
     secondary = similar(reference)
@@ -255,7 +284,17 @@ function warped_pair(sz::Tuple{Int,Int}, offset; seed::Integer = 0, pad::Integer
     return Float32.(reference), Float32.(secondary), tdx, tdy
 end
 
-warped_pair(n::Integer, offset; kw...) = warped_pair((Int(n), Int(n)), offset; kw...)
+"""
+    photo() -> Matrix{Float64}
+
+The documentation's example photograph, as a 640x640 grey field in `[0, 1]`.
+
+A real photograph rather than generated texture for the pages whose point is that a reader can *see*
+the displacement: a recognizable subject moving against a fixed crowd is legible at a glance, where
+two panels of noise are not. `docs/src/assets/ali_liston.png` — Muhammad Ali over Sonny Liston,
+John Rooney / AP, 1965, public domain (published in the US without a copyright notice).
+"""
+photo() = Float64.(FileIO.load(joinpath(@__DIR__, "src", "assets", "ali_liston.png")))
 
 """
     decorrelate(img, weight; amplitude, seed) -> Matrix
