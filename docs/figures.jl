@@ -50,22 +50,29 @@ function symlimits(fields...)
 end
 
 """
-    image_panels(images...; titles) -> Figure
+    image_panels(images...; titles, shared = true) -> Figure
 
 A row of input images on a shared grayscale.
+
+`shared = false` scales each panel to its own range instead, and drops the colorbar — for comparing
+images whose units differ, where one shared scale would crush every panel but the widest-ranging one.
+A shared scale is the default because for two images of the same scene a brightness difference between
+them is a real difference the figure should show.
 """
-function image_panels(images...; titles = ("reference", "secondary"), size = (900, 420))
+function image_panels(images...; titles = ("reference", "secondary"), size = (900, 420),
+                      shared::Bool = true)
     fig = Figure(; size, figure_padding = 10)
     # A percentile range rather than the extremes: added noise puts a few pixels far outside the
     # surface's own range, and scaling to those flattens the features the figure exists to show.
-    vals = mapreduce(vec, vcat, images)
-    lim = (quantile(vals, 0.01), quantile(vals, 0.99))
+    span(vals) = (quantile(vals, 0.01), quantile(vals, 0.99))
+    lim = shared ? span(mapreduce(vec, vcat, images)) : nothing
     local hm
     for (i, (img, title)) in enumerate(zip(images, titles))
         hm = heatmap!(panel(fig, (1, i), title), mapshow(Float64.(img));
-                      colormap = :grays, colorrange = lim)
+                      colormap = :grays,
+                      colorrange = isnothing(lim) ? span(vec(Float64.(img))) : lim)
     end
-    Colorbar(fig[1, length(images) + 1], hm)
+    shared && Colorbar(fig[1, length(images) + 1], hm)
     return fig
 end
 
@@ -149,6 +156,23 @@ function surface_panels(chip, window, surface; size = (1200, 400))
     scatter!(ax, [Float64(pj)], [Float64(Base.size(surface, 1) - pi_ + 1)];
              marker = :cross, markersize = 18, color = :cyan, strokewidth = 0)
     Colorbar(fig[1, 4], hm)
+    return fig
+end
+
+"""
+    mask_panels(masks...; titles) -> Figure
+
+A row of boolean per-point masks on a fixed two-level scale, so `true` reads identically in every panel
+and the eye compares the pattern rather than a shade.
+
+Each title carries its own `count`, so the figure and the number the page quotes cannot drift apart.
+"""
+function mask_panels(masks...; titles, size = (1100, 400))
+    fig = Figure(; size, figure_padding = 10)
+    for (i, (m, title)) in enumerate(zip(masks, titles))
+        ax = panel(fig, (1, i), "$title — $(count(m)) points")
+        heatmap!(ax, mapshow(Float64.(m)); colormap = [:gainsboro, :black], colorrange = (0, 1))
+    end
     return fig
 end
 

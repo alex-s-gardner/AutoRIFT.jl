@@ -61,10 +61,6 @@ looking at the correlation field for your own data.
 They disagree, which is the point:
 
 ```@example quality
-quality_panels(out)
-```
-
-```@example quality
 field_panels(blank(out.correlation, measured(out)),
              blank(min.(out.peak_ratio, 5), measured(out));
              titles = ("correlation", "peak_ratio (clipped at 5)"), colormap = :magma)
@@ -149,6 +145,20 @@ neighbourhood the displacement came from — since that is what stands behind th
 (interpolated = count(out.interpolated),
  unresolved = count(==(0), out.chip_size))
 ```
+
+Where they are matters more than how many, since it decides whether excluding them costs you a region
+or a sprinkling:
+
+```@example quality
+mask_panels(out.interpolated, out.chip_size .== 0;
+            titles = ("interpolated", "unresolved"))
+```
+
+The two could hardly look less alike, and that is the useful part. Interpolation is rare here — six
+isolated points, scattered rather than clustered, so excluding them costs nothing in particular. The
+unresolved points are a solid block across the decorrelating band: that loss is a whole region of the
+scene, and no threshold or filter choice recovers it. A count of `1451` and a count of `6` read as
+comparable magnitudes of the same kind of problem; the figure shows they are not.
 
 Whether to keep interpolated points depends on the consumer. They are real estimates with real
 uncertainty, just not independent measurements; a strain calculation usually wants them excluded, a

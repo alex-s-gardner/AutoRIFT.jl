@@ -69,6 +69,42 @@ So: **correlation is not how you choose a filter.** It compares points within on
 against another. Judge a filter by accuracy against known motion if you have it, and by the spatial
 coherence of the field if you do not.
 
+## What each filter actually does
+
+The table names five filters without showing any of them. Each panel below is the same gradient-afflicted
+secondary image, filtered — on its own grayscale, since the outputs differ in units by three orders of
+magnitude:
+
+```@example prep
+mask = trues(size(secondary))
+methods = (("none", NoPreprocess()), ("highpass", Highpass()), ("wallis", Wallis()),
+           ("sobel", Sobel()), ("laplacian", Laplacian()))
+
+image_panels([first(AutoRIFT.preprocess(secondary, mask, m)) for (_, m) in methods]...;
+             titles = first.(methods), size = (1700, 380), shared = false)
+```
+
+`:none` shows the gradient as the dominant structure in the frame. The three filters that remove it do
+not remove the same thing, which the table's numbers cannot show:
+
+```@example prep
+using Statistics: std
+for (name, m) in methods
+    f = first(AutoRIFT.preprocess(secondary, mask, m))
+    left, right = std(@view f[:, 1:170]), std(@view f[:, 343:512])
+    println(rpad(name, 11), " contrast right/left ", round(right / left; digits = 2))
+end
+```
+
+The gradient multiplies the texture, so it makes the right side both brighter *and* more contrasty.
+`:highpass` subtracts a local mean, which removes the brightness and leaves the contrast trend standing
+at 2.3 — higher than the 1.5 it started with, because the brightness that partly masked it is gone. `:wallis` normalizes local variance as well, and lands at 1.00: that is the difference between the
+two, and it is invisible in the images above but plain in the number.
+
+`:sobel` keeps the trend too (2.1), being a derivative of an amplitude that still grows. `:laplacian`
+looks nearly blank because it is: only about 1.7% of its pixels exceed a tenth of its maximum, so a
+handful of extremes set the range and the rest of the field is compressed toward zero.
+
 ```@example prep
 none_out = autorift(reference, secondary; preprocess = :none, settings...)
 high_out = autorift(reference, secondary; preprocess = :highpass, settings...)

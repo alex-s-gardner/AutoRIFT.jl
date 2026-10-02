@@ -219,8 +219,32 @@ rather than dense correlation — which is the case for `AKAZEGuess` on a rotati
 
 The chip comes from the **secondary** and is correlated against an **unrotated** reference window, so
 it has to be turned *back* to the reference's orientation: the rotations actually applied are
-`angles .- about`. That is not a convention to choose. Measured on speckle rotated 8°, peak
-correlation of a chip rotated by each candidate:
+`angles .- about`. That is a claim about geometry, so here it is as geometry — a scene turned 8°, and
+the chip the correlator would take from it, rotated by each candidate:
+
+```@example guess
+img = Float32.(photo())
+r0, c0, h = 300, 300, 110
+rows, cols = (r0 - h):(r0 + h - 1), (c0 - h):(c0 + h - 1)
+
+window = img[rows, cols]                                        # from the reference, upright
+turned = AutoRIFT._rotate_bilinear(img, 8.0, (Float64(c0), Float64(r0)))
+chip = turned[rows, cols]                                       # from the secondary, carrying the 8°
+centre = (Float64(h), Float64(h))
+
+image_panels(window, chip,
+             AutoRIFT._rotate_bilinear(chip, 8.0, centre),
+             AutoRIFT._rotate_bilinear(chip, -8.0, centre);
+             titles = ("reference window", "chip from the secondary",
+                       "chip rotated +8°", "chip rotated −8°"),
+             size = (1500, 400))
+```
+
+Follow the waistband. It is horizontal in the reference window and tilted in the chip; `+8°` tilts it
+further, and only `−8°` brings it back level. Rotating *with* the scene's rotation doubles the
+mismatch, which is why the sign is subtraction and not a choice.
+
+Measured on speckle rotated 8°, peak correlation of a chip rotated by each candidate:
 
 | chip | no rotation | +8° | −8° |
 |---:|---:|---:|---:|

@@ -123,6 +123,24 @@ level first runs a sparse **coarse pass** to find where motion is spatially cohe
 full grid only inside a dilated neighbourhood of that. Since a later level's coarse pass sees only the
 points still outstanding, its coverage decision differs from the same level run alone.
 
+The difference is not scattered noise, which is what makes the mechanism visible:
+
+```@example multichip
+union_of_levels = measured(levels[16]) .| measured(levels[32]) .| measured(levels[64])
+
+mask_panels(union_of_levels, measured(merged), union_of_levels .& .!measured(merged);
+            titles = ("union of the three levels", "the merge", "lost by merging"))
+```
+
+The lost points form a **ring** around the band's core, plus the left and right margins — not a
+uniform scatter and not the band itself. Inside the ring the merge still answers; outside it the finer
+levels had already succeeded. The ring is the shoulder of the band, where correlation is marginal
+enough that a later level's coarse pass no longer accepts the neighbourhood, and so never attempts
+points the same level answered when run alone.
+
+The arithmetic is not quite subtraction, either: 565 points are lost, but the merge answers two that no
+single level did, which is why the net is 563.
+
 **Where levels do overlap they agree.** Comparing the single-level runs point by point where both
 produced an answer:
 
