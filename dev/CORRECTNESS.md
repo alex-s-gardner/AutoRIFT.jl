@@ -309,6 +309,12 @@ whatever `_cell_mean` returns: **implementing this item touches `_cell_mean` and
 
 ## 3. Make one position serve both halves of a level
 
+**Checked 2026-10-04: both named endpoint reds below are green today.** `LT05_L1GS_001013`'s `dx`/`dy`
+bias is `-0.00030`/`-0.00049` and `S1C_IW_SLC__1SSV_20250416T010159`'s is `+0.00006`/`+0.00005`, both
+inside the `±0.01` gate — the two "Resolved" fixes later in this section already closed what was open.
+Left as-is rather than implemented: it was already gated behind item 2 (dropped above) and the register's
+own measurement, and the case it was deferred for no longer exists.
+
 `INTER_AREA` places a coarse node at the cell's **mean** coordinate; `INTER_CUBIC` reads the level's
 answer back from the cell's geometric **centre**. Those are the same point only when the cell is uniform.
 Measured on the NISAR L1 chip-768 lattice, in grid coordinates:
