@@ -655,13 +655,19 @@ stride. The cause is downstream of where the coarse node sits — in the coarse 
 result restricts the fine search and is read back. The capture carries `lvlN_dx`, `lvlN_dy`,
 `lvlN_searchx`/`searchy` and `lvlN_kept` per level, which is what a comparison of those would be fed.
 
-**Deferred by decision until the rest of the golden set is green, and the reason is measurability rather
-than caution.** These are the widest-blast-radius items in the register: the node position is a property of
-the *grid*, so changing it moves the coarse levels of every radar and NISAR case at once and re-opens the
-`3.rdr` and `3.nisar` gates. With four cases still red on a missing COMPASS CSLC, a change here could not be
-attributed — a green that appeared and a red that appeared would be indistinguishable from each other and
-from the CSLC gap. Act on it when the reds that remain are only these two, and measure against all 22 plus
-both radar gates, not against the two targets.
+### Superseded: the deferral below never had to be acted on
+
+**This section originally deferred the question "what happens to a coarse estimate after it is
+correlated" until the rest of the golden set was green, reasoning that the node position is the
+widest-blast-radius item in the register and a change here could not be attributed while `3.rdr` and
+`3.nisar` carried four reds on a missing COMPASS CSLC.** Both halves of that reasoning are now moot:
+the CSLC gap was a stale cached artifact, fixed outright, and `3.rdr` is **8 of 8**, `3.nisar` **1 of
+2** (`dev/GATES.md`'s 2026-10-04 re-measurement; the one `3.nisar` red is an unrelated `dy corr
+0.97988 < 0.99` miss, not a core-bias blowout from a missing input) — but more to the point, the
+deferred question itself was already answered without waiting: the two "Resolved" sections immediately
+below identify and fix the two actual faults (the decimated prior and search radius, and the `dy_prior`
+sign), which is exactly why both named endpoint cases are green today, per the note at the top of this
+item. Nothing here is still waiting on the golden set.
 
 ### Resolved: `_decimate_level` computed the level's prior and search radius two ways the reference does not
 
