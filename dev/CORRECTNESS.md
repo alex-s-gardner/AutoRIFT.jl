@@ -802,7 +802,7 @@ Recorded in full, with per-item evidence and revisit conditions, in **`tools/gol
 | The reference reports a search-window corner for a degenerate chip | a fabricated displacement over masked or textureless ground, which also changes which pyramid levels are skipped |
 | Even-kernel `colfilt` chunk seam | assumes a left margin of `(k-1)÷2` where `generic_filter` uses `k÷2`; `nchunks - 1` corrupted columns per row. Not reproduced in AutoRIFT.jl |
 | `UInt8` quantization before correlating | discards precision the filtered float field already has; the reference's own byte and float paths disagree. Production is moving to `Float32`, so both paths need a gate |
-| Scene rotation derived from pixels, not the orbit | the reference's two recovered axes are not perpendicular, which a real cross-track direction cannot be |
+| Scene rotation derived from pixels, not the orbit | the reference's two recovered axes are not perpendicular, which a real cross-track direction cannot be. The durable orbit reader now exists (`OpticalDatasets.landsat_ephemeris`, `ImagePairGeometry.ground_track`, `AutoRIFT.track_angles`); measured cost of the reference's bias: an rms of 0.10-0.21 on five of six scenes, and a band-reject fire/decline flip on the sixth |
 | Agreement threshold is a fraction of the full window area | a border point is held to the same absolute neighbour count as an interior one |
 | Outlier-filter neighbourhood derived from the X axis alone | on a 64x16 chip the window covers four times as much ground across track as along it |
 | Level decimation derived from the X axis alone | coarsens y by 8 for a chip 52 px tall on a 48 px grid |

@@ -786,6 +786,32 @@ end
     @test all(outmask)
 end
 
+@testset "track_angles" begin
+    # A displacement along +x only, square pixels: along-track is 0°, cross-track its perpendicular.
+    along, cross = AutoRIFT.track_angles(1.0, 0.0; spacing = (1.0, 1.0))
+    @test along == 0.0
+    @test cross == 90.0
+
+    # Along +y only: the division overflows to ±90° rather than branching, matching the reference's
+    # own `atan` of a ratio (`autoRIFT.py:138-151`).
+    along2, cross2 = AutoRIFT.track_angles(0.0, 1.0; spacing = (1.0, 1.0))
+    @test along2 == 90.0
+    @test cross2 == 0.0
+
+    # A non-square pixel does not cancel out of the ratio: the same metre displacement reads as a
+    # different angle once resampled onto an anisotropic grid.
+    along3, _ = AutoRIFT.track_angles(1.0, 1.0; spacing = (1.0, 1.0))
+    along4, _ = AutoRIFT.track_angles(1.0, 1.0; spacing = (2.0, 1.0))
+    @test along3 != along4
+    @test along3 ≈ 45.0
+
+    # The two returned angles are perpendicular by construction, for any input.
+    for (dx, dy) in ((3.0, -7.0), (-2.0, 5.0), (0.1, 0.1))
+        a, c = AutoRIFT.track_angles(dx, dy; spacing = (30.0, -30.0))
+        @test abs(abs(a - c) - 90.0) < 1e-9
+    end
+end
+
 @testset "bytescale reproduces uniform_data_type" begin
     if !has_fixtures()
         @info "Fixture corpus absent; skipping the bytescale comparison."

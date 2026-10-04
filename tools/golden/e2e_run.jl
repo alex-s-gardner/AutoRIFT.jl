@@ -207,8 +207,8 @@ function native_scene(path::AbstractString, name::AbstractString, c::GoldenCase)
     end
     m === :fft || error("no route for native filter `$m` on $name")
     gt = ArchGDAL.getgeotransform(ds)
-    along, cross = orbit_scan_angles(scene_ang(name, joinpath(CACHE, "angcache")), scene_epsg(ds);
-                                     spacing = (gt[2], gt[6]))
+    along, cross = landsat_scan_angles(name, joinpath(CACHE, "angcache"), scene_epsg(ds);
+                                       spacing = (gt[2], gt[6]))
     w, _ = AutoRIFT.preprocess(img, valid, AutoRIFT.Wallis(5, 0.0))
     w[.!valid] .= 0.0f0
     d, _ = AutoRIFT.preprocess(w, valid, AutoRIFT.Destripe(; along_track = along, cross_track = cross))

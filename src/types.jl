@@ -432,6 +432,30 @@ Destripe(; along_track, cross_track, band_half = 70, notch_half = 100, clamp = 3
     Destripe(along_track, cross_track, band_half, notch_half, clamp, power_threshold, ratio, sigma)
 
 """
+    track_angles(dx, dy; spacing) -> (along_track, cross_track)
+
+[`Destripe`](@ref)'s scan-angle convention, from a ground-track displacement `(dx, dy)` in a
+raster's projected CRS and that raster's pixel `spacing = (sx, sy)`.
+
+Any source of a ground-track vector can feed this — an orbit ephemeris projected into the raster's
+CRS, a pixel-shape estimate, anything else that resolves to a direction on the grid — which is why it
+takes a displacement rather than, say, an `Orbit`.
+
+**Pixel units, not metres.** A slope is a ratio, so a uniform scale cancels, but a non-square pixel
+does not: `spacing` is required rather than defaulted so that case is not silently assumed away.
+`along_track` is `atan(dy/sy, dx/sx)` in degrees — note `atan` of a ratio, not `atan2`, matching the
+reference's `_calculate_slope` (`autoRIFT.py:138-151`): the result is in `(-90, 90)` and a vertical
+displacement gives `±90` by the division overflowing rather than by a branch. `cross_track` is its
+perpendicular, folded back into the same open interval rather than reported as a signed `90°` offset.
+"""
+function track_angles(dx::Real, dy::Real; spacing::Tuple{Real,Real})
+    sx, sy = abs(Float64(spacing[1])), abs(Float64(spacing[2]))
+    along = rad2deg(atan(Float64(dy) / sy / (Float64(dx) / sx)))
+    cross = along + (along > 0 ? -90.0 : 90.0)
+    return (along, cross)
+end
+
+"""
     Laplacian(; width = 5)
 
 Laplacian (isotropic second derivative) of the log-amplitude image. Intended

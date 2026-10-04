@@ -151,7 +151,7 @@ end
 export autorift, autorift!, reinit!
 export SimilarityMeasure, ZNCC, NCC, Coherence
 export PreprocessMethod, Highpass, Wallis, WallisGapfill, Sobel, Laplacian,
-       Destripe, Decibel, Deramp, NoPreprocess
+       Destripe, Decibel, Deramp, NoPreprocess, track_angles
 export SubpixelMethod, PyramidRefine, NoRefine
 export OutlierMethod, GardnerFilter, NoOutlierFilter
 export ImagePair
