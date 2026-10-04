@@ -798,6 +798,64 @@ and spread the two forms agree to a median of 4.4e-5 — a relative 1.8e-6, thre
 scene shows. The cancellation needs the bright *low-contrast* regions a real image has and a Gaussian does
 not, so a test built on `randn` will report the change as harmless when it is not.
 
+## 4b. Stop defaulting to `UInt8` before correlating
+
+**Decision 2026-10-04, not yet implemented.** `bytescale`'s quantization should not be the Julia
+pipeline's default — it is Python's own memory saving (`uniform_data_type`, `autoRIFT.py:359-384`,
+reached because the production driver sets `DataType = 0`), not a Julia requirement, and it is now
+costing an allocation Python's motivation does not buy here.
+
+**Where it actually runs**, which is not AutoRIFT.jl's own `src/`: `ItsLiveOffsetProduction.jl`'s
+`tools/golden/julia_e2e.jl`, `native_imagery`, is the one place in the real granule-to-product Julia
+chain that calls `AutoRIFT.bytescale` — two full-scene `Matrix{UInt8}` allocations, one per acquisition,
+pushed into `bytes` and correlated instead of the already-filtered `Float32` field. That function's own
+docstring records a deliberate memory-minimization redesign immediately before this step — "one pass...
+four full-scene arrays live at once where the allocating form held eight" — which quantizing to `UInt8`
+partly undoes: two more full-scene arrays allocated right after, for a reason that is Python's rather
+than Julia's. `AutoRIFT.jl`'s own correlator needs no particular element type (`src/track.jl:6-9`: "one
+function covers every element type," where the reference's C++ core has two).
+
+**This is a deliberate divergence, not a bug fix, and the measurement already exists.** `tools/golden/
+README.md`'s "Matched for agreement, not endorsed" `UInt8` row records the reference's own two entry
+points (`arImgDisp_u` vs `arImgDisp_s`) disagreeing — 1.7% of points by up to 36 px overall, up to 7 px
+on one scene per `tools/golden/stages.jl`'s header, and a 31x tie-breaking disparity in the base level's
+weakest correlation quartile. So defaulting to `Float32` changes the correlator's actual output relative
+to what the Python reference produces today, the same category of trade item 4 above records for the
+Wallis variance — correlating `Float32` is the more accurate choice, not the one that reproduces
+production.
+
+**Scope of the change:**
+
+1. `ItsLiveOffsetProduction.jl`'s `native_imagery` — delete `bytes = Vector{Matrix{UInt8}}()` and the two
+   `push!(bytes, AutoRIFT.bytescale(filtered, keep))` calls; correlate the already-allocated
+   `filtered::Matrix{Float32}` buffers directly. Strictly fewer allocations, not a tradeoff: the two
+   `UInt8` buffers go away and nothing is added in their place.
+2. **No whole-image normalization should take `bytescale`'s place.** `bytescale`'s global mean and
+   standard deviation exist for one reason — compressing the field's dynamic range into 256 levels
+   while keeping as much local variance as that budget allows — and that reason disappears once nothing
+   is quantized; it is not a general-purpose normalization the correlator separately benefits from.
+   `ZNCC` (the measure both the optical and radar paths use) already removes each window's own mean and
+   scale per shift (`src/types.jl:125`, "ZNCC's mean-and-scale removal" of a sensor-gain difference), so
+   a whole-image rescale buys the correlator nothing it does not already do locally and correctly. Any
+   replacement step that still computes a global mean/std and rescales `filtered` by it — "normalizing
+   but not quantizing" — would be carrying over half of `bytescale` for no reason; the correct change
+   removes the computation along with the cast, not just the cast.
+3. Whatever currently *asserts* byte-path agreement needs to stop treating it as the production path
+   rather than silently going red: `tools/golden/stages.jl`'s "every rung that runs a correlator runs it
+   twice, on `UInt8` and on `Float32`" convention and its `DataType`-scalar capture comparison, and
+   `julia_e2e.jl`'s own `--compare-intermediate` mode, which compares against the reference's captured
+   (byte-path) intermediate. Agreement there becomes a tolerance gate rather than an exact match — the
+   same conclusion the existing register item already reaches: "both paths need a gate, not one replacing
+   the other."
+4. `AutoRIFT.jl`'s own `bytescale` (`src/preprocess.jl`) and its golden rung (`tools/golden/e2e.jl`) stay
+   — still needed to characterize what the byte path *would* have produced, for the gate above and for
+   anyone still running the Python reference.
+
+**What this unblocks.** `ItsLiveOffsetProduction.jl`'s own `tools/golden/README.md`, "Future change:
+fetching only the chunks a pair needs," names `bytescale`'s whole-array statistic as the one remaining
+blocker to per-chunk fetching: "When `UInt8` goes, no image-wide statistic remains and this becomes
+viable." This change clears that too.
+
 ## 5. The rest of the register
 
 Recorded in full, with per-item evidence and revisit conditions, in **`tools/golden/README.md`**:
