@@ -113,7 +113,7 @@ function check_pass(pair, pts, pc, pg, chip, radius; label = "")
 
     # Which points each path attempted, and which it could not measure, must match exactly: those
     # are decided by the searchability, bounds and validity tests, which the device path takes from
-    # the same `chip_bounds`/`search_bounds`/`_any_valid` the CPU loop uses.
+    # the same `chip_bounds`/`search_bounds`/`_valid_fraction` the CPU loop uses.
     @test a.searched == b.searched
     @test count(isnan, a.dx) == count(isnan, b.dx)
     @test findall(isnan, a.dx) == findall(isnan, b.dx)

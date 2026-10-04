@@ -70,10 +70,11 @@ radii, over a `2half+1` window, and compare against the reference's own `lvl*_dx
 Returns the two fields, the window, and the gate's residual, so a caller can map or re-analyse without
 correlating again.
 """
-function level_replay(c::GoldenCase; chip::Integer, n::Integer = 100, half::Integer = 32)
+function level_replay(c::GoldenCase; chip::Integer, n::Integer = 100, half::Integer = 32,
+                      param_overrides...)
     k = read_capture(c; n)
     kw = kwargs_from_capture(k)
-    p = params(; kw...)
+    p = params(; kw..., param_overrides...)
     chip0 = Int(k.scalars["ChipSize0X"])
 
     fines = filter(x -> x.kind == "fine", k.levels)

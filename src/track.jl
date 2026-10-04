@@ -346,9 +346,9 @@ end
 
 **The validity mask is padded lazily where the imagery is padded eagerly, because the two are read
 differently.** A padded image is handed to the FFT and to the integral tables, which walk it densely;
-the mask has exactly one consumer, `_any_valid` over a chip footprint, which short-circuits on the
-first valid pixel. So the branch this adds is paid once or twice per point rather than per element,
-while the array it avoids is scene-sized.
+the mask has exactly one consumer, `_valid_fraction` over a chip footprint, which touches each of a
+chip's pixels once. So the branch this adds is paid once per pixel of the chip rather than of the
+whole padded scene, while the array it avoids is scene-sized.
 
 Avoiding it matters because `_zeropad` would *expand* it. A mask arrives packed — `valid` returns the
 `BitMatrix` broadcasting produces — and `Matrix{T}(undef, …)` of a `Bool` eltype is one byte per pixel,
@@ -357,7 +357,7 @@ a third of what a pass holds. Nothing reads it densely enough to want that.
 
 `false` outside is the same convention `_zeropad` uses, and it is what distinguishes "outside the
 image" from "dark": a chip made of padding correlates with any other such chip, so the correlator
-declines a point whose chip holds no valid pixel.
+declines a point whose chip is mostly padding.
 """
 struct PaddedMask{A<:AbstractMatrix{Bool}} <: AbstractMatrix{Bool}
     parent::A
@@ -376,7 +376,7 @@ end
 Base.size(m::PaddedMask) = (m.nrows, m.ncols)
 
 # Plain comparisons rather than a `@boundscheck` block, deliberately: being outside the parent *is* the
-# padding rather than an error, and a caller's `@inbounds` — which `_any_valid` has — would remove a
+# padding rather than an error, and a caller's `@inbounds` — which `_valid_fraction` has — would remove a
 # `@boundscheck` and with it the only thing that makes this a padded mask.
 @inline function Base.getindex(m::PaddedMask, i::Int, j::Int)
     ip = i - m.py
@@ -551,10 +551,10 @@ function _track_bucket!(out::DisplacementField, ref, sec, okmask, pts::PointSet,
         # place a point anywhere, so it is checked rather than assumed.
         checkbounds(Bool, ref, chip_rows, chip_cols) || continue
         checkbounds(Bool, ref, win_rows, win_cols) || continue
-        # A chip with no valid pixel is padding, not imagery. Testing the chip rather than
-        # the window is deliberate: the window may legitimately overlap the edge, since the
-        # correlation only needs the chip to be real.
-        _any_valid(okmask, chip_rows, chip_cols) || continue
+        # A chip that is mostly padding is not imagery, even where it holds one real pixel.
+        # Testing the chip rather than the window is deliberate: the window may legitimately
+        # overlap the edge, since the correlation only needs the chip to be real.
+        _valid_fraction(okmask, chip_rows, chip_cols) > p.min_chip_valid_fraction || continue
 
         out.searched[i] = true
 
@@ -718,16 +718,15 @@ function _rotate_chip(ws::CorrelationWorkspace, chip::AbstractMatrix, deg::Float
     return dst
 end
 
-# Explicit loop rather than `any` over a view. Both short-circuit and neither allocates, but
-# the loop is 2x faster in the worst case that matters — an all-invalid window, where there is
-# no early exit to take (measured 440 ns against 888 ns on 32x32). The generic path does not
-# vectorise across a `SubArray` the way a column-major loop does, and this is the only branch
-# here that is not free.
-@inline function _any_valid(mask, rows, cols)
+# Explicit loop rather than broadcasting a view into `count`, for the same reason the former
+# `_any_valid` used one: the generic path does not vectorise across a `SubArray` the way a
+# column-major loop does.
+@inline function _valid_fraction(mask, rows, cols)
+    n = 0
     @inbounds for j in cols, i in rows
-        mask[i, j] && return true
+        mask[i, j] && (n += 1)
     end
-    return false
+    return n / (length(rows) * length(cols))
 end
 
 # Threaded driver: as many tasks as threads, each claiming the next unclaimed chunk until they run

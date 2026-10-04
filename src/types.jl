@@ -1097,6 +1097,10 @@ struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:Preproces
     coarse_buffer::Int
     min_coarse_valid_fraction::Float64
 
+    # A chip is correlated only if more than this fraction of its own footprint — not the larger
+    # search window around it — is valid. `_any_valid`'s old all-or-nothing test is this at 0.0.
+    min_chip_valid_fraction::Float64
+
     # A-priori displacement (pixels), the predictor in a predictor-corrector
     # sense: the search window is centred on it rather than on zero.
     dx_prior::Float64
@@ -1122,6 +1126,9 @@ end
 # threshold (`autoRIFT.py:803`), and exclusive: a five-point hole is not small enough.
 const _DEFAULT_FILL_MIN_HOLE = 5
 
+# See `params`'s own docstring for the value and the measurement behind it.
+const _DEFAULT_MIN_CHIP_VALID_FRACTION = 0.65
+
 # The positional form without a backend, which is the documented stable API and what `app/` calls.
 # Appends `CPU()`, so an existing 18-argument call is unchanged in meaning.
 #
@@ -1133,8 +1140,8 @@ Params(similarity, preprocess, subpixel, outliers, threaded, rotation, chip_size
        progress) =
     Params(similarity, preprocess, subpixel, outliers, threaded, rotation, chip_size_min,
            chip_size_max, grid_spacing, search_radius, min_search_radius, coarse_stride,
-           coarse_buffer, min_coarse_valid_fraction, dx_prior, dy_prior, fill_window,
-           _DEFAULT_FILL_MIN_HOLE, rng_seed, progress, CPU())
+           coarse_buffer, min_coarse_valid_fraction, _DEFAULT_MIN_CHIP_VALID_FRACTION,
+           dx_prior, dy_prior, fill_window, _DEFAULT_FILL_MIN_HOLE, rng_seed, progress, CPU())
 
 # The form without `fill_min_hole`, which the 18-argument one above also routes through. Kept so a
 # caller written against the field list before hole size was a criterion still compiles, and gets
@@ -1145,7 +1152,8 @@ Params(similarity, preprocess, subpixel, outliers, threaded, rotation, chip_size
        progress, backend) =
     Params(similarity, preprocess, subpixel, outliers, threaded, rotation, chip_size_min,
            chip_size_max, grid_spacing, search_radius, min_search_radius, coarse_stride,
-           coarse_buffer, min_coarse_valid_fraction, dx_prior, dy_prior, fill_window,
+           coarse_buffer, min_coarse_valid_fraction, _DEFAULT_MIN_CHIP_VALID_FRACTION,
+           dx_prior, dy_prior, fill_window,
            _DEFAULT_FILL_MIN_HOLE, rng_seed, progress, backend)
 
 """

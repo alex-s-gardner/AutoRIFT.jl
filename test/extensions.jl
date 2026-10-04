@@ -272,7 +272,9 @@ end
     n = 400
     ref, sec = projected_pair(n, (0, 5))
     m = trues(n, n)
-    m[100:250, 100:250] .= false
+    # 101x101 of 400x400: big enough to swallow some chips whole and leave others merely
+    # grazed, small enough that most of the grid sits outside it and still measures.
+    m[100:200, 100:200] .= false
 
     plain = autorift(ref, sec; EXT_KW..., reference_valid = m, secondary_valid = m)
     wrapped = autorift(ref, sec; EXT_KW...,

@@ -33,9 +33,10 @@ new toolchain. Reference: autoRIFT 2.1.1 in
 > | `_cell_means` places a coarse node at its cell's block mean rather than shifting the cell's first point — deliberate, and it averages the nodata fill in | the core `dx` bias on five of eight radar cases and both NISAR cases; every other gated statistic improved | "the radar and NISAR gates after the cell-mean change" |
 >
 > Gate 0 (`tools/ab`) is unaffected by any of them: it passes a zero prior on an unrotated synthetic grid,
-> so neither the sign convention nor the nodata fill crosses it. **`3.rdr` is 3 of 8 and `3.nisar` 0 of 2**,
-> both on core-bias bounds calibrated before the cell-mean placement; they are the open red gates, and the
-> final section records why the bounds are not simply widened.
+> so neither the sign convention nor the nodata fill crosses it. **`3.rdr` is 3 of 8 and `3.nisar` 0 of 2**
+> here, both on core-bias bounds calibrated before the cell-mean placement — but this is itself superseded;
+> see "Re-measured 2026-10-04" at the end of this file for the current figures and for what
+> `CORRECTNESS.md` item 1 changed afterward.
 
 **`regate.jl` covers all 22 cases: `3.opt` twelve optical, `3.rdr` eight radar, `3.nisar` both NISAR.**
 `3.nisar` runs a sixteenth of each NISAR grid (`--stride 4 --block 128`, ~1 minute a case), because a
@@ -6160,3 +6161,38 @@ error message showed, since the message stated the true range.
 A third failure was **not** a defect: `S1A_IW_SLC__1SSV_20240618` b died with a bus error inside Julia's
 runtime on its first attempt and completed on the second at a peak of 8.59 GiB. The machine had 15 GiB of
 disk free and 3 GiB of swap, and the case before it peaked at 16.47 GiB.
+
+## Re-measured 2026-10-04: the top notice's `3.rdr`/`3.nisar` figures were stale
+
+Re-run on current `main` (`regate.jl --all`, Julia 1.13.0), before `CORRECTNESS.md` item 1 landed:
+**`3.rdr` is 8 of 8 and `3.nisar` is 1 of 2** — not the `3/8` and `0/2` the top notice still says. No
+`src/multichip.jl` change explains it; the recorded figures were simply never refreshed after whatever
+later fix (plausibly `#29`'s tile/block-alignment work) improved them. `NISAR_L2`'s one remaining red is
+a `dy corr 0.97988 < 0.99` miss, not the core-bias blowout the top notice describes — a different, smaller
+defect, unrelated to item 1 below.
+
+**Then `CORRECTNESS.md` item 1 landed, and two gates moved for a reason rather than by regression.**
+`_track_bucket!` now declines a chip whose own footprint is not sufficiently inside the valid region
+(`min_chip_valid_fraction`, default `0.65`), which is a *deliberate* new divergence from the Python
+reference everywhere a chip can straddle a nodata boundary — not just NISAR's rotated swath. Measured:
+
+- **`3.opt`/`3.x` (`stages.jl`'s "3.7 coarse correlation" rung) go red on every optical case**, each by
+  exactly the same shape: on `LC08_L1TP_009011`, `only ref` goes from 0 to 449 of 35,142 reference-measured
+  coarse nodes, `exact` on the matched population unchanged at 99.95%, bias unchanged. Confirmed by
+  threshold, not inferred: setting `min_chip_valid_fraction` back to `0.0` on this case reproduces the old
+  `0`/green result exactly. These are chips near the scene's own frame corner — Landsat and Sentinel-2
+  scenes have one too, not only NISAR's — that the reference still correlates and AutoRIFT.jl now declines.
+  Not a regression; `stages.jl`'s coverage gate has no vocabulary for a deliberate decline yet, the same gap
+  `3.rdr`/`3.nisar` already lived with for the swath-boundary case.
+- **`3.rdr`/`3.nisar` are unaffected** — 8/8 and 1/2 unchanged from the re-measurement above. The Sentinel-1
+  and NISAR captures this ladder reaches do not carry a reference-only population at the new threshold.
+- **Package test suite**: 705,002/705,002, including two recalibrated to the new default
+  (`test/extensions.jl`'s mask size, `test/track.jl`'s edge-overlap example) and two new ones exercising the
+  fraction directly.
+
+**`0.1`/`0.2` (`tools/ab` against `micromamba -n arift-ref`) are red on both runs, before and after the
+item-1 change**, on a `ProcessSignaled(6)` crash calling the reference Python — an environment issue
+(the `arift-ref` environment itself, not a code path either side of this ladder touches) rather than a
+code regression. `5.orbit` is red on a missing local capture log (`systemerror` opening a file), also
+pre-existing. Neither was re-measured further; both are environment/data-cache gaps this machine has had
+before, not new.

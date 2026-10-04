@@ -34,7 +34,7 @@ function _gpu_pass!(backend_obj, out::AutoRIFT.DisplacementField, ref, sec, okma
     # Which points this pass will actually correlate, and their geometry. Collected on the host: the
     # searchability test, the bounds checks and the valid-pixel test are per point and cheap, and
     # doing them here means the device sees a dense batch rather than one with holes.
-    sel, chip_r0, chip_c0, win_r0, win_c0, prxs, prys = _gpu_select(ref, okmask, pts)
+    sel, chip_r0, chip_c0, win_r0, win_c0, prxs, prys = _gpu_select(ref, okmask, pts, p)
     n = length(sel)
     n == 0 && return out
 
@@ -69,10 +69,10 @@ end
 # The points this pass will correlate, with the per-point geometry the kernels need.
 #
 # Every test here is `_track_chunk!`'s, in the same order and for the same reasons: a zero radius
-# means excluded, a chip outside the image is skipped, and a chip with no valid pixel is padding
-# rather than imagery. The bounds are taken from `chip_bounds`/`search_bounds` rather than
-# recomputed, so the asymmetric window convention and the even chip's half-extent stay in one place.
-function _gpu_select(ref, okmask, pts::AutoRIFT.PointSet{1})
+# means excluded, a chip outside the image is skipped, and a chip that is mostly padding is not
+# imagery. The bounds are taken from `chip_bounds`/`search_bounds` rather than recomputed, so the
+# asymmetric window convention and the even chip's half-extent stay in one place.
+function _gpu_select(ref, okmask, pts::AutoRIFT.PointSet{1}, p::AutoRIFT.Params)
     sel = Int[]
     chip_r0 = Int32[]
     chip_c0 = Int32[]
@@ -86,7 +86,7 @@ function _gpu_select(ref, okmask, pts::AutoRIFT.PointSet{1})
         win_rows, win_cols = AutoRIFT.search_bounds(pts, i)
         checkbounds(Bool, ref, chip_rows, chip_cols) || continue
         checkbounds(Bool, ref, win_rows, win_cols) || continue
-        AutoRIFT._any_valid(okmask, chip_rows, chip_cols) || continue
+        AutoRIFT._valid_fraction(okmask, chip_rows, chip_cols) > p.min_chip_valid_fraction || continue
         push!(sel, i)
         push!(chip_r0, first(chip_rows))
         push!(chip_c0, first(chip_cols))

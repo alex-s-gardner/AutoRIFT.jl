@@ -646,8 +646,9 @@ copied back onto it, which is why the floor is 1.29 GiB and the peak 32.
 `_zeropad` allocates `Matrix{T}`, and a validity mask arrives *packed* — `valid` returns the `BitMatrix`
 broadcasting produces. So padding the mask expanded it eightfold: **3.13 GiB against the 0.39 GiB its
 source occupies**, once per pass. Nothing read it densely enough to want that; the mask has exactly one
-consumer, `_any_valid` over a chip footprint, which short-circuits on the first valid pixel.
-`AutoRIFT.PaddedMask` pads it lazily instead. Paired runs, identical wisdom, one process each:
+consumer, `_valid_fraction` over a chip footprint, which touches each of a chip's pixels once rather than
+the whole padded scene. `AutoRIFT.PaddedMask` pads it lazily instead. Paired runs, identical wisdom, one
+process each:
 
 | arm | wall | CPU | occupancy | peak footprint | allocated |
 |---|---:|---:|---:|---:|---:|

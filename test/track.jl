@@ -271,20 +271,28 @@ end
     # images are padded so the inner loop needs no bounds test, but padding is not data.
     ref, sec = shifted_pair(200, (0, 0); T = Float32)
     pair = ImagePair(ref, sec)
-    pts = pointset([100.0, 5.0, 5000.0], [100.0, 100.0, 100.0];
+    pts = pointset([100.0, 10.0, 5000.0], [100.0, 100.0, 100.0];
                    chip_size = 32, search_radius = 25)
     d = track(pair, pts, params())
 
     @test d.searched[1]        # wholly inside
-    # Partially overlapping: this chip is 20 of 32 columns of real imagery, so it carries
-    # genuine information and is searched. Rejecting it would discard usable data at every
-    # scene edge.
+    # Partially overlapping: this chip is 25 of 32 columns of real imagery (well above
+    # `min_chip_valid_fraction`'s default), so it carries genuine information and is searched.
+    # Rejecting a chip this intact would discard usable data at every scene edge.
     @test d.searched[2]
     @test !isnan(d.dx[2])
     # Wholly outside: the chip is entirely padding, which would correlate perfectly with
     # any other patch of padding. Skipped.
     @test !d.searched[3]
     @test isnan(d.dx[3])
+
+    # A chip that is merely half-and-half (here 20 of 32 columns, 0.625) is below
+    # `min_chip_valid_fraction`'s default and is now declined, where the old any-pixel test
+    # would have searched it (`dev/CORRECTNESS.md` item 1).
+    marginal = pointset([5.0], [100.0]; chip_size = 32, search_radius = 25)
+    dm = track(pair, marginal, params())
+    @test !dm.searched[1]
+    @test isnan(dm.dx[1])
 end
 
 @testset "a chip of pure padding is rejected" begin
@@ -319,6 +327,26 @@ end
     @test !isempty(inside)
     @test all(i -> !d.searched[i], inside)
     @test nmeasured(d) > 0                  # unmasked points still resolve
+end
+
+@testset "a chip majority nodata is declined by fraction, not by any pixel" begin
+    # What `_valid_fraction` catches and the old any-pixel test did not (`dev/CORRECTNESS.md` item
+    # 1): a chip that is *partly* masked, not wholly. One point's 32x32 chip (`chip_bounds` on
+    # `x = y = 150.0`, `chip_size = 32` spans rows and columns 134:165) with its top half masked —
+    # exactly half the chip's pixels, a fraction neither 0 nor 1.
+    n = 300
+    ref = synthetic_texture(n; seed = 7)
+    sec = copy(ref)
+    m = trues(n, n)
+    m[134:149, 134:165] .= false
+    pair = ImagePair(ref, sec; reference_valid = m, secondary_valid = m)
+    pts = pointset([150.0], [150.0]; chip_size = 32, search_radius = 25)
+
+    # Strictly more than the threshold is required, so a chip at exactly 0.5 is declined at the
+    # default and kept once the bar is lowered below 0.5, with no change but the threshold.
+    @test !any(track(pair, pts, params(; min_chip_valid_fraction = 0.5)).searched)
+    @test any(track(pair, pts, params(; min_chip_valid_fraction = 0.0)).searched)
+    @test !any(track(pair, pts, params(; min_chip_valid_fraction = 0.9)).searched)
 end
 
 @testset "filtering feeds through" begin

@@ -358,6 +358,15 @@ chip_size = (X = 16, Y = 32)   # taller than wide
   before it restricts the fine search, in coarse cells.
 - `min_coarse_valid_fraction = 0.01`: skip a chip-size level whose coarse pass
   validates a smaller fraction than this.
+- `min_chip_valid_fraction = 0.65`: correlate a point only if more than this fraction of its own chip
+  footprint is valid — not the larger search window around it, which may legitimately reach the image
+  edge. `dev/CORRECTNESS.md` item 1: on `NISAR_L1_PR_RSLC` at chip 768, `tools/golden/level_replay.jl`
+  finds a swath-boundary ring of 292 nodes whose chips straddle the valid/nodata edge, rms 3.26 px
+  against the reference with 20 of 292 off by more than a pixel. Sweeping the threshold on that same
+  ring: agreement does not improve from 0.0 to 0.5 (still rms 3.3), falls to rms 0.6 at 0.6, and is
+  clean by 0.65 (rms 0.002, max 0.023, zero nodes beyond a pixel) — and stays clean up to 0.9 without
+  declining a single one of the level's 2,817 interior nodes. `0.65` sits just past the point
+  agreement stops improving, trading the least boundary coverage for it.
 
 ## Outlier rejection and filling
 - `rotation = nothing`: try several chip rotations and keep the best, per
@@ -419,6 +428,7 @@ function params(;
     coarse_stride = 4,
     coarse_buffer = 8,
     min_coarse_valid_fraction = 0.01,
+    min_chip_valid_fraction = _DEFAULT_MIN_CHIP_VALID_FRACTION,
     outliers = :gardner,
     rotation = nothing,
     outlier_window = nokw,
@@ -466,6 +476,7 @@ function params(;
         Int(_check_positive(:coarse_stride, coarse_stride)),
         Int(coarse_buffer),
         _check_fraction(:min_coarse_valid_fraction, min_coarse_valid_fraction),
+        _check_fraction(:min_chip_valid_fraction, min_chip_valid_fraction),
         Float64(dx_prior), Float64(dy_prior),
         _check_odd_window(:fill_window, fill_window),
         Int(_check_nonnegative(:fill_min_hole, fill_min_hole)),

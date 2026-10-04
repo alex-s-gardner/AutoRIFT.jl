@@ -29,6 +29,23 @@ endorsed"** and in the open-items list above it. This file is the index, ordered
 
 ## 1. Mask the input: never correlate a chip that is mostly nodata
 
+**Resolved in AutoRIFT.jl on 2026-10-03; the Python port is tracked separately and not yet landed.**
+`_track_bucket!` (`src/track.jl`) now declines a point unless `_valid_fraction` of its chip footprint
+exceeds `Params.min_chip_valid_fraction` (default `0.65`), replacing the old `_any_valid` any-pixel test;
+the GPU path (`ext/gpu/pass.jl`) carries the same test. The threshold is calibrated against this item's
+own measurement below, not guessed: sweeping it on the NISAR L1 chip-768 boundary ring
+(`tools/golden/level_replay.jl`), agreement does not move between 0.0 and 0.5 (rms stays 3.3 px), falls to
+0.6 px at 0.6, and is clean by 0.65 (rms 0.002 px, max 0.023, zero of 292 boundary nodes beyond a pixel) —
+and stays clean through 0.9 without declining any of the level's 2,817 interior nodes. `NISAR_L2`'s capture
+predates `capture.py` recording the per-level prior, so this item's own tool cannot replay it yet; the L1
+measurement is what the default is drawn from.
+
+**This is now a real, deliberate divergence from the Python reference** rather than a shared defect this
+file reproduces on purpose — until the Python side lands, `autoRIFT.py` still correlates these chips and
+AutoRIFT.jl no longer does, which is the opposite direction from every other item here. Expect `3.rdr`/
+`3.nisar` golden-case comparisons to move accordingly; a disagreement at a swath boundary after this date
+is this item taking effect, not a regression.
+
 **The single highest-value change, and the cheapest.** A NISAR geogrid is a rotated radar footprint on a
 map grid, so the valid data has a long diagonal boundary and the nodata fill is the *majority* of the
 array — 56.8% on L1, 55.7% on L2. Nothing in either implementation keeps a correlation chip off that
