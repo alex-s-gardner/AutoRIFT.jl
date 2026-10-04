@@ -263,6 +263,12 @@ would mean the scratch and `BlockBuffers.filter_scratch` following the image's e
 
 ## 2. Decimate a coarse level with the mask, not the fill value
 
+**Measured 2026-10-04, after item 1 landed, and left open rather than implemented.** Of the 292
+boundary-ring nodes item 1's own calibration tracks on `NISAR_L1_PR_RSLC` chip 768, item 1 already
+declines the 31 whose chip is mostly fill; the other 261, still built from this item's uncorrected
+positions, agree with the reference to 0.002 px rms. No residual error is visible to fix — matching
+this file's own note below that item 1 "largely subsumes" this one.
+
 Every per-point array is decimated to a coarse level by an unweighted mean over the cell, and every one
 encodes nodata as an in-band fill value rather than carrying a mask alongside:
 
