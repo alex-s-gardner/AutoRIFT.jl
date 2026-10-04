@@ -520,6 +520,67 @@ end
     end
 end
 
+@testset "_masked_boxmean! and _masked_boxstd preserve Float64 precision" begin
+    # dev/CORRECTNESS.md item 1c: the dense path (`all(mask)`) sums `img` in its own type; the masked
+    # path used to narrow through a fixed `Float32` scratch regardless, so a `Float64` image reached a
+    # different answer depending only on whether a gap existed *anywhere* in the array handed to one
+    # call and not the other — not on anything near the pixel in question.
+    rng = Random.MersenneTwister(0x1c7)
+    n = 64
+    w = 5
+    img64 = rand(rng, Float64, n, n) .* 200 .+ 50
+
+    # The whole array takes the masked path (one far corner pixel is invalid); an interior block with
+    # no gap of its own takes the dense path. Comparable interior pixels must agree exactly.
+    mask = trues(n, n)
+    mask[end, end] = false
+    whole = AutoRIFT._masked_boxmean(img64, mask, w)
+
+    rows = 5:40
+    cols = 5:40
+    block = img64[rows, cols]
+    bmask = trues(size(block))
+    isolated = AutoRIFT._masked_boxmean(block, bmask, w)
+
+    inner = 3:33   # clear of the block's own filter edge: margin 2-3 against the width-5 radius of 2
+    @test whole[rows[inner], cols[inner]] == isolated[inner, inner]
+
+    # The variance has to narrow at the same point as the mean, or the two disagree with each other
+    # within one `wallis` call instead of across calls.
+    meanw = AutoRIFT._masked_boxmean(img64, mask, w)
+    stdw = AutoRIFT._masked_boxstd(img64, mask, meanw, w)
+    meani = AutoRIFT._masked_boxmean(block, bmask, w)
+    stdi = AutoRIFT._masked_boxstd(block, bmask, meani, w)
+    @test stdw[rows[inner], cols[inner]] == stdi[inner, inner]
+
+    # Narrower types are untouched: the scratch stays Float32, as it already was.
+    img32 = Float32.(img64)
+    block32 = Float32.(block)
+    whole32 = AutoRIFT._masked_boxmean(img32, mask, w)
+    isolated32 = AutoRIFT._masked_boxmean(block32, bmask, w)
+    @test whole32[rows[inner], cols[inner]] == isolated32[inner, inner]
+
+    # A caller-supplied scratch of the wrong element type is refused rather than silently narrowing.
+    bad_scratch = Matrix{Float32}(undef, size(img64))
+    @test_throws "scratch must be Matrix{Float64}" AutoRIFT._masked_boxmean!(
+        Matrix{Float32}(undef, size(img64)), img64, mask, w, bad_scratch)
+end
+
+@testset "block_buffers' filter scratch follows the pair's element type" begin
+    p = AutoRIFT.params(; chip_size = 8, search_radius = 4)
+    layout = AutoRIFT.block_layout(AutoRIFT.gridpoints((64, 64), 8; chip_size = 8, search_radius = 4),
+                                   p, (64, 64), (64, 64))
+    buf64 = AutoRIFT.block_buffers(ImagePair(rand(Float64, 64, 64), rand(Float64, 64, 64)), layout)
+    @test eltype(buf64.filter_scratch) == Float64
+
+    buf32 = AutoRIFT.block_buffers(ImagePair(rand(Float32, 64, 64), rand(Float32, 64, 64)), layout)
+    @test eltype(buf32.filter_scratch) == Float32
+
+    bufu8 = AutoRIFT.block_buffers(
+        ImagePair(rand(UInt8, 64, 64), rand(UInt8, 64, 64)), layout)
+    @test eltype(bufu8.filter_scratch) == Float32
+end
+
 # ---------------------------------------------------------------------------
 # The Landsat 7 scan-line gap filter, against the reference's own output
 # ---------------------------------------------------------------------------

@@ -107,7 +107,7 @@ resident(m::FiniteMask) = map(isfinite, m.parent)
 # `_read_block!` copies into dense buffers, so they are unreachable from the blocked one. They exist
 # for the third caller — a future one — that would otherwise be correct but quietly slow.
 _masked_boxmean!(out::AbstractMatrix{Float32}, img::AbstractMatrix, mask::FiniteMask, w::Int,
-                 scratch::Union{Nothing,AbstractMatrix{Float32}}) =
+                 scratch::Union{Nothing,AbstractMatrix{<:AbstractFloat}}) =
     _masked_boxmean!(out, img, resident(mask), w, scratch)
 
 _erode_mask!(out::AbstractMatrix{Bool}, mask::FiniteMask, w::Int) =
@@ -937,12 +937,14 @@ highpass(img::AbstractMatrix, mask::AbstractMatrix{Bool}, width::Integer) =
 
 Exists for tiled processing, where the alternative is a fresh output and scratch array per block —
 churn that `Sys.maxrss` records as a requirement even though the collector frees it. `scratch` is a
-second `Float32` array of the same shape, needed only when `mask` excludes something; pass one to
-make the call allocation-free in that case too.
+second array of the same shape, needed only when `mask` excludes something; pass one to make the
+call allocation-free in that case too. Its element type must be `promote_type(eltype(img), Float32)`
+— `Float32` for every real sensor type, `Float64` only when `img` genuinely is, which is what keeps a
+pooled `Float32` buffer from narrowing a `Float64` image before `_masked_boxmean!` sums it.
 """
 function highpass!(out::AbstractMatrix{Float32}, img::AbstractMatrix,
                    mask::AbstractMatrix{Bool}, width::Integer;
-                   scratch::Union{Nothing,AbstractMatrix{Float32}} = nothing)
+                   scratch::Union{Nothing,AbstractMatrix{<:AbstractFloat}} = nothing)
     axes(out) == axes(img) == axes(mask) || throw(DimensionMismatch(
         "out, img and mask must share axes"))
     # In place over the local mean: each output reads only the mean at its own index, and the
@@ -1027,9 +1029,17 @@ _masked_boxmean(img::AbstractMatrix, mask::AbstractMatrix{Bool}, w::Int) =
 
 # `scratch`, when given, is the NaN-encoded copy this would otherwise allocate. Supplying it is what
 # makes a per-block call allocation-free; `nothing` allocates as before.
+#
+# **Its element type follows the image's, not a fixed `Float32`.** The dense path above sums `img`
+# directly, in whatever type it is; this path copies through `promote_type(eltype(img), Float32)` —
+# `Float32` for every real sensor type (`UInt8`, `Int16`, `Int32`, `Float32` itself), `Float64` only
+# for genuinely `Float64` input, where encoding through a fixed `Float32` scratch would narrow before
+# `windowmean!` ever sums it. `Float32` is the floor rather than `eltype(img)` itself because the
+# encoding needs a `NaN`, which no integer type has. `dev/CORRECTNESS.md` item 1c is the measurement
+# that two code paths disagreeing on a `Float64` image is what this closes.
 function _masked_boxmean!(out::AbstractMatrix{Float32}, img::AbstractMatrix,
                           mask::AbstractMatrix{Bool}, w::Int,
-                          scratch::Union{Nothing,AbstractMatrix{Float32}})
+                          scratch::Union{Nothing,AbstractMatrix{<:AbstractFloat}})
     # The copy exists only to encode invalidity as NaN, which is what makes the running sum
     # skip those pixels. With nothing masked there is nothing to encode, so read `img`
     # directly — `windowmean!` is generic in its input. On a gap-free image, which is the
@@ -1040,17 +1050,20 @@ function _masked_boxmean!(out::AbstractMatrix{Float32}, img::AbstractMatrix,
     # otherwise would silently take the dense path over an image that needs the masked one.
     all(mask) && return windowmean!(out, img, w)
 
-    masked = isnothing(scratch) ? Matrix{Float32}(undef, size(img)) : scratch
+    T = promote_type(eltype(img), Float32)
+    masked = isnothing(scratch) ? Matrix{T}(undef, size(img)) : scratch
     axes(masked) == axes(img) || throw(DimensionMismatch(
         "scratch must share axes with the image"))
+    eltype(masked) == T || throw(ArgumentError(
+        "scratch must be Matrix{$T} for a $(eltype(img)) image, got $(typeof(masked))"))
     gaps = false
     @inbounds for i in eachindex(masked)
         if mask[i]
-            v = Float32(img[i])
+            v = T(img[i])
             masked[i] = v
             gaps |= isnan(v)
         else
-            masked[i] = NaN32
+            masked[i] = T(NaN)
             gaps = true
         end
     end
@@ -1087,14 +1100,19 @@ end
 # output by 2% and move which pixels the gap filler treats as low-contrast.
 function _masked_boxstd(img::AbstractMatrix, mask::AbstractMatrix{Bool},
                         mean::AbstractMatrix{Float32}, w::Int)
-    sq = Matrix{Float32}(undef, size(img))
+    # Same `promote_type` floor as `_masked_boxmean!`, and for the same reason: squaring a value
+    # already narrowed to `Float32` would disagree with `_masked_boxmean!`'s own precision on a
+    # `Float64` image, which is exactly the inconsistency `dev/CORRECTNESS.md` item 1c closes — one
+    # `wallis` call's mean and variance have to narrow at the same point, or not at all.
+    T = promote_type(eltype(img), Float32)
+    sq = Matrix{T}(undef, size(img))
     gaps = false
     @inbounds for i in eachindex(sq)
         if mask[i] && isfinite(mean[i])
-            v = Float32(img[i])
+            v = T(img[i])
             sq[i] = v * v
         else
-            sq[i] = NaN32
+            sq[i] = T(NaN)
             gaps = true
         end
     end

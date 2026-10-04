@@ -741,21 +741,26 @@ Sized to the largest read window in the layout. Smaller blocks — the trailing 
 does not divide evenly — take a view of the corner, which is why nothing here is sized per block.
 Not thread-safe: one set per task, the same contract as a correlation workspace.
 """
-struct BlockBuffers{T,M}
+struct BlockBuffers{T,M,S}
     reference::Matrix{T}
     secondary::Matrix{T}
     reference_valid::Matrix{M}
     secondary_valid::Matrix{M}
-    # The filter's output for each image, and one shared scratch array for the NaN-encoded copy
-    # `_masked_boxmean!` needs when a mask excludes something. `Float32` because every filter
-    # produces signed values whatever the input type.
+    # The filter's own output for each image, always `Float32` because every filter produces
+    # signed values whatever the input type — this is what the correlator reads downstream.
+    #
+    # The scratch below is a different array with a different reason for its type: it is the
+    # NaN-encoded copy `_masked_boxmean!` needs when a mask excludes something, and if it narrowed
+    # to `Float32` unconditionally it would discard precision a `Float64` pair genuinely has before
+    # `windowmean!` ever sums it (`dev/CORRECTNESS.md` item 1c). `S` is `promote_type(T, Float32)`,
+    # so it only widens past `Float32` when `T` is `Float64`.
     #
     # Scratch is shared between the two images because the two filter calls are sequential: the
     # reference's is complete before the secondary's begins, so the array is dead in between. One
     # per image would be correct and would waste half of it.
     filtered_reference::Matrix{Float32}
     filtered_secondary::Matrix{Float32}
-    filter_scratch::Matrix{Float32}
+    filter_scratch::Matrix{S}
     # Eroded masks. `_filtered` shrinks a mask by the filter width, so these cannot alias the raw
     # masks above — `track!` intersects the pair's two masks and would then be reading a mask that
     # its own filtering had already narrowed.
@@ -772,10 +777,11 @@ function block_buffers(pair::ImagePair, layout::BlockLayout)
     nr = maximum(length(b.read_rows) for b in layout.blocks)
     nc = maximum(length(b.read_cols) for b in layout.blocks)
     T = eltype(pair)
+    S = promote_type(T, Float32)
     return BlockBuffers(Matrix{T}(undef, nr, nc), Matrix{T}(undef, nr, nc),
                         Matrix{Bool}(undef, nr, nc), Matrix{Bool}(undef, nr, nc),
                         Matrix{Float32}(undef, nr, nc), Matrix{Float32}(undef, nr, nc),
-                        Matrix{Float32}(undef, nr, nc),
+                        Matrix{S}(undef, nr, nc),
                         Matrix{Bool}(undef, nr, nc), Matrix{Bool}(undef, nr, nc))
 end
 

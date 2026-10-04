@@ -220,7 +220,21 @@ Ruled out along the way, each at the cost of a run, and all still true:
 
 ## 1c. A box filter's output depends on whether its input has a gap, above `Float32`
 
-**Open, and independent of item 1b.** `_masked_boxmean!` begins `all(mask) && return windowmean!(out, img,
+**Resolved on 2026-10-04, by preserving precision rather than narrowing on both paths.** Both
+`_masked_boxmean!`'s scratch and `_masked_boxstd`'s squared-value buffer now hold
+`promote_type(eltype(img), Float32)` instead of a fixed `Float32`, and `BlockBuffers.filter_scratch`
+follows the same rule (`src/tile.jl`'s `BlockBuffers{T,M,S}`, `S = promote_type(T, Float32)`). `Float32`
+is the floor rather than `eltype(img)` itself: the encoding needs a `NaN`, which no integer type has, so
+`UInt8`/`Int16`/`Int32` still land on `Float32` exactly as before — this changes behaviour only for
+genuinely `Float64` input, which no sensor type or golden case supplies. `windowmean!`'s own kernels
+needed no change: both already promote every read to `Float64` for the running sum (`src/window.jl`),
+so the lost precision was entirely in the scratch copy made before either kernel ever saw it. Verified
+with a new `test/preprocess.jl` testset reproducing the item's own comparison (a whole array taking the
+masked path against an isolated gap-free block taking the dense path, on `Float64` input) and confirming
+it now agrees exactly, while `Float32`/narrower input is bit-for-bit unchanged.
+
+**Below is the original record of the defect, kept for the mechanism.** `_masked_boxmean!` began
+`all(mask) && return windowmean!(out, img,
 w)`, handing `img` to the dense path in its own element type. The masked path below it cannot: it encodes
 invalidity as `NaN` in a `Float32` scratch, so every element is narrowed to `Float32` first. The two
 therefore form different terms — `Float64(img[i])` against `Float64(Float32(img[i]))` — and the branch is
