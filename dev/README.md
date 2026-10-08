@@ -15,6 +15,7 @@ which is why this material is kept here rather than deleted as the port work con
 | [`gpu-feasibility.md`](gpu-feasibility.md) | per-stage device timings behind the GPU backend, and why the correlation agrees to 1e-5 while the displacements agree exactly |
 | [`plan-tiling.md`](plan-tiling.md) | the blocked-processing design and the partition invariants it has to hold |
 | [`plan-16gib.md`](plan-16gib.md) | where a run's peak memory actually is, which of the plausible levers are real, and the order of work that fits the two NISAR cases on a 16 GiB instance |
+| [`post-correlation-coregistration.md`](post-correlation-coregistration.md) | why SAR pairs are resampled before correlation rather than handed to the correlator with their misregistration: the two designs tried, the amplitude-shift bias against ISCE3 that rules them out, and what revisiting would take |
 
 Measurements were taken on an Apple M2 Max unless a file says otherwise.
 

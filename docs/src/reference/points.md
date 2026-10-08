@@ -20,8 +20,4 @@ rebuild
 sanitize!
 chip_bounds
 search_bounds
-remove_misregistration
 ```
-
-`remove_misregistration`'s working method lives in an extension: load `ImagePairGeometry` to get it.
-The core holds only the declaration and this docstring.
