@@ -184,11 +184,6 @@ const PUBLIC_NAMES = (
     # The grid, which is how per-point fields reach the correlator.
     :PointSet, :pointset, :gridpoints, :scatter, :rebuild, :sanitize!,
     :npoints, :nsearchable, :issearchable, :chip_bounds, :search_bounds,
-    # Removing a geometric misregistration from a measured displacement. Defined only when
-    # `ImagePairGeometry` is loaded, since that is what computes the offset field and the scene
-    # geometry — the method lives in the extension, and the name is declared here so it has something
-    # to extend.
-    :remove_misregistration,
     # Running it, and the results.
     :init, :autorift_with_grid, :Cache, :imagepair, :MultichipResult, :nmeasured,
     :DisplacementField, :displacement_field, :track, :track!,
