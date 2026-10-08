@@ -41,6 +41,7 @@ WallisGapfill
 Laplacian
 Sobel
 Destripe
+track_angles
 Deramp
 Decibel
 ```
