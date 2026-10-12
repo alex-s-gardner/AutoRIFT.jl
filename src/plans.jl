@@ -171,6 +171,15 @@ const WISDOM_FILENAME = Ref("")
 # particular.
 const FFTW_WISDOM_DIR_VAR = "AUTORIFT_FFTW_WISDOM_DIR"
 
+# The CPU part of the wisdom filename: `model`, the model string `Sys.cpu_info()` reports, made
+# filesystem-safe, or `cpu_name`, LLVM's name for the core (`Sys.CPU_NAME`), when there is no model.
+# Linux on aarch64 reports none ("unknown"), and there the core is what tells machines apart:
+# `neoverse-v2` for Graviton4, `neoverse-v3` for Graviton5.
+function wisdom_cpu(model::AbstractString, cpu_name::AbstractString)
+    name = (isempty(model) || model == "unknown") ? cpu_name : model
+    return replace(name, r"[^A-Za-z0-9._-]+" => "_")
+end
+
 """
     AutoRIFT.fftw_wisdom_path() -> String or nothing
 
@@ -193,8 +202,7 @@ function fftw_wisdom_path()
         # "Intel(R) Xeon(R) Gold 6248R CPU @ 3.00GHz"), none of which belong in a filename. Cached:
         # it is 12.3 us of the cost and cannot change under a running process.
         if isempty(WISDOM_FILENAME[])
-            cpu = replace(Sys.cpu_info()[1].model, r"[^A-Za-z0-9._-]+" => "_")
-            WISDOM_FILENAME[] = "$(cpu)-fftw$(FFTW_VERSION).wisdom"
+            WISDOM_FILENAME[] = "$(wisdom_cpu(Sys.cpu_info()[1].model, Sys.CPU_NAME))-fftw$(FFTW_VERSION).wisdom"
         end
         # The directory is resolved every call, and that is not an oversight. `Scratch`'s
         # `with_scratch_directory` redirects `scratch_dir` *dynamically*, and the test suite relies
