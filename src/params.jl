@@ -131,7 +131,9 @@ _one_subpixel(x, _up = nokw) = _badtype(:subpixel, x, "a Symbol or a `SubpixelMe
 # preferring one — the alternative is a caller who sets `mad_scale` next to a `GardnerFilter`
 # and never learns it was ignored.
 function _outliers(x::OutlierMethod, kw::NamedTuple)
-    _no_stray_params(x, kw, "a $(typeof(x)) instance, which already carries its own " *
+    # `nameof` rather than the type itself: printing a type reaches the type printer, which a
+    # `--trim`ed binary does not have, and this message is built on every call.
+    _no_stray_params(x, kw, "a $(nameof(typeof(x))) instance, which already carries its own " *
                      "parameters")
     return x
 end

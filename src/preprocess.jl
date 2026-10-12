@@ -1281,7 +1281,7 @@ function destripe(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::De
     band_a = _reject_band(size(img), m.cross_track, m)
     band_b = _reject_band(size(img), m.along_track, m)
 
-    spectrum = FFTW.fftshift(FFTW.fft(clamped))
+    spectrum = FFTW.fftshift(whole_cfft(ComplexF32.(clamped), FFTW_FORWARD))
     power = abs.(spectrum)
     # A cell counts if it stands `sigma` deviations above the mean. Counting cells rather than summing
     # power is what keeps one bright spike from deciding the comparison.
@@ -1323,10 +1323,13 @@ function destripe(img::AbstractMatrix{<:Real}, mask::AbstractMatrix{Bool}, m::De
     @inbounds for i in eachindex(spectrum)
         spectrum[i] *= (1.0f0 - reject[i])
     end
-    out = real.(FFTW.ifft(FFTW.ifftshift(spectrum)))
+    # `ifft`: the backward transform scaled by `1/n`, the factor computed as AbstractFFTs computes it
+    # and applied to the real part, which is the real part of the scaled value.
+    out = whole_cfft(FFTW.ifftshift(spectrum), FFTW_BACKWARD)
+    scale = one(Float32) / length(out)
     result = Matrix{Float32}(undef, size(img))
     @inbounds for i in eachindex(result)
-        result[i] = mask[i] ? Float32(out[i]) : 0.0f0
+        result[i] = mask[i] ? real(out[i]) * scale : 0.0f0
     end
     return result
 end

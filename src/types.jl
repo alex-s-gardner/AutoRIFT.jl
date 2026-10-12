@@ -1318,15 +1318,21 @@ function _check_measures(p::Params, nlevels::Integer)
     return nothing
 end
 
-# As `_check_measures`, for the subpixel tuple.
+# As `_check_measures`, for the subpixel tuple — except that entries past the last level are accepted
+# when each repeats the last level's method. Those are what `subpixel_at` would return for them anyway,
+# so they change nothing, and they let one ladder type cover every level count: a run whose level count
+# is known only at run time keeps a concrete `Params`.
 function _check_subpixels(p::Params, nlevels::Integer)
     n = length(p.subpixel)
-    n <= nlevels || throw(ArgumentError(
+    (n <= nlevels || _repeats_from(p.subpixel, nlevels)) || throw(ArgumentError(
         "`subpixel` names $n methods but there are only $nlevels chip-size levels. Widen the " *
         "`chip_size_min`/`chip_size_max` range, or name fewer methods — the last one applies to " *
         "every remaining level."))
     return nothing
 end
+
+# Whether every entry of `t` after `k` equals entry `k`.
+_repeats_from(t::Tuple, k::Integer) = k >= 1 && all(i -> t[i] == t[k], (k + 1):length(t))
 
 # Search-radius normalisation lives with the point set it operates on; see
 # `sanitize!` in points.jl.

@@ -737,9 +737,12 @@ collector returns none of that to the OS promptly, so `Sys.maxrss` records the h
 churn rather than a requirement, and a scheduler packing jobs onto a small instance is bounded by
 exactly that figure.
 
-Sized to the largest read window in the layout. Smaller blocks — the trailing ones where the grid
-does not divide evenly — take a view of the corner, which is why nothing here is sized per block.
-Not thread-safe: one set per task, the same contract as a correlation workspace.
+Sized to the largest read window in the layout, which `capacity` records. Smaller blocks — the trailing
+ones where the grid does not divide evenly — take a view of the corner, which is why nothing here is
+sized per block. Not thread-safe: one set per task, the same contract as a correlation workspace.
+
+A run reading its filtered windows from a [`FilterTileCache`](@ref) writes only the filtered planes and
+their eroded masks, so its raw planes and filter scratch are empty (see [`AutoRIFT.block_buffers`](@ref)).
 """
 struct BlockBuffers{T,M,S}
     reference::Matrix{T}
@@ -766,24 +769,34 @@ struct BlockBuffers{T,M,S}
     # its own filtering had already narrowed.
     filtered_reference_valid::Matrix{M}
     filtered_secondary_valid::Matrix{M}
+    # The largest read window the set holds, `(rows, cols)` — what a block's windows are tiled to fit,
+    # whichever planes are allocated.
+    capacity::Tuple{Int,Int}
 end
 
 """
-    AutoRIFT.block_buffers(pair::ImagePair, layout::BlockLayout) -> BlockBuffers
+    AutoRIFT.block_buffers(pair::ImagePair, layout::BlockLayout; filtered_only = false) -> BlockBuffers
 
 Storage for the largest block in `layout`, to be reused across all of them.
+
+`filtered_only` allocates only the filtered planes and their eroded masks, for a run that reads its
+filtered windows from a [`FilterTileCache`](@ref) and so never reads a raw window or filters one: 10 of a
+`Float32` pair's 24 bytes per pixel. On NISAR L1 at a 11286x5736 read window that is 0.65 GiB per task
+instead of 1.55.
 """
-function block_buffers(pair::ImagePair, layout::BlockLayout)
+function block_buffers(pair::ImagePair, layout::BlockLayout; filtered_only::Bool = false)
     nr = maximum(length(b.read_rows) for b in layout.blocks)
     nc = maximum(length(b.read_cols) for b in layout.blocks)
     T = eltype(pair)
     S = promote_type(T, Float32)
-    return BlockBuffers(Matrix{T}(undef, nr, nc), Matrix{T}(undef, nr, nc),
-                        Matrix{Bool}(undef, nr, nc), Matrix{Bool}(undef, nr, nc),
+    rr, rc = filtered_only ? (0, 0) : (nr, nc)
+    return BlockBuffers(Matrix{T}(undef, rr, rc), Matrix{T}(undef, rr, rc),
+                        Matrix{Bool}(undef, rr, rc), Matrix{Bool}(undef, rr, rc),
                         Matrix{Float32}(undef, nr, nc), Matrix{Float32}(undef, nr, nc),
-                        Matrix{S}(undef, nr, nc),
-                        Matrix{Bool}(undef, nr, nc), Matrix{Bool}(undef, nr, nc))
+                        Matrix{S}(undef, rr, rc),
+                        Matrix{Bool}(undef, nr, nc), Matrix{Bool}(undef, nr, nc), (nr, nc))
 end
+
 
 # A block's raw pair, read into reusable storage.
 #
@@ -895,6 +908,13 @@ _read_window!(dest::AbstractMatrix, img::StridedMatrix, rows, cols) =
 # **The per-tile lock stays.** It is what stops two tasks deriving the same tile at once, which the
 # mapping does not decide on its own — reading is safe unsynchronized once a tile is marked present, but
 # writing is not, so the lock still has a job.
+#
+# **Positioned reads and writes are the alternative to the mapping** (`io = :pread`). `pread`/`pwrite`
+# carry their own offset, so they have no shared position either and need no lock beyond the per-tile
+# one. What differs is accounting, not contention: a mapped page that has been touched counts toward the
+# process's resident size, so a run whose caches span tens of gigabytes reports that much resident even
+# though the pages are the kernel's file cache. Through `pread` the same pages stay in the file cache
+# without being mapped into the process, at the cost of one copy per tile read.
 
 # The tile-grid arithmetic below depends only on `dims` and `tile`, never on what a tile holds, so it is
 # shared with `tools/golden/tilecache.jl`'s `TileCache` — the same cache one layer up, for raw reads
@@ -921,6 +941,56 @@ _tile_cache_report(filled::Integer, served::Integer, bytes_per_tile::Integer) =
            filled == 0 ? "-" : string(round(served / filled; digits = 2)), "x reuse), ",
            round(filled * bytes_per_tile / 2^30; digits = 2), " GiB written")
 
+# How a disk-backed tile cache reaches its scratch file; see the note on `FilterTileCache`.
+_check_filter_cache_io(io::Symbol) = io in (:mmap, :pread) ? nothing : throw(ArgumentError(
+    "`filter_cache_io` must be `:mmap` or `:pread`, got :$io"))
+_check_filter_cache_io(io) = throw(ArgumentError(
+    "`filter_cache_io` must be `:mmap` or `:pread`, got $(repr(io))"))
+
+# Read bytes of `io` from byte `off`, or write `buf` there, without moving or sharing the
+# stream's own position — so concurrent tasks need no lock. Windows has no `pread`, so there the stream
+# position is taken under a lock instead.
+const _POSITIONED_IO_LOCK = ReentrantLock()
+
+# The first `nbytes` of `buf` — a dense byte vector or a byte reinterpretation of one — from byte `off`.
+function _pread_into!(io::IOStream, buf::AbstractVector{UInt8}, nbytes::Integer, off::Integer)
+    nbytes <= length(buf) || throw(ArgumentError("$nbytes bytes do not fit a $(length(buf))-byte buffer"))
+    @static if Sys.iswindows()
+        @lock _POSITIONED_IO_LOCK (seek(io, off); unsafe_read(io, pointer(buf), nbytes))
+    else
+        GC.@preserve buf begin
+            p = pointer(buf)
+            done = 0
+            while done < nbytes
+                n = ccall(:pread, Cssize_t, (Cint, Ptr{UInt8}, Csize_t, Int64),
+                          _cfd(io), p + done, nbytes - done, off + done)
+                n < 0 && Base.systemerror("pread")
+                n == 0 && throw(EOFError())
+                done += n
+            end
+        end
+    end
+    return nothing
+end
+
+# The C file descriptor of `io`. `fd` returns an `Int` before Julia 1.11 and a `RawFD` from 1.11.
+_cfd(io::IOStream) = (f = fd(io); f isa Integer ? Cint(f) : reinterpret(Cint, f))
+
+function _pwrite(io::IOStream, buf::Vector{UInt8}, off::Integer)
+    @static if Sys.iswindows()
+        @lock _POSITIONED_IO_LOCK (seek(io, off); write(io, buf))
+    else
+        done = 0
+        while done < length(buf)
+            n = ccall(:pwrite, Cssize_t, (Cint, Ptr{UInt8}, Csize_t, Int64),
+                      _cfd(io), pointer(buf, done + 1), length(buf) - done, off + done)
+            n < 0 && Base.systemerror("pwrite")
+            done += n
+        end
+    end
+    return nothing
+end
+
 """
     FilterTileCache
 
@@ -938,8 +1008,11 @@ struct FilterTileCache
     ntiles::Tuple{Int,Int}
     io::IOStream
     path::String
-    # The whole file, mapped once. Every tile's four planes are disjoint byte ranges of this one
-    # array, so filling one is an ordinary array write with no file-position state to contend over.
+    # `:mmap` or `:pread`; see the note above this struct.
+    mode::Symbol
+    # With `:mmap`, the whole file, mapped once. Every tile's four planes are disjoint byte ranges of
+    # this one array, so filling one is an ordinary array write with no file-position state to contend
+    # over. Empty with `:pread`.
     mapped::Vector{UInt8}
     # One lock per tile — deriving is a filter over a padded read, seconds of work in the large, and
     # holding one lock across every tile at once would serialize the very thing a blocked run
@@ -951,9 +1024,13 @@ struct FilterTileCache
 end
 
 """
-    FilterTileCache(dims, width; tile = 1024, dir = mktempdir(; cleanup = false)) -> FilterTileCache
+    FilterTileCache(dims, width; tile = 1024, dir = mktempdir(; cleanup = false), io = :mmap)
+        -> FilterTileCache
 
 A cache for a pair of size `dims`, filtered at `width`, tiled `tile` pixels on a side.
+
+`io` is how the scratch file is accessed: `:mmap` maps it into the process, `:pread` reads and writes
+each tile with positioned I/O, which keeps the cached pages out of the process's resident size.
 
 `tile` wants to be at least the chunk or burst granularity of whatever the pair reads from, so that
 filling one tile is one read of the source rather than a fraction of one — the same guidance
@@ -966,16 +1043,18 @@ gigabytes of address space and a few of actual use.
 """
 function FilterTileCache(dims::Tuple{Int,Int}, width::Integer;
                          tile::Integer = 1024,
-                         dir::AbstractString = mktempdir(; cleanup = false))
+                         dir::AbstractString = mktempdir(; cleanup = false),
+                         io::Symbol = :mmap)
     tile > 0 || throw(ArgumentError("`tile` must be positive, got $tile"))
+    _check_filter_cache_io(io)
     nt = _tile_grid(dims, tile)
     nbytes = prod(nt) * tile * tile * (2 * sizeof(Float32) + 2 * sizeof(Bool))
     mkpath(dir)
     path = joinpath(dir, "filtertilecache_$(dims[1])x$(dims[2])_$(tile)_$(width).bin")
-    io = open(path, "w+")
-    truncate(io, nbytes)
-    mapped = Mmap.mmap(io, Vector{UInt8}, nbytes)
-    return FilterTileCache(dims, Int(tile), Int(width), nt, io, path, mapped,
+    stream = open(path, "w+")
+    truncate(stream, nbytes)
+    mapped = io === :mmap ? Mmap.mmap(stream, Vector{UInt8}, nbytes) : UInt8[]
+    return FilterTileCache(dims, Int(tile), Int(width), nt, stream, path, io, mapped,
                            [ReentrantLock() for _ in 1:prod(nt)],
                            zeros(Bool, prod(nt)), Threads.Atomic{Int}(0), Threads.Atomic{Int}(0))
 end
@@ -1006,6 +1085,7 @@ Close the scratch file and delete it.
 """
 function Base.close(c::FilterTileCache)
     close(c.io)
+    c.mode === :pread && (isfile(c.path) && rm(c.path); return nothing)
     # `close(c.io)` releases the file handle the mapping was built from, not the mapping itself,
     # which otherwise lives until GC finalizes it at some later, unspecified time. Windows refuses to
     # delete a file with an active mapping (measured: `rm` below throws `EACCES`), where POSIX
@@ -1026,18 +1106,21 @@ _filter_tile_offset(c::FilterTileCache, ti::Integer, tj::Integer) =
 _filter_tile_span(c::FilterTileCache, r::AbstractUnitRange) = _tile_grid_span(c.tile, r)
 _filter_tile_extent(c::FilterTileCache, ti::Integer, tj::Integer) = _tile_grid_extent(c.dims, c.tile, ti, tj)
 
-# The four `c.tile`-square planes backing one tile, as views into the mapping — reading or writing
-# through them reads or writes the file directly, with no separate transfer step. Laid out reference
-# then secondary then their masks, matching the byte order `_filter_tile_bytes` counts.
-function _filter_tile_arrays(c::FilterTileCache, ti::Integer, tj::Integer)
-    off = _filter_tile_offset(c, ti, tj)
-    n = c.tile * c.tile
-    fr = reshape(reinterpret(Float32, view(c.mapped, (off + 1):(off + 4n))), c.tile, c.tile)
-    fs = reshape(reinterpret(Float32, view(c.mapped, (off + 4n + 1):(off + 8n))), c.tile, c.tile)
-    rv = reshape(reinterpret(Bool, view(c.mapped, (off + 8n + 1):(off + 8n + n))), c.tile, c.tile)
-    sv = reshape(reinterpret(Bool, view(c.mapped, (off + 8n + n + 1):(off + 8n + 2n))), c.tile, c.tile)
+# The four `tile`-square planes of one tile held in `bytes` from byte `off`, as views. Laid out
+# reference then secondary then their masks, matching the byte order `_filter_tile_bytes` counts.
+function _filter_tile_planes(bytes::Vector{UInt8}, off::Integer, tile::Integer)
+    n = tile * tile
+    fr = reshape(reinterpret(Float32, view(bytes, (off + 1):(off + 4n))), tile, tile)
+    fs = reshape(reinterpret(Float32, view(bytes, (off + 4n + 1):(off + 8n))), tile, tile)
+    rv = reshape(reinterpret(Bool, view(bytes, (off + 8n + 1):(off + 8n + n))), tile, tile)
+    sv = reshape(reinterpret(Bool, view(bytes, (off + 8n + n + 1):(off + 8n + 2n))), tile, tile)
     return fr, fs, rv, sv
 end
+
+# The planes of a mapped cache's tile, as views into the mapping — reading or writing through them reads
+# or writes the file directly. A `:pread` cache writes through `_pwrite` and reads `_read_filter_columns!`.
+_filter_tile_arrays(c::FilterTileCache, ti::Integer, tj::Integer) =
+    _filter_tile_planes(c.mapped, _filter_tile_offset(c, ti, tj), c.tile)
 
 # A dense `Matrix{Bool}` copy of a mask window, without copying twice when indexing already produced
 # one — as it does whenever the source mask is itself a plain `Matrix{Bool}` (the common case for an
@@ -1068,7 +1151,9 @@ function _ensure_filter_tile!(c::FilterTileCache, pair::ImagePair, m::Highpass, 
             Threads.atomic_add!(c.served, 1)
             return nothing
         end
-        fr, fs, rv, sv = _filter_tile_arrays(c, ti, tj)
+        bytes = c.mode === :mmap ? c.mapped : Vector{UInt8}(undef, _filter_tile_bytes(c))
+        off = c.mode === :mmap ? _filter_tile_offset(c, ti, tj) : 0
+        fr, fs, rv, sv = _filter_tile_planes(bytes, off, c.tile)
         rows, cols = _filter_tile_extent(c, ti, tj)
         reach = filter_reach(m)
         nr, nc = c.dims
@@ -1096,6 +1181,7 @@ function _ensure_filter_tile!(c::FilterTileCache, pair::ImagePair, m::Highpass, 
         copyto!(view(fs, 1:nrl, 1:ncl), view(pfs, io0:(io0 + nrl - 1), jo0:(jo0 + ncl - 1)))
         copyto!(view(rv, 1:nrl, 1:ncl), view(prv, io0:(io0 + nrl - 1), jo0:(jo0 + ncl - 1)))
         copyto!(view(sv, 1:nrl, 1:ncl), view(psv, io0:(io0 + nrl - 1), jo0:(jo0 + ncl - 1)))
+        c.mode === :pread && _pwrite(c.io, bytes, _filter_tile_offset(c, ti, tj))
         c.present[k] = true
         Threads.atomic_add!(c.filled, 1)
     end
@@ -1114,7 +1200,6 @@ function _cached_filtered_window!(dest_fr, dest_rv, dest_fs, dest_sv,
                                   rows::AbstractUnitRange, cols::AbstractUnitRange)
     for tj in _filter_tile_span(c, cols), ti in _filter_tile_span(c, rows)
         _ensure_filter_tile!(c, pair, m, ti, tj)
-        fr, fs, rv, sv = _filter_tile_arrays(c, ti, tj)
         trows, tcols = _filter_tile_extent(c, ti, tj)
         wr = intersect(rows, trows)
         wc = intersect(cols, tcols)
@@ -1123,12 +1208,49 @@ function _cached_filtered_window!(dest_fr, dest_rv, dest_fs, dest_sv,
         dc = wc .- first(cols) .+ 1
         sr = wr .- first(trows) .+ 1
         sc = wc .- first(tcols) .+ 1
+        fr, fs, rv, sv = if c.mode === :mmap
+            _filter_tile_arrays(c, ti, tj)
+        else
+            # The window's columns of each plane, which are contiguous in the file, into buffers this
+            # task keeps; `sc` then indexes from the buffer's first column.
+            planes = _read_filter_columns!(_filter_read_buffers(c), c, ti, tj, sc)
+            sc = 1:length(sc)
+            planes
+        end
         copyto!(view(dest_fr, dr, dc), view(fr, sr, sc))
         copyto!(view(dest_fs, dr, dc), view(fs, sr, sc))
         copyto!(view(dest_rv, dr, dc), view(rv, sr, sc))
         copyto!(view(dest_sv, dr, dc), view(sv, sr, sc))
     end
     return nothing
+end
+
+# One task's buffers for `:pread` window reads: a tile's four planes, reused across every read the task
+# makes rather than allocated per tile.
+function _filter_read_buffers(c::FilterTileCache)
+    key = (:autorift_filter_read_buffers, c.tile)
+    return get!(task_local_storage(), key) do
+        (Matrix{Float32}(undef, c.tile, c.tile), Matrix{Float32}(undef, c.tile, c.tile),
+         Matrix{Bool}(undef, c.tile, c.tile), Matrix{Bool}(undef, c.tile, c.tile))
+    end::Tuple{Matrix{Float32},Matrix{Float32},Matrix{Bool},Matrix{Bool}}
+end
+
+# Columns `sc` of tile `(ti, tj)`'s four planes into `bufs`, one positioned read per plane: a plane is
+# column-major, so a span of whole columns is one contiguous byte range. Reading the window's columns
+# rather than the whole tile is what keeps `:pread` near the mapping's throughput — measured at 0.8x of
+# `:mmap` for block-shaped windows, against 0.25-0.4x for a whole tile into a fresh buffer.
+function _read_filter_columns!(bufs, c::FilterTileCache, ti::Integer, tj::Integer, sc::AbstractUnitRange)
+    off = _filter_tile_offset(c, ti, tj)
+    n = c.tile * c.tile
+    plane_offsets = (0, 4n, 8n, 9n)
+    return ntuple(4) do k
+        buf = bufs[k]
+        e = sizeof(eltype(buf))
+        span = reinterpret(UInt8, vec(buf))
+        nbytes = e * c.tile * length(sc)
+        _pread_into!(c.io, span, nbytes, off + plane_offsets[k] + e * c.tile * (first(sc) - 1))
+        buf
+    end
 end
 
 """
@@ -1138,6 +1260,12 @@ How many tiles were derived and how many were served from the mapping — the sa
 `tools/golden/tilecache.jl`'s `TileCache` reports for raw reads.
 """
 cache_report(c::FilterTileCache) = _tile_cache_report(c.filled[], c.served[], _filter_tile_bytes(c))
+
+# Whether a run's blocks read their filtered windows from `cache` rather than filtering raw ones: the
+# test `_prepared_block_pair` branches on and `block_buffers` sizes for, so the two cannot disagree.
+_reads_filter_cache(cache::Union{Nothing,FilterTileCache}, p::Params) =
+    !isnothing(cache) && _poolable(p.preprocess)
+
 
 # The *filtered* pair a block sees, from raw input.
 #
@@ -1161,7 +1289,7 @@ cache_report(c::FilterTileCache) = _tile_cache_report(c.filled[], c.served[], _f
 # tile, from the cache instead.
 function _prepared_block_pair(buf::BlockBuffers, pair::ImagePair, rows, cols, p::Params,
                               cache::Union{Nothing,FilterTileCache} = nothing)
-    if !isnothing(cache) && _poolable(p.preprocess)
+    if _reads_filter_cache(cache, p)
         nr, nc = length(rows), length(cols)
         fr = @view buf.filtered_reference[1:nr, 1:nc]
         fs = @view buf.filtered_secondary[1:nr, 1:nc]
@@ -1595,13 +1723,15 @@ block; and a block's filtered values and eroded mask agree with a whole-scene fi
 block writes, which is what the filter term in [`AutoRIFT.halo`](@ref) buys.
 """
 function correlate_tiled(raw::ImagePair, grid::PointSet{2}, p::Params, block_size,
-                         filter_cache_tile::Union{Nothing,Integer} = nothing)
+                         filter_cache_tile::Union{Nothing,Integer} = nothing;
+                         filter_cache_io::Symbol = :mmap)
     layout = block_layout(grid, p, size(raw), block_size)
     # One set for the whole run. `block_buffers` sizes from the layout's largest read window, which
     # no level changes, so allocating per pass would allocate the same nine arrays twice per level.
     # A threaded run takes its own set per task instead, since blocks then write concurrently.
-    buffers = istrue(p.threaded) ? nothing : block_buffers(raw, layout)
-    fc = _filter_cache(filter_cache_tile, raw, p)
+    fc = _filter_cache(filter_cache_tile, raw, p; io = filter_cache_io)
+    buffers = istrue(p.threaded) ? nothing :
+              block_buffers(raw, layout; filtered_only = _reads_filter_cache(fc, p))
     # Budget 0: this correlates the pair it is handed, reading windows from wherever that pair lives.
     # Deciding to read it into memory belongs to the entry points, where the caller can say otherwise.
     r = _multichip(Blocked(raw, layout, layout.blocks, buffers, 0, fc), grid, p)
@@ -1678,13 +1808,14 @@ function _run_blocked(raw::ImagePair, pts::PointSet{2}, p::Params, layout::Block
         ordered = _cost_ordered_blocks(blocks, pts)
         ntasks = min(length(ordered), Threads.nthreads())
         tasks = map(1:ntasks) do _
-            StableTasks.@spawn _run_task_blocks!(out, next, raw, pts, serial, ordered, layout,
+            Threads.@spawn _run_task_blocks!(out, next, raw, pts, serial, ordered, layout,
                                                  geometry, measure, subpixel, cache)
         end
         foreach(wait, tasks)
     else
         # Serial: one set serves every block, and the caller's serves every pass.
-        serialbuf = isnothing(buffers) ? block_buffers(raw, layout) : buffers
+        serialbuf = isnothing(buffers) ?
+                    block_buffers(raw, layout; filtered_only = _reads_filter_cache(cache, p)) : buffers
         for b in blocks
             _run_one_block!(out, serialbuf, raw, pts, serial, b, layout.halo, geometry, measure,
                             subpixel, cache)
@@ -1710,7 +1841,7 @@ function _run_task_blocks!(out::DisplacementField, next::Threads.Atomic{Int}, ra
                            layout::BlockLayout, geometry::PassGeometry,
                            measure::SimilarityMeasure, subpixel::SubpixelMethod,
                            cache::Union{Nothing,FilterTileCache} = nothing)
-    buf = block_buffers(raw, layout)
+    buf = block_buffers(raw, layout; filtered_only = _reads_filter_cache(cache, p))
     while true
         k = Threads.atomic_add!(next, 1)
         k <= length(blocks) || break
@@ -1731,7 +1862,7 @@ function _run_one_block!(out::DisplacementField, buf::BlockBuffers, raw::ImagePa
                          geometry::PassGeometry, measure::SimilarityMeasure,
                          subpixel::SubpixelMethod, cache::Union{Nothing,FilterTileCache} = nothing)
     windows, assign = _read_windows(pts, b, halo, size(raw),
-                                    size(buf.reference, 1), size(buf.reference, 2))
+                                    buf.capacity...)
     if isnothing(assign)
         isempty(windows) && return out
         w = only(windows)

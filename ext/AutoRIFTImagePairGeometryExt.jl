@@ -202,13 +202,17 @@ Five keywords a caller would otherwise have to re-derive, each read out of `g` r
     division is exact.
   * `subpixel`, as the reference's per-level ladder: `16, 32, 64, 64` for optical and
     `32, 64, 128, 128` for radar. A single factor cannot express it, and the reference looks the
-    factor up per chip size.
+    factor up per chip size. Always four entries: past the run's last level each repeats that
+    level's factor, which is what the ladder's own last-entry rule would give, so the `Params` type
+    is the same whatever `chip_size_max` turns out to be.
 
 `optical` selects that last pair, matching the driver's `optflag`; it defaults from `g`'s coordinate
 system, which is what decides it in production.
 
 Every other keyword is forwarded to [`AutoRIFT.params`](@ref) unchanged, so a caller overrides any of
-the above by passing it.
+the above by passing it. The method choices this does not set are passed as objects — `ZNCC()`,
+`GardnerFilter()`, `CPU()` — rather than left to their Symbol defaults, so that with object-valued
+keywords from the caller the result's type is known where `params` is called.
 """
 function AutoRIFT.params(g::PairGeometry; chip_size_0 = 240.0,
                          optical::Bool = g.coordinate isa ProjectedCoordinate, kwargs...)
@@ -230,13 +234,21 @@ function AutoRIFT.params(g::PairGeometry; chip_size_0 = 240.0,
     grid_m = abs(g.geotransform[2])
     spacing = trunc(Int, chip_x * grid_m / chip_size_0)
 
+    chip = (X = chip_x, Y = _even(chip_x * scale_y))
+    cmax = haskey(kwargs, :chip_size_max) ? AutoRIFT.extent(kwargs[:chip_size_max]) :
+           (X = Int(max_x), Y = _even(Int(max_x) * scale_y))
     return AutoRIFT.params(;
-        chip_size = (X = chip_x, Y = _even(chip_x * scale_y)),
-        chip_size_max = (X = Int(max_x), Y = _even(Int(max_x) * scale_y)),
+        similarity = AutoRIFT.ZNCC(), outliers = AutoRIFT.GardnerFilter(), backend = AutoRIFT.CPU(),
+        chip_size = chip,
+        chip_size_max = cmax,
         grid_spacing = (X = spacing, Y = spacing),
-        subpixel = _subpixel_ladder(optical),
+        subpixel = _subpixel_ladder(optical, _nlevels(chip.X, cmax.X)),
         kwargs...)
 end
+
+# The number of chip-size levels from `cmin` up to `cmax`, doubling, for a ratio `params` accepts. A
+# ratio it refuses gives a count the ladder clamps to `1:4`; `params` then reports the ratio itself.
+_nlevels(cmin::Integer, cmax::Integer) = clamp(trailing_zeros(max(cmax ÷ max(cmin, 1), 1)) + 1, 1, 4)
 
 # `round(x / 2) * 2` — the reference's way of keeping a chip extent even, which the correlator's
 # centroid convention requires.
@@ -255,10 +267,12 @@ end
 # One refinement factor per pyramid level, coarsest last. The reference holds these as a dictionary
 # keyed by chip size (`testautoRIFT.py:330-334`) and looks the factor up per level; `Params` holds
 # the same ladder positionally, with the last entry applying to every remaining level.
-_subpixel_ladder(optical::Bool) =
-    optical ? (AutoRIFT.PyramidRefine(16), AutoRIFT.PyramidRefine(32), AutoRIFT.PyramidRefine(64),
-               AutoRIFT.PyramidRefine(64)) :
-    (AutoRIFT.PyramidRefine(32), AutoRIFT.PyramidRefine(64), AutoRIFT.PyramidRefine(128),
-     AutoRIFT.PyramidRefine(128))
+#
+# Entries past level `nlevels` repeat that level's factor, so a run with fewer levels than the ladder
+# has entries gets exactly the factors the reference's dictionary gives it, in a tuple of the same type.
+function _subpixel_ladder(optical::Bool, nlevels::Integer)
+    f = optical ? (16, 32, 64, 64) : (32, 64, 128, 128)
+    return ntuple(i -> AutoRIFT.PyramidRefine(f[min(i, nlevels)]), Val(4))
+end
 
 end # module

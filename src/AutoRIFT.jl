@@ -38,7 +38,6 @@ using LinearAlgebra: LinearAlgebra
 using Mmap: Mmap
 # `WallisGapfill` fills gaps with noise, and `Params.rng_seed` is what makes that reproducible.
 using Random: Random
-using StableTasks: StableTasks
 
 """
     autorift(reference, secondary; kwargs...)

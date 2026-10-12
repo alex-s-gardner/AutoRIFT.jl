@@ -53,7 +53,7 @@ function _parallel_slices(work!::F, idx::AbstractUnitRange, cost::Real) where {F
     next = Threads.Atomic{Int}(1)
     ntasks = min(length(slices), nthreads)
     tasks = map(1:ntasks) do _
-        StableTasks.@spawn _parallel_claimed!(work!, slices, next)
+        Threads.@spawn _parallel_claimed!(work!, slices, next)
     end
     foreach(wait, tasks)
     return nothing
@@ -108,7 +108,7 @@ function _parallel_reduce(accumulate!::A, init::I, combine!::C,
     next = Threads.Atomic{Int}(1)
     ntasks = min(length(slices), nthreads)
     tasks = map(1:ntasks) do _
-        StableTasks.@spawn _parallel_reduce_claimed!(accumulate!, accs, slices, next)
+        Threads.@spawn _parallel_reduce_claimed!(accumulate!, accs, slices, next)
     end
     foreach(wait, tasks)
     out = first(accs)
