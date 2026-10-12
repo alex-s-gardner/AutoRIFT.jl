@@ -760,7 +760,7 @@ function _track_threaded!(out::DisplacementField, ref, sec, okmask, pts::PointSe
     next = Threads.Atomic{Int}(1)
     ntasks = min(length(ranges), Threads.nthreads())
     tasks = map(1:ntasks) do _
-        StableTasks.@spawn _track_claimed!(out, ref, sec, okmask, pts, chip, radius,
+        Threads.@spawn _track_claimed!(out, ref, sec, okmask, pts, chip, radius,
                                            up, p, measure, ranges, next)
     end
     foreach(wait, tasks)

@@ -18,7 +18,7 @@
 #     explicit input and output buffers is safe under that arrangement.
 
 using FFTW: FFTW
-using FFTW_jll: libfftw3f_path
+import FFTW_jll
 using Scratch: scratch_dir
 
 # ---------------------------------------------------------------------------
@@ -39,14 +39,11 @@ using Scratch: scratch_dir
 # destruction. Holding `Ptr{Cvoid}` avoids needing any of it — measured 37 MiB peak RSS for a
 # trimmed binary against 489 MiB for the equivalent Julia process.
 #
-# The library is named by `FFTW_jll.libfftw3f_path` and not by either obvious alternative, both of
-# which were tried and fail in opposite directions. `FFTW.libfftw3f` is a `FakeLazyLibrary`
-# resolved by a load-time callback; a trimmed binary has no such callback and the `ccall` dies at
-# *runtime* with a `TypeError`. A bare soname (`"libfftw3f.dylib"`) works in a trimmed binary with
-# the artifact on the loader path, but fails in an ordinary session, where it is not. The resolved
-# artifact path works in both.
-
-const LIBFFTW3F = libfftw3f_path
+# Every `ccall` names the library as `FFTW_jll.libfftw3f`, the path FFTW_jll's `__init__` sets in the
+# running process, and not as either obvious alternative. `FFTW.libfftw3f` is a `FakeLazyLibrary`
+# resolved by a load-time callback; a trimmed binary has no such callback and the `ccall` dies at *run
+# time* with a `TypeError`. A path captured in a `const` while the package or the binary is built is
+# the build machine's artifact path, which a relocated binary does not have.
 
 # FFTW's own flag values, from `fftw3.h`. Hard-coded because the whole point is not to depend on
 # FFTW.jl's plan machinery; `FFTW.MEASURE` is the same integer.
@@ -299,7 +296,7 @@ function load_fftw_wisdom!()
                 # Nonzero is FFTW accepting the file. A corrupt one returns zero, which must leave
                 # `WISDOM_IMPORTED` false so the warning fires — silently planning everything from
                 # scratch because a cache file is damaged is exactly what it exists to surface.
-                ok = ccall((:fftwf_import_wisdom_from_file, LIBFFTW3F), Cint, (Ptr{Cvoid},), f)
+                ok = ccall((:fftwf_import_wisdom_from_file, FFTW_jll.libfftw3f), Cint, (Ptr{Cvoid},), f)
                 WISDOM_IMPORTED[] = ok != 0
             finally
                 ccall(:fclose, Cint, (Ptr{Cvoid},), f)
@@ -345,7 +342,7 @@ function save_fftw_wisdom!()
         f = ccall(:fopen, Ptr{Cvoid}, (Cstring, Cstring), tmp, "w")
         f == C_NULL && return nothing
         try
-            ccall((:fftwf_export_wisdom_to_file, LIBFFTW3F), Cvoid, (Ptr{Cvoid},), f)
+            ccall((:fftwf_export_wisdom_to_file, FFTW_jll.libfftw3f), Cvoid, (Ptr{Cvoid},), f)
         finally
             ccall(:fclose, Cint, (Ptr{Cvoid},), f)
         end
@@ -384,7 +381,7 @@ function fft_plan(ny::Int, nx::Int)
             # transposes every transform, which for a symmetric test size looks like it works.
             inb = Matrix{Float32}(undef, ny, nx)
             outb = Matrix{ComplexF32}(undef, ny ÷ 2 + 1, nx)
-            plan = ccall((:fftwf_plan_dft_r2c_2d, LIBFFTW3F), Ptr{Cvoid},
+            plan = ccall((:fftwf_plan_dft_r2c_2d, FFTW_jll.libfftw3f), Ptr{Cvoid},
                          (Cint, Cint, Ptr{Float32}, Ptr{ComplexF32}, Cuint),
                          nx, ny, inb, outb, PLAN_FLAGS)
             plan == C_NULL && error("FFTW could not plan a $(ny)x$(nx) real-to-complex " *
@@ -406,7 +403,7 @@ from the same `next_fft_size` the plan is keyed on.
 """
 @inline function fft_execute!(plan::Ptr{Cvoid}, input::Matrix{Float32},
                               output::Matrix{ComplexF32})
-    ccall((:fftwf_execute_dft_r2c, LIBFFTW3F), Cvoid,
+    ccall((:fftwf_execute_dft_r2c, FFTW_jll.libfftw3f), Cvoid,
           (Ptr{Cvoid}, Ptr{Float32}, Ptr{ComplexF32}), plan, input, output)
     return output
 end
@@ -427,7 +424,7 @@ function ifft_plan(ny::Int, nx::Int)
             _measuring_new_size!()
             inb = Matrix{ComplexF32}(undef, ny ÷ 2 + 1, nx)
             outb = Matrix{Float32}(undef, ny, nx)
-            plan = ccall((:fftwf_plan_dft_c2r_2d, LIBFFTW3F), Ptr{Cvoid},
+            plan = ccall((:fftwf_plan_dft_c2r_2d, FFTW_jll.libfftw3f), Ptr{Cvoid},
                          (Cint, Cint, Ptr{ComplexF32}, Ptr{Float32}, Cuint),
                          nx, ny, inb, outb, PLAN_FLAGS)
             plan == C_NULL && error("FFTW could not plan a $(ny)x$(nx) complex-to-real " *
@@ -458,7 +455,7 @@ function cfft_plan(ny::Int, nx::Int)
             _measuring_new_size!()
             inb = Matrix{ComplexF32}(undef, ny, nx)
             outb = Matrix{ComplexF32}(undef, ny, nx)
-            plan = ccall((:fftwf_plan_dft_2d, LIBFFTW3F), Ptr{Cvoid},
+            plan = ccall((:fftwf_plan_dft_2d, FFTW_jll.libfftw3f), Ptr{Cvoid},
                          (Cint, Cint, Ptr{ComplexF32}, Ptr{ComplexF32}, Cint, Cuint),
                          nx, ny, inb, outb, FFTW_FORWARD, PLAN_FLAGS)
             plan == C_NULL && error("FFTW could not plan a $(ny)x$(nx) forward complex " *
@@ -477,7 +474,7 @@ function icfft_plan(ny::Int, nx::Int)
             _measuring_new_size!()
             inb = Matrix{ComplexF32}(undef, ny, nx)
             outb = Matrix{ComplexF32}(undef, ny, nx)
-            plan = ccall((:fftwf_plan_dft_2d, LIBFFTW3F), Ptr{Cvoid},
+            plan = ccall((:fftwf_plan_dft_2d, FFTW_jll.libfftw3f), Ptr{Cvoid},
                          (Cint, Cint, Ptr{ComplexF32}, Ptr{ComplexF32}, Cint, Cuint),
                          nx, ny, inb, outb, FFTW_BACKWARD, PLAN_FLAGS)
             plan == C_NULL && error("FFTW could not plan a $(ny)x$(nx) inverse complex " *
@@ -497,7 +494,7 @@ the inverse. Unlike c2r, this transform does *not* destroy its input, so a spect
 """
 @inline function cfft_execute!(plan::Ptr{Cvoid}, input::Matrix{ComplexF32},
                                output::Matrix{ComplexF32})
-    ccall((:fftwf_execute_dft, LIBFFTW3F), Cvoid,
+    ccall((:fftwf_execute_dft, FFTW_jll.libfftw3f), Cvoid,
           (Ptr{Cvoid}, Ptr{ComplexF32}, Ptr{ComplexF32}), plan, input, output)
     return output
 end
@@ -519,13 +516,53 @@ size, which produces a plausible-looking surface with the wrong normalisation.
 """
 @inline function ifft_execute!(plan::Ptr{Cvoid}, input::Matrix{ComplexF32},
                                output::Matrix{Float32})
-    ccall((:fftwf_execute_dft_c2r, LIBFFTW3F), Cvoid,
+    ccall((:fftwf_execute_dft_c2r, FFTW_jll.libfftw3f), Cvoid,
           (Ptr{Cvoid}, Ptr{ComplexF32}, Ptr{Float32}), plan, input, output)
     scale = 1.0f0 / length(output)
     @inbounds @simd for i in eachindex(output)
         output[i] *= scale
     end
     return output
+end
+
+"""
+    whole_cfft(X, direction) -> Matrix{ComplexF32}
+
+The unnormalised complex transform of all of `X`: forward for `direction = FFTW_FORWARD`, as FFTW.jl's
+`fft` computes it, and backward for `FFTW_BACKWARD`, as its `bfft` does.
+
+Planned exactly as FFTW.jl plans those — `FFTW_ESTIMATE`, out of place, through the guru64 interface
+with the dimensions and strides it passes and no output array — so the planner chooses the same
+algorithm and the result has the same bits. Planned and destroyed per call: a destripe transforms a
+scene once, so there is nothing for the cache above to reuse.
+"""
+function whole_cfft(X::Matrix{ComplexF32}, direction::Cint)
+    ny, nx = size(X)
+    Y = Matrix{ComplexF32}(undef, ny, nx)
+    # `(n, input stride, output stride)` per dimension, fastest first, as `FFTW.dims_howmany` builds it.
+    dims = Int[ny, 1, 1, nx, ny, ny]
+    lock(PLAN_LOCK)
+    plan = try
+        ccall((:fftwf_plan_guru64_dft, FFTW_jll.libfftw3f), Ptr{Cvoid},
+              (Cint, Ptr{Int}, Cint, Ptr{Int}, Ptr{ComplexF32}, Ptr{ComplexF32}, Cint, Cuint),
+              2, dims, 0, C_NULL, X, C_NULL, direction, FFTW_ESTIMATE)
+    finally
+        unlock(PLAN_LOCK)
+    end
+    plan == C_NULL && error("FFTW could not plan a " * string(ny) * "x" * string(nx) *
+                            " complex transform.")
+    try
+        ccall((:fftwf_execute_dft, FFTW_jll.libfftw3f), Cvoid,
+              (Ptr{Cvoid}, Ptr{ComplexF32}, Ptr{ComplexF32}), plan, X, Y)
+    finally
+        lock(PLAN_LOCK)
+        try
+            ccall((:fftwf_destroy_plan, FFTW_jll.libfftw3f), Cvoid, (Ptr{Cvoid},), plan)
+        finally
+            unlock(PLAN_LOCK)
+        end
+    end
+    return Y
 end
 
 """

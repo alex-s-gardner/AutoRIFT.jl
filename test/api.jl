@@ -150,6 +150,38 @@ scratch_files() = sum(count(f -> startswith(f, "filtertilecache_"), files)
     @test scratch_files() == before
 end
 
+@testset "filter_cache_io = :pread matches the mapped cache, and leaks no scratch file" begin
+    ref, sec = shifted_pair(512, (6, -4); T = Float32)
+    kw = (; chip_size = 32, search_radius = 25, process_block_size = (160, 160), filter_cache_tile = 64)
+    mapped = autorift(ref, sec; kw...)
+    before = scratch_files()
+    positioned = autorift(ref, sec; kw..., filter_cache_io = :pread)
+    @test all(isequal.(mapped.dx, positioned.dx))
+    @test all(isequal.(mapped.dy, positioned.dy))
+    @test mapped.chip_size == positioned.chip_size
+    @test scratch_files() == before
+
+    # The positional entry point, threaded, which is what a blocked production run calls.
+    grid = gridpoints(size(ref), 24; chip_size = 32, search_radius = 25)
+    p = params(; chip_size = 32, search_radius = 25, threaded = true)
+    a = AutoRIFT.autorift(ImagePair(ref, sec), grid, p, (160, 160), 0, 64)
+    b = AutoRIFT.autorift(ImagePair(ref, sec), grid, p, (160, 160), 0, 64; filter_cache_io = :pread)
+    @test all(isequal.(a.dx, b.dx))
+    @test all(isequal.(a.dy, b.dy))
+
+    # `reinit!` rebuilds the cache in the mode it was built with.
+    c = init(ref, sec; kw..., filter_cache_io = :pread)
+    @test autorift!(c).dx == positioned.dx
+    b_ref, b_sec = shifted_pair(512, (-9, 3); T = Float32)
+    reinit!(c; reference = b_ref, secondary = b_sec)
+    @test c.runner.filter_cache.mode === :pread
+    close(c)
+    @test scratch_files() == before
+
+    @test_throws "`filter_cache_io` must be `:mmap` or `:pread`" autorift(ref, sec; kw...,
+                                                                          filter_cache_io = :read)
+end
+
 @testset "repeated runs do not recompute" begin
     # Idempotence, and the reason the cache tracks freshness at all: a driver that calls
     # `autorift!` twice by accident should not pay twice.

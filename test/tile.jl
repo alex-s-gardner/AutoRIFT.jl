@@ -691,6 +691,12 @@ end
     layout = AutoRIFT.block_layout(grid, p, size(raw), (512, 512))
     buf = AutoRIFT.block_buffers(ImagePair(ref, sec), layout)
     bufrows, bufcols = size(buf.reference)
+    @test buf.capacity == (bufrows, bufcols)
+    # A run reading a filter-tile cache keeps only the filtered planes, at the same capacity.
+    fbuf = AutoRIFT.block_buffers(ImagePair(ref, sec), layout; filtered_only = true)
+    @test fbuf.capacity == buf.capacity
+    @test size(fbuf.filtered_reference) == size(fbuf.filtered_secondary_valid) == buf.capacity
+    @test isempty(fbuf.reference) && isempty(fbuf.secondary_valid) && isempty(fbuf.filter_scratch)
     cs = AutoRIFT.extent(last(AutoRIFT.chip_sizes(p)))
     decim = AutoRIFT._level_decimation(p, cs)
     @test decim > 1

@@ -117,19 +117,15 @@ end
 # `False()` rather than `false` for `threaded`: `Params` carries threading as a *type* so the grid
 # loop's branch is resolved at compile time.
 #
-# Single-threaded is not only the natural fit for the one-vCPU instance this binary exists for — it
-# is currently the only option, and the reason is upstream rather than here. `True()` **trims with
-# zero verifier errors and then fails at runtime**: the spawned closure raises a `MethodError` with
-# `args=()`, i.e. the task entry point itself was trimmed away. The verifier does not follow task
-# entry closures, so this is a clean build that cannot run — the worst failure mode of the three.
+# Single-threaded is the natural fit for the one-vCPU instance this binary exists for. `True()` trims
+# too, on Julia 1.13: a build run on four threads gives output bit-identical to `False()`. Julia 1.12
+# trims `True()` with zero verifier errors and then fails at run time — the spawned closure raises a
+# `MethodError` with `args=()`, its task entry point trimmed away — and a six-line program whose whole
+# body is `Threads.@spawn atomic_add!(acc, 42)` fails the same way there.
 #
-# Reproduced without AutoRIFT: a six-line program whose whole body is `Threads.@spawn
-# atomic_add!(acc, 42)` fails identically. So it is `--trim` and `Threads.@spawn`, not
-# `StableTasks` and not the grid loop. Re-test on a later Julia; the change here is one word.
-#
-# The loss is bounded. Threading is a within-pair optimization, and `benchmark/suite/throughput.jl`
-# measures pair-level parallelism at 2.7x intra-pair threading anyway — so the shape this binary
-# wants is many single-threaded processes, which is exactly what it is.
+# Threading is a within-pair optimization, and `benchmark/suite/throughput.jl` measures pair-level
+# parallelism at 2.7x intra-pair threading, so the shape this binary wants is many single-threaded
+# processes.
 function app_params(chip_size::Int, search_radius::Int, grid_spacing::Int, upsampling::Int)
     # The geometry fields are extents — `(X = …, Y = …)` named tuples. Written as literals rather
     # than through `AutoRIFT.extent`, because a positional `Params` call is the trimmable entry point
