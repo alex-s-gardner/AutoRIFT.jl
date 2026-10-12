@@ -76,6 +76,11 @@ end
         @test !occursin("/", basename(path))
         @test isdirpath(dirname(path)) || isdir(dirname(path))
     end
+    # A machine with no model string is named by its core, so two aarch64 instance types do not
+    # share one file.
+    @test AutoRIFT.wisdom_cpu("Apple M2 Max", "apple-m2") == "Apple_M2_Max"
+    @test AutoRIFT.wisdom_cpu("unknown", "neoverse-v2") == "neoverse-v2"
+    @test AutoRIFT.wisdom_cpu("", "neoverse-v3") == "neoverse-v3"
 end
 
 @testset "the scratch directory is resolved per call, not cached" begin
