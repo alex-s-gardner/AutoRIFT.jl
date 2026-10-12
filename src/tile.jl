@@ -963,7 +963,7 @@ function _pread_into!(io::IOStream, buf::AbstractVector{UInt8}, nbytes::Integer,
             done = 0
             while done < nbytes
                 n = ccall(:pread, Cssize_t, (Cint, Ptr{UInt8}, Csize_t, Int64),
-                          reinterpret(Cint, fd(io)), p + done, nbytes - done, off + done)
+                          _cfd(io), p + done, nbytes - done, off + done)
                 n < 0 && Base.systemerror("pread")
                 n == 0 && throw(EOFError())
                 done += n
@@ -973,6 +973,9 @@ function _pread_into!(io::IOStream, buf::AbstractVector{UInt8}, nbytes::Integer,
     return nothing
 end
 
+# The C file descriptor of `io`. `fd` returns an `Int` before Julia 1.11 and a `RawFD` from 1.11.
+_cfd(io::IOStream) = (f = fd(io); f isa Integer ? Cint(f) : reinterpret(Cint, f))
+
 function _pwrite(io::IOStream, buf::Vector{UInt8}, off::Integer)
     @static if Sys.iswindows()
         @lock _POSITIONED_IO_LOCK (seek(io, off); write(io, buf))
@@ -980,7 +983,7 @@ function _pwrite(io::IOStream, buf::Vector{UInt8}, off::Integer)
         done = 0
         while done < length(buf)
             n = ccall(:pwrite, Cssize_t, (Cint, Ptr{UInt8}, Csize_t, Int64),
-                      reinterpret(Cint, fd(io)), pointer(buf, done + 1), length(buf) - done, off + done)
+                      _cfd(io), pointer(buf, done + 1), length(buf) - done, off + done)
             n < 0 && Base.systemerror("pwrite")
             done += n
         end
