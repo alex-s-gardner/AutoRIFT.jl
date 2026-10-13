@@ -1724,12 +1724,13 @@ block writes, which is what the filter term in [`AutoRIFT.halo`](@ref) buys.
 """
 function correlate_tiled(raw::ImagePair, grid::PointSet{2}, p::Params, block_size,
                          filter_cache_tile::Union{Nothing,Integer} = nothing;
-                         filter_cache_io::Symbol = :mmap)
+                         filter_cache_io::Symbol = :mmap, filter_cache_dir = nothing)
+    _check_filter_cache_dir(filter_cache_dir)
     layout = block_layout(grid, p, size(raw), block_size)
     # One set for the whole run. `block_buffers` sizes from the layout's largest read window, which
     # no level changes, so allocating per pass would allocate the same nine arrays twice per level.
     # A threaded run takes its own set per task instead, since blocks then write concurrently.
-    fc = _filter_cache(filter_cache_tile, raw, p; io = filter_cache_io)
+    fc = _filter_cache(filter_cache_tile, raw, p; io = filter_cache_io, parent = filter_cache_dir)
     buffers = istrue(p.threaded) ? nothing :
               block_buffers(raw, layout; filtered_only = _reads_filter_cache(fc, p))
     # Budget 0: this correlates the pair it is handed, reading windows from wherever that pair lives.

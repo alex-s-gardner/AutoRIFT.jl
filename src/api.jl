@@ -103,7 +103,7 @@ the FFT plans are then built once rather than per pair. For a single pair, call
 function CommonSolve.init(reference::AbstractMatrix, secondary::AbstractMatrix;
               reference_valid = nothing, secondary_valid = nothing,
               process_block_size = nothing, cache_budget = :auto, filter_cache_tile = nothing,
-              filter_cache_io = :mmap, kwargs...)
+              filter_cache_io = :mmap, filter_cache_dir = nothing, kwargs...)
     p = params(; kwargs...)
     raw = ImagePair(reference, secondary; reference_valid, secondary_valid)
     # Before the grid and the plans, so a filter that cannot run on this element type is an error at
@@ -112,6 +112,7 @@ function CommonSolve.init(reference::AbstractMatrix, secondary::AbstractMatrix;
     _check_cache_budget(cache_budget)
     _check_filter_cache_tile(filter_cache_tile)
     _check_filter_cache_io(filter_cache_io)
+    _check_filter_cache_dir(filter_cache_dir)
     bs = _block_size(process_block_size)
     # A blocked run filters each block from its own read window, so the filtered scene is never
     # formed — which is what bounds peak memory by the block rather than by the scene, and is the
@@ -124,7 +125,7 @@ function CommonSolve.init(reference::AbstractMatrix, secondary::AbstractMatrix;
     # The layout is built here rather than at the first run, so a block size that cannot work is an
     # error at the call that set it. `block_layout` is what knows the halo, so it is what checks.
     return Cache{typeof(p)}(p, raw, _runner(raw, grid, p, bs, cache_budget, filter_cache_tile;
-                                            filter_cache_io), grid, nothing, true)
+                                            filter_cache_io, filter_cache_dir), grid, nothing, true)
 end
 
 # `process_block_size` as an `Extent` of pixels, or `nothing` for one block.
@@ -244,11 +245,11 @@ end
 # so there is no per-pass redundancy to cache — and ignores it rather than erroring, the same way an
 # unblocked run silently ignores `cache_budget`.
 _runner(raw::ImagePair, ::PointSet{2}, p::Params, ::Nothing, _cache, _filter_cache_tile;
-        filter_cache_io::Symbol = :mmap) =
+        filter_cache_io::Symbol = :mmap, filter_cache_dir = nothing) =
     WholeScene(_prepare(raw, p))
 
 function _runner(raw::ImagePair, grid::PointSet{2}, p::Params, bs::Extent, cache, filter_cache_tile;
-                 filter_cache_io::Symbol = :mmap)
+                 filter_cache_io::Symbol = :mmap, filter_cache_dir = nothing)
     layout = block_layout(grid, p, size(raw), bs)
     # After the layout, because `:auto` weighs the pair's bytes against the read volume these blocks
     # imply. The resolved count is what `Blocked` carries, so a pair swapped in by `reinit!` is read
@@ -258,24 +259,34 @@ function _runner(raw::ImagePair, grid::PointSet{2}, p::Params, bs::Extent, cache
     # One call per pair type. `_prefetched` reads a disk-backed pair into memory when the budget allows,
     # so its result is one of two types; split here, each runner is concretely typed, and the union
     # reaches the caller as two whole runners rather than as an argument of every call inside one.
-    pair isa typeof(raw) && return _blocked(pair, layout, budget, p, filter_cache_tile, filter_cache_io)
-    return _blocked(pair, layout, budget, p, filter_cache_tile, filter_cache_io)
+    pair isa typeof(raw) &&
+        return _blocked(pair, layout, budget, p, filter_cache_tile, filter_cache_io, filter_cache_dir)
+    return _blocked(pair, layout, budget, p, filter_cache_tile, filter_cache_io, filter_cache_dir)
 end
 
 function _blocked(pair::ImagePair, layout::BlockLayout, budget::Int, p::Params, filter_cache_tile,
-                  filter_cache_io::Symbol)
-    fc = _filter_cache(filter_cache_tile, pair, p; io = filter_cache_io)
+                  filter_cache_io::Symbol, filter_cache_dir)
+    fc = _filter_cache(filter_cache_tile, pair, p; io = filter_cache_io, parent = filter_cache_dir)
     buffers = istrue(p.threaded) ? nothing :
               block_buffers(pair, layout; filtered_only = _reads_filter_cache(fc, p))
     return Blocked(pair, layout, layout.blocks, buffers, budget, fc)
 end
 
-# `nothing` unless the caller opted in and `_poolable` covers this preprocess method.
-_filter_cache(::Nothing, ::ImagePair, ::Params; io::Symbol = :mmap) = nothing
-function _filter_cache(tile::Integer, pair::ImagePair, p::Params; io::Symbol = :mmap)
+# `nothing` unless the caller opted in and `_poolable` covers this preprocess method. The scratch file
+# goes in a directory of its own — under `parent` when given, else the system's temporary directory —
+# because its name is derived from the pair's size, which two caches can share.
+_filter_cache(::Nothing, ::ImagePair, ::Params; io::Symbol = :mmap, parent = nothing) = nothing
+function _filter_cache(tile::Integer, pair::ImagePair, p::Params; io::Symbol = :mmap, parent = nothing)
     _poolable(p.preprocess) || return nothing
-    return FilterTileCache(size(pair), filter_width(p.preprocess); tile, io)
+    dir = parent === nothing ? mktempdir(; cleanup = false) : mktempdir(String(parent); cleanup = false)
+    return FilterTileCache(size(pair), filter_width(p.preprocess); tile, io, dir)
 end
+
+_check_filter_cache_dir(::Nothing) = nothing
+_check_filter_cache_dir(dir::AbstractString) = isdir(dir) ? nothing : throw(ArgumentError(
+    "`filter_cache_dir` must be an existing directory, got \"" * String(dir) * "\""))
+_check_filter_cache_dir(dir) = throw(ArgumentError(
+    "`filter_cache_dir` must be a directory path or `nothing`"))
 
 # The runner for a cache whose images have just changed.
 #
@@ -300,8 +311,9 @@ function _reinit_runner(old_runner::Blocked, raw::ImagePair, ::ImagePair, p::Par
         nothing
     else
         close(old_runner.filter_cache)
+        # In the old cache's directory, which is the caller's choice and now holds no file.
         FilterTileCache(size(raw), old_runner.filter_cache.width; tile = old_runner.filter_cache.tile,
-                        io = old_runner.filter_cache.mode)
+                        io = old_runner.filter_cache.mode, dir = dirname(old_runner.filter_cache.path))
     end
     return Blocked(_prefetched(raw, old_runner.cache_budget, p), old_runner.layout, old_runner.blocks,
                   old_runner.buffers, old_runner.cache_budget, fc)
@@ -575,6 +587,10 @@ All of [`AutoRIFT.params`](@ref)'s, plus:
 - `filter_cache_io`: how that scratch file is accessed — `:mmap` (the default) maps it into the process;
   `:pread` reads and writes each tile with positioned I/O, so the cached pages stay in the kernel's file
   cache rather than counting toward the process's resident size.
+- `filter_cache_dir`: an existing directory to hold that scratch file, in a directory of its own, or
+  `nothing` (the default) for the system's temporary directory. Pass one on a host whose temporary
+  directory is a RAM-backed `tmpfs`, as `/tmp` is on Amazon Linux 2023: a file there counts against
+  memory, and a NISAR pair's runs to gigabytes.
 
 ```julia
 out = autorift(image1, image2; chip_size = 32, search_radius = 25)
@@ -670,7 +686,8 @@ autorift(pair::ImagePair, grid::PointSet, p::Params) =
 
 """
     autorift(reference, secondary, grid::PointSet, p::Params, block_size, cache_budget = 0,
-             filter_cache_tile = nothing; filter_cache_io = :mmap) -> MultichipResult
+             filter_cache_tile = nothing; filter_cache_io = :mmap, filter_cache_dir = nothing)
+        -> MultichipResult
 
 Correlate at `grid`'s points, a block at a time, with an already-resolved [`Params`](@ref).
 
@@ -686,20 +703,22 @@ first time it is derived, so the coarse and fine passes of every chip-size level
 than refiltering. Worth it once a scene is too large for `cache_budget` to hold in memory — see
 [`FilterTileCache`](@ref). `filter_cache_io` is how that scratch file is accessed: `:mmap` maps it,
 `:pread` reads and writes each tile with positioned I/O, which keeps its pages out of the process's
-resident size.
+resident size. `filter_cache_dir` is the directory it goes under, as for [`autorift`](@ref)'s keyword
+form; `nothing` is the system's temporary directory.
 
 Pass an [`ImagePair`](@ref) as `reference` to supply validity masks.
 """
 autorift(reference::AbstractMatrix, secondary::AbstractMatrix, grid::PointSet, p::Params,
          block_size::Tuple{Int,Int}, cache_budget::Int = 0, filter_cache_tile::Union{Nothing,Int} = nothing;
-         filter_cache_io::Symbol = :mmap) =
+         filter_cache_io::Symbol = :mmap, filter_cache_dir::Union{Nothing,String} = nothing) =
     _run(ImagePair(reference, secondary), grid, p, _block_size(block_size), cache_budget,
-        filter_cache_tile; filter_cache_io)
+        filter_cache_tile; filter_cache_io, filter_cache_dir)
 
 autorift(pair::ImagePair, grid::PointSet, p::Params, block_size::Tuple{Int,Int},
          cache_budget::Int = 0, filter_cache_tile::Union{Nothing,Int} = nothing;
-         filter_cache_io::Symbol = :mmap) =
-    _run(pair, grid, p, _block_size(block_size), cache_budget, filter_cache_tile; filter_cache_io)
+         filter_cache_io::Symbol = :mmap, filter_cache_dir::Union{Nothing,String} = nothing) =
+    _run(pair, grid, p, _block_size(block_size), cache_budget, filter_cache_tile; filter_cache_io,
+         filter_cache_dir)
 
 """
     autorift(reference, secondary, p::Params, block_size::Tuple{Int,Int}, cache_budget::Int) -> MultichipResult
@@ -749,11 +768,11 @@ operations that need a layout.
 function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, grid::PointSet;
                   reference_valid = nothing, secondary_valid = nothing,
                   process_block_size = nothing, cache_budget = :auto, filter_cache_tile = nothing,
-                  filter_cache_io = :mmap, kwargs...)
+                  filter_cache_io = :mmap, filter_cache_dir = nothing, kwargs...)
     p = params(; kwargs...)
     raw = ImagePair(reference, secondary; reference_valid, secondary_valid)
     return _run(raw, grid, p, _block_size(process_block_size), cache_budget, filter_cache_tile;
-                filter_cache_io)
+                filter_cache_io, filter_cache_dir)
 end
 
 # Dispatch on the point set's dimensionality: only a gridded one can run multiple chip sizes.
@@ -762,12 +781,13 @@ end
 # blocked run filters per block and must never form a filtered scene, since that copy is the
 # allocation it exists to avoid.
 function _run(raw::ImagePair, grid::PointSet{2}, p::Params, bs::Union{Nothing,Extent}, cache,
-             filter_cache_tile = nothing; filter_cache_io = :mmap)
+             filter_cache_tile = nothing; filter_cache_io = :mmap, filter_cache_dir = nothing)
     _check_preprocess(eltype(raw), p.preprocess)
     _check_cache_budget(cache)
     _check_filter_cache_tile(filter_cache_tile)
     _check_filter_cache_io(filter_cache_io)
-    runner = _runner(raw, grid, p, bs, cache, filter_cache_tile; filter_cache_io)
+    _check_filter_cache_dir(filter_cache_dir)
+    runner = _runner(raw, grid, p, bs, cache, filter_cache_tile; filter_cache_io, filter_cache_dir)
     r = _multichip(runner, grid, p)
     # A one-shot call has no `reinit!` to carry the cache to a later pair, so its scratch file must be
     # cleaned up here rather than leaked — `close(runner)` is a no-op for `WholeScene` and for a
@@ -781,11 +801,12 @@ end
 # restriction to apply — `track` is the whole computation. It filters the scene, so there is nothing to
 # read up front: `_prepare` has already materialized everything.
 function _run(raw::ImagePair, pts::PointSet{1}, p::Params, ::Nothing, cache, filter_cache_tile = nothing;
-              filter_cache_io = :mmap)
+              filter_cache_io = :mmap, filter_cache_dir = nothing)
     _check_preprocess(eltype(raw), p.preprocess)
     _check_cache_budget(cache)
     _check_filter_cache_tile(filter_cache_tile)
     _check_filter_cache_io(filter_cache_io)
+    _check_filter_cache_dir(filter_cache_dir)
     return track(_prepare(raw, p), pts, p)
 end
 
@@ -846,7 +867,7 @@ _check_preprocess(::Type{<:Real}, ::Deramp) = throw(ArgumentError(
 # Blocks are laid out over a *gridded* point set, since the halo is derived from where points sit
 # relative to each other. A scattered set has no such layout, so there is nothing to divide.
 _run(::ImagePair, ::PointSet{1}, ::Params, ::Extent, _cache, _filter_cache_tile = nothing;
-     filter_cache_io = :mmap) =
+     filter_cache_io = :mmap, filter_cache_dir = nothing) =
     throw(ArgumentError(
     "`process_block_size` needs a gridded `PointSet`, but this one is scattered. Blocks are " *
     "rectangles of the output grid, and a scattered point set has no grid to cut. Drop the " *
@@ -867,14 +888,15 @@ each rebuilding the grid and hoping it matches. Not exported: the array API has 
 function autorift_with_grid(reference::AbstractMatrix, secondary::AbstractMatrix;
                             reference_valid = nothing, secondary_valid = nothing,
                             process_block_size = nothing, cache_budget = :auto,
-                            filter_cache_tile = nothing, filter_cache_io = :mmap, kwargs...)
+                            filter_cache_tile = nothing, filter_cache_io = :mmap,
+                            filter_cache_dir = nothing, kwargs...)
     p = params(; kwargs...)
     raw = ImagePair(reference, secondary; reference_valid, secondary_valid)
     # From the raw pair's size, which the filters preserve.
     grid = _build_grid(size(raw), p)
     _warm_grid_plans(grid, p)
     return _run(raw, grid, p, _block_size(process_block_size), cache_budget, filter_cache_tile;
-                filter_cache_io), grid
+                filter_cache_io, filter_cache_dir), grid
 end
 
 # ---------------------------------------------------------------------------

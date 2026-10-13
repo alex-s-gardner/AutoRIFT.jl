@@ -150,6 +150,37 @@ scratch_files() = sum(count(f -> startswith(f, "filtertilecache_"), files)
     @test scratch_files() == before
 end
 
+@testset "filter_cache_dir puts the scratch file there, not under tempdir()" begin
+    ref, sec = shifted_pair(512, (6, -4); T = Float32)
+    kw = (; chip_size = 32, search_radius = 25, process_block_size = (160, 160), filter_cache_tile = 64)
+    mktempdir() do parent
+        before = scratch_files()
+        # Seen from inside the run: the cache's file exists under `parent` while correlation reads it.
+        c = init(ref, sec; kw..., filter_cache_dir = parent)
+        inside(d) = sum(count(f -> startswith(f, "filtertilecache_"), files) for (_, _, files) in walkdir(d); init = 0)
+        @test inside(parent) == 1
+        @test startswith(c.runner.filter_cache.path, parent)
+        r = autorift!(c)
+        # `reinit!` rebuilds the cache in the same directory.
+        reinit!(c; reference = ref, secondary = sec)
+        @test startswith(c.runner.filter_cache.path, parent)
+        @test inside(parent) == 1
+        close(c)
+        @test inside(parent) == 0
+        @test scratch_files() == before
+        @test all(isequal.(r.dx, autorift(ref, sec; kw...).dx))
+
+        # The positional entry point, and two caches in one directory each in a directory of its own.
+        grid = gridpoints(size(ref), 24; chip_size = 32, search_radius = 25)
+        p = params(; chip_size = 32, search_radius = 25)
+        a = AutoRIFT.autorift(ImagePair(ref, sec), grid, p, (160, 160), 0, 64; filter_cache_dir = parent)
+        b = AutoRIFT.autorift(ImagePair(ref, sec), grid, p, (160, 160), 0, 64; filter_cache_dir = parent)
+        @test all(isequal.(a.dx, b.dx))
+        @test inside(parent) == 0
+    end
+    @test_throws "must be an existing directory" autorift(ref, sec; kw..., filter_cache_dir = "/no/such/dir")
+end
+
 @testset "filter_cache_io = :pread matches the mapped cache, and leaks no scratch file" begin
     ref, sec = shifted_pair(512, (6, -4); T = Float32)
     kw = (; chip_size = 32, search_radius = 25, process_block_size = (160, 160), filter_cache_tile = 64)
