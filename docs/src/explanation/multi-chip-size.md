@@ -38,12 +38,12 @@ A scene where the right chip size differs by region: a band that both moves fast
 surrounded by a static, well-correlated surface.
 
 ```@example multichip
-include("../../figures.jl")  # plotting helpers and the synthetic scenes; see [Plotting](@ref)
+include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 
 band(row) = clamp((108 - abs(row - 256)) / 28, 0, 1)
 
 reference, clean, truth_dx, _ =
-    warped_pair(512, (row, col) -> (2 + 20 * band(row), 0.0); seed = 11)
+    warped_pair(photo(), 512, (row, col) -> (2 + 20 * band(row), 0.0))
 secondary = decorrelate(clean, (row, col) -> band(row); amplitude = 0.12, seed = 3)
 
 # One grid for every arm below, so the point counts compare. A grid's margin is set by the coarsest
@@ -63,7 +63,7 @@ levels = Dict(cs => single(cs) for cs in (16, 32, 64))
 [(chip = cs, measured = AutoRIFT.nmeasured(levels[cs])) for cs in (16, 32, 64)]
 ```
 
-Out of 2500 points: the 16-pixel chip answers 1038, the 32-pixel chip 1775, the 64-pixel chip 2349.
+Out of 2500 points: the 16-pixel chip answers 1478, the 32-pixel chip 2074, the 64-pixel chip 2266.
 Coverage rises with chip size, which is the whole reason coarse levels exist.
 
 ```@example multichip
@@ -92,9 +92,9 @@ end
 [(chip = cs, gradient_error(levels[cs])...) for cs in (16, 32, 64)]
 ```
 
-The 16-pixel chip answers nowhere in the gradient — it has too little texture against the added
-noise. The 32-pixel chip answers 26 points to within 2.6 pixels, and the 64-pixel chip answers 273 to
-within 4.2. The coarse level's advantage is coverage and its cost is resolution, quantified.
+The 16-pixel chip answers only 12 points in the gradient — it has too little texture against the
+added noise. The 32-pixel chip answers 88 points to within 4.2 pixels, and the 64-pixel chip answers
+253 to within 7.1. The coarse level's advantage is coverage and its cost is resolution, quantified.
 
 ## The merge
 
@@ -107,8 +107,9 @@ merged = autorift(reference, secondary, grid; chip_size = 16, chip_size_max = 64
  for cs in sort(unique(merged.chip_size))]
 ```
 
-`chip_size == 0` marks a point no level resolved. The remaining 1815 points are drawn from all three
-levels, and the layer says which — so a downstream consumer can tell a sharply-resolved displacement
+`chip_size == 0` marks a point no level resolved. The remaining 2026 points come from the 16- and
+32-pixel levels — the 64-pixel level, run on what the finer two left, answers none of them here — and
+the layer says which — so a downstream consumer can tell a sharply-resolved displacement
 from a heavily-averaged one, which is why the chip size is kept rather than discarded.
 
 ```@example multichip
@@ -117,8 +118,8 @@ quality_panels(merged)
 
 Two things in that figure are worth noticing.
 
-**The merge is not the union of the levels.** Run separately the three levels cover 2378 points
-between them; merged they cover 1815. A level does not attempt every point the finer ones left — each
+**The merge is not the union of the levels.** Run separately the three levels cover 2359 points
+between them; merged they cover 2026. A level does not attempt every point the finer ones left — each
 level first runs a sparse **coarse pass** to find where motion is spatially coherent, and searches the
 full grid only inside a dilated neighbourhood of that. Since a later level's coarse pass sees only the
 points still outstanding, its coverage decision differs from the same level run alone.
@@ -138,8 +139,8 @@ levels had already succeeded. The ring is the shoulder of the band, where correl
 enough that a later level's coarse pass no longer accepts the neighbourhood, and so never attempts
 points the same level answered when run alone.
 
-The arithmetic is not quite subtraction, either: 565 points are lost, but the merge answers two that no
-single level did, which is why the net is 563.
+The arithmetic is not quite subtraction, either: 337 points are lost, but the merge answers four that no
+single level did, which is why the net is 333.
 
 **Where levels do overlap they agree.** Comparing the single-level runs point by point where both
 produced an answer:

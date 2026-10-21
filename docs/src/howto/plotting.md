@@ -25,7 +25,7 @@ using AutoRIFT, CairoMakie
 include("../../figures.jl")  # the helpers this page describes
 
 # A pair that moved only along x, so the correct picture has structure in dx and none in dy.
-reference, secondary, _, _ = warped_pair(512, (row, col) -> (8.0, 0.0); seed = 2)
+reference, secondary, _, _ = warped_pair(photo(), 512, (row, col) -> (8.0, 0.0))
 out = autorift(reference, secondary; chip_size = 32, search_radius = 20, grid_spacing = 8)
 
 fig = Figure(; size = (900, 420))
@@ -39,7 +39,7 @@ difference is unmistakable:
 
 ```@example plotting
 striped, striped_sec, _, _ =
-    warped_pair(512, (row, col) -> (2 + 12 * (abs(row - 256) < 60), 0.0); seed = 2)
+    warped_pair(photo(), 512, (row, col) -> (2 + 12 * (abs(row - 256) < 60), 0.0))
 out2 = autorift(striped, striped_sec; chip_size = 32, search_radius = 20, grid_spacing = 8)
 
 fig = Figure(; size = (900, 420))
@@ -69,7 +69,10 @@ measured(out) = .!isnan.(out.dx)
 would otherwise plot as a chip size of zero.
 
 ```@example plotting
-partial = autorift(reference, secondary; chip_size = 16, chip_size_max = 64, grid_spacing = 8)
+# A decorrelated band, so that more than one chip size answers.
+banded = decorrelate(secondary, (row, col) -> abs(row - 256) < 80 ? 1.0 : 0.0; amplitude = 0.2,
+                     seed = 3)
+partial = autorift(reference, banded; chip_size = 16, chip_size_max = 64, grid_spacing = 8)
 
 fig = Figure(; size = (900, 420))
 hm1 = heatmap!(Axis(fig[1, 1]; title = "chip_size, raw", aspect = DataAspect()),

@@ -13,9 +13,9 @@ The parallelism to reach for first is across pairs, not within one:
 
 ```@example batch
 using AutoRIFT
-include("../../figures.jl")  # plotting helpers and the synthetic scenes; see [Plotting](@ref)
+include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 
-pairs = [warped_pair(256, (row, col) -> (3.0, 1.0); seed = s)[1:2] for s in 1:4]
+pairs = [warped_pair(photo(), 256, (row, col) -> (Float64(s), 1.0))[1:2] for s in 1:4]
 settings = (; chip_size = 16, chip_size_max = 32, search_radius = 12, grid_spacing = 8)
 
 results = Vector{Any}(undef, length(pairs))
@@ -74,7 +74,7 @@ stops every thread.
 share of the work grows as the grid gets coarser:
 
 ```@example batch
-big_reference, big_secondary, _, _ = warped_pair(512, (row, col) -> (3.0, 1.0); seed = 21)
+big_reference, big_secondary, _, _ = warped_pair(photo(), 512, (row, col) -> (3.0, 1.0))
 for spacing in (8, 16, 32, 64)
     out = autorift(big_reference, big_secondary; settings..., grid_spacing = spacing,
                    threaded = false)
@@ -93,8 +93,8 @@ Consecutive acquisitions share an image — each new reference is the previous s
 image already prepared in *either* slot, so a walk filters each acquisition once rather than twice:
 
 ```@example batch
-# One texture, progressively warped: consecutive frames genuinely correlate.
-frames = [warped_pair(256, (row, col) -> (3.0 * (k - 1), 1.0 * (k - 1)); seed = 5)[2] for k in 1:4]
+# One photograph, progressively warped: consecutive frames genuinely correlate.
+frames = [warped_pair(photo(), 256, (row, col) -> (3.0 * (k - 1), 1.0 * (k - 1)))[2] for k in 1:4]
 
 walk = AutoRIFT.init(frames[1], frames[2]; settings..., threaded = false)
 counts = [AutoRIFT.nmeasured(autorift!(walk))]

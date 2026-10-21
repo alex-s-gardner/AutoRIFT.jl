@@ -12,7 +12,7 @@ Nothing about the correlation changes. This page is about the layer on top of it
 
 ```@example geo
 using AutoRIFT, Rasters, ArchGDAL, Dates
-include("../../figures.jl")  # plotting helpers and the synthetic scenes; see [Plotting](@ref)
+include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 using DimensionalData.Lookups
 using Statistics: median
 
@@ -34,7 +34,7 @@ reproducible, but the structure is the same: a north-up grid, y **decreasing**, 
 # Features move 8 pixels east and 4 pixels north. In `autorift`'s reporting convention that is a
 # negative `dx` and a positive `dy`, since the offset points from secondary back to reference and
 # north is toward *decreasing* row on a north-up grid. See [Conventions](@ref).
-reference_array, secondary_array, _, _ = warped_pair(513, (row, col) -> (-8.0, 4.0); seed = 3)
+reference_array, secondary_array, _, _ = warped_pair(photo(), 513, (row, col) -> (-8.0, 4.0))
 
 const RES = 30.0  # metres per pixel
 
@@ -241,7 +241,7 @@ field_panels(blank(collect(out.vx), isfinite.(collect(out.vx))),
              titles = ("vx, no mask", "vx, cloud masked"))
 ```
 
-A point survives if *any* pixel of its chip is valid, so the hole is smaller than you might expect and a
+A point survives if more than 65% of its chip is valid, so the hole is smaller than you might expect and a
 partially covered chip still measures — at a lower correlation. `secondary_valid` is the same for the
 other image, and either can be an array or a raster. [Masking invalid pixels](@ref) has the measured
 behavior.

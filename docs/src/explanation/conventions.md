@@ -27,15 +27,15 @@ A pair built by hand rather than by a helper, so the direction of motion is read
 
 ```@example conventions
 using AutoRIFT
-include("../../figures.jl")  # plotting helpers and the synthetic scenes; see [Plotting](@ref)
+include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 using Statistics: median
 
 # The secondary image is the reference shifted by `motion = (columns, rows)`, so every feature — the
 # bright blob included — appears that much further right and further down in it. Cropping from an
-# oversized texture is what keeps the shift from pulling in out-of-image data.
+# oversized photograph is what keeps the shift from pulling in out-of-image data.
 function moved_pair(n, motion; pad = 40)
     move_col, move_row = motion
-    big = texture((n + 2pad, n + 2pad); seed = 4)
+    big = photo()[1:(n + 2pad), 1:(n + 2pad)]
     for dr in -8:8, dc in -8:8
         big[pad + n ÷ 2 + dr, pad + n ÷ 3 + dc] += 3 * exp(-(dr^2 + dc^2) / 32)
     end

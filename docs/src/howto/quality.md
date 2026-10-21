@@ -35,10 +35,10 @@ So the gate is one line:
 
 ```@example quality
 using AutoRIFT
-include("../../figures.jl")  # plotting helpers and the synthetic scenes; see [Plotting](@ref)
+include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 
 band(row) = clamp((108 - abs(row - 256)) / 28, 0, 1)
-reference, clean, _, _ = warped_pair(512, (row, col) -> (2 + 20 * band(row), 0.0); seed = 11)
+reference, clean, _, _ = warped_pair(photo(), 512, (row, col) -> (2 + 20 * band(row), 0.0))
 secondary = decorrelate(clean, (row, col) -> band(row); amplitude = 0.3, seed = 3)
 
 out = autorift(reference, secondary; chip_size = 16, chip_size_max = 64, grid_spacing = 8)
@@ -103,7 +103,7 @@ deliberately:
 ```@example quality
 # Motion of 24 pixels against a radius of 25: inside the window's nominal reach, but the surface spans
 # -radius to radius-1, so the peak lands on its last sample.
-railed_ref, railed_sec, _, _ = warped_pair(512, (row, col) -> (24.0, 0.0); seed = 9)
+railed_ref, railed_sec, _, _ = warped_pair(photo(), 512, (row, col) -> (24.0, 0.0))
 railed = autorift(railed_ref, railed_sec;
                   chip_size = 32, chip_size_max = 32, search_radius = 25, grid_spacing = 32)
 
@@ -111,7 +111,7 @@ m = measured(railed)
 (measured = count(m), at_boundary = count(railed.correlation[m] .== 0))
 ```
 
-Every measured point is railed. Raise the radius and they resolve:
+All but two measured points are railed. Raise the radius and they resolve:
 
 ```@example quality
 wider = autorift(railed_ref, railed_sec;
@@ -154,10 +154,10 @@ mask_panels(out.interpolated, out.chip_size .== 0;
             titles = ("interpolated", "unresolved"))
 ```
 
-The two could hardly look less alike, and that is the useful part. Interpolation is rare here — six
-isolated points, scattered rather than clustered, so excluding them costs nothing in particular. The
+The two could hardly look less alike, and that is the useful part. Interpolation is sparse here — 79
+points in small scattered clusters, so excluding them costs nothing in particular. The
 unresolved points are a solid block across the decorrelating band: that loss is a whole region of the
-scene, and no threshold or filter choice recovers it. A count of `1451` and a count of `6` read as
+scene, and no threshold or filter choice recovers it. A count of `1119` and a count of `79` read as
 comparable magnitudes of the same kind of problem; the figure shows they are not.
 
 Whether to keep interpolated points depends on the consumer. They are real estimates with real

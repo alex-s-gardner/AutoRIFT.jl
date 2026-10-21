@@ -23,10 +23,10 @@ Here is a pair where the secondary image carries an illumination gradient the re
 
 ```@example prep
 using AutoRIFT
-include("../../figures.jl")  # plotting helpers and the synthetic scenes; see [Plotting](@ref)
+include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 using Statistics: median, quantile
 
-reference, clean, truth_dx, _ = warped_pair(512, (row, col) -> (6.0, -2.0); seed = 13)
+reference, clean, truth_dx, _ = warped_pair(photo(), 512, (row, col) -> (6.0, -2.0))
 # Brightness rising left to right, plus a weak vertical trend. Only the secondary image has it.
 secondary = Float32[clean[row, col] * (0.4f0 + 1.2f0 * (col / 512)) + 0.3f0 * (row / 512)
                     for row in axes(clean, 1), col in axes(clean, 2)]
@@ -57,9 +57,9 @@ end
 
 Read that table carefully, because it contains the one result most likely to mislead you:
 
-**`:none` has the highest correlation of any option and the worst accuracy.** Median correlation 0.965
-against `:highpass`'s 0.812, and median error 0.062 px against 0.016 — four times worse, with a 99th
-percentile of 0.31 px against 0.05.
+**`:none` correlates better than every filter but `:sobel`, and is the least accurate.** Median
+correlation 0.838 against `:highpass`'s 0.582, and a 99th percentile error of 0.09 px against 0.05 —
+nearly twice as large.
 
 The gradient is itself a strong, smoothly varying signal that both chips share, so it inflates the
 correlation coefficient while contributing nothing about where the features went. Filtering removes that
@@ -98,12 +98,11 @@ end
 
 The gradient multiplies the texture, so it makes the right side both brighter *and* more contrasty.
 `:highpass` subtracts a local mean, which removes the brightness and leaves the contrast trend standing
-at 2.3 — higher than the 1.5 it started with, because the brightness that partly masked it is gone. `:wallis` normalizes local variance as well, and lands at 1.00: that is the difference between the
+at 2.2 — higher than the 1.8 it started with, because the brightness that partly masked it is gone. `:wallis` normalizes local variance as well, and lands at 1.00: that is the difference between the
 two, and it is invisible in the images above but plain in the number.
 
 `:sobel` keeps the trend too (2.1), being a derivative of an amplitude that still grows. `:laplacian`
-looks nearly blank because it is: only about 1.7% of its pixels exceed a tenth of its maximum, so a
-handful of extremes set the range and the rest of the field is compressed toward zero.
+removes most of it, at 1.1.
 
 ```@example prep
 none_out = autorift(reference, secondary; preprocess = :none, settings...)
@@ -128,9 +127,10 @@ for width in (3, 5, 11, 21)
 end
 ```
 
-Correlation climbs steadily with width — 0.664 at 3, up to 0.953 at 21 — while the 99th percentile of the
-error nearly doubles, 0.05 to 0.09 px. A wider highpass passes more of the low-frequency content, so it
-approaches `:none` from below in both respects. The default of 5 is near the accuracy optimum here.
+Correlation climbs steadily with width — 0.437 at 3, up to 0.812 at 21 — while the 99th percentile of the
+error doubles, 0.03 to 0.06 px. A wider highpass passes more of the low-frequency content, so it
+approaches `:none` from below in both respects. The default of 5 is within 0.02 px of the most accurate
+width here, which is 3.
 
 ## Which filter for which imagery
 
@@ -138,7 +138,7 @@ approaches `:none` from below in both respects. The default of 5 is near the acc
 |---|---|---:|---|
 | [`NoPreprocess`](@ref) | nothing; ZNCC alone | 0 | already-normalized imagery, or a deliberate baseline |
 | [`Highpass`](@ref) | removes a windowed local mean | 2 | the default. Optical imagery, most cases |
-| [`Wallis`](@ref) | normalizes local mean *and* variance | 2 | scenes mixing high- and low-contrast ground — shadow beside snow |
+| [`Wallis`](@ref) | normalizes local mean *and* variance | 4 | scenes mixing high- and low-contrast ground — shadow beside snow |
 | [`WallisGapfill`](@ref) | `Wallis`, filling gaps with matched noise | 37 | imagery with holes you would rather fill than mask |
 | [`Sobel`](@ref) | gradient magnitude | 2 | edge-dominated scenes; discards flat texture |
 | [`Laplacian`](@ref) | isotropic second derivative | 2 | as `Highpass`, with a sharper cut |

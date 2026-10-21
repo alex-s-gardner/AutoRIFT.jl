@@ -14,10 +14,10 @@ A 512² pair whose features move 28 pixels in x and 12 in y:
 
 ```@example guess
 using AutoRIFT
-include("../../figures.jl")  # plotting helpers and the synthetic scenes; see [Plotting](@ref)
+include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 using Statistics: median
 
-reference, secondary, truth_dx, _ = warped_pair(512, (row, col) -> (28.0, -12.0); seed = 17)
+reference, secondary, truth_dx, _ = warped_pair(photo(), 512, (row, col) -> (28.0, -12.0))
 settings = (; chip_size = 32, chip_size_max = 32, grid_spacing = 16)
 
 image_panels(reference, secondary)

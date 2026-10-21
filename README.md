@@ -17,10 +17,10 @@ out = autorift(reference, secondary)
 out.dx, out.dy, out.correlation
 ```
 
-![A texture, a copy of it whose middle band moved, and the recovered displacement field](https://raw.githubusercontent.com/alex-s-gardner/AutoRIFT.jl/main/docs/src/assets/readme_example.png)
+![A photograph, a copy of it bowed downward, and the recovered displacement field](https://raw.githubusercontent.com/alex-s-gardner/AutoRIFT.jl/main/docs/src/assets/readme_example.png)
 
-A band across the middle moved 22 pixels and decorrelated; the surface around it moved 2. The third
-panel is what the call above returns. Reproduce it with
+The second image is the first bowed downward: 20 pixels at the centre column, none at the left and
+right edges — follow the ring ropes. The third panel is what the call above returns. Reproduce it with
 [`docs/readme_figure.jl`](docs/readme_figure.jl).
 
 Applications include glacier and ice-sheet velocity, sea-ice drift, particle image velocimetry,

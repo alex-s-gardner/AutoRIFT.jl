@@ -20,9 +20,9 @@ is computed. Those scores make up the **correlation surface**.
 
 ```@example tracking
 using AutoRIFT
-include("../../figures.jl")  # plotting helpers and the synthetic scenes; see [Plotting](@ref)
+include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 
-reference, secondary, _, _ = warped_pair(512, (row, col) -> (6.4, -3.2); seed = 5)
+reference, secondary, _, _ = warped_pair(photo(), 512, (row, col) -> (6.4, -3.2))
 
 chip_size, radius = 32, 16
 centre = (256, 256)
@@ -150,8 +150,8 @@ mid(A) = median(filter(!isnan, A))
 (refined = (mid(refined.dx), mid(refined.dy)), whole = (mid(whole.dx), mid(whole.dy)))
 ```
 
-The truth is `(6.4, -3.2)`. Refinement lands within a sixteenth of a pixel of both; without it the
-answer is the whole-pixel `(6, -3)`.
+The truth is `(6.4, -3.2)`. Refinement lands within a tenth of a pixel of both; without it the answer
+is the whole-pixel `(6, -3)`.
 
 ## Why the peak can be wrong
 

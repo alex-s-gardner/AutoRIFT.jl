@@ -20,10 +20,10 @@ invalid. So if your reader already converts no-data to `NaN`, masking is done:
 
 ```@example masks
 using AutoRIFT
-include("../../figures.jl")  # plotting helpers and the synthetic scenes; see [Plotting](@ref)
+include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 using Statistics: median, quantile
 
-reference, secondary, truth_dx, _ = warped_pair(512, (row, col) -> (6.0, -2.0); seed = 13)
+reference, secondary, truth_dx, _ = warped_pair(photo(), 512, (row, col) -> (6.0, -2.0))
 settings = (; chip_size = 32, chip_size_max = 32, search_radius = 20, grid_spacing = 8)
 
 patch = (236:276, 236:276)   # a 41x41 cloud in the reference image
@@ -46,13 +46,14 @@ dark ground. A sensor that writes `0` or `-9999` needs an explicit mask.
 input_field(Float64.(explicit), "reference_valid (false = masked)"; colormap = :grays)
 ```
 
-## A masked chip is skipped only when it is entirely masked
+## A masked chip is skipped when most of it is masked
 
-This is the rule that governs everything else on this page. A point is abandoned when its chip contains
-**no** valid pixel; a chip with even one valid pixel is correlated.
+This is the rule that governs everything else on this page. A point is correlated only if more than
+`min_chip_valid_fraction` — 65% by default — of its own chip is valid. The search window around it may
+hold any amount of masked ground.
 
 So the hole in the output is *smaller* than you would get from excluding any overlap, and a bigger chip
-loses less ground to a small cloud, not more — a large chip is harder to cover completely:
+is covered by a smaller fraction of itself:
 
 ```@example masks
 for chip in (16, 32, 64)
@@ -65,10 +66,13 @@ for chip in (16, 32, 64)
 end
 ```
 
-Chip 64 loses nothing at all: no 64×64 chip fits inside a 41×41 hole, so every chip keeps some valid
-ground. That also means a multi-chip-size search *recovers* a masked region — the coarse level answers
-where the fine level had nothing to work with, and those points come back marked with their own
-`chip_size`. See [Multiple chip sizes](@ref).
+Every size loses a few dozen points, for different reasons. A 16-pixel chip fits inside the 41×41 cloud,
+so the points there have nothing to correlate. No 64-pixel chip is more than 41% masked, so it loses only
+the points nearest the cloud's centre, where that fraction passes the threshold, and a few beside them
+that the outlier filter rejects. That is why a multi-chip-size search *recovers* a masked region: run
+with `chip_size = 16, chip_size_max = 64`, the 64-pixel level answers over the cloud where the 16-pixel
+level had nothing to work with, and those points come back marked with their own `chip_size`. See
+[Multiple chip sizes](@ref).
 
 ## What a partially masked chip reports
 
@@ -77,7 +81,7 @@ measurements. The effect on a partially covered chip is a loss of *confidence*, 
 
 ```@example masks
 masked = autorift(reference, secondary; reference_valid = explicit, settings...)
-_, grid = AutoRIFT.autorift_with_grid(reference, secondary; settings...)
+unmasked, grid = AutoRIFT.autorift_with_grid(reference, secondary; settings...)
 truth = reshape([truth_dx[round(Int, grid.y[i]), round(Int, grid.x[i])] for i in eachindex(grid.x)],
                 Base.size(masked.dx))
 
@@ -91,21 +95,22 @@ covered = map(eachindex(grid.x)) do i
 end
 covered = reshape(covered, Base.size(masked.dx))
 
-ok = measured(masked)
-for (lo, hi) in ((0.0, 0.0), (0.0, 0.1), (0.1, 0.3), (0.3, 0.6))
-    sel = lo == hi ? (covered .== 0) .& ok : (covered .> lo) .& (covered .<= hi) .& ok
+# Points measured both with and without the mask, so each bin compares the same chips.
+ok = measured(masked) .& measured(unmasked)
+for (lo, hi) in ((0.0, 0.1), (0.1, 0.3), (0.3, 0.6))
+    sel = (covered .> lo) .& (covered .<= hi) .& ok
     count(sel) == 0 && continue
     err = filter(isfinite, abs.(masked.dx[sel] .- truth[sel]))
-    corr = filter(isfinite, masked.correlation[sel])
-    println("chip ", lpad(lo == hi ? "unmasked" : "$(round(Int, 100lo))-$(round(Int, 100hi))% masked", 16),
-            "  n = ", lpad(count(sel), 4),
-            "   median correlation ", round(median(corr); digits = 3),
+    corr(out) = round(median(filter(isfinite, out.correlation[sel])); digits = 3)
+    println("chip ", lpad("$(round(Int, 100lo))-$(round(Int, 100hi))% masked", 12),
+            "  n = ", lpad(count(sel), 3),
+            "   median correlation ", corr(unmasked), " → ", corr(masked),
             "   median |error| ", round(median(err); digits = 3), " px")
 end
 ```
 
-Median error is one refinement quantization step — the same as an unmasked chip — while correlation falls
-from about 0.81 to 0.71 as coverage grows. The correlation drop is the honest signal here, and it is
+Median error stays within one refinement quantization step, while the same chips' correlation drops once
+the mask covers part of them. The correlation drop is the honest signal here, and it is
 another reason to gate on `correlation` rather than on the mask: see [Judging a result](@ref).
 
 ## What happens if you do not mask
@@ -127,7 +132,7 @@ near_patch("explicit mask", masked)
 near_patch("-9999 left as data", autorift(as_fill, secondary; settings...))
 ```
 
-Every point whose chip touches the fill value is lost, where masking keeps most of them. A constant
+Every point whose chip touches the fill value is lost, where masking keeps those mostly clear of it. A constant
 block has no texture, so the correlation there is degenerate and `autorift` declines to report it — which
 is the right outcome, but it costs the partially covered points that a mask would have measured. The
 reference implementation reports the search-window corner in this situation, a systematic bias toward one

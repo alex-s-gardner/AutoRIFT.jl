@@ -9,20 +9,21 @@ arrives, since a per-point field cannot be a scalar keyword.
 
 ## The scene
 
-Two images of the same surface, taken at different times. A band across the middle moved 22 pixels
-to the left between them; everything else moved 2. The band also **decorrelates** — its surface
-changes between the two images, not just its position — which is what a real moving surface does and
-what makes a chip size worth choosing.
+Two images of the same scene, the second warped from the first so the answer is known. A band across
+the middle — Ali's waist and the ropes behind him — moved 22 pixels to the left between them;
+everything else moved 2. The band also **decorrelates** — its surface changes between the two images,
+not just its position — which is what a real moving surface does and what makes a chip size worth
+choosing.
 
 ```@example walkthrough
 using AutoRIFT
-include("../../figures.jl")  # plotting helpers and the synthetic scenes; see [Plotting](@ref)
+include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 
 # Fraction of full speed at image row `row`: 1 inside the band, tapering to 0 outside it.
 band(row) = clamp((108 - abs(row - 256)) / 28, 0, 1)
 
 reference, clean, truth_dx, truth_dy =
-    warped_pair(512, (row, col) -> (2 + 20 * band(row), 0.0); seed = 11)
+    warped_pair(photo(), 512, (row, col) -> (2 + 20 * band(row), 0.0))
 
 secondary = decorrelate(clean, (row, col) -> band(row); amplitude = 0.12, seed = 3)
 
@@ -54,7 +55,7 @@ displacement_panels(out)
 ```
 
 The band is recovered. Defaults did the rest: chips of 32, 64 and 128 pixels, a search radius of 25,
-and an output point every 32 pixels — which on a 512-pixel image is a 14 × 14 grid, coarse enough
+and an output point every 32 pixels — which on a 512-pixel image is an 11 × 11 grid, coarse enough
 that the figure shows individual points. Every later step measures every 8 pixels so the result reads
 as a field:
 
@@ -104,11 +105,11 @@ knob — cost grows with the area searched, not its width.
 measured.
 
 ```@example walkthrough
-sparse = autorift(reference, secondary; grid_spacing = 64)
+sparse = autorift(reference, secondary; grid_spacing = 32)
 dense = autorift(reference, secondary; grid_spacing = 8)
 
 field_panels(blank(sparse.dx, measured(sparse)), blank(dense.dx, measured(dense));
-             titles = ("spacing 64", "spacing 8"))
+             titles = ("spacing 32", "spacing 8"))
 ```
 
 Same field, sampled twice. Neighbouring points at spacing 8 overlap heavily — their chips are 32
@@ -127,7 +128,7 @@ quality_panels(out)
 ```
 
 The chip-size map is the most informative figure here: 16 pixels answers the well-correlated
-surroundings, and the decorrelated band needs 32 or 64. Neither uniform choice does both — the fine
+surroundings, and the decorrelated band needs 32, and in a few places 64. Neither uniform choice does both — the fine
 chip fails in the band and the coarse chip blurs the edge everywhere else.
 
 This is not an image pyramid. Every size correlates the images at full resolution; only the chip
@@ -256,7 +257,7 @@ out = autorift(reference, secondary, pts)
 round.(out.dx; digits = 2)
 ```
 
-The three points at row 256 sit in the band and return about 22; the point at row 100 is outside it
+The five points at row 256 sit in the band and return about 22; the point at row 100 is outside it
 and returns about 2. Use this when the points of interest are known and sparse — the multi-chip-size
 search needs a layout, so a scattered set runs a single scale.
 

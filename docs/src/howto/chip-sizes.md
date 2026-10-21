@@ -7,9 +7,9 @@ you can pick them without a sweep.
 
 ```@example tuning
 using AutoRIFT
-include("../../figures.jl")  # plotting helpers and the synthetic scenes; see [Plotting](@ref)
+include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 
-reference, secondary, _, _ = warped_pair(512, (row, col) -> (6.0, -2.0); seed = 13)
+reference, secondary, _, _ = warped_pair(photo(), 512, (row, col) -> (6.0, -2.0))
 
 image_panels(reference, secondary)
 ```

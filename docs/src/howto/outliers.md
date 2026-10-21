@@ -16,11 +16,11 @@ correlation there has nothing to lock onto:
 
 ```@example outliers
 using AutoRIFT
-include("../../figures.jl")  # plotting helpers and the synthetic scenes; see [Plotting](@ref)
+include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 using Statistics: median, quantile
 
 band(row) = clamp((108 - abs(row - 256)) / 28, 0, 1)
-reference, clean, truth_dx, _ = warped_pair(512, (row, col) -> (2 + 20 * band(row), 0.0); seed = 11)
+reference, clean, truth_dx, _ = warped_pair(photo(), 512, (row, col) -> (2 + 20 * band(row), 0.0))
 patch(row, col) = (300 <= row <= 400 && 120 <= col <= 260) ? 1.0 : 0.0
 secondary = decorrelate(clean, patch; amplitude = 2.5, seed = 7)
 
@@ -49,8 +49,10 @@ rejected = measured(raw) .& .!measured(filtered)
 input_field(Float64.(rejected), "rejected by the filter"; colormap = :grays)
 ```
 
-The rejections concentrate in the decorrelated patch, which is the point: the filter found a region where
-the displacements disagree with their neighbours, without being told the region existed.
+The rejections fall in two places. One is the decorrelated patch, which is the point: the filter found a
+region where the displacements disagree with their neighbours, without being told the region existed.
+The other is the two edges of the band, where a chip straddles two speeds 20 pixels apart — the case
+described under *When the filter is the wrong tool* below.
 
 ## How much it is worth
 
@@ -69,9 +71,10 @@ summary(out) = (n = length(error_of(out)),
 (unfiltered = summary(raw), filtered = summary(filtered))
 ```
 
-The **median is identical** — 0.016 px either way, one refinement quantization step. The filter changes
-nothing about the points that were already right. What it changes is the tail: the 99th percentile falls
-from about 40 pixels to 0.06, and the worst point from 47 pixels to 2.
+The **median barely moves** — 0.016 px unfiltered and 0.0 filtered, within one refinement quantization
+step of each other. The filter changes nothing about the points that were already right. What it changes
+is the tail: the 99th percentile falls from about 38 pixels to 0.06, and the worst point from 47 pixels
+to 3.6.
 
 That shape is worth internalizing. A filter that improved the median would be smoothing the field, which
 is a different operation with different costs. This one removes points; the ones it keeps are untouched.
@@ -131,8 +134,8 @@ end
 Three things to read out of that:
 
 - **`agree_tolerance` and `mad_scale` trade coverage against the tail**, and the trade is not symmetric.
-  Loosening either keeps a few dozen more points and costs an order of magnitude in the 99th percentile;
-  tightening `mad_scale` to 1.5 halves the tail again for about 20 points. Which side to err on depends
+  Loosening either keeps 40 to 110 more points and raises the 99th percentile from 0.06 px to 2–3.5 px;
+  tightening `mad_scale` to 1.5 gives up 23 points for a slightly smaller tail. Which side to err on depends
   on whether your consumer can tolerate a wrong vector or a missing one.
 - **`iterations = 1` is the worst setting here** — it keeps the most points and has by far the worst tail.
   Stage 1's iteration is doing real work: one pass cannot see an outlier whose neighbours are also
