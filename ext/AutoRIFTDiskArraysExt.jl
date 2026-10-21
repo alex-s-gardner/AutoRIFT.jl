@@ -1,14 +1,13 @@
 """
     AutoRIFTDiskArraysExt
 
-Teach [`AutoRIFT.ondisk`](@ref) to recognize a chunked backend, so an unblocked run refuses input it
-would read a pixel at a time, `AutoRIFT._chunk_rows` the backend's chunk height, so a threaded
-read splits on a boundary the storage shares, and `AutoRIFT._read_block!` to read a window straight
-into the buffer it was given.
+Adds methods for any `DiskArrays` array (Zarr, NetCDF, HDF5, and so on, with or without Rasters):
 
-Its own extension rather than part of `AutoRIFTRastersExt`, because the property is not about
-rasters: a Zarr, NetCDF or HDF5 array reached through `DiskArrays` has it too, and each of those
-loads without Rasters. `DiskArrays.isdisk` is the predicate every such backend already answers.
+  * `AutoRIFT.ondisk` recognizes it as disk-backed, so an unblocked run refuses input it would read
+    a pixel at a time.
+  * `AutoRIFT._chunk_rows` returns the backend's chunk height, so a threaded read splits on a
+    boundary the storage shares.
+  * `AutoRIFT._read_block!` reads a window straight into the buffer it is given.
 """
 module AutoRIFTDiskArraysExt
 

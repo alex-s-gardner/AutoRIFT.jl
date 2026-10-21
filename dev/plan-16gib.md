@@ -1388,3 +1388,56 @@ NISAR L2 `dy` correlation 0.97988 against a 0.99 bound, which the power-of-two l
 digit on all four gated statistics, so the bound is stale rather than crossed; and `5.e2e` red on all 15
 cases at `scene_footprint`, a GDAL open failure on native granules that are not on this machine.
 `Pkg.test()` passes at one thread and at eight.
+
+## What an untiled whole-scene pass holds
+
+Untiled peak on NISAR L1 is 32 GiB against a 1.29 GiB floor once the imagery is memory-mapped, so almost all
+of it is live working set (`-t 10`, grid 2328×2304, scene 57760×50511):
+
+| term | GiB |
+|---|---:|
+| imagery, both images | 5.43 *(mapped, not heap)* |
+| grid arrays | 0.40 |
+| one displacement field, per level | 0.08 |
+| refinement workspaces, 10 tasks | 0.04 |
+| concurrent correlation workspaces, worst level | 4.36 |
+| retained workspace pool | 1.51 |
+| scene pad, per pass | 6.3 |
+
+Every level pads on this grid, because a Geogrid's points sit near the footprint edge and carry radii up
+to 1905 px. Each pass copies the whole scene grown by its own halo, eight copies per run. That copy also
+defeats memory-mapping: 5.43 GiB is kept off the heap and then copied back onto it. GC takes 0.2 to 0.3% of
+wall clock for these copies, so caching one pad across passes would recover nothing measurable. Padding per
+window, as the blocked path does per block, would remove the remaining 6 GiB. Blocking is the setting that
+does this: the same granule blocked peaks at 25.2 GiB.
+
+The validity mask is padded lazily (`AutoRIFT.PaddedMask`) because a packed `BitMatrix` mask would expand
+eightfold when padded, to 3.13 GiB against 0.39 GiB, once per pass. Paired runs:
+
+| arm | wall | CPU | occupancy | peak footprint | allocated |
+|---|---:|---:|---:|---:|---:|
+| padded mask | 545.0 s | 5215.7 s | 9.57 | 38.33 GiB | 161.5 GiB |
+| **lazy mask** | **538.7 s** | 5195.1 s | **9.64** | **31.97 GiB** | 138.1 GiB |
+
+Peak is 6.36 GiB (16.6%) lower with no runtime cost. Both arms measure 1,799,746 points and give the same
+`dx` and `dy` checksums over raw bits.
+
+## The workspace pool is bounded across geometries
+
+Correlation workspaces are pooled, with up to `AutoRIFT.POOL_SLOTS_PER_KEY` (2) retained per geometry. A
+whole NISAR L1 grid visits 105 geometries and, unbounded, ends holding 9.9 GiB, mostly near-duplicate
+buckets from different levels that a finished level can never reuse. `AutoRIFT.WORKSPACE_POOL_BYTES`
+(default 2 GiB) bounds the total, evicting the least-recently-used geometry.
+`AutoRIFT.WORKSPACE_LIVE_BYTES` (default unbounded) separately bounds the workspaces checked out at once;
+on L2 blocked at 2304×1152 they are about 4.5 GiB of the 7.8 GiB above the process floor.
+
+Interleaved runs, one process each, nothing differing but the pool bound:
+
+| arm | wall | CPU | occupancy of 10 | peak footprint | pool at end |
+|---|---:|---:|---:|---:|---|
+| unbounded | 615.5, 537.8 s | 5273, 5186 s | 8.57, 9.64 | 42.96, 42.06 GiB | 105 keys, 9.87 GiB |
+| bounded at 2 GiB | 538.6, 535.1 s | 5193, 5179 s | 9.64, 9.68 | 39.78, 38.32 GiB | 16 keys, 1.51 GiB |
+
+Peak footprint falls from 42.06 to 39.05 GiB (7.2%) at the same wall clock and CPU seconds to 0.1%. All
+four runs give the same `dx` checksum, because a rebuilt workspace is the size of the one dropped.
+Retention is not peak: cutting 8.4 GiB of retained workspace moved peak by 3.0 GiB.

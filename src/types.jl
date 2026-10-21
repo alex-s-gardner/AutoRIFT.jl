@@ -48,32 +48,20 @@ const nokw = NoKW()
     AutoRIFT.ImageElement
 
 The element types the correlator accepts: `Real` for optical and amplitude imagery, `Complex` for
-single-look-complex radar under [`Coherence`](@ref).
-
-`Union{Real,Complex}` rather than `Number`, which is what the type walls first said. `Number` admits
-types no path here handles, which die as a bare `MethodError` several layers down with no mention of
-the actual constraint. Naming the real bound once makes the signatures state what the pipeline
-supports instead of merely more than it supports.
+single-look-complex radar under [`Coherence`](@ref). Equal to `Union{Real,Complex}`.
 """
 const ImageElement = Union{Real,Complex}
 
 """
     AutoRIFT.Extent
 
-A quantity with an x and a y component, in pixels: `(X = 16, Y = 32)`.
+A quantity with an x and a y component, in pixels: `(X = 16, Y = 32)`. Chip size, search radius and
+grid spacing are extents.
 
-Chip size, search radius and grid spacing are all two-dimensional, and naming the axes is what
-makes a transposition visible. `chip.X` reads as itself where `chip[1]` needs the convention looked
-up — and a transposed extent is the error this package has already made twice, once in a point set
-and once in an FFT size that "for a symmetric test size looks like it works".
-
-A `NamedTuple` rather than a struct, and that is load-bearing three ways. It stays `isbitstype`, so
-`Params` does and the trimmed binary keeps its inline layout. It is byte-identical to
-`Tuple{Int,Int}` — 16 bytes, offsets 0 and 8 — so it maps to `struct { int64_t x, y; }` with no
-padding for a C caller, since the names live in the type rather than the data. And it is writable as
-a literal, where a struct would need a constructor call at every site.
-
-Build one from a scalar or a tuple with [`AutoRIFT.extent`](@ref); a scalar means square.
+The type is `NamedTuple{(:X, :Y),Tuple{Int,Int}}`. It is `isbitstype`, so `Params` is too, and it has
+the layout of `Tuple{Int,Int}` (two `Int64`s, no padding), which maps to `struct { int64_t x, y; }`
+for a C caller. Build one from a scalar or a tuple with [`AutoRIFT.extent`](@ref); a scalar means
+square.
 """
 const Extent = NamedTuple{(:X, :Y),Tuple{Int,Int}}
 
@@ -93,12 +81,11 @@ struct False <: BoolAsType end
 """
     SimilarityMeasure
 
-Abstract supertype for the metric used to compare a chip against a search
-window. Concrete subtypes: [`ZNCC`](@ref), [`NCC`](@ref), [`Coherence`](@ref).
+Abstract supertype for the measure that compares a chip against a search window. Concrete subtypes:
+[`ZNCC`](@ref), [`NCC`](@ref), [`Coherence`](@ref).
 
-A similarity measure determines how the correlation surface is formed. Given a
-chip `T` and the window of the search image `I` at each candidate shift, each
-measure defines a numerator and a normalising denominator.
+Given a chip `T` and the window of the search image `I` at each candidate shift, a measure defines a
+numerator and a normalizing denominator, which together form the correlation surface.
 """
 abstract type SimilarityMeasure end
 
@@ -132,20 +119,16 @@ abstract type SimilarityMeasure end
 """
     ZNCC()
 
-Zero-mean normalized cross-correlation, also called the *normalized correlation
-coefficient* or (in digital image correlation) the Pearson local correlation
-coefficient. Equivalent to OpenCV's `TM_CCOEFF_NORMED`.
+Zero-mean normalized cross-correlation, also called the normalized correlation coefficient or, in
+digital image correlation, the Pearson local correlation coefficient. Equivalent to OpenCV's
+`TM_CCOEFF_NORMED`.
 
 ```math
 R = \\frac{\\sum (T - \\bar{T})(I - \\bar{I})}{\\sqrt{\\sum (T - \\bar{T})^2 \\sum (I - \\bar{I})^2}}
 ```
 
-Invariant to an additive brightness offset in either image, which makes it the
-right choice for optical imagery with varying illumination.
-
-The default, and the measure the reference implementation uses for every input
-type. (Earlier autoRIFT releases used [`NCC`](@ref) for floating-point input,
-which was a bug; v2.0.0 unified on `ZNCC`.)
+Invariant to an additive brightness offset in either image, so it suits optical imagery with varying
+illumination. The default, and the measure autoRIFT v2.0.0 and later use for every input type.
 """
 struct ZNCC <: SimilarityMeasure end
 
@@ -160,11 +143,9 @@ R = \\frac{\\sum T \\cdot I}{\\sqrt{\\sum T^2 \\sum I^2}}
 ```
 
 !!! warning
-    `NCC` is **not** invariant to an additive offset, so a brightness difference
-    between the two acquisitions biases the peak. Prefer [`ZNCC`](@ref) unless
-    the mean itself carries signal you want to keep. Provided for comparison and
-    for reproducing autoRIFT releases before v2.0.0, which used this measure for
-    floating-point input.
+    `NCC` is not invariant to an additive offset, so a brightness difference between the two
+    acquisitions biases the peak. Prefer [`ZNCC`](@ref) unless the mean carries signal to keep. It
+    reproduces autoRIFT releases before v2.0.0, which used it for floating-point input.
 """
 struct NCC <: SimilarityMeasure end
 
@@ -178,32 +159,28 @@ Complex coherence magnitude, for single-look-complex (SLC) radar input.
                {\\sqrt{\\sum |T'|^2 \\sum |W'|^2}}
 ```
 
-where ``T'`` and ``W'`` are the chip and the window with their (complex) means removed — the
-complex analogue of [`ZNCC`](@ref), and mean-removed on *both* sides for the same reason: it is
-what makes ``\\gamma(T, T) = 1`` exactly. The surface is real — the magnitude — so peak location
-and the subpixel cascade are the same code the real measures use.
+where ``T'`` and ``W'`` are the chip and the window with their complex means removed. This is the
+complex analogue of [`ZNCC`](@ref) and gives ``\\gamma(T, T) = 1`` exactly. The surface is the real
+magnitude, so peak location and sub-pixel refinement use the same code as the real measures.
 
-Requires complex input; a real image has no phase to exploit and [`ZNCC`](@ref) is the measure
-for it.
+Requires complex input; use [`ZNCC`](@ref) for a real image.
 
-Coherence resolves finer detail than amplitude, following Joughin (2002), but it fails where
-amplitude does not.
+Coherence resolves finer detail than amplitude (Joughin, 2002) but fails where amplitude does not.
 
 !!! warning "Phase variation destroys the peak"
-    Interferometric phase across the chip can *reduce or eliminate* the correlation peak, worst
-    exactly where the deformation is largest. Amplitude matching is unaffected there.
+    Interferometric phase across the chip can reduce or eliminate the correlation peak, most where
+    the deformation is largest. Amplitude matching is unaffected there.
 
-    Two consequences. Run [`Deramp`](@ref) as the preprocessing step, and expect to fall back:
-    passing a *tuple* to `similarity` runs coherence at the finest chip size and a real measure
-    above it, so a point coherence cannot resolve is left for a larger amplitude chip.
+    Use [`Deramp`](@ref) as the preprocessing step and give `similarity` a tuple, which runs coherence
+    at the finest chip size and a real measure above it, so a point coherence cannot resolve is left
+    to a larger amplitude chip.
 
     ```julia
     autorift(z1, z2; similarity = (:coherence, :zncc), preprocess = :deramp,
              chip_size = 32, chip_size_max = 128)
     ```
 
-What the escalation buys, and what it is verified against, is
-[How feature tracking works](@ref).
+See [How feature tracking works](@ref) for what the escalation gains.
 """
 struct Coherence <: SimilarityMeasure end
 
@@ -222,22 +199,19 @@ abstract type SubpixelMethod end
 """
     NoRefine()
 
-Report the integer-pixel peak with no refinement. Used for the coarse pass,
-where only a rough displacement is needed to restrict the fine search.
+Report the integer-pixel peak with no refinement. The coarse pass uses it, since it needs only a rough
+displacement to restrict the fine search.
 """
 struct NoRefine <: SubpixelMethod end
 
 """
     PyramidRefine(; upsampling = 64)
 
-Locate the peak to `1/upsampling` pixel by upsampling a 5x5 neighbourhood of
-the correlation surface with a Gaussian pyramid and taking the argmax of the
-result. This is the autoRIFT reference approach, and it is deliberately robust
-to the "peak locking" bias that a parabola fit suffers on quantized imagery.
+Locate the peak to `1/upsampling` pixel by upsampling the 5x5 neighborhood of the integer peak with a
+Gaussian pyramid and taking the argmax. This is the autoRIFT reference approach. Unlike a parabola
+fit, it is not subject to peak-locking bias on quantized imagery.
 
-`upsampling` must be a power of two greater than one; the reference divides by
-`upsampling` after upsampling to the next power of two, so a non-power-of-two
-silently produces a wrongly scaled displacement.
+`upsampling` must be a power of two greater than one; otherwise `ArgumentError` is thrown.
 """
 struct PyramidRefine <: SubpixelMethod
     upsampling::Int
@@ -256,8 +230,8 @@ PyramidRefine(; upsampling = 64) = PyramidRefine(upsampling)
 """
     upsampling(method::SubpixelMethod)
 
-The subpixel quantization denominator: the peak is located to `1/upsampling` of
-a pixel. `1` for [`NoRefine`](@ref).
+The sub-pixel denominator: the peak is located to `1/upsampling` of a pixel. `1` for
+[`NoRefine`](@ref).
 """
 upsampling(::NoRefine) = 1
 upsampling(m::PyramidRefine) = m.upsampling
@@ -269,12 +243,12 @@ upsampling(m::PyramidRefine) = m.upsampling
 """
     PreprocessMethod
 
-Abstract supertype for the filter applied to both images before correlation.
-Preprocessing suppresses the low-frequency radiometric differences between two
-acquisitions so that correlation responds to texture rather than to brightness.
+Abstract supertype for the filter applied to both images before correlation. Preprocessing suppresses
+low-frequency radiometric differences between acquisitions so that correlation responds to texture
+rather than brightness.
 
-Concrete subtypes: [`Highpass`](@ref), [`Wallis`](@ref), [`WallisGapfill`](@ref),
-[`Sobel`](@ref), [`Laplacian`](@ref), [`Decibel`](@ref), [`NoPreprocess`](@ref).
+Concrete subtypes: [`Highpass`](@ref), [`Wallis`](@ref), [`WallisGapfill`](@ref), [`Sobel`](@ref),
+[`Laplacian`](@ref), [`Decibel`](@ref), [`Destripe`](@ref), [`Deramp`](@ref), [`NoPreprocess`](@ref).
 """
 abstract type PreprocessMethod end
 
@@ -288,9 +262,9 @@ struct NoPreprocess <: PreprocessMethod end
 """
     Highpass(; width = 5)
 
-Subtract a local box mean, i.e. convolve with an identity-minus-box kernel of
-side `width`. The cheapest way to remove the illumination gradient between two
-scenes, and the default in the autoRIFT reference driver.
+Subtract a local box mean, equivalent to convolving with an identity-minus-box kernel of side `width`.
+It is the cheapest way to remove the illumination gradient between two scenes and is the default in
+the autoRIFT reference driver. `width` must be odd and at least 3.
 """
 struct Highpass <: PreprocessMethod
     width::Int
@@ -301,13 +275,12 @@ Highpass(; width = 5) = Highpass(width)
 """
     Wallis(; width = 5, min_std = 0.0)
 
-Wallis (1976) adaptive contrast filter: subtract the local mean and divide by
-the local standard deviation over a `width`-by-`width` window, so that local
-contrast is equalized across the scene.
+Wallis (1976) adaptive contrast filter: subtract the local mean and divide by the local standard
+deviation over a `width`-by-`width` window, equalizing local contrast across the scene. `width` must be
+odd and at least 3.
 
-Stronger than [`Highpass`](@ref) where illumination varies sharply, at the cost
-of amplifying noise in low-texture areas. `min_std` clamps the divisor to avoid
-that amplification; `0.0` disables the clamp.
+It handles sharply varying illumination better than [`Highpass`](@ref) but amplifies noise in
+low-texture areas. `min_std` sets a floor on the divisor to limit that; `0.0` applies no floor.
 
 The reference uses `width = 21` for Sentinel-1 and `5` otherwise.
 """
@@ -326,14 +299,12 @@ Wallis(; width = 5, min_std = 0.0) = Wallis(width, min_std)
 """
     WallisGapfill(; width = 5, min_std = 0.25)
 
-[`Wallis`](@ref) plus synthetic infill of interior no-data gaps, for Landsat-7
-imagery acquired after the 2003-05-31 Scan Line Corrector failure. Gap pixels
-are filled with noise matched to the local statistics so that they neither
-correlate spuriously nor mask out their neighbourhood.
+[`Wallis`](@ref) plus synthetic infill of interior no-data gaps, for Landsat-7 imagery acquired after
+the 2003-05-31 Scan Line Corrector failure. Gap pixels are filled with noise matched to the local
+statistics, so they neither correlate spuriously nor mask out their neighbors.
 
-Filling uses the random number generator seeded by the `rng_seed` keyword, so
-results are reproducible. (The Python reference draws from NumPy's unseeded
-global generator and is therefore not reproducible against itself.)
+The generator is seeded by `params`' `rng_seed`, so results are reproducible. The Python reference uses
+an unseeded generator and does not reproduce itself.
 """
 struct WallisGapfill <: PreprocessMethod
     width::Int
@@ -365,8 +336,8 @@ _gapfill_buffer(w::Integer) = sqrt(2 * ((Int(w) - 1) / 2)^2) + 0.01
 """
     Sobel(; width = 5)
 
-Sum of the Sobel derivative kernels in x and y, giving an edge-emphasising
-filter. `width` selects the derivative kernel size.
+Sum of the Sobel derivative kernels in x and y, an edge-emphasizing filter. `width` is the derivative
+kernel size, odd and at least 3.
 """
 struct Sobel <: PreprocessMethod
     width::Int
@@ -378,27 +349,21 @@ Sobel(; width = 5) = Sobel(width)
     Destripe(; along_track, cross_track, band_half = 70, notch_half = 100,
              clamp = 3, power_threshold = 500, ratio = 2, sigma = 10)
 
-Reject the stronger of two band-limited noise directions in the frequency domain.
+Reject the stronger of two band-limited noise directions in the frequency domain, for Landsat 4 and 5,
+whose Multispectral Scanner leaves coherent banding along one of two scan directions. The stripes occupy
+a thin line through the origin of the Fourier transform, which can be removed without touching the
+texture that correlation needs.
 
-For Landsat 4 and 5, whose Multispectral Scanner leaves coherent banding along one of the two scan
-directions. A band-reject in the Fourier domain removes it where a spatial filter cannot: the stripes are
-narrow in frequency and broad in space, so they occupy a thin line through the origin that can be excised
-without touching the texture correlation needs.
+`along_track` and `cross_track` are the scan directions in degrees on the raster's own grid. They are
+required keywords. [`track_angles`](@ref) computes them from a ground-track displacement.
 
-`along_track` and `cross_track` are the scan directions in **degrees on the raster's own grid**, and they are
-arguments rather than derived from the image. Two reasons. It keeps this a pure function of image and
-geometry, so it is testable on a synthetic scene with known stripes. And the geometry has a better source
-than the pixels: a scene's `_ANG.txt` carries the orbit ephemeris, which gives the ground-track heading
-directly once transformed into the raster's CRS — the scene is rotated because the acquisition track does not
-align with map coordinates, and near the poles none does.
+Only one direction is filtered, and only sometimes. The two band powers are compared, and the reject
+applies only if one exceeds the other by `ratio` and the larger exceeds `power_threshold`. Otherwise the
+image is returned clamped to `±clamp` but not filtered.
 
-Only one direction is filtered, and only sometimes. The two band powers are compared, and the reject applies
-only if one exceeds the other by `ratio` **and** the larger exceeds `power_threshold`. Otherwise the image is
-returned clamped but unfiltered — which is not a pass-through, since `clamp` still applies.
-
-The defaults are the reference's (`autoRIFT.py:153-243`). `band_half` and `notch_half` are in pixels and are
-*not* scaled to the image, so the rejected band is a fixed width in frequency regardless of scene size,
-which is a property of the reference rather than a derivation.
+`band_half` and `notch_half` are in pixels and are not scaled to the image. The defaults are the
+reference's (`autoRIFT.py:153-243`). Works on the whole image, so it has no finite
+[`filter_reach`](@ref) and cannot run in a blocked run.
 """
 struct Destripe <: PreprocessMethod
     along_track::Float64
@@ -434,19 +399,15 @@ Destripe(; along_track, cross_track, band_half = 70, notch_half = 100, clamp = 3
 """
     track_angles(dx, dy; spacing) -> (along_track, cross_track)
 
-[`Destripe`](@ref)'s scan-angle convention, from a ground-track displacement `(dx, dy)` in a
-raster's projected CRS and that raster's pixel `spacing = (sx, sy)`.
+[`Destripe`](@ref)'s scan angles, in degrees, from a ground-track displacement `(dx, dy)` in a raster's
+projected CRS and that raster's pixel `spacing = (sx, sy)`. Any source of a ground-track vector can
+supply `(dx, dy)`, such as an orbit ephemeris projected into the raster's CRS.
 
-Any source of a ground-track vector can feed this — an orbit ephemeris projected into the raster's
-CRS, a pixel-shape estimate, anything else that resolves to a direction on the grid — which is why it
-takes a displacement rather than, say, an `Orbit`.
-
-**Pixel units, not metres.** A slope is a ratio, so a uniform scale cancels, but a non-square pixel
-does not: `spacing` is required rather than defaulted so that case is not silently assumed away.
-`along_track` is `atan(dy/sy, dx/sx)` in degrees — note `atan` of a ratio, not `atan2`, matching the
-reference's `_calculate_slope` (`autoRIFT.py:138-151`): the result is in `(-90, 90)` and a vertical
-displacement gives `±90` by the division overflowing rather than by a branch. `cross_track` is its
-perpendicular, folded back into the same open interval rather than reported as a signed `90°` offset.
+The angles are computed in pixel units: `along_track = atan((dy / sy) / (dx / sx))`, the arctangent of a
+ratio rather than a two-argument `atan`, matching the reference's `_calculate_slope`
+(`autoRIFT.py:138-151`). The result lies in `(-90, 90)`, and a vertical displacement gives `±90`.
+`cross_track` is the perpendicular direction, folded into the same interval. `spacing` is required
+because a non-square pixel changes the ratio.
 """
 function track_angles(dx::Real, dy::Real; spacing::Tuple{Real,Real})
     sx, sy = abs(Float64(spacing[1])), abs(Float64(spacing[2]))
@@ -458,8 +419,8 @@ end
 """
     Laplacian(; width = 5)
 
-Laplacian (isotropic second derivative) of the log-amplitude image. Intended
-for radar amplitude.
+Laplacian (isotropic second derivative) of the log-amplitude image, for radar amplitude. `width` is
+the kernel side, odd and at least 3.
 """
 struct Laplacian <: PreprocessMethod
     width::Int
@@ -470,45 +431,38 @@ Laplacian(; width = 5) = Laplacian(width)
 """
     Decibel()
 
-Convert amplitude to decibels, `20 log10(A)`. Intended for radar amplitude,
-where the dynamic range is large and multiplicative.
+Convert amplitude to decibels, `20 log10(A)`, for radar amplitude, whose brightness varies
+multiplicatively. Pixels with non-positive amplitude are marked invalid.
 """
 struct Decibel <: PreprocessMethod end
 
 """
     Deramp(; axis = :both)
 
-Remove the linear phase ramp from a complex image. **Complex input only.**
+Remove the linear phase ramp from a complex image. Complex input only; a real image throws
+`ArgumentError` at the `autorift` call.
 
-A phase ramp is a frequency shift: it moves the band centre away from zero, and a signal whose
-band is off-centre aliases when oversampled. Since [`PyramidRefine`](@ref) oversamples the
-correlation surface, this is a correctness requirement for complex correlation rather than an
-enhancement — ISCE2's `cuAmpcor` says the same in `cuDeramp.cu`: removing the ramp "is necessary
-before oversampling a complex signal".
+A phase ramp is a frequency shift. A signal whose band is off-center aliases when oversampled, and
+[`PyramidRefine`](@ref) oversamples the correlation surface, so complex correlation needs the ramp
+removed (ISCE2's `cuAmpcor` makes the same point in `cuDeramp.cu`). The linear component is also the
+dominant part of the phase variation that suppresses the [`Coherence`](@ref) peak.
 
-It also directly addresses the failure mode [`Coherence`](@ref) warns about. Phase variation
-across a chip suppresses the correlation peak; the linear component of that variation is both the
-dominant part and the part that can be estimated from the chip alone, with no interferogram.
-
-The estimate follows `cuAmpcor`'s method 1. For each axis, sum the conjugate product of adjacent
+The estimate follows `cuAmpcor`'s method 1. For each axis, sum the conjugate product of adjacent valid
 pixels and take the argument of that sum:
 
 ```math
 \\phi_x = \\arg \\sum_{i} \\overline{z_i} \\, z_{i + \\Delta x}
 ```
 
-Summing the product rather than averaging per-pixel phase differences makes the estimate
-**amplitude-weighted for free** — a bright pixel pair contributes more than a dim one, which is
-what you want when speckle means dim pixels are mostly noise. It also avoids wrapping: no
-`atan` is taken until after the sum.
+Summing the products weights each pixel pair by its amplitude, and no `atan` is taken until after the
+sum, so no unwrapping is needed.
 
-`axis` selects `:x`, `:y`, or `:both`. Deramping one axis is occasionally right for data whose
-ramp is known to lie along track.
+`axis` selects `:x`, `:y`, or `:both`.
 
 !!! note "Not a substitute for amplitude fallback"
-    A linear ramp is the first term of the phase variation, not all of it. Steep topography and
-    high shear produce higher-order variation this cannot remove, which is why
-    [`Coherence`](@ref) recommends a measure tuple that falls back to amplitude.
+    A linear ramp is only part of the phase variation. Steep topography and high shear produce
+    higher-order variation that this cannot remove; give `similarity` a tuple that falls back to
+    amplitude (see [`Coherence`](@ref)).
 """
 struct Deramp <: PreprocessMethod
     axis::Symbol
@@ -523,7 +477,7 @@ Deramp(; axis = :both) = Deramp(axis)
 """
     RotationMethod
 
-Whether the dense stage tries several chip rotations and keeps the best.
+Whether the dense stage correlates each chip at several rotations and keeps the best.
 
 Subtypes: [`RotationSearch`](@ref), [`NoRotationSearch`](@ref). Pass one as `params`' `rotation`.
 """
@@ -561,12 +515,13 @@ struct NoRotationSearch <: RotationMethod end
     RotationSearch(angles = (-3.0, 0.0, 3.0); about = 0.0)
 
 Correlate each chip at every angle in `angles`, in degrees, and keep the strongest peak. `about` is
-the scene's own rotation, in the sense [`scene_rotation`](@ref) reports it, so the rotations actually
-applied to the chip are `angles .- about`.
+the scene's own rotation, in the sense [`scene_rotation`](@ref) reports it, so the rotations applied to
+the chip are `angles .- about`. `angles` is any real vector, range or tuple of distinct, finite values;
+`about` must be finite. An empty `angles`, a repeated angle or a non-finite value throws
+`ArgumentError`.
 
-Opt-in because it multiplies the correlation cost by `length(angles)`, and worth that cost when the
-scene itself rotates — a rotated chip decorrelates against an unrotated window even where the surface
-is perfectly trackable. `angles` must be distinct and finite.
+Correlation cost is multiplied by up to `length(angles)`. The search helps when the scene itself
+rotates, since a rotated chip decorrelates against an unrotated window.
 
 ```julia
 autorift(a, b, guess; rotation = RotationSearch())              # ±3°, 3x cost
@@ -574,14 +529,10 @@ autorift(a, b, guess; rotation = RotationSearch((-6, -3, 0, 3, 6)))
 autorift(a, b, guess; rotation = RotationSearch(; about = 8.0)) # searches 5-11°
 ```
 
-Five angles cost 1.7×, not 5×, since the per-point work around the correlation is shared across
-them. [`AutoRIFT.angles`](@ref) reports the rotations a pass will try, and the best-fitting angle is
-available per point — a measurement, not only a correction.
-
-Not a substitute for [`Deramp`](@ref) or for the consistency filter, and it does not correct
-**shear**: deformation is computed from the vector field afterwards.
-[Giving the search a first guess](@ref) measures what the search recovers, why `about` subtracts, and
-where the estimate comes from.
+Five angles cost 1.7×, not 5×, since the per-point work around the correlation is shared across them.
+[`AutoRIFT.angles`](@ref) reports the rotations a pass will try. The search does not correct shear.
+See [Giving the search a first guess](@ref) for what the search recovers, why `about` is subtracted,
+and where the estimate comes from.
 """
 struct RotationSearch{A<:Tuple} <: RotationMethod
     angles::A
@@ -611,25 +562,11 @@ RotationSearch(angles = (-3.0, 0.0, 3.0); about::Real = 0.0) = RotationSearch(an
 """
     AutoRIFT.angles(method::RotationSearch) -> Tuple
 
-The chip rotations a pass will try, in degrees — the rotations **applied to the chip**, so `about` is
-already subtracted out.
+The chip rotations a pass will try, in degrees: `m.angles .- m.about`. These are the rotations applied
+to the chip, so `about` is already subtracted. `m.angles` is the search window and `m.about` the scene
+rotation it is centered on.
 
-That is why this is a function rather than a field read: `m.angles` is the search window and
-`m.about` is the scene rotation it is centred on, and what `_rotate_chip` needs is neither of those
-but `angles .- about`. Resolving it here means the correlator and the tests cannot disagree about the
-sign — which mattered, since the first version of this had it backwards and the table in
-[`RotationSearch`](@ref) is what caught it.
-
-No `about == 0` fast path. One was written, on the assumption the common case should skip the
-subtraction, and it is measurably *slower* than the unconditional form in **both** cases — 2.08
-against 1.83 ns at `about = 0` — because subtracting a constant from a tuple is free and the branch
-is not.
-
-Only defined for [`RotationSearch`](@ref). There was a `NoRotationSearch` method returning `(0.0,)`,
-justified as letting the caller skip a branch — but no such caller exists: the correlation dispatches
-on the method *type* first (`_correlate_rotations!` has a `NoRotationSearch` method that never
-consults this), which is what makes the off path compile to the unrotated call. A method whose stated
-purpose is contradicted by the dispatch above it is worse than no method.
+Defined only for [`RotationSearch`](@ref); there is no method for [`NoRotationSearch`](@ref).
 """
 angles(m::RotationSearch) = m.angles .- m.about
 
@@ -659,32 +596,23 @@ _poolable(::Highpass) = true
 """
     AutoRIFT.filter_reach(method::PreprocessMethod) -> Int
 
-How many pixels beyond a region must be supplied for the filter's output *inside* that region to
-equal what filtering the whole image would give.
+How many pixels beyond a region must be supplied for the filter's output inside that region to equal
+what filtering the whole image gives. Blocked processing sizes its halo from this.
 
-**Negative means no finite reach**, so check the sign before using the result as a width. A filter
-that estimates from the whole image — [`Deramp`](@ref) — cannot be reproduced from a window of any
-size, and returns `-1` rather than a large number that would merely be less wrong. Adding a negative reach
-to a correlation extent yields a halo *shorter* than the correlation alone, which is exactly the
-silent under-read this trait exists to prevent; [`AutoRIFT.halo`](@ref) throws instead.
+A negative value means no finite reach: check the sign before using the result as a width. A filter
+that estimates from the whole image, [`Deramp`](@ref) or [`Destripe`](@ref), returns `-1`.
+[`AutoRIFT.halo`](@ref) throws for such a method.
 
-Separate from [`filter_width`](@ref) because the two differ, and the difference is not a detail: a
-filter that consumes a window of an already-windowed quantity reaches twice its half-width, since the
-second window spans the first's output. Tiled processing sizes its halo from this, so a value that is
-too small produces a filter output that is quietly wrong near every block edge rather than merely
-different.
+The value is an upper bound on the reach, which may exceed the true reach:
 
-**This is always an upper bound, and only sometimes the reach itself.** A halo wider than a filter needs
-costs work and changes no answer, while one too narrow is silently wrong, so a method whose worst case is
-hard to pin down returns the worst case. Three cases, all instances of that one rule: exact for a single
-convolution; doubled for [`Wallis`](@ref), because excluding a pixel whose own local mean is not finite is
-a window of a window, though its variance terms are both single windows of the raw image and reach only
-the half-width on their own; and looser still for [`WallisGapfill`](@ref), which reaches `GAPFILL_REACH`
-plus its dilation plus its window because whether a pixel is filled depends on how far the nearest real
-data lies — a distance-transform decision rather than a windowed one.
+- `filter_width ÷ 2` for a single convolution ([`Highpass`](@ref), [`Sobel`](@ref),
+  [`Laplacian`](@ref)); `0` for [`NoPreprocess`](@ref) and [`Decibel`](@ref).
+- Twice that for [`Wallis`](@ref), because excluding a pixel whose own local mean is not finite is a
+  window of a window.
+- For [`WallisGapfill`](@ref), `GAPFILL_REACH` plus the dilation of its window plus the Wallis reach,
+  because whether a pixel is filled depends on the distance to the nearest real data.
 
-Pinned per method by a test that measures the true reach and requires this trait to bound it, so the
-two cannot drift.
+Differs from [`filter_width`](@ref) for this reason.
 """
 filter_reach(m::PreprocessMethod) = filter_width(m) ÷ 2
 
@@ -780,32 +708,23 @@ abstract type PassRunner end
 Where the correlation kernels run. Concrete subtypes: [`AutoRIFT.CPU`](@ref),
 [`AutoRIFT.MetalGPU`](@ref), [`AutoRIFT.CUDAGPU`](@ref).
 
-Selected with the `backend` keyword, which accepts the `Symbol` naming a backend or an
-instance. `CPU()` is the default and the only one that needs no additional package.
+Selected with `params`' `backend` keyword, which takes the Symbol `:cpu`, `:metal` or `:cuda`, or an
+instance. `CPU()` is the default and needs no additional package.
 
-The GPU backends are **experimental and do not currently outperform the CPU**: a device pass is
-2.7-3.2x one CPU core, but slower than a threaded CPU run on a single image pair. They are worth
-selecting where the cores are already committed and the device is idle. See
-[Correlating on a GPU](@ref).
+The GPU backends are experimental. A device pass is faster than one CPU core but slower than a threaded
+CPU run on a single image pair; see [Correlating on a GPU](@ref).
 
-A singleton per backend, carried as a `Params` **type parameter** rather than a field value, so the
-grid loop's choice is resolved at compile time and the unused paths are eliminated — the same
-arrangement `threaded` uses, for the same reason. That is also what keeps `Params` `isbitstype`, and
-what makes the GPU support invisible to a `--trim`ed binary: `app/` builds a `Params` carrying
-`CPU()`, so no GPU method is reachable from `main` and none is compiled in. The kernels themselves
-live in package extensions, so a caller who never loads `Metal` never pays for it either.
-
-The GPU backends are declared here rather than in their extensions because a `Params` type
-parameter must exist before the extension that implements it loads — a caller may construct
-`params(; backend = :metal)` and only then `using Metal`. Selecting a backend whose package is
-absent throws from [`AutoRIFT.required_package`](@ref)'s message rather than a `MethodError`.
+Each backend is a singleton carried as a `Params` type parameter, so the choice is resolved at compile
+time and `Params` stays `isbitstype`. The GPU backends are declared in the core so that
+`params(; backend = :metal)` can be called before `using Metal`. Correlating with a backend whose
+package is not loaded throws `ArgumentError` naming the package from [`AutoRIFT.required_package`](@ref).
 """
 abstract type Backend end
 
 """
     AutoRIFT.CPU()
 
-Run the correlation on the CPU, threaded or not per the `threaded` keyword. The default.
+Run the correlation on the CPU, threaded or not according to `params`' `threaded`. The default.
 """
 struct CPU <: Backend end
 
@@ -814,9 +733,9 @@ struct CPU <: Backend end
 
 Run the correlation on an Apple GPU through Metal.jl. Needs `using Metal`.
 
-Requires Metal.jl 1.10 or later, which is where the batched FFT this depends on landed.
+Requires Metal.jl 1.10 or later, which provides the batched FFT it uses.
 
-Experimental, and slower than a threaded CPU run on one image pair — see [`AutoRIFT.Backend`](@ref).
+Experimental, and slower than a threaded CPU run on one image pair; see [`AutoRIFT.Backend`](@ref).
 """
 struct MetalGPU <: Backend end
 
@@ -825,21 +744,17 @@ struct MetalGPU <: Backend end
 
 Run the correlation on an NVIDIA GPU through CUDA.jl. Needs `using CUDA`.
 
-**Not implemented.** The kernels in `ext/gpu/` are vendor-neutral, written against
-KernelAbstractions.jl, but only the Metal adapter ships — so selecting this backend finds no
-extension to load. Declared here because a `Params` type parameter must exist before the extension
-that implements it, which is what makes adding the adapter a new file rather than a change here.
+Not implemented. The kernels in `ext/gpu/` are written against KernelAbstractions.jl, but only the Metal
+adapter exists, so correlating with this backend throws `ArgumentError` and loading CUDA does not help.
 """
 struct CUDAGPU <: Backend end
 
 """
     AutoRIFT.isgpu(backend) -> Bool
 
-Whether `backend` executes on a device with its own memory.
-
-A trait rather than an `isa` union at each call site, so a backend added later declares its own
-answer instead of being added to a branch. What it gates is the choices that follow from having a
-separate address space — batching, host/device transfer, and the rejection of intra-pair threading.
+Whether `backend` executes on a device with its own memory. `true` for [`AutoRIFT.MetalGPU`](@ref) and
+[`AutoRIFT.CUDAGPU`](@ref), `false` for [`AutoRIFT.CPU`](@ref). A new backend defines its own method.
+`params` rejects a GPU backend combined with `threaded = true`.
 """
 isgpu(::Backend) = false
 isgpu(::MetalGPU) = true
@@ -858,28 +773,17 @@ required_package(::CUDAGPU) = "CUDA"
 """
     AutoRIFT.PassGeometry
 
-The largest chip and search radius any point in a pass uses.
+The largest chip and search radius any point in a pass uses, as two [`AutoRIFT.Extent`](@ref) fields:
+`chip` and `radius`.
 
-Two [`AutoRIFT.Extent`](@ref)s: the largest `chip` and the largest `radius`.
+These bound the pass rather than describe every point. A point is correlated at its own radius rounded
+up to a rung of the `AutoRIFT.RADIUS_BUCKET_RUNGS` ladder and clamped to `radius`, so the pass uses one
+transform length per bucket its points reach. `chip` is uniform within a level.
 
-These **bound** the pass rather than describing every point in it. A point is correlated at its own
-radius rounded up to a rung of the ladder in `AutoRIFT.RADIUS_BUCKET_RUNGS` and clamped to
-`radius` (`AutoRIFT._radius_bucket`), and that bucket sizes the workspace it runs through — so a pass
-executes one transform length per bucket its points reach, not one for the whole pass. The `chip`
-extent is the transform's other dimension and is uniform within a level.
-
-Transform length is not free of the answer: a different length reassociates the same floating-point sum
-differently. Two lengths agree to about 1e-7 on `correlation`, and a peak's *location* almost always
-survives a perturbation that small — but where it does not, the displacement moves by one refinement
-step. Pooling keys on the same extents; see `take_workspace!`.
-
-That leaves one way the pass geometry still reaches a point's answer, which is why this remains a value
-a caller can supply. The bucket is clamped to `radius`, so a point in the **topmost** bucket is
-correlated at whatever maximum its point set happens to contain — and a subset generally has a smaller
-one. Passing the whole set's geometry to a subset removes that dependence. Measured on a sub-block whose
-own maximum radius is 10 against a grid whose maximum is 25, so the same radius clamps to 10 in one and
-buckets to 16 in the other: `correlation` differs, `dx` is identical on all 36 points and `dy` moves on
-one by `1/64` — and all three agree exactly once the whole set's geometry is passed.
+A different transform length changes `correlation` by about 1e-7 and, rarely, moves a displacement by
+one refinement step. A point in the topmost bucket is correlated at the maximum radius of its point
+set, which is smaller for a subset than for the whole set. To make a subset reproduce the whole set's
+answer, pass the whole set's geometry to [`track!`](@ref); it may widen the pass but not narrow it.
 
 Build one with [`AutoRIFT.pass_geometry`](@ref).
 """
@@ -897,16 +801,13 @@ end
 
 Abstract supertype for how implausible displacements are identified and dropped.
 
-Correlation returns a displacement at every searched point, including points where the peak
-was noise. Those false matches are not small errors — they are arbitrary vectors, and one can
-dominate any downstream fit. What separates them from real motion is spatial coherence:
-neighbouring points on one moving surface move similarly, while a false match agrees with
-nothing around it. Every method here is some way of asking that question.
+Correlation returns a displacement at every searched point, including points where the peak was noise.
+False matches are arbitrary vectors that disagree with their neighbors, whereas neighboring points on
+one moving surface move similarly. Each method tests that spatial coherence.
 
 Concrete subtypes: [`GardnerFilter`](@ref), [`NoOutlierFilter`](@ref).
 
-Selected with the `outliers` keyword, which accepts either the `Symbol` naming a method or an
-instance — the latter being the only way to override a method's own parameters.
+Selected with `params`' `outliers` keyword, which takes a Symbol (`:gardner`, `:none`) or an instance.
 """
 abstract type OutlierMethod end
 
@@ -916,34 +817,32 @@ abstract type OutlierMethod end
 
 The two-stage filter of Gardner et al. (2018), as implemented in autoRIFT's `DISP_FILT`.
 
-Stage 1 keeps a point only if `min_agree_fraction` of its neighbourhood lies within
-`agree_tolerance` of it — cheap, and removes isolated wild vectors. Stage 2 keeps a point only
-if it lies within `mad_scale` median absolute deviations of its neighbourhood median, which
-catches the subtler case of a false match sitting near other false matches. Both run on
-displacements normalized by the local search radius, and both iterate: rejection is monotone,
-so removing one outlier can expose its neighbours.
+Stage 1 keeps a point only if at least `min_agree_fraction` of the window area lies within
+`agree_tolerance` of it, which removes isolated wild vectors. Stage 2 keeps a point only if it lies
+within `mad_scale` median absolute deviations of its neighborhood median, which catches a false match
+near other false matches. Both stages work on displacements normalized by the local search radius and
+iterate, since removing one outlier can expose its neighbors.
 
 # Keywords
-- `window`: neighbourhood width in grid points. Must be odd and at least 3, so the
-  neighbourhood has a centre.
-- `iterations`: iterations of stage 1. Stage 2 runs one fewer, minimum one, per the reference.
-- `min_agree_fraction`: fraction of the *full* window area that must agree. The default `8/25`
-  is eight of a 5x5 window's twenty-five points.
-- `agree_tolerance`: how close counts as agreement, as a fraction of the local search radius.
-- `mad_scale`: how many median absolute deviations from the neighbourhood median a point may
-  lie before stage 2 rejects it.
+- `window = 5`: neighborhood width in grid points. Odd and at least 3.
+- `iterations = 3`: iterations of stage 1. Stage 2 runs one fewer, minimum one, as in the reference.
+- `min_agree_fraction = 8/25`: fraction of the full window area that must agree, in `[0, 1]`. The
+  default is eight of the 25 points of a 5x5 window.
+- `agree_tolerance = 0.2`: how close counts as agreement, as a fraction of the local search radius,
+  in `(0, 1]`.
+- `mad_scale = 4.0`: how many median absolute deviations from the neighborhood median a point may lie
+  before stage 2 rejects it. Positive.
+
+An invalid value throws `ArgumentError`.
 
 !!! note "Relation to the normalized median test"
-    This is *inspired by* the universal outlier detection of Westerweel & Scarano (2005) but is
-    not that test, and the differences change which points survive. The centre point is
-    included in both the median and the MAD, where Westerweel & Scarano exclude it — excluding
-    it is what makes their test ask whether a vector agrees with its neighbours rather than
-    with a set it partly defines. The normalization is by local search radius rather than by
-    `MAD + ε` with an absolute `ε`; the threshold is 4 rather than their universal 2; and the
-    agreement pre-pass has no counterpart there at all.
+    This is inspired by the universal outlier detection of Westerweel & Scarano (2005) but is not that
+    test. The center point is included in both the median and the MAD, where Westerweel & Scarano
+    exclude it. The normalization is by local search radius rather than by `MAD + ε` with an absolute
+    `ε`. The threshold is 4 rather than their universal 2. The agreement stage has no counterpart
+    there.
 
-    See [`AutoRIFT.reject_outliers`](@ref). Westerweel & Scarano's test proper is a candidate
-    for a future `OutlierMethod`.
+See [`AutoRIFT.reject_outliers`](@ref).
 """
 struct GardnerFilter <: OutlierMethod
     window::Int
@@ -981,22 +880,17 @@ end
 """
     NoOutlierFilter()
 
-Keep every measured displacement.
-
-Not a sensible production choice — a single false match can dominate a downstream fit — but
-the right tool for deciding *which* stage dropped a point, since it separates the correlator's
-failures from the filter's rejections.
+Keep every measured displacement. A single false match can dominate a downstream fit, so this is
+for diagnosis: it separates the correlator's failures from the filter's rejections.
 """
 struct NoOutlierFilter <: OutlierMethod end
 
 """
     AutoRIFT.window(method::OutlierMethod) -> Int
 
-Neighbourhood width the method needs, in grid points, or `0` if it needs none.
+Neighborhood width the method needs, in grid points, or `0` if it needs none.
 
-Used to decide whether a decimated grid has enough points to judge consistency at all: a
-coarse grid narrower than the window cannot support the filter, and the caller skips it rather
-than filtering against a truncated neighbourhood.
+The coarse pass uses it to skip the filter on a decimated grid narrower than the window.
 """
 window(f::GardnerFilter) = f.window
 window(::NoOutlierFilter) = 0
@@ -1004,16 +898,12 @@ window(::NoOutlierFilter) = 0
 """
     AutoRIFT.relax(method::OutlierMethod) -> OutlierMethod
 
-A variant of `method` suited to a decimated grid.
+A looser variant of `method` for a decimated grid.
 
-The coarse pass runs on a strided subset, so its neighbourhoods span several times more ground
-and a point's neighbours are genuinely further away and less like it. Holding them to the fine
-pass's standard would reject coherent motion. What "loosened" means is the method's own
-business, which is why this returns an instance rather than taking a scale factor — a method
-with a universal threshold may legitimately return itself.
-
-For [`GardnerFilter`](@ref) it drops one iteration; the reference derives the same effect from
-an overlap fraction.
+The coarse pass runs on a strided subset, so a point's neighbors lie further away and resemble it
+less. Holding them to the fine pass's standard would reject coherent motion. What loosening means is
+the method's own: [`GardnerFilter`](@ref) drops one iteration (minimum one), and
+[`NoOutlierFilter`](@ref) returns itself.
 """
 relax(f::GardnerFilter) = GardnerFilter(;
     window = f.window, iterations = max(f.iterations - 1, 1),
@@ -1024,31 +914,29 @@ relax(m::NoOutlierFilter) = m
 """
     AutoRIFT.rescale(method::OutlierMethod, oversample, stride = 1) -> OutlierMethod
 
-`method` with its neighbourhood matched to a grid posted `oversample` times finer than its chip.
+`method` with its neighborhood matched to a grid posted `oversample` times finer than its chip.
 
-When grid spacing divides the chip size, adjacent grid points share most of their imagery: at
-`chip_size = 16` and `grid_spacing = 8` a point's 5x5 neighbourhood spans two chip widths, and
-its neighbours are largely the same pixels. Two things follow, and the reference applies both
-(`autoRIFT.py:484-505`):
+When the grid spacing divides the chip size, adjacent points share most of their imagery. At
+`chip_size = 16` and `grid_spacing = 8`, a point's 5x5 neighborhood spans two chip widths. The
+reference applies two corrections (`autoRIFT.py:484-505`), which [`GardnerFilter`](@ref) implements:
 
-  * The window widens to `(window - 1) * oversample + 1`, so the neighbourhood spans the same
-    *ground* it would at one point per chip rather than a fraction of it.
+  * The window widens to `(window - 1) * oversample + 1`, so it spans the same ground as at one point
+    per chip.
   * The agreement fraction rises to `frac * (1 - overlap) + overlap^2`, where `overlap` is the
-    fraction of a neighbour's chip shared with the centre's. Overlapping chips agree partly
-    because they see the same pixels, so the evidence a neighbour provides is worth less and
-    more neighbours must supply it.
+    fraction of a neighbor's chip shared with the center's, because overlapping chips agree partly by
+    seeing the same pixels.
 
-`stride` is the coarse pass's decimation; it reduces the overlap, because decimated neighbours
-sit further apart. Pass it for the coarse filter and leave it at one for the fine.
+`stride` is the coarse pass's decimation, which reduces the overlap because decimated neighbors sit
+further apart. Pass it for the coarse filter and leave it at `1` for the fine filter. `oversample < 1`
+throws `ArgumentError`; `oversample == 1` returns the method unchanged. [`NoOutlierFilter`](@ref)
+returns itself.
 
-Not folded into [`relax`](@ref): that answers "this grid is decimated", this answers "this grid
-is finer than its chips", and a run can need either, both, or neither.
+Separate from [`relax`](@ref): `relax` handles a decimated grid and this handles a grid finer than its
+chips. A run can need either, both or neither.
 
-Skipping this is measurable rather than theoretical. Against the ITS_LIVE granule for a Landsat
-pair over Jakobshavn at `chip_size = 16`, `grid_spacing = 8` — where the reference would use a
-9-wide window at a 0.41 fraction — the unscaled 5-wide filter at 0.32 scores a 0.916 speed
-correlation against the rescaled filter's **0.996**, and admits 1.3% of estimates reporting fast
-ice where the reference reports slow against **none**.
+For a Landsat pair over Jakobshavn at `chip_size = 16`, `grid_spacing = 8`, the unscaled 5-wide filter
+at 0.32 agreement scores a 0.916 speed correlation against the ITS_LIVE granule, and the rescaled
+filter scores 0.996.
 """
 function rescale(f::GardnerFilter, oversample::Integer, stride::Integer = 1)
     oversample >= 1 || throw(ArgumentError(
@@ -1070,22 +958,18 @@ rescale(m::NoOutlierFilter, ::Integer, ::Integer = 1) = m
 """
     Params
 
-Fully resolved, immutable, concretely-typed parameter set. Constructed once by
-[`AutoRIFT.params`](@ref) from user keywords; every `Symbol` has been mapped to
-a method object and every number validated by the time a `Params` exists, so
-nothing downstream ever re-checks or re-dispatches on a `Symbol`.
+Fully resolved, immutable parameter set, built by [`AutoRIFT.params`](@ref) from keywords. Every
+Symbol has been mapped to a method object and every number validated.
 
-The method choices are type parameters, not fields, so the correlation and
-filtering kernels specialize on them.
+The method choices are type parameters rather than fields, so the kernels specialize on them.
+`similarity` and `subpixel` are tuples with one entry per chip-size level; a tuple shorter than the
+level list has its last entry repeated, and a scalar keyword gives a 1-tuple. The reference's sub-pixel
+denominator depends on chip size, so a level's displacement may be quantized to 1/16 px at the base
+chip size and to 1/32 or 1/64 above it. See [`chip_measures`](@ref) and `chip_subpixels`.
 
-`similarity` is a *tuple* of measures, one per chip-size level, because a run may escalate
-between them — coherence at the finest chip, amplitude above it. A scalar keyword resolves to a
-1-tuple, and a tuple shorter than the level list has its last entry repeated, so the common case
-of one measure everywhere is the 1-tuple and costs nothing. See [`chip_measures`](@ref).
-
-`subpixel` is a tuple for the same reason and with the same rule: the reference's subpixel
-denominator is a function of chip size rather than of the run, so a level's displacement may be
-quantized to 1/16 px at the base chip and 1/32 or 1/64 above it. See `chip_subpixels`.
+The positional constructor is stable API; its arguments follow the field declaration order. Shorter
+forms omit `min_chip_valid_fraction` and `fill_min_hole` (defaults `0.65` and `5`) and, in the
+shortest, `backend` (default `CPU()`).
 """
 struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:PreprocessMethod,
               R<:Tuple{SubpixelMethod,Vararg{SubpixelMethod}},O<:OutlierMethod,T<:BoolAsType,
@@ -1183,16 +1067,13 @@ Params(similarity, preprocess, subpixel, outliers, threaded, rotation, chip_size
 """
     chip_sizes(p::Params) -> Vector{Extent}
 
-The chip-size levels actually used, ascending. Levels are `chip_size_min .* 2^k` up to
-`chip_size_max`.
+The chip-size levels, ascending: `chip_size_min .* 2^k` up to `chip_size_max`. Both axes double
+together, because `params` requires `chip_size_max ./ chip_size_min` to be the same power of two in
+each axis.
 
-Both axes double together, which is well-defined because `params` requires
-`chip_size_max ./ chip_size_min` to be the same power of two in each — so the aspect a caller asked
-for holds at every level rather than drifting across them.
-
-Ascending order is load-bearing: every level only writes where no finer level
-already produced a value, so the *smallest* chip that yields a valid estimate
-wins. Small chips resolve detail; large chips succeed in low-texture areas.
+The order matters: a level writes only where no finer level produced a value, so the smallest chip
+that yields a valid estimate wins. Small chips resolve detail; large chips succeed in low-texture
+areas.
 """
 function chip_sizes(p::Params)
     sizes = Extent[]
@@ -1209,9 +1090,9 @@ end
 
 An [`AutoRIFT.Extent`](@ref) from a scalar, a tuple, or a named tuple.
 
-A scalar means square — `32` is `(X = 32, Y = 32)` — which is what nearly every call wants and what
-keeps the common spelling short. `(X = 16, Y = 32)` names the axes; a bare `(16, 32)` is accepted as
-x-then-y, matching the order every other pair in this package uses.
+A scalar means square: `32` is `(X = 32, Y = 32)`. `(X = 16, Y = 32)` names the axes, and a bare
+`(16, 32)` or a two-element vector is read as x then y. A non-integer value, a named tuple with other
+field names, or a vector of another length throws `ArgumentError`.
 """
 extent(x::Integer) = Extent((Int(x), Int(x)))
 extent(x::Extent) = x
@@ -1233,29 +1114,15 @@ extent(x) = throw(ArgumentError(
 """
     chip_measures(p::Params, nlevels::Integer) -> Tuple
 
-The similarity measure for each of `nlevels` chip-size levels, in order.
+The similarity measure for each of `nlevels` chip-size levels, as a tuple, finest first.
+`nlevels` defaults to `length(chip_sizes(p))`.
 
-`p.similarity` is a tuple. Where it is shorter than the level list — which includes the usual
-case of a single measure — the last entry repeats, so `similarity = :zncc` means ZNCC at every
-level and `similarity = (:coherence, :zncc)` means coherence at the finest chip and ZNCC at every
-coarser one.
+Where `p.similarity` is shorter than `nlevels`, its last entry repeats: `similarity = :zncc` gives ZNCC
+at every level, and `(:coherence, :zncc)` gives coherence at the finest chip size and ZNCC at every
+coarser one (the escalation of Joughin, 2002). A tuple longer than `nlevels` throws `ArgumentError`.
 
-That padding rule is what makes the escalation of Joughin (2002) expressible without a second way
-to specify levels: the finest chip tries the sharper, more fragile measure, and the coarser chips
-— which exist precisely to succeed where the fine ones failed — use the robust one. A measure
-tuple *longer* than the level list is an error, since the extra entries would silently do nothing.
-
-Returns a **tuple**, not a vector, and that is load-bearing rather than stylistic: a
-`Vector{SimilarityMeasure}` has an abstract element type, so the measure reaching `chipsize_level`
-would be known only as `SimilarityMeasure` — a dynamic dispatch in the chip-size loop, and enough
-to make the whole package untrimmable (verified: it produced `unresolved call ... Core.kwcall`
-and broke `app/`'s build).
-
-For that reason the chip-size loop itself does not call this — it uses [`measure_at`](@ref), which
-needs no allocation and no `ntuple` over a runtime length. **This function is for inspecting a
-configuration**, not for running one: answering "what will each level actually use?" in one call,
-which is otherwise a loop the caller has to write. The tests use it that way, and so would anyone
-debugging a hierarchy.
+This is for inspecting a configuration. The chip-size loop calls [`measure_at`](@ref), which does not
+allocate.
 """
 function chip_measures(p::Params, nlevels::Integer = length(chip_sizes(p)))
     _check_measures(p, nlevels)
@@ -1267,9 +1134,8 @@ end
 
 The measure for chip-size level `level` (1 = finest), with the last tuple entry repeating.
 
-The indexed form of [`chip_measures`](@ref), and what the chip-size loop actually calls: it
-allocates nothing, and because `p.similarity` is a tuple the result keeps its concrete type, so
-the correlation kernel specializes and `--trim` can resolve the call.
+The indexed form of [`chip_measures`](@ref), called by the chip-size loop. It does not allocate, and
+the result keeps its concrete type because `p.similarity` is a tuple.
 """
 @inline measure_at(p::Params, level::Integer) =
     p.similarity[min(level, length(p.similarity))]
@@ -1280,8 +1146,8 @@ the correlation kernel specializes and `--trim` can resolve the call.
 The subpixel method each chip-size level will use, finest first, with the last tuple entry
 repeating.
 
-The counterpart of [`chip_measures`](@ref), and for inspecting a configuration rather than running
-one — the chip-size loop calls `subpixel_at`, which allocates nothing.
+The counterpart of [`chip_measures`](@ref) for `p.subpixel`, for inspecting a configuration. The
+chip-size loop calls `subpixel_at`, which does not allocate.
 """
 function chip_subpixels(p::Params, nlevels::Integer = length(chip_sizes(p)))
     _check_subpixels(p, nlevels)
@@ -1293,15 +1159,11 @@ end
 
 The subpixel method for chip-size level `level` (1 = finest), with the last tuple entry repeating.
 
-Per level because the reference's subpixel denominator is a function of chip size, not of the run:
-`OverSampleRatio` may be a dict, and the production driver always passes one — `{16, 32, 64, 64}`
-keyed by `ChipSize0X * [1,2,4,8]` for optical input and `{32, 64, 128, 128}` for radar
-(`autoRIFT.py:652-653`, `testautoRIFT.py:488-510`). So a coarse level locates its peak more finely
-than the base level does, and a single denominator cannot express that.
-
-Indexed rather than iterated for the same reason as [`measure_at`](@ref): `p.subpixel` is a tuple, so
-the result keeps its concrete type, the refinement kernel specializes, and `--trim` can resolve the
-call.
+The sub-pixel method depends on the level because the reference's `OverSampleRatio` is keyed by chip
+size. The production driver passes `{16, 32, 64, 64}` for optical input and `{32, 64, 128, 128}` for
+radar, keyed by `ChipSize0X * [1, 2, 4, 8]` (`autoRIFT.py:652-653`, `testautoRIFT.py:488-510`), so a
+coarse level locates its peak more finely than the base level. Does not allocate; the result keeps its
+concrete type.
 """
 @inline subpixel_at(p::Params, level::Integer) =
     p.subpixel[min(level, length(p.subpixel))]

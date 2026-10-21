@@ -1,12 +1,11 @@
 # Geospatial
 
-Load `Rasters` and `autorift` gains a raster method: it reads the pixel size and the coordinate
-reference system from the inputs, and returns map-oriented feature motion rather than pixel offsets.
-Load `DimensionalData` alone for the same dimension handling without a CRS.
+Loading `Rasters` adds an `autorift` method that reads the pixel size and coordinate reference system
+from the inputs and returns map-oriented feature motion rather than pixel offsets. Loading
+`DimensionalData` alone adds the same dimension handling without a CRS.
 
-Signatures are given here because the core's `autorift` is documented on
-[Correlating](correlating.md); these are the methods those packages add. Each section resolves its
-names in the extension module that defines them, where the packages it triggers on are in scope.
+The core `autorift` is documented on [Correlating](correlating.md); this page documents the methods
+these packages add. Each section resolves its names in the extension module that defines them.
 
 ## Rasters
 

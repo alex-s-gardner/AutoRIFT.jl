@@ -32,17 +32,16 @@
 
 One unit of tiled work: the grid points it writes, and the pixels it reads to do so.
 
-`grid_rows`/`grid_cols` index the **output grid**, and every grid point belongs to exactly one
-block — so assembling results is a copy, with no point computed twice and none left out.
+`grid_rows`/`grid_cols` index the output grid. Every grid point belongs to exactly one block, so
+assembling results is a copy.
 
-`read_rows`/`read_cols` index the **scene**: the written extent grown by the layout's halo and clipped
-to the image, over the points the block may search. Neighbouring blocks' read windows overlap, and that
-overlap is the halo doing its job.
+`read_rows`/`read_cols` index the scene: the written extent grown by the layout's halo and clipped to
+the image, over the points the block may search. Neighboring blocks' read windows overlap by the halo.
 
-They are a **bound**, not the window a pass reads. A block's searchable coordinates need not be
-contiguous, and on a geogrid they are not, so `AutoRIFT._read_windows` derives the windows a pass
-actually reads from the point set it is about to correlate and tiles them to fit these bounds. That is
-what makes this figure the one `AutoRIFT.block_buffers` sizes from.
+They bound the pixels a pass reads rather than giving the window itself. A block's searchable
+coordinates need not be contiguous (on a geogrid they are not), so `AutoRIFT._read_windows` derives the
+windows a pass reads from its point set and tiles them to fit these bounds. `AutoRIFT.block_buffers`
+sizes from these bounds.
 """
 struct Block
     grid_rows::UnitRange{Int}
@@ -85,23 +84,19 @@ Base.length(l::BlockLayout) = length(l.blocks)
 
 Pixels a block must read beyond what it writes, as an [`AutoRIFT.Extent`](@ref).
 
-The sum of the correlation reach — `chip/2 + radius + ceil(abs(prior))`, which
-`_pass_geometry` already computes and which this does not re-derive — and the preprocessing
-filter's reach. Both apply to every point, so both are taken at their maximum over the run.
+The sum of the correlation reach (`chip/2 + radius + ceil(abs(prior))` plus 2 pixels of slack) and
+the preprocessing filter's reach, each at its maximum over the run. The reach is evaluated at the
+coarsest level, not at `grid` as supplied, because a level sets its own chip size and floors the radii
+(see `AutoRIFT._worst_level_points`).
 
-Measured against the *coarsest level*, not against `grid` as supplied. A level overwrites the
-chip size and floors the radii, so a grid's own `chip_size_x` and `radius_x` are not what any
-pass runs — see `AutoRIFT._worst_level_points`.
+The filter term comes from [`AutoRIFT.filter_reach`](@ref), not from `filter_width ÷ 2`: `Wallis`
+applies two chained window passes and so reaches twice its half-width.
 
-The filter term comes from [`AutoRIFT.filter_reach`](@ref) rather than from `filter_width ÷ 2`,
-because the two differ: `Wallis` applies two chained window passes and so reaches twice its
-half-width.
+The outlier filter is not included. It runs on the assembled field rather than per block, because its
+reach compounds past what a halo can absorb.
 
-The outlier filter is **not** included: it runs on the assembled field rather than per block,
-because its reach compounds past what a halo can absorb. See the note at the top of this file.
-
-Throws for a preprocessing method with no finite reach, since no halo makes such a filter
-blockwise-reproducible.
+Throws `ArgumentError` for a preprocessing method with no finite reach, since no halo makes such a
+filter blockwise-reproducible.
 """
 function halo(grid::PointSet, p::Params, imagesize::Tuple{Int,Int})
     w = _filter_halo(p)
@@ -117,15 +112,10 @@ end
 
 The halo for a grid [`AutoRIFT.gridpoints`](@ref) would build from `p`, without building it.
 
-`p` alone determines the answer for such a grid: every point carries the same chip size and radius,
-so the maxima `halo(grid, p, imagesize)` reduces over are the values in `p` — floored at
-`min_search_radius`, exactly as [`AutoRIFT.sanitize!`](@ref) floors them. Given that, the grid
-contributes nothing the parameters do not already state.
-
-Exists because a caller choosing a block size needs the halo *before* the run, and building a grid to
-ask costs 550 MiB and 50 ms on a Landsat-sized scene — for two integers. The grid form remains the
-one to use for a caller-supplied `PointSet`, where per-point radii and priors may vary and the maxima
-are genuinely a property of the points.
+Every point of such a grid has the same chip size and radius, so the maxima are the values in `p`,
+with radii floored at `min_search_radius` as [`AutoRIFT.sanitize!`](@ref) floors them. Building a grid
+to obtain the halo costs 550 MiB and 50 ms on a Landsat-sized scene. For a caller-supplied `PointSet`,
+where per-point radii and priors may vary, use the grid form.
 """
 function halo(p::Params)
     w = _filter_halo(p)
@@ -158,26 +148,20 @@ end
 """
     AutoRIFT._worst_level_points(grid::PointSet, p::Params) -> PointSet{1}
 
-`grid`'s points carrying the largest chip size and radius any level will run them at.
+`grid`'s points carrying the largest chip size and radius any level will run them at, as a
+`PointSet{1}`.
 
-The halo has to cover every level, and a level's geometry is not the grid's. `chipsize_level`
-ignores `grid.chip_size_x` and sets its own from [`AutoRIFT.chip_sizes`](@ref), so the reach is
-set by `chip_size_max` however the caller sized the grid; and `_level_points` ends in
-[`AutoRIFT.sanitize!`](@ref), which floors every non-zero radius at `p.min_search_radius`, so a
-grid whose radii sit below that floor is searched wider than it asks for.
+The halo must cover every level, and a level's geometry differs from the grid's in three ways:
 
-A third correction applies to a gridded set: the coarse pass's `_cell_max_radius!` gives a point the
-widest radius in its neighbourhood, so a point the grid marks unsearchable is searched anyway, and
-`_pass_geometry` skips exactly those. Their radii are widened here so it does not — see
-`AutoRIFT._widen_for_halo!` for why their *priors* are what makes this matter.
+  * `chipsize_level` ignores `grid.chip_size_x` and uses [`AutoRIFT.chip_sizes`](@ref), so the reach
+    is set by `chip_size_max`.
+  * [`AutoRIFT.sanitize!`](@ref) floors every non-zero radius at `p.min_search_radius`.
+  * The coarse pass gives a point the widest radius in its neighborhood, so a point the grid marks
+    unsearchable can be searched. Their radii are widened here (see `AutoRIFT._widen_for_halo!`).
 
-Both corrections matter only for a grid the caller built: [`AutoRIFT.autorift`](@ref)'s own grid
-takes `chip_size = p.chip_size_max` already, and its radii come from the same keywords the floor
-is compared against. A grid built at a smaller chip size is the case that breaks — at
-`chip_size = 32` against `chip_size_max = 128` the coarsest level reaches 46 px further per axis
-than the grid implies, and a block sized to the grid reads too little to reproduce it.
-
-A `PointSet{1}`, since `_pass_geometry` reduces over points and does not use the layout.
+These matter for a grid the caller built. [`AutoRIFT.autorift`](@ref)'s own grid already uses
+`chip_size = p.chip_size_max`. For a grid built at `chip_size = 32` with `chip_size_max = 128`, the
+coarsest level reaches 46 px further per axis than the grid implies.
 """
 function _worst_level_points(grid::PointSet, p::Params)
     flat = scatter(grid)
@@ -282,19 +266,13 @@ end
     AutoRIFT._level_centre_offset(p::Params) -> (ox, oy)
 
 Pixels past its own grid point that the coarsest level's correlation reaches, from sitting at a cell
-centre.
+center.
 
-A decimated level correlates at the centre of each `stride`-by-`stride` cell rather than at the cell's
-first grid point (see `AutoRIFT._cell_means`), which is up to `(stride - 1) / 2` cells further along
-each axis. A halo derived from grid points alone is short by that much, and a block would read too
-little to reproduce the untiled run — visible only as a last-bits difference in the peak height at
-points near a block seam, since the displacement itself survives a slightly different transform.
-
-Taken over every level rather than at `chip_size_max`, because the stride is set by the chip-to-spacing
-ratio and it is the *largest* offset that has to fit, whichever level produces it.
-
-Half a pixel is added for the parity snap `AutoRIFT._cell_means` applies, which can move a node
-that much further out again.
+A decimated level correlates at the center of each `stride`-by-`stride` cell rather than at the cell's
+first grid point (see `AutoRIFT._cell_means`), up to `(stride - 1) / 2` cells further along each axis.
+Without this term a block reads too little to reproduce the untiled run, which shows as a last-bit
+difference in peak height near block seams. The maximum is taken over every level, since the stride
+depends on the chip-to-spacing ratio. Half a pixel is added for the parity snap `_cell_means` applies.
 """
 function _level_centre_offset(p::Params)
     sx = sy = 0.0
@@ -317,30 +295,24 @@ _round_up(want::Integer, unit::Integer) = unit <= 0 ? want : cld(want, unit) * u
 """
     AutoRIFT.block_layout(grid::PointSet{2}, p::Params, imagesize, block_size) -> BlockLayout
 
-Divide `grid` into blocks spanning at most `block_size = (X, Y)` **pixels** of output each, with the
-read window each needs.
+Divide `grid` into blocks spanning at most `block_size = (X, Y)` pixels of output each, with the read
+window each needs. Pixels are used because the imagery a block reads, not its output, is what bounds
+memory (3.2 KiB of output against 6.7 MiB of imagery at a 512-pixel block).
 
-Pixels, because pixels are what blocking bounds. A block's output is negligible — 3.2 KiB against
-the 6.7 MiB of imagery it reads at a 512-pixel block, and the whole scene's output grid is smaller
-than one block's read window — so the quantity worth naming is the imagery held at once. It is also
-the unit everything here already works in: the halo, the read windows, and the buffers are all
-pixels.
+A block holds a whole number of grid points, so `block_size` is a target. The count of points comes
+from the span a trial block actually covers rather than from `grid_spacing`, because a caller-supplied
+grid need not be uniformly spaced or axis-aligned (a geogrid from a rotated radar footprint moves both
+coordinates along both index directions). The trailing block in each direction is short when the grid
+does not divide evenly.
 
-A block must be a whole number of grid points, so the size is a target: the block holds as many points
-as fit within it. The count comes from the span a trial block of the grid actually covers rather than
-from `grid_spacing`, because a caller-supplied grid need be neither uniformly spaced nor axis-aligned —
-a geogrid built from a rotated radar footprint moves both coordinates along both index directions. The
-trailing block in each direction is short when the grid does not divide evenly.
+A block's read window spans only the points it will search, grown by the reach of the coarse pass's
+radius widening. A block with no searchable point reads nothing. Points whose coordinate is a
+placeholder rather than a position get a second window, since one window covering both populations
+would run from the block to the scene corner. See [`AutoRIFT.Block`](@ref) and `PointSet`'s
+`positioned`.
 
-A block's read window spans only the points it will search — the grid's searchable points grown by the
-reach of the coarse pass's radius widening, which is what any pass can actually reach. A block with no
-searchable point reads nothing at all.
-
-Points whose coordinate is a placeholder rather than a position get a **second** window, because a
-placeholder lies nowhere near the block's own extent and one window covering both would run from the
-block to the scene corner. See [`AutoRIFT.Block`](@ref) and `PointSet`'s `positioned`.
-
-Throws if a block would be smaller than the halo it reads, since such a block is all overlap.
+Throws `ArgumentError` if `block_size` is not positive or if a block would be smaller than the halo it
+reads.
 """
 function block_layout(grid::PointSet{2}, p::Params, imagesize::Tuple{Int,Int},
                       block_size)
@@ -467,48 +439,32 @@ end
     AutoRIFT.block_size_for(grid::PointSet{2}, p::Params, imagesize; kw...) -> Extent
     AutoRIFT.block_size_for(p::Params, imagesize; kw...) -> Extent
 
-A `process_block_size` for this configuration: `AutoRIFT.BLOCK_HALO_MULTIPLE` times the halo in each
-axis, floored at `AutoRIFT.BLOCK_FLOOR` pixels and clamped to the scene — which at a multiple of 1 is
-the smallest block the halo permits, floored so a narrow halo does not produce a tiny one.
+A `process_block_size` for this configuration: `AutoRIFT.BLOCK_HALO_MULTIPLE` (1) times the halo in
+each axis, at least `AutoRIFT.BLOCK_FLOOR` (1024) pixels, clamped to the scene. This is the smallest
+block the halo permits, with the floor preventing a tiny block when the halo is narrow.
 
-Keywords: `chunk` as `(rows, cols)` of the storage's own grid, and `floor_pixels`.
+Keywords: `chunk`, the `(rows, cols)` of the storage's own chunk grid, to which the size is rounded
+up, and `floor_pixels`, a further lower bound.
 
-**Blocks are the unit of threaded work and the halo is a fixed-width skirt on every one**, so the two
-ends of the range fail for different reasons and the best block is interior to them. Too small and a
-block reads mostly skirt: on the golden S1B case, halo 684x256, a 768x320 block costs a read
-amplification of 7.23x for a *worse* peak than 1024 — 3.24 GiB against 3.01. Too large and the buffers
-dominate, at 10.32 GiB by 2048, and one block becomes too much work to balance: on NISAR L1 at 6144 px
-a single block holds 19.8% of the granule and 2.37x what a thread should carry, so twelve threads
-deliver five.
+Blocks are the unit of threaded work, and each reads a fixed-width halo around itself, so both small
+and large blocks cost time. A block that is too small reads mostly halo: on the golden S1B case
+(halo 684x256), a 768x320 block has a read amplification of 7.23x and a higher peak memory than 1024
+(3.24 GiB against 3.01). A block that is too large holds too much memory and too much work to
+balance across threads: at 2048 the buffers reach 10.32 GiB, and on NISAR L1 at 6144 px one block holds
+19.8% of the granule, so twelve threads deliver the work of five.
 
-**The rule is fitted to a measured sweep of every golden case**, not to a model.
-`tools/golden/block_optimum.jl` walks each case's ladder and keeps only the arms that reproduce that
-case's untiled run, so every row scored is answer-preserving. A fixed size cannot do the job: the
-per-case optima span 128 px to 6144 px and `2240x1152`, so the rule has to be relative to something,
-and the halo is what sets both failure modes above.
+The rule is fitted to a sweep of all 22 golden cases (`tools/golden/block_optimum.jl`), counting only
+block sizes that reproduce the untiled result. The per-case optima range from 128 px to 6144 px, so
+the size is expressed relative to the halo. The objective is wall clock subject to peak memory fitting
+16 GiB. Minimizing peak instead costs 1.11x the runtime over the golden set (up to 2.02x on one
+Sentinel-1 case) to save about a gigabyte, and no rule tried peaks above 13.22 GiB over the harness
+floor (the shipped rule: 8.72 GiB). Relative to the best size per case, the multiple of 1 measures
+0.99x on the two NISAR cases (83% of the set's wall clock), against 1.33x at 2 and 1.53x at 3. The
+1024 floor measures 1.05x on the other twenty cases, against 1.08x at 768, 1.15x at 512, 1.10x at
+2048, and 1.25x at 4096. The worst single case is 1.47x, on one that runs in 1.6 s.
 
-**The objective is wall clock subject to peak memory fitting 16 GiB**, not minimum peak. Those choose
-differently: over the golden set, minimizing peak costs 1.11x the runtime, and up to 2.02x on a single
-Sentinel-1 case, for about a gigabyte against a budget with more than ten to spare. Peak is worth
-minimizing only where it binds, and on the measured set nothing binds — the widest rule tried peaks
-13.22 GiB above the harness floor and the shipped one 8.72.
-
-Scored against every arm of every case, `1x` with a `1024` floor is the optimum in both terms the rule
-has. The multiple is set by the two NISAR cases, which are 83% of the set's wall clock: 1x measures 0.99x
-of the per-case best, 2x measures 1.33x and 3x measures 1.53x, because a larger block is fewer blocks and
-twelve threads cannot balance them. The floor is set by the other twenty, whose halo it exceeds: 1.05x at
-1024 or 1536, 1.08x at 768, 1.15x at 512, 1.10x at 2048 and 1.25x at 4096. The worst single case is 1.47x,
-on one that runs in 1.6 s.
-
-**Why a multiple of the halo rather than a block count.** An earlier form maximized the size subject
-to `blocks_per_thread * nthreads` pieces, and the count it produced does not track the optimum: at the
-measured best arm the blocks per thread run from 7 to 3,330 across the set. The halo is what sets both
-failure modes above, so it is what the rule is expressed in.
-
-The `Params`-only method is for a caller who has no grid yet, and assumes the grid
-[`AutoRIFT.gridpoints`](@ref) would build — uniform radii, axis-aligned, `p.grid_spacing` apart —
-exactly as [`AutoRIFT.halo(p)`](@ref) does, and for the same reason: building a grid to choose a block
-size costs 550 MiB on a Landsat-sized scene to produce two integers.
+The `Params`-only method assumes the grid [`AutoRIFT.gridpoints`](@ref) would build (uniform radii,
+axis-aligned, `p.grid_spacing` apart), as [`AutoRIFT.halo(p)`](@ref) does.
 """
 block_size_for(grid::PointSet{2}, p::Params, imagesize::Tuple{Integer,Integer}; kw...) =
     _block_size_for(halo(grid, p, imagesize), imagesize; kw...)
@@ -714,12 +670,8 @@ end
 
 The sub-window `img[rows, cols]`, materialized.
 
-The allocating counterpart of [`AutoRIFT._read_block!`](@ref), which is what the driver uses. A
-disk-backed `img` reads only this window, so no method for a lazy array is needed — indexing is
-already the windowed read.
-
-A `copy` rather than a `view` deliberately. The correlator's inner loop wants contiguous memory,
-and a strided view of a large scene would make every chip read stride the full row.
+The allocating counterpart of [`AutoRIFT._read_block!`](@ref). A disk-backed `img` reads only this
+window. The result is a copy rather than a view because the correlator wants contiguous memory.
 """
 _read_block(img::AbstractMatrix, rows, cols) = img[rows, cols]
 
@@ -727,19 +679,13 @@ _read_block(img::AbstractMatrix, rows, cols) = img[rows, cols]
     AutoRIFT.BlockBuffers
 
 Reusable storage for one block's raw imagery, so a run allocates one block's worth rather than one
-per block — and one set per *run*, not per pass: the layout fixes the largest window, so the coarse
-and fine passes of every level want identically-sized arrays.
+per block. One set serves the whole run, because the layout fixes the largest window and every pass
+of every level wants arrays of that size. A fresh pair per block would raise `Sys.maxrss` to the
+high-water mark of garbage (22.9 MiB per pair at an 888-pixel read window, 1467 MiB over 64 blocks).
 
-Peak resident memory is what an instance's limit sees, and a blocked run holds no more *live* data
-than an untiled one — measured live-heap growth is ~1 MiB either way. What it does is churn: a fresh
-block pair per block, 22.9 MiB each at a 888-pixel read window, 1467 MiB over 64 blocks. The
-collector returns none of that to the OS promptly, so `Sys.maxrss` records the high-water mark of
-churn rather than a requirement, and a scheduler packing jobs onto a small instance is bounded by
-exactly that figure.
-
-Sized to the largest read window in the layout, which `capacity` records. Smaller blocks — the trailing
-ones where the grid does not divide evenly — take a view of the corner, which is why nothing here is
-sized per block. Not thread-safe: one set per task, the same contract as a correlation workspace.
+Sized to the largest read window in the layout, which `capacity` records. Smaller blocks, such as the
+trailing ones, use a view of the corner. Not thread-safe: use one set per task, as for a correlation
+workspace.
 
 A run reading its filtered windows from a [`FilterTileCache`](@ref) writes only the filtered planes and
 their eroded masks, so its raw planes and filter scratch are empty (see [`AutoRIFT.block_buffers`](@ref)).
@@ -841,9 +787,8 @@ end
 
 Read `img[rows, cols]` into `dest`, which must have that shape.
 
-The in-place counterpart of [`AutoRIFT._read_block`](@ref), and the form the tiled driver uses so a
-run allocates one block's storage rather than one per block. A lazy input's method reads only this
-window from disk.
+The in-place counterpart of [`AutoRIFT._read_block`](@ref), used by the tiled driver. A lazy input
+reads only this window from disk.
 """
 function _read_block!(dest::AbstractMatrix, img::AbstractMatrix, rows, cols)
     size(dest) == (length(rows), length(cols)) || throw(DimensionMismatch(
@@ -997,9 +942,8 @@ end
 Each tile's filtered pixels and eroded validity mask, for both images of a pair, computed once and kept
 in a memory-mapped scratch file rather than recomputed on every pass that touches it.
 
-Only [`Highpass`](@ref) is cached this way: it is the one filter `_prepare_block` pools buffers for —
-"the default, and the only filter the production driver runs inside the correlator" — so it is the one
-worth this. `width` is that filter's width.
+Only [`Highpass`](@ref) is cached this way, being the default filter and the only one the production
+driver runs inside the correlator. `width` is its width.
 """
 struct FilterTileCache
     dims::Tuple{Int,Int}
@@ -1032,14 +976,12 @@ A cache for a pair of size `dims`, filtered at `width`, tiled `tile` pixels on a
 `io` is how the scratch file is accessed: `:mmap` maps it into the process, `:pread` reads and writes
 each tile with positioned I/O, which keeps the cached pages out of the process's resident size.
 
-`tile` wants to be at least the chunk or burst granularity of whatever the pair reads from, so that
-filling one tile is one read of the source rather than a fraction of one — the same guidance
-`tools/golden/tilecache.jl`'s `TileCache` documents, and for the same reason.
+`tile` should be at least the chunk or burst granularity of the source, so that filling a tile is one
+read of the source.
 
-The scratch file is sized for every tile in `dims` up front — `prod(ntiles) * tile^2 * 10` bytes — so
-the mapping can cover it from the start; it is sparse on any filesystem that supports that, so only the
-tiles a run actually touches cost disk. On a NISAR L1 pair at the default tile that is tens of
-gigabytes of address space and a few of actual use.
+The scratch file is sized for every tile in `dims` up front (`prod(ntiles) * tile^2 * 10` bytes). It
+is sparse on filesystems that support that, so only the tiles a run touches use disk. On a NISAR L1
+pair at the default tile that is tens of gigabytes of address space and a few of actual use.
 """
 function FilterTileCache(dims::Tuple{Int,Int}, width::Integer;
                          tile::Integer = 1024,
@@ -1133,16 +1075,12 @@ _as_matrix_bool(m::AbstractMatrix{Bool}) = Matrix{Bool}(m)
 
 Make tile `(ti, tj)` present in `c`, deriving it from `pair` if it is not already.
 
-**The interior kept is bit-identical to a block's own filtered read.** `_prepare_block`'s Highpass
-branch filters a block's read window, which is grown by the whole halo — far more than the filter
-needs — and keeps all of it; this pads only by `filter_reach(m)`, the neighbourhood
-`highpass!`/`_filtered!` actually reach, so the pixels this keeps see the same real neighbours either
-way and the boundary a wider window would also clip is outside what either one writes.
+The interior kept is bit-identical to a block's own filtered read. The tile is derived with padding of
+`filter_reach(m)`, the neighborhood `highpass!` and `_filtered!` reach, so its pixels see the same real
+neighbors as in a block's read window.
 
-Locked for the whole check-and-derive, on a per-tile lock rather than one shared across all of them:
-two tasks wanting the same absent tile must not both derive it, and only the lock guarantees a later
-reader sees a completed write rather than a torn one. The uncontended cost — tens of nanoseconds — is
-far smaller than serializing every tile behind one lock.
+The check and derivation run under a per-tile lock, so two tasks wanting the same absent tile do not
+both derive it and a later reader sees a completed write.
 """
 function _ensure_filter_tile!(c::FilterTileCache, pair::ImagePair, m::Highpass, ti::Integer, tj::Integer)
     k = (tj - 1) * c.ntiles[1] + ti
@@ -1192,8 +1130,8 @@ end
     _cached_filtered_window!(dest_fr, dest_rv, dest_fs, dest_sv, c, pair, m, rows, cols)
 
 Fill the four destination views (each `length(rows)` by `length(cols)`) with `pair` filtered by `m`
-over `rows`/`cols`, tile by tile — deriving or reading each covering tile of `c` and copying its
-overlap with the request straight out of the mapping.
+over `rows`/`cols`, tile by tile, deriving each covering tile of `c` if absent and copying its overlap
+with the request.
 """
 function _cached_filtered_window!(dest_fr, dest_rv, dest_fs, dest_sv,
                                   c::FilterTileCache, pair::ImagePair, m::Highpass,
@@ -1256,8 +1194,7 @@ end
 """
     cache_report(c::FilterTileCache) -> String
 
-How many tiles were derived and how many were served from the mapping — the same diagnostic
-`tools/golden/tilecache.jl`'s `TileCache` reports for raw reads.
+How many tiles were derived and how many were served from the cache.
 """
 cache_report(c::FilterTileCache) = _tile_cache_report(c.filled[], c.served[], _filter_tile_bytes(c))
 
@@ -1621,33 +1558,26 @@ _block_points(pts::PointSet{2}, b::Block) = _block_points(pts, b, b.read_rows, b
 
 Correlate each pass a block at a time. See `AutoRIFT.PassRunner`.
 
-`raw` is the **unfiltered** pair, and that is what makes blocking bound memory rather than merely
-reorganize it: each block is filtered from its own read window, so the filtered scene the whole-scene
-runner holds is never formed.
+`raw` is the unfiltered pair. Each block is filtered from its own read window, so the filtered scene
+is never formed and memory is bounded by the block.
 
-`blocks` is the partition this runner correlates over — `layout.blocks` for a fine pass, and the
-strided subset `AutoRIFT._coarse_block_layout` derives for a coarse one. `layout` is kept
-alongside it because `block_buffers` sizes from the whole layout's largest read window, which no pass
-changes. `buffers` is `nothing` for a threaded run, where each task takes its own set.
+`blocks` is the partition this runner correlates over: `layout.blocks` for a fine pass, and the
+strided subset `AutoRIFT._coarse_block_layout` derives for a coarse one. `layout` is kept because
+`block_buffers` sizes from the whole layout's largest read window. `buffers` is `nothing` for a
+threaded run, where each task takes its own set.
 
-`cache_budget` is the bytes of disk-backed input that may be read into memory up front, carried so that
-`reinit!` decides the same way for a later pair as `init` did for the first; `0` keeps the windowed
-reads. `raw` is already whatever that decision produced — see [`AutoRIFT._prefetched`](@ref).
+`cache_budget` is the bytes of disk-backed input that may be read into memory up front, so that
+`reinit!` decides as `init` did; `0` keeps windowed reads. `raw` is already the result of that
+decision (see [`AutoRIFT._prefetched`](@ref)).
 
-`filter_cache` is a [`FilterTileCache`](@ref), or `nothing` to filter every block fresh as before. It is
-a *different* redundancy from `cache_budget`'s: caching the raw pair in memory does not stop a block's
-own filter from being recomputed every pass, which `filter_cache` is for.
+`filter_cache` is a [`FilterTileCache`](@ref), or `nothing` to filter every block on every pass. It
+avoids recomputing a block's filter on each pass, which `cache_budget` does not.
 
 !!! warning "`blocks` indexes one grid, and only that grid"
-    A `Block` holds *grid index ranges*, so this runner is bound to the grid shape its partition was
-    built from. Passing [`AutoRIFT.run_pass`](@ref) a point set of any other shape indexes those
-    ranges into the wrong array and throws `BoundsError` from `_block_points` — it does not silently
-    correlate the wrong points, but nor is it caught at the call.
-
-    Anything that changes the grid shape — the coarse stride, or a per-level decimation — must
-    therefore go through [`AutoRIFT.restrict`](@ref) to re-derive the partition first. That is what
-    `restrict` is for, and it is the whole reason it exists as a method on the runner rather than as
-    a step inside the coarse pass.
+    A `Block` holds grid index ranges, so this runner is bound to the grid shape its partition was
+    built from. Passing [`AutoRIFT.run_pass`](@ref) a point set of another shape throws `BoundsError`
+    from `_block_points`. Anything that changes the grid shape (the coarse stride, a per-level
+    decimation) must go through [`AutoRIFT.restrict`](@ref) first, which re-derives the partition.
 """
 struct Blocked{P<:ImagePair,B<:Union{Nothing,BlockBuffers}} <: PassRunner
     raw::P
@@ -1689,8 +1619,8 @@ restrict(r::Blocked, setup, _gridsize::Tuple{Int,Int}) =
 
 Close and delete `r`'s filter tile cache, if it has one. A no-op otherwise.
 
-Needed only for a runner held across many pairs through [`AutoRIFT.init`](@ref)/`reinit!` — a one-shot
-[`autorift`](@ref) call closes its own cache when it returns.
+Needed only for a runner held across many pairs through [`AutoRIFT.init`](@ref) and `reinit!`; a
+one-shot [`autorift`](@ref) call closes its own cache.
 """
 Base.close(r::Blocked) = (isnothing(r.filter_cache) || close(r.filter_cache); nothing)
 
@@ -1712,15 +1642,14 @@ _warn_coarse_fallback(::Blocked, chip_size::Extent) = @warn(
 [`AutoRIFT.correlate_multichip`](@ref)'s result, computed in blocks spanning at most `block_size`
 pixels so that peak memory tracks the block rather than the scene.
 
-`raw` is the **unfiltered** pair, and that is what makes this bound memory rather than merely
-reorganize it: each block is filtered from its own read window, so the filtered scene the untiled
-path holds resident is never formed. Handing this an already-filtered pair filters it twice.
+`raw` is the unfiltered pair; each block is filtered from its own read window. An already-filtered
+pair would be filtered twice.
 
-Bit-identical to the untiled path. Every block is handed the whole grid's
-[`AutoRIFT.PassGeometry`](@ref), so it runs the transform the untiled pass would have run; every
-decision that looks at more than one point is taken once, on the assembled grid, rather than per
-block; and a block's filtered values and eroded mask agree with a whole-scene filter everywhere the
-block writes, which is what the filter term in [`AutoRIFT.halo`](@ref) buys.
+The result is bit-identical to the untiled path. Every block is given the whole grid's
+[`AutoRIFT.PassGeometry`](@ref), so it runs the same transform; every decision that looks at more than
+one point is taken once on the assembled grid; and a block's filtered values and eroded mask agree
+with a whole-scene filter everywhere the block writes, because of the filter term in
+[`AutoRIFT.halo`](@ref).
 """
 function correlate_tiled(raw::ImagePair, grid::PointSet{2}, p::Params, block_size,
                          filter_cache_tile::Union{Nothing,Integer} = nothing;

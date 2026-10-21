@@ -1,23 +1,23 @@
 
 # Multiple chip sizes
 
-Chip size is a trade with no good answer. A small chip resolves detail and follows a sharp boundary,
-but it contains little texture, so on a smooth or decorrelated surface it correlates with nothing. A
-large chip succeeds there and is blind to detail. Neither choice is right everywhere in one scene.
+Chip size trades resolution against reliability. A small chip resolves detail and follows a sharp
+boundary, but it contains little texture, so on a smooth or decorrelated surface it correlates with
+nothing. A large chip succeeds there but cannot resolve detail. No single size is right everywhere in
+one scene.
 
-So AutoRIFT tries several. Each point is attempted at the finest chip size first; coarser levels run
-only where the finer ones failed, and the **smallest chip that produces a coherent answer wins**.
+AutoRIFT therefore tries several. Each point is attempted at the finest chip size first, coarser
+levels run only where the finer ones failed, and the smallest chip that produces a coherent answer
+wins.
 
 ## It is not an image pyramid
 
-Worth stating plainly, because the structure invites the wrong name. The imagery is never downsampled.
-Every level correlates the pair at full resolution and only the *chip* changes size — there is no
-coarse-to-fine warm start from a decimated image.
+The imagery is never downsampled. Every level correlates the pair at full resolution and only the
+*chip* changes size. There is no coarse-to-fine warm start from a decimated image.
 
-What does get coarsened is the **grid**. A level with a chip twice as wide posts its points twice as
-far apart, which is what makes the levels nest: one coarse point corresponds exactly to a block of
-fine ones. Levels are `chip_size * 2^k`, and both axes double together, so a chip's aspect ratio is
-the same at every level.
+The **grid** is coarsened. A level with a chip twice as wide posts its points twice as far apart, so
+one coarse point corresponds to a block of fine ones and the levels nest. Levels are `chip_size * 2^k`,
+and both axes double together, so a chip's aspect ratio is the same at every level.
 
 ```@example multichip
 using AutoRIFT
@@ -25,17 +25,16 @@ using AutoRIFT
 AutoRIFT.chip_sizes(AutoRIFT.params(; chip_size = 16, chip_size_max = 64))
 ```
 
-Three levels. `chip_size` is the finest and `chip_size_max` the coarsest; `chip_size_max` must be the
-same power-of-two multiple of `chip_size` in both axes, which is what the nesting requires.
+There are three levels. `chip_size` is the finest and `chip_size_max` the coarsest. `chip_size_max`
+must be the same power-of-two multiple of `chip_size` in both axes, which the nesting requires.
 
-The one genuine pyramid in the algorithm is elsewhere: [`PyramidRefine`](@ref) upsamples the
-neighbourhood of a correlation peak to find its sub-pixel position. That is a pyramid over a
-correlation surface, not over an image.
+The only pyramid in the algorithm is in [`PyramidRefine`](@ref), which upsamples the neighborhood of a
+correlation peak to find its sub-pixel position. It acts on a correlation surface, not an image.
 
 ## What each level contributes
 
-A scene where the right chip size differs by region: a band that both moves fast and decorrelates,
-surrounded by a static, well-correlated surface.
+In this scene the right chip size differs by region. A horizontal band moves fast and has noise added
+to the secondary image, and the surface around it moves slowly and stays well correlated.
 
 ```@example multichip
 include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
@@ -46,8 +45,8 @@ reference, clean, truth_dx, _ =
     warped_pair(photo(), 512, (row, col) -> (2 + 20 * band(row), 0.0))
 secondary = decorrelate(clean, (row, col) -> band(row); amplitude = 0.12, seed = 3)
 
-# One grid for every arm below, so the point counts compare. A grid's margin is set by the coarsest
-# chip and the search radius, so building it for chip 64 makes every arm post the same points.
+# One grid for every run below, so the point counts compare. A grid's margin is set by the coarsest
+# chip and the search radius, so building it for chip 64 makes every run post the same points.
 grid = AutoRIFT.gridpoints(size(reference), 8; chip_size = 64, search_radius = 24)
 
 image_panels(reference, secondary)
@@ -63,8 +62,8 @@ levels = Dict(cs => single(cs) for cs in (16, 32, 64))
 [(chip = cs, measured = AutoRIFT.nmeasured(levels[cs])) for cs in (16, 32, 64)]
 ```
 
-Out of 2500 points: the 16-pixel chip answers 1478, the 32-pixel chip 2074, the 64-pixel chip 2266.
-Coverage rises with chip size, which is the whole reason coarse levels exist.
+Of 2500 grid points, the 16-pixel chip answers 1478, the 32-pixel chip 2074 and the 64-pixel chip
+2266. Coverage rises with chip size, which is why coarse levels exist.
 
 ```@example multichip
 field_panels(blank(levels[16].dx, measured(levels[16])),
@@ -73,9 +72,8 @@ field_panels(blank(levels[16].dx, measured(levels[16])),
              titles = ("chip 16", "chip 32", "chip 64"))
 ```
 
-Coverage is not accuracy. Where the displacement *varies* across a chip — the tapering edges of the
-band — a coarse chip still returns something, and that something is an average of two different
-speeds:
+Coverage is not accuracy. Where the displacement varies across a chip, as at the tapering edges of the
+band, a coarse chip still returns a value, and it is an average of two different speeds:
 
 ```@example multichip
 using Statistics: median
@@ -92,9 +90,10 @@ end
 [(chip = cs, gradient_error(levels[cs])...) for cs in (16, 32, 64)]
 ```
 
-The 16-pixel chip answers only 12 points in the gradient — it has too little texture against the
-added noise. The 32-pixel chip answers 88 points to within 4.2 pixels, and the 64-pixel chip answers
-253 to within 7.1. The coarse level's advantage is coverage and its cost is resolution, quantified.
+In the gradient the 16-pixel chip answers only 12 points, because it has too little texture against
+the added noise. The 32-pixel chip answers 88 points with a median error of 4.2 pixels, and the
+64-pixel chip answers 253 with a median error of 7.1. A coarse level gains coverage and loses
+resolution.
 
 ## The merge
 
@@ -107,24 +106,22 @@ merged = autorift(reference, secondary, grid; chip_size = 16, chip_size_max = 64
  for cs in sort(unique(merged.chip_size))]
 ```
 
-`chip_size == 0` marks a point no level resolved. The remaining 2026 points come from the 16- and
-32-pixel levels — the 64-pixel level, run on what the finer two left, answers none of them here — and
-the layer says which — so a downstream consumer can tell a sharply-resolved displacement
-from a heavily-averaged one, which is why the chip size is kept rather than discarded.
+`chip_size == 0` marks a point no level resolved. The other 2026 points come from the 16- and 32-pixel
+levels. The 64-pixel level runs on the points the finer two left and answers none of them here. The
+`chip_size` layer records which level answered each point, so a consumer can tell a sharply resolved
+displacement from a heavily averaged one.
 
 ```@example multichip
 quality_panels(merged)
 ```
 
-Two things in that figure are worth noticing.
-
-**The merge is not the union of the levels.** Run separately the three levels cover 2359 points
-between them; merged they cover 2026. A level does not attempt every point the finer ones left — each
+**The merge is not the union of the levels.** Run separately, the three levels cover 2359 points
+between them. Merged, they cover 2026. A level does not attempt every point the finer ones left. Each
 level first runs a sparse **coarse pass** to find where motion is spatially coherent, and searches the
-full grid only inside a dilated neighbourhood of that. Since a later level's coarse pass sees only the
-points still outstanding, its coverage decision differs from the same level run alone.
+full grid only inside a dilated neighborhood of that. A later level's coarse pass sees only the
+outstanding points, so its coverage decision differs from the same level run alone.
 
-The difference is not scattered noise, which is what makes the mechanism visible:
+The difference is spatially structured:
 
 ```@example multichip
 union_of_levels = measured(levels[16]) .| measured(levels[32]) .| measured(levels[64])
@@ -133,16 +130,15 @@ mask_panels(union_of_levels, measured(merged), union_of_levels .& .!measured(mer
             titles = ("union of the three levels", "the merge", "lost by merging"))
 ```
 
-The lost points form a **ring** around the band's core, plus the left and right margins — not a
-uniform scatter and not the band itself. Inside the ring the merge still answers; outside it the finer
-levels had already succeeded. The ring is the shoulder of the band, where correlation is marginal
-enough that a later level's coarse pass no longer accepts the neighbourhood, and so never attempts
-points the same level answered when run alone.
+The lost points form two ragged horizontal strips along the tapering edges of the band, reaching
+toward the left and right image margins. The core of the band and the surface outside it are not lost.
+The strips lie where correlation is marginal, so a later level's coarse pass does not accept the
+neighborhood and never attempts points that the same level answered when run alone.
 
-The arithmetic is not quite subtraction, either: 337 points are lost, but the merge answers four that no
-single level did, which is why the net is 333.
+The net change differs from the number of lost points: 337 points are lost, but the merge answers four
+that no single level did, so the net is 333.
 
-**Where levels do overlap they agree.** Comparing the single-level runs point by point where both
+**Where levels overlap, they agree.** Comparing the single-level runs point by point where both
 produced an answer:
 
 ```@example multichip
@@ -156,21 +152,22 @@ end
 (low = overlap(16, 32), high = overlap(32, 64))
 ```
 
-A sixteenth of a pixel — one quantization step of the sub-pixel refinement. The levels are measuring
-the same field, so preferring the finest one that works costs nothing in consistency.
+The median difference is 0.016 pixel, or 1/64 pixel, the quantization step of the default sub-pixel
+refinement. The levels measure the same field, so taking the finest level that works does not make
+the result inconsistent.
 
 ## The coarse pass
 
 Searching every point at full radius is the dominant cost, and most of it is wasted: displacement is
-spatially coherent, so a sparse sample tells you where the rest will land. Each level therefore
+spatially coherent, so a sparse sample shows where the rest will land. Each level therefore
 
 1. correlates a decimated subset of its points,
-2. filters those results for consistency with their neighbours,
+2. filters those results for consistency with their neighbors,
 3. dilates what survives, and
 4. searches the full grid only inside that mask.
 
-Where the coarse pass finds nothing coherent, the fine pass is skipped entirely — and if it validates
-too small a fraction of the scene, the whole level is skipped. Three keywords control it:
+If the coarse pass finds nothing coherent, or the filter keeps less than `min_coarse_valid_fraction`
+of the coarse points that returned a value, the level is skipped. Three keywords control the coarse pass:
 
 | keyword | default | effect |
 |---|---|---|
@@ -178,38 +175,37 @@ too small a fraction of the scene, the whole level is skipped. Three keywords co
 | `coarse_buffer` | `8` | dilation radius of the validity mask, in coarse cells — how far past the coarse evidence the fine pass may reach |
 | `min_coarse_valid_fraction` | `0.01` | skip a level whose coarse pass validates less than this |
 
-This is also why a search radius of **zero** excludes a point rather than erroring: setting the radius
-per point is the mechanism by which the coarse mask restricts the fine pass, so a zero radius has to
-mean "do not search here". [`AutoRIFT.nsearchable`](@ref) counts the points that will actually be
-correlated.
+The coarse mask restricts the fine pass by zeroing the search radius at each point outside it, so a
+zero search radius at a point excludes the point rather than raising an error.
+[`AutoRIFT.nsearchable`](@ref) counts the points that will be correlated.
 
 !!! note "A coarse level needs room"
-    A level's decimated grid has to be large enough to filter. On a small image the coarsest levels
-    can end up with a grid too small to be worth running, and they are skipped — so a 256-pixel scene
-    at the default `chip_size_max` may return nothing at all. Keep test scenes at 512 pixels or limit
+    A level's decimated grid must be large enough to filter. On a small image the coarsest levels can
+    have a grid too small to run, and they are skipped. A 256-pixel scene at the default
+    `chip_size_max` may return nothing. Use scenes of 512 pixels or more, or set
     `chip_size_max` explicitly.
 
 ## Choosing the range
 
-`chip_size` is the finest level and the one that sets your best achievable resolution;
-`chip_size_max` is how far the search will escalate when the fine chip fails.
+`chip_size` is the finest level and sets the best achievable resolution. `chip_size_max` is how far
+the search escalates when the fine chip fails.
 
-- **Both equal** runs a single level: cheapest, and right when the scene is uniform in texture and in
-  the smoothness of its motion.
-- **The default `4 * chip_size`** gives three levels and is a reasonable starting point for a scene
-  with mixed terrain.
-- **A wider range** costs little where the fine levels already succeed, since a level only runs on
-  what is left, but each additional level widens the grid margin — the margin is set by the coarsest
-  chip, so raising `chip_size_max` shrinks the output grid.
+- **Both equal** runs a single level. It is the cheapest option and suits a scene uniform in texture
+  and in the smoothness of its motion.
+- **The default `4 * chip_size`** gives three levels and is a reasonable start for a scene with mixed
+  terrain.
+- **A wider range** costs little where the fine levels already succeed, since a level runs only on
+  the points still unresolved. The grid margin is set by the coarsest chip, so raising `chip_size_max`
+  shrinks the output grid.
 
-Where the right range varies *within* a scene, bound it per point rather than globally: a
-[`AutoRIFT.PointSet`](@ref) carries `chip_size_min_x` and `chip_size_max_x` fields. Steps 6 to 8 of
-[A guided walkthrough](@ref) do this. Note the asymmetry — the finest level is attempted at every
-point regardless, so per-point bounds restrict the coarser levels only.
+Where the right range varies within a scene, bound it per point: a [`AutoRIFT.PointSet`](@ref) carries
+`chip_size_min_x` and `chip_size_max_x` fields, and Steps 6 to 8 of [A guided walkthrough](@ref) use
+them. The finest level is attempted at every point regardless of these fields, so per-point bounds
+restrict the coarser levels only.
 
 ## See also
 
-- [How feature tracking works](@ref) — one chip, one window, one surface
-- [A guided walkthrough](@ref) — the levels in use, step 4 onward
-- [`AutoRIFT.correlate_multichip`](@ref) and [`AutoRIFT.chipsize_level`](@ref) — running the loop, or
+- [How feature tracking works](@ref): one chip, one window, one surface
+- [A guided walkthrough](@ref): the levels in use, from Step 4
+- [`AutoRIFT.correlate_multichip`](@ref) and [`AutoRIFT.chipsize_level`](@ref): running the loop, or
   one level of it, directly

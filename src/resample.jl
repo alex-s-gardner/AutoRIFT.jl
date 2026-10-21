@@ -23,9 +23,9 @@
 """
     Nearest()
 
-Nearest-neighbour resampling: each destination sample takes the value of the source sample containing
-its centre. The right choice for a mask, where an interpolated value between two categories would mean
-nothing. See [`resample`](@ref).
+Nearest-neighbor resampling: each destination sample takes the value of the source sample containing
+its center. Use it for a mask, where an interpolated value between two categories is meaningless. See
+[`resample`](@ref).
 """
 struct Nearest end
 
@@ -33,27 +33,26 @@ struct Nearest end
     Area()
 
 Area-averaging resampling: each destination sample is the mean of the source samples its footprint
-covers, weighted by overlap and ignoring `NaN`. The right choice for decimating a measured field,
-where a point sample would discard most of the data. See [`resample`](@ref).
+covers, weighted by overlap and ignoring `NaN`. Use it to decimate a measured field, where a point
+sample would discard most of the data. See [`resample`](@ref).
 """
 struct Area end
 
 """
     Bilinear()
 
-Bilinear resampling: the weighted mean of the surrounding 2-by-2 neighbourhood, ignoring `NaN`. The
-right choice for decimating a quantity whose *fractional* part carries meaning — one about to be
-rounded or taken to a ceiling — where sampling a single corner of the cell would discard the
-fraction that decides the answer. See [`resample`](@ref).
+Bilinear resampling: the weighted mean of the surrounding 2-by-2 neighborhood, ignoring `NaN`. Use it
+to decimate a quantity whose fractional part matters, such as one about to be rounded or taken to a
+ceiling. See [`resample`](@ref).
 """
 struct Bilinear end
 
 """
     Bicubic()
 
-Bicubic resampling: a smooth interpolant over the surrounding 4-by-4 neighbourhood. The right choice
-for upsampling a displacement field into a prior, where nearest-neighbour would put visible seams in
-the output. See [`resample`](@ref).
+Bicubic resampling: a smooth interpolant over the surrounding 4-by-4 neighborhood. Use it to upsample
+a displacement field into a prior, where nearest-neighbor would leave visible seams. See
+[`resample`](@ref).
 """
 struct Bicubic end
 
@@ -66,16 +65,12 @@ Resample `A` to `dstsize`, ignoring `NaN`.
 destination sample with no valid contributor is `NaN`.
 
 Coordinates use the half-sample convention: destination sample `i` maps to source position
-`(i - 0.5) * scale + 0.5`, so the two grids cover the same extent and neither is offset by
-half a sample relative to the other. Getting this wrong shifts a whole chip-size level by a
-fraction of a grid cell, which is invisible in any single level and accumulates across them.
+`(i - 0.5) * scale + 0.5`, so the two grids cover the same extent with no half-sample offset.
 
-`scale` is the source samples per destination sample, per axis, and defaults to the size ratio.
-Pass it when the two grids stand in a correspondence the sizes do not determine: a source taken
-as every `stride`-th sample of the destination has a scale of exactly `1/stride`, which the ratio
-`cld(n, stride) / n` only equals when `stride` divides `n`. Where it does not, the ratio drifts
-against the lattice the samples were actually taken on, reaching a full cell of offset at the far
-edge — so a caller that decimated by a stride must say so rather than let the sizes imply it.
+`scale` is the source samples per destination sample, per axis, and defaults to the size ratio. Pass
+it when the sizes do not determine the correspondence. A source taken as every `stride`-th sample of
+the destination has a scale of exactly `1/stride`, but the size ratio `cld(n, stride) / n` equals that
+only when `stride` divides `n`; otherwise it drifts, reaching a full cell of offset at the far edge.
 """
 function resample(A::AbstractMatrix, dstsize::Tuple{Int,Int}, method;
                   scale::Tuple{Real,Real} = (size(A, 1) / dstsize[1], size(A, 2) / dstsize[2]))
@@ -308,23 +303,18 @@ end
 """
     dilate_within(mask, radius) -> BitMatrix
 
-Every position **strictly closer than** Euclidean `radius` to a `true` in `mask`.
+Every position strictly closer than Euclidean `radius` to a `true` in `mask`.
 
-Grows the coarse pass's validity mask before it restricts the fine search: a coarse
-estimate is evidence that the neighbourhood is worth searching, not only that one point.
-The radius is in grid cells and is a genuine Euclidean distance rather than a chessboard
-one, which matters at the radii in use — a chessboard ball of radius 8 is 40%
-larger in area than a Euclidean one.
+Used to grow the coarse pass's validity mask before it restricts the fine search. `radius` is in grid
+cells and the distance is Euclidean, not chessboard (a chessboard ball of radius 8 has 40% more area).
 
-Strict, matching the reference's `distance_transform_edt(!MC) < BuffDistanceC`
-(`autoRIFT.py:709`). The boundary carries real weight on a lattice: at the default radius of 8 the
-positions at distance *exactly* 8 are the axis-aligned ones eight cells out, and admitting them
-widens the searched region by 72 coarse cells on the golden Landsat case — 30,084 fine points once
-the mask is expanded, every one of them a point the reference leaves unsearched.
+The comparison is strict, matching the reference's `distance_transform_edt(!MC) < BuffDistanceC`
+(`autoRIFT.py:709`). At the default radius of 8, positions at distance exactly 8 are the
+axis-aligned ones eight cells out. Admitting them widens the searched region by 72 coarse cells on
+the golden Landsat case, which is 30,084 fine points the reference leaves unsearched.
 
-Exact, via the two-pass squared-distance transform of Felzenszwalb & Huttenlocher (2012):
-separable, O(n) per row and column, and not an approximation like the chamfer masks that
-image libraries often default to.
+The distance is exact, computed by the two-pass squared-distance transform of Felzenszwalb &
+Huttenlocher (2012), which is separable and O(n) per row and column.
 """
 function dilate_within(mask::AbstractMatrix{Bool}, radius::Real)
     d2 = _squared_distance_transform(mask)
@@ -341,21 +331,19 @@ end
 
 Positions in a connected component of `mask` holding fewer than `minsize` `true`s.
 
-Eight-connected, so two positions touching only at a corner belong to one component. That is
-the reference's `connectivity=2` (`autoRIFT.py:1652`), and it is not a detail: under
-four-connectivity a diagonal pair of holes is two components of one rather than one of two, and
-the size test then gives a different answer.
+Components are eight-connected, so two positions touching only at a corner belong to one component,
+as in the reference's `connectivity=2` (`autoRIFT.py:1652`). Under four-connectivity a diagonal pair
+of holes would be two components of one position, and the size test would give a different answer.
 
-This selects which holes in a displacement field are interpolated across. A hole small enough to
-be surrounded by coherent motion should be filled whatever its shape, and counting a
-neighbourhood cannot express that — an L-shaped four-pixel hole has positions with too few
-neighbours to pass any count while still being a hole worth closing.
+This selects which holes in a displacement field are interpolated across, regardless of shape. An
+L-shaped four-position hole, for example, has positions with too few neighbors to pass a neighbor
+count.
 
 `minsize` is exclusive, matching `bwareaopen(image, size1)`'s `size < size1`: at `minsize = 5`
 components of one to four positions are returned and a five-position component is not.
 
-One union-find pass over the array with union by size and full path compression, so the cost is
-effectively linear and no component is materialised as a separate array.
+One union-find pass over the array (union by size, full path compression), so the cost is effectively
+linear.
 """
 function small_components(mask::AbstractMatrix{Bool}, minsize::Integer)
     Base.require_one_based_indexing(mask)
@@ -407,10 +395,8 @@ end
 
 Squared Euclidean distance from each position to the nearest `true` in `mask`.
 
-`Inf` where `mask` is empty. Separable: a 1-D transform down each column, then the lower
-envelope of parabolas along each row. The second step is the Felzenszwalb–Huttenlocher
-construction, which is what makes it exact and linear rather than an iterative
-approximation.
+`Inf` where `mask` is empty. Separable: a 1-D transform down each column, then the lower envelope of
+parabolas along each row (Felzenszwalb and Huttenlocher), which is exact and linear.
 """
 function _squared_distance_transform(mask::AbstractMatrix{Bool})
     nr, nc = size(mask)

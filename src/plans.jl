@@ -185,16 +185,14 @@ end
 
 Path to this machine's FFTW wisdom file, or `nothing` if no directory is available to hold it.
 
-Keyed by CPU model and FFTW version: wisdom is portable across neither, and importing another
-machine's would produce plans tuned for the wrong cache hierarchy. The file name carries both, so a
-directory may hold one file per machine type and each process reads only its own.
+The file name carries the CPU model (or the LLVM core name when the model is unknown) and the FFTW
+version, because wisdom is portable across neither. A directory may hold one file per machine type,
+and each process reads only its own.
 
-The directory is a scratch space inside the depot, which on a workstation already outlives any
-process — the first run on a machine measures its plans and every run after reads them. Set
-`AUTORIFT_FFTW_WISDOM_DIR` to override it, which is what a deployment wants when the process
-filesystem is discarded between jobs: pointing it at shared storage turns "measure once per machine"
-back into the truth it is on a workstation. Writes there are safe from several processes at once —
-see `AutoRIFT.save_fftw_wisdom!`.
+The directory is a scratch space inside the Julia depot, so the first run on a machine measures its
+plans and later runs read them. Set `AUTORIFT_FFTW_WISDOM_DIR` to use another directory, for a
+deployment whose filesystem is discarded between jobs (for example shared storage). Writes are safe
+from several processes at once; see `AutoRIFT.save_fftw_wisdom!`.
 """
 function fftw_wisdom_path()
     try
@@ -227,9 +225,8 @@ end
 
 Forget the cached FFTW wisdom filename and this process's FFTW wisdom state, so the next
 [`fftw_wisdom_path`](@ref) re-derives the path and a cold process warns again if it measures.
-
-Called from `__init__`: a filename derived from the CPU model while *precompiling* would otherwise be
-serialised into the image and inherited by a machine with a different one.
+Called from `__init__`, so a filename derived while precompiling is not inherited by a machine with a
+different CPU.
 """
 function reset_fftw_wisdom_path!()
     WISDOM_FILENAME[] = ""
@@ -283,8 +280,8 @@ end
 
 Import this machine's saved FFTW wisdom, if any. Idempotent and never throws.
 
-Called from `__init__`. A missing, unreadable, or corrupt file is not an error — it means the
-next plan is measured from scratch, which is what would happen without any of this.
+Called from `__init__`. A missing, unreadable, or corrupt file is not an error: the next plan is
+measured from scratch.
 """
 function load_fftw_wisdom!()
     WISDOM_LOADED[] && return nothing
@@ -321,8 +318,9 @@ end
 
 Write this machine's FFTW wisdom, if any new size has been planned. Never throws.
 
-Called after [`warm_plans!`](@ref) rather than at exit: an `atexit` hook would miss a process
-killed by a scheduler, which for batch work is the normal way for a process to end.
+Called after [`warm_plans!`](@ref) rather than at exit, so a process killed by a scheduler still
+saves what it measured. The file is written to a temporary and renamed, so concurrent writers never
+leave a partial file. A failed write is not retried until a new size is planned.
 """
 function save_fftw_wisdom!()
     WISDOM_DIRTY[] || return nothing
@@ -366,12 +364,10 @@ end
 
 Real-to-complex FFT plan for an `ny`-by-`nx` `Float32` array, from the cache.
 
-Returns FFTW's own `Ptr{Cvoid}` plan handle — see the note at the top of this file for why it is
-not an `FFTW.rFFTWPlan`. Execute it with [`fft_execute!`](@ref).
+Returns FFTW's own `Ptr{Cvoid}` plan handle rather than an `FFTW.rFFTWPlan`. Execute it with
+[`fft_execute!`](@ref). Plans are never freed.
 
-Thread-safe. The common case is a cache hit, which takes no lock — an unsynchronised
-read of a `Dict` that is only ever grown under a lock is safe here because a miss
-falls through to the locked path and re-checks.
+Thread-safe. A cache hit takes no lock, and a miss plans under a lock.
 """
 function fft_plan(ny::Int, nx::Int)
     key = (ny, nx)
@@ -406,8 +402,8 @@ end
 Run a real-to-complex plan from [`fft_plan`](@ref).
 
 The buffers must be the sizes the plan was created for. FFTW does not check, and a mismatch is a
-buffer overrun rather than an error — which is why `CorrelationWorkspace` sizes its FFT buffers
-from the same `next_fft_size` the plan is keyed on.
+buffer overrun. `CorrelationWorkspace` sizes its FFT buffers with the `next_fft_size` the plan is
+keyed on.
 """
 @inline function fft_execute!(plan::Ptr{Cvoid}, input::Matrix{Float32},
                               output::Matrix{ComplexF32})
@@ -447,12 +443,9 @@ end
 
 Complex-to-complex forward and inverse FFT plans for an `ny`-by-`nx` `ComplexF32` array.
 
-Used by [`Coherence`](@ref), whose chip is complex and so cannot go through the real-to-complex
-transform the real measures use. Both directions are full `ny`-by-`nx` — there is no conjugate
-symmetry to exploit — so a complex transform moves about twice the data of the real one at the
-same size. That is the price of phase, and it is far below the price of not transforming at all.
-
-Same `(nx, ny)` argument reversal and the same wisdom persistence as [`fft_plan`](@ref).
+Used by [`Coherence`](@ref), whose chip is complex. Both directions are full `ny`-by-`nx`, since
+there is no conjugate symmetry to exploit, so a complex transform moves about twice the data of the
+real one at the same size. Wisdom persistence is the same as for [`fft_plan`](@ref).
 """
 function cfft_plan(ny::Int, nx::Int)
     key = (ny, nx)
@@ -497,8 +490,8 @@ end
 
 Run a complex-to-complex plan from [`cfft_plan`](@ref) or [`icfft_plan`](@ref).
 
-**Unnormalised in both directions**, like FFTW's c2r transform — the caller applies `1/n` after
-the inverse. Unlike c2r, this transform does *not* destroy its input, so a spectrum may be reused.
+Unnormalized in both directions, like FFTW's c2r transform: the caller applies `1/n` after the
+inverse. Unlike c2r, it does not destroy its input, so a spectrum may be reused.
 """
 @inline function cfft_execute!(plan::Ptr{Cvoid}, input::Matrix{ComplexF32},
                                output::Matrix{ComplexF32})
@@ -512,11 +505,8 @@ end
 
 Run a complex-to-real plan from [`ifft_plan`](@ref), scaled.
 
-**FFTW's inverse transform is unnormalised** — it returns `n` times the inverse DFT, where
-`AbstractFFTs.plan_irfft` wrapped the same plan in a `ScaledPlan` that divided for us. The scaling
-is applied here so callers see the same values as before, and so the omission cannot be
-rediscovered per call site: a missing `1/n` scales every correlation numerator by the transform
-size, which produces a plausible-looking surface with the wrong normalisation.
+FFTW's inverse transform is unnormalized (it returns `n` times the inverse DFT). The `1/n` scaling is
+applied here, so callers receive the inverse DFT.
 
 !!! warning "The input is destroyed"
     FFTW's c2r transform overwrites its input buffer unless planned with `FFTW_PRESERVE_INPUT`,
@@ -536,13 +526,12 @@ end
 """
     whole_cfft(X, direction) -> Matrix{ComplexF32}
 
-The unnormalised complex transform of all of `X`: forward for `direction = FFTW_FORWARD`, as FFTW.jl's
+The unnormalized complex transform of all of `X`: forward for `direction = FFTW_FORWARD`, as FFTW.jl's
 `fft` computes it, and backward for `FFTW_BACKWARD`, as its `bfft` does.
 
-Planned exactly as FFTW.jl plans those — `FFTW_ESTIMATE`, out of place, through the guru64 interface
-with the dimensions and strides it passes and no output array — so the planner chooses the same
-algorithm and the result has the same bits. Planned and destroyed per call: a destripe transforms a
-scene once, so there is nothing for the cache above to reuse.
+The plan is built as FFTW.jl builds them (`FFTW_ESTIMATE`, out of place, guru64 interface), so the
+result has the same bits. It is planned and destroyed per call, not cached, because a destripe
+transforms a scene once.
 """
 function whole_cfft(X::Matrix{ComplexF32}, direction::Cint)
     ny, nx = size(X)
@@ -576,24 +565,18 @@ end
 """
     warm_plans!(sizes; complex = false)
 
-Create the plans for `sizes` on the calling task, before any parallel work starts.
-
-Without this, every task racing to correlate its first point would contend on the
-planner lock and serialise — turning the most parallel part of the run into its
-most serial. Called once per pass, where the set of sizes is known in advance.
+Create the plans for `sizes`, an iterable of `(ny, nx)`, on the calling task before any parallel
+work starts. Otherwise every task would contend on the planner lock at its first point. Called once
+per pass.
 
 `persist` writes the FFTW wisdom measured here when the call finishes. Pass `false` from a caller
-that warms many sizes in sequence and persists on its own schedule: FFTW's export has no incremental
-form, so every call rewrites the whole accumulated file.
+that warms many sizes in sequence and persists on its own schedule, since FFTW's export rewrites the
+whole accumulated file.
 
 `complex` selects the complex-to-complex pair that [`Coherence`](@ref) executes instead of the
-real-to-complex pair the real measures use. It must match the measure the pass will actually run:
-warming the wrong kind is doubly wrong, since it pays full `PLAN_FLAGS` planning — hundreds of
-milliseconds per size cold — for a plan that is never executed, *and* leaves the plans that are
-executed to be created inside a worker task, which is precisely the planner contention this
-function exists to prevent. Verified
-against a coherence pass before this argument existed: it warmed `RFFT_PLANS[(72,72)]`, never used
-it, and built `CFFT_PLANS[(72,72)]` lazily under the lock.
+real-to-complex pair. It must match the measure the pass runs: the wrong kind pays full planning (hundreds
+of milliseconds per size, cold) for a plan that is never executed, and leaves the executed plans to be
+created inside a worker task.
 """
 function warm_plans!(sizes; complex::Bool = false, persist::Bool = true)
     for (ny, nx) in sizes
@@ -640,31 +623,27 @@ end
 Measure and persist the FFTW plans `p` can reach at any search radius up to `max_search_radius`, and
 return how many distinct transform sizes were planned.
 
-**What this is for.** A plan is measured on first use and persisted by
-[`AutoRIFT.fftw_wisdom_path`](@ref), so a process that finds wisdom on disk starts at full speed and
-one that does not pays `PLAN_FLAGS` planning for every size its grid happens to reach. Left to
-discover sizes as jobs arrive, a shared wisdom file warms up raggedly — whichever pairs run first
-contribute their sizes and the rest keep paying. This plans the whole reachable set up front, so the
-first real job is as warm as the thousandth.
+A plan is measured on first use and persisted by [`AutoRIFT.fftw_wisdom_path`](@ref). A process
+that finds wisdom on disk starts warm, and one that does not pays planning for every size its grid
+reaches. This function plans the whole reachable set up front, so the first job on a machine is as
+fast as later ones.
 
-**Why a radius bound is the only thing it needs.** A point is correlated at its radius rounded up to a
-rung of the `AutoRIFT._radius_bucket` ladder, and the rungs are fixed rather than derived from
-the data. So although search radius grows with a pair's time separation, that only changes *which*
-rungs are reached, never what they are: one precomputation covers every time separation up to the
-bound. Pass the widest radius the deployment can produce.
+A point is correlated at its radius rounded up to a rung of the `AutoRIFT._radius_bucket` ladder, and
+the rungs are fixed rather than derived from the data. A larger time separation changes which rungs are
+reached but not what they are, so one precomputation covers every pair up to `max_search_radius`, the
+widest radius the deployment can produce. It is required because no default is right for every sensor.
+Throws `ArgumentError` if it is less than 1.
 
-**The one size it cannot cover.** `_radius_bucket` returns the pass maximum verbatim for a radius at or
-above it, and that maximum is a property of the grid rather than of the ladder. Sizes involving it are
-left to be measured on first use — measured at 10-15% of the sizes a real optical pair reaches.
+The pass maximum is not covered: `_radius_bucket` returns it verbatim for a radius at or above it, and
+it is a property of the grid rather than of the ladder. Sizes involving it are measured on first use,
+which is 10 to 15% of the sizes a real optical pair reaches.
 
-Costs what it saves: planning is 116-347 ms at the sizes an optical pair reaches and 8.2 s at the
-widest a NISAR pair with an 8 km search would, so a few hundred sizes is minutes and a few thousand is
-tens of minutes — once per machine type. `max_search_radius` is required because no default is right for
-every sensor.
+Planning takes 116 to 347 ms per size for an optical pair and 8.2 s at the widest size of a NISAR pair
+with an 8 km search, so a few hundred sizes take minutes and a few thousand tens of minutes, once per
+machine type.
 
-Reports progress no more often than every `progress_interval` seconds, and persists what it has measured
-at the same time, so a long precomputation can be interrupted without losing its work and resumed by
-running it again.
+Progress is logged at most every `progress_interval` seconds (default 10), and wisdom is saved at the
+same time, so an interrupted run can be resumed by running it again.
 """
 function precompute_fftw_wisdom(p::Params; max_search_radius::Integer,
                                 progress_interval::Real = 10.0)
@@ -721,8 +700,8 @@ _plan_cost_weight(sz::Tuple{Int,Int}) = sqrt(float(sz[1]) * float(sz[2]))
 """
     clear_plans!()
 
-Drop all cached plans. For tests and benchmarks that need to measure planning cost;
-not part of normal operation.
+Drop all cached plans. For tests and benchmarks that measure planning cost; not part of normal
+operation.
 """
 function clear_plans!()
     lock(PLAN_LOCK) do

@@ -77,6 +77,7 @@ makedocs(;
                                  "Multiple chip sizes" => "explanation/multi-chip-size.md",
                                  "Memory" => "explanation/memory.md",
                                  "Performance" => "explanation/performance.md"],
+                  "Benchmarks" => "benchmarks.md",
                   "API reference" => REFERENCE])
 
 DocumenterVitepress.deploydocs(; repo = "github.com/alex-s-gardner/AutoRIFT.jl",

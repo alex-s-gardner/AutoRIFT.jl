@@ -1,37 +1,37 @@
 
 # Judging a result
 
-Every point that returns a displacement returns it with a `correlation` and a `peak_ratio`. They
-measure different things and only one of them is a reliability gate.
+Every point that returns a displacement also returns a `correlation` and a `peak_ratio`. They measure
+different things, and only `correlation` is useful as a reliability threshold.
 
-## Gate on `correlation`
+## Threshold on `correlation`
 
-`correlation` is the height of the matched peak — how *strong* the match was. `peak_ratio` is the peak
-divided by the best rival elsewhere on the same surface — whether the match was *unique*. A threshold
-wants the first.
+`correlation` is the height of the matched peak, which says how strong the match was. `peak_ratio` is
+the peak divided by the best rival elsewhere on the same surface, which says whether the match was
+unique. A reliability threshold needs the first.
 
-That is measured, not assumed. Over the 80,648 directly measured points of a Jakobshavn pair that both
-this package and the Python reference resolved, labelled against "the two disagree by more than
-0.25 px" — which 0.34% of them carry:
+The comparison below uses the 80,648 directly measured points of a Jakobshavn pair that both this
+package and the Python reference resolved. Each point is labelled by whether the two disagree by more
+than 0.25 px, which 0.34% of them do:
 
 | measure | AUC | disagreement rate, worst decile | best decile |
 |---|---:|---:|---:|
-| `correlation` | **0.791** | 1.2% | 0.0% |
+| `correlation` | 0.791 | 1.2% | 0.0% |
 | `peak_ratio` | 0.544 | 0.5% | 0.6% |
 
-`correlation` falls monotonically across its deciles, from 1.2% down to zero. `peak_ratio` is flat at
-0.1–0.6% and not even monotonic — its highest decile is its worst — so **as a reliability gate on its
-own it has essentially no skill.** Nor is that an artifact of pooling points of differing correlation:
-within a band of fixed `correlation` the ranking mildly *inverts*, at an AUC of 0.43 over 0.2–0.4 and
-0.50 over 0.4–0.6. The two measures are nearly independent, at a Spearman rank correlation of 0.242.
-`tools/ab/peak_ratio_skill.jl` computes all of it.
+The disagreement rate falls monotonically across the deciles of `correlation`, from 1.2% to zero. For
+`peak_ratio` it is flat at 0.1–0.6% and not monotonic (its highest decile is its worst), so
+`peak_ratio` has essentially no skill as a reliability threshold. Pooling points of different
+correlation does not explain this: within a band of fixed `correlation`, the AUC of `peak_ratio` is 0.43
+over 0.2–0.4 and 0.50 over 0.4–0.6. The two measures are nearly independent, with a Spearman rank
+correlation of 0.242. `tools/ab/peak_ratio_skill.jl` computes all of these.
 
-That is not a defect in the quantity, it is what the quantity measures. Ambiguity and unreliability are
-different failures, and on this scene — a fast outlet glacier whose flow the search radius covers — the
-two implementations disagree where the match is *weak*, not where it is contested. A ratio near 1 does
-mean two displacements matched nearly equally well; it does not follow that the one chosen was wrong.
+Ambiguity and unreliability are different failures. On this scene, a fast outlet glacier whose flow the
+search radius covers, the two implementations disagree where the match is weak, not where it is
+contested. A ratio near 1 means two displacements matched nearly equally well, which does not make the
+chosen one wrong.
 
-So the gate is one line:
+The threshold is one line:
 
 ```@example quality
 using AutoRIFT
@@ -52,13 +52,11 @@ field_panels(blank(out.dx, measured(out)), blank(out.dx, good);
              titles = ("dx, all measured", "dx, correlation > 0.3"))
 ```
 
-What threshold depends on the imagery and on what the result feeds. `0.3` is a common working floor;
-below about `0.1` a ZNCC peak carries little information. There is no universal number — pick it by
-looking at the correlation field for your own data.
+The right threshold depends on the imagery and on what the result feeds. `0.3` is a common floor, and
+below about `0.1` a ZNCC peak carries little information. Choose it by inspecting the correlation field
+for your own data.
 
 ## The two layers side by side
-
-They disagree, which is the point:
 
 ```@example quality
 field_panels(blank(out.correlation, measured(out)),
@@ -66,39 +64,34 @@ field_panels(blank(out.correlation, measured(out)),
              titles = ("correlation", "peak_ratio (clipped at 5)"), colormap = :magma)
 ```
 
-`peak_ratio` has structure the correlation field does not, and vice versa. Neither is a proxy for the
-other.
+Each layer shows structure the other does not.
 
 ## What `peak_ratio` is for
 
-Diagnosis, not thresholding. A ratio near 1 means some other displacement matched nearly as well, so
-the reported one is a coin flip between two candidates. That happens with **periodic texture** —
-crevasse fields, dune trains, crop rows, a regular particle seeding — which produces rival peaks one
-wavelength apart, each as tall as the true one. A peak height cannot see that failure at all.
-
-The fix when you find it is a chip size that spans more than one wavelength, not a tighter gate.
+`peak_ratio` is a diagnostic. A ratio near 1 means some other displacement matched nearly as well, so
+the reported one is a choice between two candidates. This happens with periodic texture such as
+crevasse fields, dune trains, crop rows, or regular particle seeding, which produces rival peaks one
+wavelength apart, each as tall as the true one. A peak height cannot detect this failure. The remedy is
+a chip size that spans more than one wavelength.
 
 Two special values:
 
-- `Inf32` — no rival peak was positive, so the primary is the only candidate the surface offers.
-- `NaN32` — the surface was too small to have anything outside the exclusion box, so no ratio could be
-  computed. Distinct from a low ratio.
+- `Inf32`: no rival peak was positive, so the primary is the only candidate the surface offers.
+- `NaN32`: no ratio could be computed, because the surface was too small to have anything outside the
+  exclusion box or its maximum was not positive. This is distinct from a low ratio.
 
-Testing `isfinite` separates both from a real value.
+`isfinite` separates both from a real value.
 
 ## Finding where `search_radius` is too small
 
-This is the failure that looks most like a measurement: if the true displacement lies outside the
-search window, the surface never contains the right peak and the best available one wins. The
-correlator detects the condition — the peak landing on the surface's own edge — and marks it by setting
-**both `correlation` and `peak_ratio` to zero**.
+If the true displacement lies outside the search window, the surface does not contain the right peak and
+the best available one wins, which looks like a normal measurement. The correlator detects the condition
+by the peak landing on the surface's own edge, and sets both `correlation` and `peak_ratio` to zero.
 
-Zero is otherwise unreachable for either: a real ZNCC peak is strictly positive, and a real ratio is at
-least 1, the primary being the surface maximum. So any positive threshold on either layer already
-rejects these points, without the caller needing to know the condition exists.
-
-The displacement is still reported, being the best available lower bound. To find such points
-deliberately:
+Zero is otherwise unreachable for either layer: a real ZNCC peak is strictly positive, and a real ratio
+is at least 1 because the primary is the surface maximum. Any positive threshold on either layer
+therefore rejects these points. The displacement is still reported, as a lower bound. To find such
+points:
 
 ```@example quality
 # Motion of 24 pixels against a radius of 25: inside the window's nominal reach, but the surface spans
@@ -121,57 +114,55 @@ mw = measured(wider)
  dx = wider.dx[findfirst(mw)])
 ```
 
-A whole scene of zeros is unmistakable. A *region* of them is the useful case — it says the radius
-covers most of the scene but not its fastest part, and is the signal to raise the radius there
-specifically rather than everywhere. A per-point radius is how ([A guided walkthrough](@ref), step 7).
+A region of zeros means the radius covers most of the scene but not its fastest part. Raise the radius
+there with a per-point radius rather than everywhere ([A guided walkthrough](@ref), step 7).
 
-!!! note "Beyond the radius entirely, nothing is returned"
-    The railing above needs the motion to be near the radius. Push it well past — 30 pixels against a
-    radius of 25 — and the level's coarse pass finds nothing spatially coherent to work from, so the
-    level is skipped and the result is empty rather than railed. An all-`NaN` result with a radius you
-    thought was generous is the same diagnosis by a different route.
+!!! note "Motion far beyond the radius returns nothing"
+    Railing needs the motion to be near the radius. With 30 pixels of motion against a radius of 25,
+    the level's coarse pass finds nothing spatially coherent, the level is skipped, and the result is
+    empty rather than railed. An all-`NaN` result with a radius you thought generous has the same
+    cause.
 
 ## The other layers
 
-`chip_size` records which level answered, and `0` means none did. It is also how much spatial averaging
-is behind each estimate, so it distinguishes a sharply-resolved displacement from a smoothed one — see
+`chip_size` records which level answered, and `0` means none did. It also gives the spatial averaging
+behind each estimate, which distinguishes a sharply resolved displacement from a smoothed one; see
 [Multiple chip sizes](@ref).
 
-`interpolated` marks points filled from their neighbours rather than measured. At such a point
-`correlation` is `NaN`, having no surface of its own to report, and `peak_ratio` is the median of the
-neighbourhood the displacement came from — since that is what stands behind the value.
+`interpolated` marks points filled from their neighbors rather than measured. At such a point
+`correlation` is `NaN`, because there is no surface of its own, and `peak_ratio` is the median over the
+neighborhood the displacement came from.
 
 ```@example quality
 (interpolated = count(out.interpolated),
  unresolved = count(==(0), out.chip_size))
 ```
 
-Where they are matters more than how many, since it decides whether excluding them costs you a region
-or a sprinkling:
+Where they are matters more than how many, because it decides whether excluding them loses a region or
+scattered points:
 
 ```@example quality
 mask_panels(out.interpolated, out.chip_size .== 0;
             titles = ("interpolated", "unresolved"))
 ```
 
-The two could hardly look less alike, and that is the useful part. Interpolation is sparse here — 79
-points in small scattered clusters, so excluding them costs nothing in particular. The
-unresolved points are a solid block across the decorrelating band: that loss is a whole region of the
-scene, and no threshold or filter choice recovers it. A count of `1119` and a count of `79` read as
-comparable magnitudes of the same kind of problem; the figure shows they are not.
+The interpolated points are 79 points in small scattered clusters, so excluding them loses little. The
+unresolved points form a solid block across the decorrelating band, apart from a measured patch at its
+center. That loss is a whole region of the scene, and no threshold or filter setting recovers it. The
+counts 79 and 1119 do not show this difference; the figure does.
 
-Whether to keep interpolated points depends on the consumer. They are real estimates with real
-uncertainty, just not independent measurements; a strain calculation usually wants them excluded, a
-visualization usually does not.
+Whether to keep interpolated points depends on the use. They are estimates from neighboring
+measurements, not independent measurements. A strain calculation usually excludes them, and a
+visualization usually keeps them.
 
 ## Removing outliers
 
-A `correlation` gate is a point-by-point test and cannot see a displacement that is individually
-well-correlated but inconsistent with its neighbours. That is what [`GardnerFilter`](@ref) does, and it
-runs inside `autorift` by default — see [Filtering outliers](@ref) for its knobs.
+A `correlation` threshold tests each point alone, so it cannot reject a displacement that is
+well correlated but inconsistent with its neighbors. [`GardnerFilter`](@ref) does, and it runs inside
+`autorift` by default; see [Filtering outliers](@ref) for its settings.
 
 ## See also
 
-- [How feature tracking works](@ref) — why a peak can be wrong in the first place
-- [Filtering outliers](@ref) — the neighbourhood test the per-point gate cannot do
-- [`AutoRIFT.MultichipResult`](@ref) — every layer, and its contract
+- [How feature tracking works](@ref): why a peak can be wrong
+- [Filtering outliers](@ref): the neighborhood test the per-point threshold cannot do
+- [`AutoRIFT.MultichipResult`](@ref): every layer, and its contract

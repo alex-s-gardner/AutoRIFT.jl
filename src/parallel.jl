@@ -26,21 +26,19 @@ const PARALLEL_MIN_WORK = 1 << 18
 
 Run `work!(slice)` over slices of `idx`, on several threads when `cost` justifies it.
 
-`work!` must write only to output positions determined by the slice it is given, and read only
-input — the slices are handed out in no particular order and run concurrently, so any dependence
-between them is a race. `cost` is the total work the whole range represents, in element operations;
-below [`PARALLEL_MIN_WORK`](@ref) the range runs whole on the calling task.
+`work!` must write only to output positions determined by its slice and read only input. Slices
+run concurrently in no particular order, so any dependence between them is a race. `cost` is the
+total work of the whole range in element operations; below [`PARALLEL_MIN_WORK`](@ref) the range
+runs whole on the calling task.
 
-Disjoint *elements* are not enough when the output is a `BitArray`: it packs 64 of them into one
-word, so two slices whose boundary falls inside a word write that word concurrently and lose each
-other's bits. A loop filling one needs a `Matrix{Bool}` or must stay whole.
+Disjoint elements are not enough when the output is a `BitArray`: it packs 64 elements into a word,
+so two slices whose boundary falls inside a word lose each other's bits. Fill a `Matrix{Bool}`, or
+do not split.
 
-**Scratch belongs inside `work!`.** Allocating it there gives every slice its own, which is what
-makes the helper safe for any caller: a buffer created in the enclosing function and captured
-instead would be shared by every task at once. Julia also boxes a name that is assigned both inside
-a closure and in the enclosing scope, so a captured-and-reassigned buffer is shared even when it
-looks per-task — `src/tile.jl` records that failure at `_run_task_blocks!`, where it silently
-corrupted several hundred of 3721 points.
+Allocate scratch inside `work!` so each slice has its own. A buffer created in the enclosing
+function and captured by `work!` is shared by every task, including when it is also reassigned in the
+enclosing scope, because Julia boxes such a variable (`src/tile.jl` `_run_task_blocks!` records a
+case that silently corrupted several hundred of 3721 points).
 """
 function _parallel_slices(work!::F, idx::AbstractUnitRange, cost::Real) where {F}
     nthreads = Threads.nthreads()
@@ -78,19 +76,16 @@ end
 
 Reduce over slices of `idx` on several threads, and return the combined accumulator.
 
-The counterpart of [`_parallel_slices`](@ref) for a loop that produces a *value* rather than filling an
-output: `init()` builds one accumulator per slice, `accumulate!(acc, slice)` folds that slice into it,
-and `combine!(into, from)` merges two. `accumulate!` comes first so `do`-block syntax reaches it, which
-is the same reason [`_parallel_slices`](@ref) takes its loop body first.
+The counterpart of [`_parallel_slices`](@ref) for a loop that produces a value: `init()` builds one
+accumulator per slice, `accumulate!(acc, slice)` folds that slice into it, and `combine!(into, from)`
+merges two. `accumulate!` is the first argument so `do`-block syntax reaches it.
 
-**The result does not depend on the schedule, which is what makes this usable under a bit-identity
-gate.** Each slice has its own accumulator, so no two tasks touch one; and the accumulators are
-combined in slice order rather than completion order, so the reduction sees the same sequence every
-run. What the caller must supply is a `combine!` that is exact — summing integer counts is, and
-accumulating floating-point values in a different grouping is not, so a `Float64` sum wants either an
-order-independent formulation or the serial loop.
+Each slice has its own accumulator, and accumulators are combined in slice order rather than
+completion order, so the result does not depend on the schedule. It is bit-identical across runs
+only if `combine!` is exact: summing integer counts is, whereas floating-point accumulation in a
+different grouping is not.
 
-`cost` and the threshold below it behave exactly as in `_parallel_slices`.
+`cost` and its threshold behave as in `_parallel_slices`.
 """
 function _parallel_reduce(accumulate!::A, init::I, combine!::C,
                           idx::AbstractUnitRange, cost::Real) where {A,I,C}

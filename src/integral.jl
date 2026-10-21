@@ -59,12 +59,9 @@
 
 Fill `S` with the integral image (summed-area table) of `A`.
 
-`S` must be one larger than `A` in each dimension. The extra leading row and
-column are zero, which is what lets [`boxsum`](@ref) read four corners with no
-bounds checking or branching — the alternative, an `A`-sized table, needs a
-special case for every box touching the first row or column.
-
-`S[i+1, j+1]` holds the sum of `A[1:i, 1:j]`.
+`S` must be one larger than `A` in each dimension. `S[i+1, j+1]` holds the sum of `A[1:i, 1:j]`, and
+the leading row and column are zero, so [`boxsum`](@ref) reads four corners with no special case at
+the first row or column.
 """
 function integral!(S::AbstractMatrix{Float64}, A::AbstractMatrix)
     m, n = size(A)
@@ -97,13 +94,8 @@ end
 """
     integral_sq!(S, A)
 
-Fill `S` with the integral image of `A .^ 2`, without materialising the squared
-array.
-
-Squaring on the fly rather than in a temporary saves an allocation the size of the
-search window at every grid point — which, across the tens of millions of image
-pairs this package is built for, is the difference between a steady state and
-continuous garbage collection.
+Fill `S` with the integral image of `A .^ 2`, squaring on the fly so no temporary array is
+allocated. `S` has the same shape as in [`integral!`](@ref).
 """
 function integral_sq!(S::AbstractMatrix{Float64}, A::AbstractMatrix)
     m, n = size(A)
@@ -135,20 +127,10 @@ end
 
 Fill `S` with the integral image of `A` and `S2` with that of `A .^ 2`, in **one** traversal.
 
-Every caller that needs the sum table needs the sum-of-squares table as well — the variance
-identity `Σ(W - W̄)² = ΣW² - (ΣW)²/n` uses both — so computing them separately reads `A` twice
-and writes two tables in two passes over memory that does not stay in cache between them.
-
-Fusing is worth **1.5-1.66x** on the pair of tables, measured at 81²/128²/192², which is 6-8% of a
-whole correlation at chip 32/64/128. Bit-identical to calling the two functions in sequence: each
-running sum accumulates in the same order over the same values, so this trades memory traffic and
-nothing else. Verified exactly, not to a tolerance.
-
-Four columns are traversed at once, for a further **1.2-1.63x** and also bit-identically — see the
-comment on the loop for why the summation order is unchanged.
-
-The separate [`integral!`](@ref) and [`integral_sq!`](@ref) remain, because `NCC` needs only the
-squares and the tests exercise each independently.
+The variance identity `Σ(W - W̄)² = ΣW² - (ΣW)²/n` needs both tables. Computing them in one pass is
+1.5 to 1.66 times faster than two passes (measured at 81²/128²/192²), and traversing four columns at
+once is a further 1.2 to 1.63 times faster. The result is bit-identical to calling [`integral!`](@ref)
+and [`integral_sq!`](@ref) in sequence.
 """
 function integral_both!(S::AbstractMatrix{Float64}, S2::AbstractMatrix{Float64},
                         A::AbstractMatrix)
@@ -274,8 +256,7 @@ end
 """
     integral(A) -> Matrix{Float64}
 
-Allocating form of [`integral!`](@ref), for tests and one-off use. The hot path
-uses the in-place version with a preallocated table.
+Allocating form of [`integral!`](@ref), for tests and one-off use.
 """
 integral(A::AbstractMatrix) = integral!(zeros(Float64, size(A, 1) + 1,
                                               size(A, 2) + 1), A)
@@ -294,16 +275,10 @@ integral_sq(A::AbstractMatrix) = integral_sq!(zeros(Float64, size(A, 1) + 1,
 Sum of the `h`-by-`w` block of the original array whose top-left corner is at
 `(i, j)`, read from its integral image `S` in four accesses.
 
-No bounds checking: the caller is responsible for `i + h <= size(S, 1)` and
-`j + w <= size(S, 2)`. This is called once per candidate shift per grid point —
-hundreds of millions of times per image pair — so the check is hoisted to the
-loop that computes the shift range instead.
-
-The element type is unconstrained beyond `Number`, which the four reads and three operations
-here are all that is required. The tables the CPU path builds are `Float64` or `ComplexF64` for
-the cancellation reason at the head of this file; a device without `Float64` builds `Float32`
-tables over a mean-centered window instead, which removes that cancellation rather than
-tolerating it.
+No bounds checking: the caller must ensure `i + h <= size(S, 1)` and `j + w <= size(S, 2)`. The
+element type may be any `Number`. The CPU path builds `Float64` or `ComplexF64` tables to avoid
+cancellation in the variance; a device without `Float64` builds `Float32` tables over a
+mean-centered window instead.
 """
 @inline function boxsum(S::AbstractMatrix{<:Number}, i::Int, j::Int, h::Int, w::Int)
     @inbounds return S[i + h, j + w] - S[i, j + w] - S[i + h, j] + S[i, j]

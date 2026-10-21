@@ -5,8 +5,8 @@ CurrentModule = AutoRIFT
 # Results
 
 `autorift` on plain arrays returns a `MultichipResult`: the displacement layers, the correlation
-strength, and which chip size answered at each point. The rest of this page is the machinery behind
-it, exposed for callers who drive a single scale or resample a field themselves.
+strength, and the chip size that produced each point. The rest of this page covers the steps behind
+it, for callers who run a single chip size or resample a field themselves.
 
 ```@docs
 MultichipResult

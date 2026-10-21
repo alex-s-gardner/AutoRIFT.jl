@@ -18,22 +18,20 @@
 """
     AutoRIFT.outlier_filter(; kwargs...) -> GardnerFilter
 
-Build a [`GardnerFilter`](@ref), AutoRIFT's default outlier method.
-
-A spelling that names the job rather than the author, kept because most callers want the
-default filter and not a choice between filters. Takes `GardnerFilter`'s keywords.
+Build a [`GardnerFilter`](@ref), AutoRIFT's default outlier method. Takes `GardnerFilter`'s
+keywords.
 """
 outlier_filter(; kwargs...) = GardnerFilter(; kwargs...)
 
 """
     reject_outliers(dx, dy, radius_x, radius_y, valid, upsampling, method) -> BitMatrix
 
-Which displacements to keep, per `method` — an [`OutlierMethod`](@ref).
+Which displacements to keep, per `method`, an [`OutlierMethod`](@ref).
 
-`dx` and `dy` are displacement fields in pixels, `radius_x`/`radius_y` the per-point
-search radii they were found within, `valid` the points to consider at all, and
-`upsampling` the subpixel refinement factor (which sets the quantization floor). Returns a
-fresh mask; the inputs are not modified.
+`dx` and `dy` are displacement fields in pixels, `radius_x`/`radius_y` the per-point search radii
+they were found within, `valid` the points to consider at all, and `upsampling` the sub-pixel
+refinement factor (which sets the quantization floor). Returns a new mask; the inputs are not
+modified. Throws `DimensionMismatch` unless all five arrays have the same axes.
 """
 function reject_outliers(
     dx::AbstractMatrix, dy::AbstractMatrix,
@@ -55,42 +53,27 @@ _reject(dx, _dy, _rx, _ry, valid, _up, ::NoOutlierFilter) =
 """
     _reject(..., f::GardnerFilter)
 
-Two stages, run in sequence, both from autoRIFT's `DISP_FILT`:
+Two stages in sequence, both from autoRIFT's `DISP_FILT`. A point is kept only if it passes both.
 
-  1. **Agreement.** Keep a point only if enough of its neighbours have a similar
-     displacement. Cheap, and removes isolated wild vectors.
+  1. **Agreement.** Keep a point only if enough of its neighbors have a similar displacement. This
+     removes isolated wild vectors.
+  2. **Median deviation.** Keep a point only if it lies within a few median absolute deviations
+     (MAD) of its neighborhood median. This catches a false match that sits near other false
+     matches.
 
-  2. **Median deviation.** Keep a point only if it lies within a few median absolute
-     deviations of its neighbourhood median. Catches the subtler case of a false match
-     that happens to sit near other false matches.
+Stage 1 recomputes its mask from scratch on each iteration, so a point rejected in one pass can
+return in the next, because its neighbors' rejection changes the counts. Stage 2 intersects with the
+mask it inherits, so a rejection there is final. The reference has the same asymmetry
+(`autoRIFT.py:1610-1643`).
 
-A point is kept only if it passes both.
+Both stages divide displacements by the local search radius before comparing. Stage 1's threshold,
+`agree_tolerance`, is a fixed fraction of the radius, so a five-pixel disagreement is negligible
+where the search reached fifty pixels and decisive where it reached six. Stage 2 is invariant to the
+radius, since the deviation and the MAD scale together, except for the quantization floor (twice the
+sub-pixel step, `2 / (upsampling * radius)`), which is an absolute step.
 
-Monotonicity differs between the stages, and matching the reference on this is what makes the
-two comparable. Stage 1 recomputes its mask from scratch each iteration — a point rejected in
-one pass can return in the next, because its neighbours' rejection changes the counts — while
-stage 2 intersects with the mask it inherits, so a rejection there is final. The reference has
-the same asymmetry: `M = (...) & (...)` in the first loop against `M = (...) & (...) & M` in the
-second (`autoRIFT.py:1610-1643`).
-
-!!! note "Why displacements are normalized by search radius"
-    Both stages divide by the local search radius before comparing, but they do not
-    both depend on it.
-
-    Stage 1's threshold is `agree_tolerance`, a fixed fraction of the radius, so
-    normalising is what gives it meaning: a five-pixel disagreement is negligible
-    where the search reached fifty pixels and decisive where it reached six, and the
-    radius varies across a scene because it comes from an a-priori velocity field.
-
-    Stage 2 is radius-*invariant* by construction. Its tolerance is `mad_scale` times
-    the neighbourhood MAD, and both the deviation and the MAD scale as one over the
-    radius, so the ratio is unchanged. Normalising there buys consistency of units
-    rather than of behaviour — the one place it changes the verdict is the
-    quantization floor, which is an absolute subpixel step and therefore *does* scale
-    against the normalized deviation.
-
-See [`GardnerFilter`](@ref) for how this differs from the normalized median test of
-Westerweel & Scarano (2005), which it resembles but is not.
+See [`GardnerFilter`](@ref) for how this differs from the normalized median test of Westerweel &
+Scarano (2005).
 """
 function _reject(
     dx::AbstractMatrix, dy::AbstractMatrix,

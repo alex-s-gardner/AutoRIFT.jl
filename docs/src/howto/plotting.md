@@ -1,24 +1,23 @@
 
 # Plotting a result
 
-A displacement field is a matrix, and a matrix drawn carelessly is drawn wrong. Two things have to be
-handled, and neither produces an error when it is missed.
+A displacement field is a matrix. Plotting one correctly takes care with two things, and neither raises an
+error when missed.
 
 ## Orientation
 
-`heatmap!` treats an array's **first** index as the x axis. A displacement field is indexed
-`[row, column]`, so passing one directly draws it transposed — rows run horizontally. A feature
-elongated along y appears elongated along x, which inverts the reading of any anisotropy in the field,
-and a north-up scene appears rotated.
+`heatmap!` treats an array's first index as the x axis. A displacement field is indexed `[row, column]`,
+so passing one directly draws it transposed, with rows running horizontally. A feature elongated along y
+appears elongated along x, and a north-up scene appears rotated.
 
-Transposing fixes the axes. Reversing the resulting columns then puts row 1 at the top, which is where
-the first row of an image belongs:
+Transposing fixes the axes. Reversing the columns of the transpose then puts row 1 at the top, where the
+first row of an image belongs:
 
 ```julia
 mapshow(A) = reverse(permutedims(A); dims = 2)
 ```
 
-That is the whole fix, and every figure in this documentation goes through it. Applied once:
+Every figure in this documentation goes through this function. Applied once:
 
 ```@example plotting
 using AutoRIFT, CairoMakie
@@ -34,8 +33,8 @@ heatmap!(Axis(fig[1, 2]; title = "dx, through mapshow", aspect = DataAspect()), 
 fig
 ```
 
-On a field this uniform the two look similar, which is the danger. Make the field anisotropic and the
-difference is unmistakable:
+On a uniform field the two panels look alike. With an anisotropic field the difference is clear. Here
+the displacement is larger in a band of rows:
 
 ```@example plotting
 striped, striped_sec, _, _ =
@@ -49,24 +48,21 @@ heatmap!(Axis(fig[1, 2]; title = "mapshow: horizontally, as built", aspect = Dat
 fig
 ```
 
-The band was built across rows. Only the second panel shows it that way.
+The band covers a range of rows, so it should be horizontal. Only the second panel shows it that way.
 
 ## Unmeasured points
 
-Not every grid point gets an answer. `dx` and `dy` are `NaN` where nothing was measured, and
-`correlation` likewise — which most colormaps render as a dead color rather than as nothing. Points
-that a level did resolve but that hold a genuine zero displacement must not look the same as points
-that failed, because zero is a real measurement.
-
-Convert explicitly:
+Not every grid point has a measurement. `dx`, `dy` and `correlation` are `NaN` where nothing was
+measured, and most colormaps draw `NaN` in a visible color. A zero displacement is a real measurement and
+must look different from a missing one. Two helpers convert explicitly:
 
 ```julia
 blank(A, keep) = map((v, k) -> k ? Float64(v) : NaN, A, keep)
 measured(out) = .!isnan.(out.dx)
 ```
 
-`chip_size` needs its own treatment: it is an integer layer using `0` for "no level answered", which
-would otherwise plot as a chip size of zero.
+`chip_size` is an integer layer that uses `0` for "no level answered". It has to be blanked too, or it
+plots as a chip size of zero.
 
 ```@example plotting
 # A decorrelated band, so that more than one chip size answers.
@@ -84,23 +80,22 @@ Colorbar(fig[1, 4], hm2)
 fig
 ```
 
-The left panel's color scale starts at zero and spends most of its range on the gaps. The right one
-spends all of it on the three real chip sizes.
+The left panel's color scale starts at zero, so the gaps take up most of its range. The right panel's scale
+covers only the chip sizes that were used.
 
 ## Color scales
 
-Three conventions, each for a different kind of layer.
+Each kind of layer uses a different convention.
 
-**Displacement is diverging and signed.** Use a diverging colormap with **symmetric** limits, and take
-those limits from a high percentile of `abs` rather than from the extremes — one outlier otherwise sets
-the scale for the whole figure. Share one scale across every panel drawn together, so a difference in
-sign or magnitude is visible rather than absorbed by per-panel scaling.
+- **Displacement** is signed. Use a diverging colormap with symmetric limits taken from a high percentile
+  of `abs` rather than the extremes, since one outlier would otherwise set the scale. Share one scale
+  across all panels drawn together, so differences in sign and magnitude show.
+- **Correlation** is normalized. Fix the range at `(0, 1)`. A fitted scale makes a weak field look as
+  strong as a good one.
+- **Chip size** takes a few values, each `chip_size_min` times a power of two. A sequential colormap works,
+  provided the zeros are blanked.
 
-**Correlation is already normalized.** Fix the range at `(0, 1)`. A fitted scale makes a weak field look
-as strong as a good one, which defeats the purpose of plotting it.
-
-**Chip size is categorical.** It takes a handful of values, all powers of two. A sequential colormap
-reads correctly; what matters is blanking the zeros.
+`displacement_panels` and `quality_panels` apply these:
 
 ```@example plotting
 displacement_panels(out)
@@ -112,8 +107,8 @@ quality_panels(out)
 
 ## Geospatial output
 
-Given `Raster` input, `autorift` returns a `RasterStack`, and Makie's `heatmap` has a Rasters recipe
-that reads the coordinates from the dimensions:
+Given `Raster` input, `autorift` returns a `RasterStack`. Makie's `heatmap` has a Rasters recipe that
+reads the coordinates from the dimensions:
 
 ```julia
 using Rasters, CairoMakie
@@ -121,28 +116,31 @@ out = autorift(reference_raster, secondary_raster; dt = Day(16))
 heatmap(out.vx; colormap = :balance)
 ```
 
-No `mapshow` there — the recipe handles orientation, because the lookups tell it which way y runs. That
-is also what makes it the place to check a sign convention by eye: a projected axis makes an error
-visible in a way an array index does not. See [Conventions](@ref).
+`mapshow` is not needed, because the recipe takes the orientation from the lookups. A projected axis also
+makes a sign error visible, which an array index does not. See [Conventions](@ref).
 
 ## The helpers used here
 
-Everything above is packaged in `docs/figures.jl` in this repository, which every documentation page
-includes. It is not part of the API — copy what you need:
+`docs/figures.jl` in this repository defines these helpers, and every documentation page includes it. It
+is not part of the package API. Copy what you need:
 
-| helper | what it draws |
+| helper | what it does |
 |---|---|
-| `mapshow(A)` | one field in image orientation |
-| `blank(A, keep)` | `NaN` where `keep` is false |
-| `measured(out)` | which points carry a displacement |
-| `image_panels(images...)` | input images on a shared grayscale |
-| `displacement_panels(out)` | `dx` and `dy` on one symmetric scale |
-| `quality_panels(out)` | `correlation` at `(0, 1)`, and chip size |
-| `field_panels(fields...; titles)` | several displacement-like fields on one scale |
-| `input_field(A, label)` | a single per-point argument — a chip size, radius or prior |
-| `surface_panels(chip, window, surface)` | one correlation, with its peak marked |
+| `mapshow(A)` | returns a field in image orientation |
+| `blank(A, keep)` | returns `A` as `Float64` with `NaN` where `keep` is false |
+| `measured(out)` | marks the points that carry a displacement |
+| `image_panels(images...; titles, shared)` | draws input images on a shared grayscale, or one scale per panel |
+| `displacement_panels(out)` | draws `dx` and `dy` on one symmetric scale |
+| `quality_panels(out)` | draws `correlation` on `(0, 1)` and the chip size |
+| `field_panels(fields...; titles)` | draws several displacement-like fields on one symmetric scale |
+| `input_field(A, label)` | draws one per-point argument, such as a chip size, radius or prior |
+| `surface_panels(chip, window, surface)` | draws a chip, its search window and the correlation surface with the peak marked |
+| `mask_panels(masks...; titles)` | draws boolean per-point masks, each title with its point count |
+| `warped_pair(source, n, offset)` | returns a reference, a warped secondary and the true `dx` and `dy` |
+| `photo()` | returns the example photograph |
+| `decorrelate(img, weight; amplitude, seed)` | adds noise scaled by `weight(row, col)` |
 
 ## See also
 
-- [Conventions](@ref) — the sign of `dy`, and why a projected plot is the check for it
-- [A guided walkthrough](@ref) — these helpers in use on every step
+- [Conventions](@ref): the sign of `dy`, and why a projected plot checks it
+- [A guided walkthrough](@ref): these helpers in use

@@ -29,25 +29,20 @@
 
 Per-point results of a correlation pass.
 
-`dx` and `dy` are displacements in pixels, `correlation` the peak similarity, `peak_ratio` how far that
-peak stood above the best rival peak elsewhere on the surface (see `AutoRIFT.peak_ratio`), and
-`searched` marks the points that were actually correlated. Non-searched and failed points are `NaN` in
-`dx`/`dy` and `false` in `searched` — distinguishing "no measurement" from a measurement of zero, which
-the reference conflates.
+`dx` and `dy` are displacements in pixels, `correlation` the peak similarity, `peak_ratio` the ratio of
+that peak to the best rival peak elsewhere on the surface (see `AutoRIFT.peak_ratio`), and `searched`
+marks the points that were correlated. Points that were not searched, or that failed, are `NaN` in
+`dx`/`dy` and `false` in `searched`, which distinguishes no measurement from a measurement of zero.
 
-`correlation` and `peak_ratio` are both quality measures and they are not interchangeable: the first is
-how strong the match was, the second whether it was *unique*. A peak of 0.6 with no rival locates a
-displacement; the same 0.6 with a second peak of 0.58 a wavelength away does not say which of the two
-the feature moved by.
+`correlation` and `peak_ratio` measure different things: the first is how strong the match was, the
+second whether it was unique. A peak of 0.6 with no rival locates a displacement; the same 0.6 with a
+second peak of 0.58 a wavelength away does not say which of the two the feature moved by.
 
-`searched` is a `Matrix{Bool}` rather than a `BitMatrix` deliberately. `BitArray` packs 64
-elements per word, so writing one element is a read-modify-write of that word — and the
-threaded grid loop has different tasks writing different points that may share a word, which
-can lose a neighbour's write. A byte per element is not shared, so the writes are genuinely
-independent. Four times the memory for a mask that is a fraction of the output anyway.
+`searched` is a `Matrix{Bool}` rather than a `BitMatrix` because threaded tasks write neighboring
+points, and writes to elements sharing a packed word can be lost.
 
-Fields share the shape of the [`PointSet`](@ref) they came from, so a gridded point set
-yields gridded output.
+Fields have the shape of the [`PointSet`](@ref) they came from, so a gridded point set yields gridded
+output.
 """
 struct DisplacementField{N,A<:AbstractArray{Float32,N},B<:AbstractArray{Bool,N}}
     dx::A
@@ -60,7 +55,7 @@ end
 """
     displacement_field(pts::PointSet) -> DisplacementField
 
-Allocate results for `pts`, initialised to "no measurement".
+Allocate results for `pts`, initialized to "no measurement".
 """
 function displacement_field(pts::PointSet)
     sz = size(pts.x)
@@ -87,35 +82,29 @@ nmeasured(d::DisplacementField) = count(!isnan, d.dx)
 
 Correlate `pair` at every searchable point of `pts`, writing into `out`.
 
-The chip is cut from the secondary image and the search window from the reference, so the
-returned displacement is the offset from secondary back to reference — see
-`peak_offset` for why that is the negative of the feature motion, and note it is
-*not* negated here. The single flip to a physical convention happens at the output
-boundary.
+The chip is cut from the secondary image and the search window from the reference, so the returned
+displacement is the offset from secondary back to reference, which is the negative of the feature
+motion (see `peak_offset`). It is not negated here.
 
-`subpixel` overrides the parameter set's refinement method, which the caller needs: a
-coarse pass wants integer peaks only, and paying for refinement there would be wasted.
+Keywords:
 
-`measure` likewise overrides the similarity measure. `p.similarity` is a tuple, one entry per
-chip-size level, so a single level cannot read it without knowing which level it is — the
-chip-size loop passes the right one. The default is the first, which is correct for a caller
-running `track!` directly on a single scale.
+  * `subpixel`: the refinement method, overriding the parameter set's first. A coarse pass
+    uses integer peaks only.
+  * `measure`: the similarity measure, overriding `first(p.similarity)`. `p.similarity` has one entry
+    per chip-size level, so the chip-size loop passes the right one.
+  * `geometry`: the largest chip and radius, overriding those derived from `pts`. Correlating a
+    subset of a point set with the geometry of the whole gives the same answer as correlating the
+    whole and reading those points out (see [`AutoRIFT.PassGeometry`](@ref)). It may widen the pass
+    but not narrow it, otherwise `ArgumentError` is thrown.
+  * `okmask`: the pixels valid in both images, default [`valid`](@ref) of the pair. Pass it when
+    correlating the same pair repeatedly to compute it once. It must equal `valid(pair)`; a narrower
+    mask silently skips points.
 
-`geometry` overrides the largest chip and radius this pass would derive from `pts`, and it is what
-makes correlating a *subset* of a point set give the same answer as correlating the whole and
-reading those points out — see [`AutoRIFT.PassGeometry`](@ref), which explains why those are
-otherwise different computations. It may only widen the pass, never narrow it.
+Throws `DimensionMismatch` if `out` and `pts` differ in length.
 
-`okmask` is the pixels valid in both images, defaulting to [`valid`](@ref) of the pair. Pass it when
-correlating the same pair repeatedly: the intersection is a property of the pair, so a caller running
-several passes over one — as the chip-size loop does — computes it once instead of per pass. It must
-be `valid(pair)`; a narrower mask silently skips points, which is what the default guards against.
-
-A point is skipped, leaving `NaN`, if its search radius is zero in either axis, if its
-chip lies wholly outside the image, or if its chip contains no valid pixel. The last is
-what keeps zero-padding out of the result: the images are padded so the inner loop needs
-no bounds test, but padding is not data, and a chip made of it would correlate with any
-other such chip. See `valid` on [`ImagePair`](@ref).
+A point is skipped, leaving `NaN`, if its search radius is zero in either axis, if its chip or search
+window falls outside the image, if no more than `min_chip_valid_fraction` of its chip is valid, or if
+its chip is constant. Padding is not data, so a chip made mostly of padding is not correlated.
 """
 function track!(out::DisplacementField, pair::ImagePair, pts::PointSet, p::Params;
                 subpixel::SubpixelMethod = first(p.subpixel),
@@ -245,8 +234,8 @@ track(pair::ImagePair, pts::PointSet, p::Params; kw...) =
 
 The pass geometry `pts` implies: the largest chip and radius over its searchable points.
 
-Pass the result to [`track!`](@ref) to correlate a *subset* of `pts` as the whole set would have
-been correlated. See [`AutoRIFT.PassGeometry`](@ref) for why that is not the same computation.
+Pass the result to [`track!`](@ref) to correlate a subset of `pts` as the whole set would have been
+correlated. See [`AutoRIFT.PassGeometry`](@ref).
 """
 function pass_geometry(pts::PointSet)
     cx = cy = rx = ry = 0
@@ -342,22 +331,13 @@ end
 """
     AutoRIFT.PaddedMask(parent, pad)
 
-`parent` grown by `pad` on every side and reading `false` outside it, without materializing anything.
+`parent` grown by `pad` on every side and reading `false` outside it, without materializing a
+padded array. The imagery is padded eagerly because the FFT reads it densely, but the mask is read
+only over each chip's footprint. A packed mask padded into a dense `Matrix{Bool}` would grow from
+0.39 GiB to 3.13 GiB on a NISAR L1 scene.
 
-**The validity mask is padded lazily where the imagery is padded eagerly, because the two are read
-differently.** A padded image is handed to the FFT and to the integral tables, which walk it densely;
-the mask has exactly one consumer, `_valid_fraction` over a chip footprint, which touches each of a
-chip's pixels once. So the branch this adds is paid once per pixel of the chip rather than of the
-whole padded scene, while the array it avoids is scene-sized.
-
-Avoiding it matters because `_zeropad` would *expand* it. A mask arrives packed — `valid` returns the
-`BitMatrix` broadcasting produces — and `Matrix{T}(undef, …)` of a `Bool` eltype is one byte per pixel,
-so padding a whole NISAR L1 scene's mask costs **3.13 GiB against the 0.39 GiB its source occupies**,
-a third of what a pass holds. Nothing reads it densely enough to want that.
-
-`false` outside is the same convention `_zeropad` uses, and it is what distinguishes "outside the
-image" from "dark": a chip made of padding correlates with any other such chip, so the correlator
-declines a point whose chip is mostly padding.
+`false` outside matches the zero padding of the imagery, so the correlator declines a chip that is
+mostly padding.
 """
 struct PaddedMask{A<:AbstractMatrix{Bool}} <: AbstractMatrix{Bool}
     parent::A

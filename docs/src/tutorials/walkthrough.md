@@ -1,19 +1,19 @@
 # A guided walkthrough
 
-Eight steps over one scene. Each adds a single capability to the call before it, and shows what that
-argument changed. Stop wherever the result is good enough — every step is a complete, working call.
+Eight steps over one scene, each adding one argument to the call. Every step is a complete, working
+call, so stop wherever the result is good enough.
 
-The first five steps are keywords. The last three pass a
-[`AutoRIFT.PointSet`](@ref AutoRIFT.PointSet), which is how a setting that *varies across the scene*
-arrives, since a per-point field cannot be a scalar keyword.
+The first five steps pass keywords. The last three pass a
+[`AutoRIFT.PointSet`](@ref AutoRIFT.PointSet), because a setting that varies across the scene is a
+per-point array and cannot be a scalar keyword.
 
 ## The scene
 
 Two images of the same scene, the second warped from the first so the answer is known. A band across
-the middle — Ali's waist and the ropes behind him — moved 22 pixels to the left between them;
-everything else moved 2. The band also **decorrelates** — its surface changes between the two images,
-not just its position — which is what a real moving surface does and what makes a chip size worth
-choosing.
+the middle (Ali's waist and the ropes behind him) moved 22 pixels to the left between them;
+everything else moved 2. Noise is added to the second image within the band, so the band's texture
+differs between the images as well as its position. A moving surface decorrelates in the same way,
+and it is why the chip size matters.
 
 ```@example walkthrough
 using AutoRIFT
@@ -37,12 +37,12 @@ field_panels(truth_dx, truth_dy; titles = ("true dx (px)", "true dy (px)"))
 ```
 
 Displacement is in pixels, `dx` along the second index and `dy` along the first, positive downward.
-It is the offset from the secondary image back to the reference, so its sign is the opposite of the
-surface's motion — a band that moved left reports a positive `dx`. [Conventions](@ref) is the page
-for that, and for the y direction under a map projection.
+It is the offset from the secondary image back to the reference, so its sign is opposite to the
+surface's motion: a band that moved left reports a positive `dx`. [Conventions](@ref) covers this and
+the y direction under a map projection.
 
-The figures are drawn in image orientation — row 1 at the top — which takes a transposition; see
-[Plotting](@ref) for the one function that does it and why a raw `heatmap!` is wrong.
+The figures are drawn in image orientation, with row 1 at the top. [Plotting](@ref) explains the
+transposition this takes and why a raw `heatmap!` is wrong.
 
 ## Step 1 — two arrays
 
@@ -54,10 +54,10 @@ out = autorift(reference, secondary)
 displacement_panels(out)
 ```
 
-The band is recovered. Defaults did the rest: chips of 32, 64 and 128 pixels, a search radius of 25,
-and an output point every 32 pixels — which on a 512-pixel image is an 11 × 11 grid, coarse enough
-that the figure shows individual points. Every later step measures every 8 pixels so the result reads
-as a field:
+The band is recovered. The defaults are chips of 32, 64 and 128 pixels, a search radius of 25, and an
+output point every 32 pixels. On a 512-pixel image that is an 11 × 11 grid, coarse enough that the
+figure shows individual points. Every later step measures every 8 pixels so the result reads as a
+field:
 
 ```@example walkthrough
 out = autorift(reference, secondary; grid_spacing = 8)
@@ -71,17 +71,16 @@ displacement_panels(out)
 quality_panels(out)
 ```
 
-Gaps are points with no answer, and they come from two places. The image border is one: a chip and its
-search window must fit inside the image. The strips along the band edges are the other, and they are
-the more instructive — a chip there spans the transition between two speeds, so no single displacement
-describes what it contains. Their position follows the chip size, which is the tell: a larger chip
-starts failing further from the edge. A gap is drawn blank rather
-than as zero, because zero displacement is a real measurement.
+Gaps are points with no answer, and they have two sources. One is the image border: a chip and its
+search window must fit inside the image. The other is the strips along the band edges, where the
+displacement changes from 2 to 22 pixels over 28 rows and the surface is partly decorrelated. A
+larger chip answers more of these points but averages the two speeds ([Multiple chip sizes](@ref)). A
+gap is drawn blank rather than as zero, because zero displacement is a real measurement.
 
 ## Step 2 — chip size and search radius
 
 A chip is the patch of the reference image matched into the secondary; the search radius is how far
-it may move. Both in pixels.
+it may move. Both are in pixels.
 
 ```@example walkthrough
 coarse = autorift(reference, secondary; chip_size = 64, search_radius = 25, grid_spacing = 8)
@@ -91,18 +90,21 @@ field_panels(blank(fine.dx, measured(fine)), blank(coarse.dx, measured(coarse));
              titles = ("chip 16", "chip 64"))
 ```
 
-Small chips resolve the band edge and are noisier; large chips are smooth and blur it. A chip must
-contain enough texture to be distinguishable from its surroundings, and must be small enough that the
-displacement is roughly uniform across it — those pull in opposite directions, which is why the
-default searches several sizes rather than one.
+`chip_size` is the finest chip tried and `chip_size_max` defaults to four times it, so the first run
+tries chips of 16, 32 and 64 pixels and the second 64, 128 and 256. The grid margin is set by the
+largest chip and the search radius, so the second run's grid spans only rows 155 to 358, in or near the
+band, and nearly all of its answers are near 22.
 
-The radius must cover the motion: everything beyond it is unreachable. It is also the expensive
-knob — cost grows with the area searched, not its width.
+A chip averages the displacement over its area, so a large chip blurs a sharp boundary. A chip also
+needs enough texture to be distinguishable from its surroundings, which a small chip may lack. These
+pull in opposite directions, which is why the default searches several sizes rather than one.
+
+The radius must cover the motion; anything beyond it is unreachable. It is also the expensive setting,
+because cost grows with the area searched.
 
 ## Step 3 — output spacing
 
-`grid_spacing` sets how often a displacement is measured, and changes nothing about how it is
-measured.
+`grid_spacing` sets how often a displacement is measured.
 
 ```@example walkthrough
 sparse = autorift(reference, secondary; grid_spacing = 32)
@@ -112,14 +114,15 @@ field_panels(blank(sparse.dx, measured(sparse)), blank(dense.dx, measured(dense)
              titles = ("spacing 32", "spacing 8"))
 ```
 
-Same field, sampled twice. Neighbouring points at spacing 8 overlap heavily — their chips are 32
-pixels wide — so a fine grid costs proportionally more without adding independent information. It
-still reads better as a figure, which is why every step here uses 8.
+Both panels sample the same field and agree except along the band edges, where the two grids land on
+different positions. Neighboring points at spacing 8 overlap heavily, since their chips are at least
+32 pixels wide, so a finer grid costs proportionally more without adding independent information.
+Every later step uses 8 because it reads better as a figure.
 
 ## Step 4 — a range of chip sizes
 
 `chip_size` and `chip_size_max` together define the sizes to try. Every point is attempted at the
-finest, and coarser ones fill in where that failed.
+finest, and coarser sizes fill in where that failed.
 
 ```@example walkthrough
 out = autorift(reference, secondary; chip_size = 16, chip_size_max = 64, grid_spacing = 8)
@@ -127,17 +130,18 @@ out = autorift(reference, secondary; chip_size = 16, chip_size_max = 64, grid_sp
 quality_panels(out)
 ```
 
-The chip-size map is the most informative figure here: 16 pixels answers the well-correlated
-surroundings, and the decorrelated band needs 32, and in a few places 64. Neither uniform choice does both — the fine
-chip fails in the band and the coarse chip blurs the edge everywhere else.
+The chip-size map shows where each size was needed. The 16-pixel chip answers the surroundings and
+part of the band. The 32-pixel chip answers band points the 16-pixel chip missed, and the 64-pixel chip
+answers one small patch. A 16-pixel chip alone leaves much of the band unanswered, and a coarse chip
+used everywhere blurs the band edge.
 
 This is not an image pyramid. Every size correlates the images at full resolution; only the chip
 changes. See [Multiple chip sizes](@ref) for how the levels combine.
 
 ## Step 5 — a prior
 
-Motion larger than the search radius is not found. The fix is to tell the search where to look, not
-to widen it.
+Motion larger than the search radius is not found. A prior offsets the search window so that it covers
+the motion without widening the radius.
 
 ```@example walkthrough
 narrow = autorift(reference, secondary; search_radius = 10, grid_spacing = 8)
@@ -147,17 +151,18 @@ field_panels(blank(narrow.dx, measured(narrow)), blank(guided.dx, measured(guide
              titles = ("radius 10", "radius 10, dx_prior 22"))
 ```
 
-At a radius of 10 the band is out of reach and comes back empty. A prior of 22 offsets the search
-window, and the same radius now measures the band at 22 pixels — the search measures the *departure*
-from the prior, so a good guess makes a small radius sufficient.
+At a radius of 10 the band is out of reach and comes back empty. With a prior of 22 the same radius
+measures the band at 22 pixels, because the search finds the departure from the prior. The prior is
+one number for the whole scene, so the surroundings, which move 2, are now out of reach. Step 8 fixes
+that with a per-point prior.
 
 Where a prior comes from, when the pair is all you have: [First guess](@ref).
 
 ## Step 6 — a chip size that varies
 
-The first three steps' settings were scalars. A setting that differs from point to point is passed as
-an array, on a [`AutoRIFT.PointSet`](@ref AutoRIFT.PointSet) — the search points themselves, one
-entry per point per field.
+A setting that differs from point to point is passed as an array, on a
+[`AutoRIFT.PointSet`](@ref AutoRIFT.PointSet), which holds the search points with one entry per point
+per field.
 
 Build the grid, then attach the field:
 
@@ -180,17 +185,17 @@ out = autorift(reference, secondary, bounded;
 quality_panels(out)
 ```
 
-The 64-pixel level no longer runs outside the band. Note what the bound does *not* do: the finest
-chip is attempted at every point regardless, so these bounds restrict the coarser levels only — see
+The bound limits every point outside the band to the 16-pixel level. Inside the band the 32- and
+64-pixel levels may run, and the map shows answers at 16 and 32 only. The finest chip is attempted at
+every point regardless of the bound, so these bounds restrict the coarser levels only. See
 [`AutoRIFT.PointSet`](@ref AutoRIFT.PointSet).
 
-Any field may stay scalar while another varies. `search_radius_x = 24` above is one number for every
-point, beside a per-point `chip_size_max_x`; mixing the two is ordinary.
+A field may stay scalar while another varies. `search_radius_x = 24` above is one number for every
+point, beside a per-point `chip_size_max_x`.
 
 ## Step 7 — a search radius that varies
 
-The radius is the expensive setting, so spending it only where the motion is large is the difference
-between a run that finishes and one that does not.
+Cost grows with the searched area, so use a wide radius only where the motion is large.
 
 ```@example walkthrough
 # Wide enough for the band, zero outside it. A zero radius skips the point entirely.
@@ -206,21 +211,22 @@ out = autorift(reference, secondary, banded; chip_size = 32, grid_spacing = 8)
 displacement_panels(out)
 ```
 
-[`AutoRIFT.nsearchable`](@ref AutoRIFT.nsearchable) counts the points that will actually be
-correlated, which is what the run costs:
+Points outside the band are not searched, so the figure is blank there.
+[`AutoRIFT.nsearchable`](@ref AutoRIFT.nsearchable) counts the points with a nonzero radius in both
+axes, which sets the cost of the run. Here 1150 of the 2500 grid points are searched:
 
 ```@example walkthrough
 uniform = AutoRIFT.pointset(grid.x, grid.y; search_radius_x = 28, search_radius_y = 28)
 (uniform = AutoRIFT.nsearchable(uniform), banded = AutoRIFT.nsearchable(banded))
 ```
 
-The radius need not be isotropic. A surface moving mostly along x wants a wide `search_radius_x` and
-a narrow `search_radius_y`; the window follows, and so does the cost.
+The radius need not be the same in both axes. A surface moving mostly along x wants a wide
+`search_radius_x` and a narrow `search_radius_y`, and the window and the cost follow.
 
 ## Step 8 — a prior that varies
 
-Step 5's prior was one number, which only works when the whole scene moves together. A per-point
-prior handles a scene where it does not.
+Step 5's single prior suits a scene that moves together. A per-point prior suits a scene where the
+motion varies.
 
 ```@example walkthrough
 prior = 2 .+ 20 .* band.(grid.y)
@@ -238,9 +244,9 @@ field_panels(blank(out.dx, measured(out)), blank(out.dx .- prior, measured(out))
 ```
 
 A radius of 6 measures a 22-pixel displacement, because the search only has to find what the prior
-got wrong. The residual is what was actually searched for, and it is small everywhere — which is the
-whole argument for a prior: accuracy comes from the correlation, reach comes from the prior, and cost
-comes from the radius alone.
+got wrong. The residual `dx − prior` is near zero except at a few points along the band edges, where
+it reaches several pixels. The prior sets the reach of the search, the radius sets its cost, and the
+correlation sets the accuracy.
 
 ## Points that are not a grid
 
@@ -258,8 +264,8 @@ round.(out.dx; digits = 2)
 ```
 
 The five points at row 256 sit in the band and return about 22; the point at row 100 is outside it
-and returns about 2. Use this when the points of interest are known and sparse — the multi-chip-size
-search needs a layout, so a scattered set runs a single scale.
+and returns about 2. Use this when the points of interest are known and sparse. The multi-chip-size
+search needs a grid layout, so a scattered set runs a single chip size.
 
 ## Next
 

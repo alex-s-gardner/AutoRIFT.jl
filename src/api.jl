@@ -21,12 +21,12 @@
 
 Preallocated state for correlating many image pairs with the same configuration.
 
-Holds the resolved parameters, the search grid, the output arrays, and — indirectly, through
-the FFT plan cache — the transform plans. Built by [`AutoRIFT.init`](@ref), advanced to the
-next pair by [`reinit!`](@ref), and run by [`autorift!`](@ref).
+Holds the resolved parameters, the search grid and the output arrays. The FFT plans live in a
+process-wide plan cache. Built by [`AutoRIFT.init`](@ref), advanced to the next pair by
+[`reinit!`](@ref), and run by [`autorift!`](@ref).
 
-Not thread-safe: one cache per task. Several tasks may each hold their own and run
-concurrently, which is the intended shape for batch processing — see [`autorift!`](@ref).
+Not thread-safe: use one cache per task. Tasks may each hold their own and run concurrently; see
+[`autorift!`](@ref).
 """
 mutable struct Cache{P<:Params}
     params::P
@@ -60,20 +60,18 @@ end
 
 The filtered pair the correlator will see.
 
-Throws for a cache built with `process_block_size`. Such a run filters each block from its own read
-window and never forms a filtered scene, so there is no whole-scene pair to return — and returning
-the raw one would silently answer a different question.
+Throws `ArgumentError` for a cache built with `process_block_size`: such a run filters each block from
+its own read window and never forms a filtered scene. `cache.raw` holds the input as supplied.
 """
 imagepair(cache::Cache) = imagepair(cache.runner)
 
 """
     close(cache::Cache)
 
-Close `cache`'s filter tile cache, if [`AutoRIFT.init`](@ref) built one — a no-op otherwise, and safe to
-call whether or not `filter_cache_tile` was ever passed.
+Close `cache`'s filter tile cache if [`AutoRIFT.init`](@ref) built one, and do nothing otherwise.
 
-A batch caller that used `filter_cache_tile` and is done with `cache` should call this; nothing else
-does, since the cache is meant to outlive any one `autorift!`/`reinit!` call.
+Call this when finished with a cache built with `filter_cache_tile`. Nothing else closes it, because a
+cache outlives any one `autorift!` or `reinit!` call.
 """
 Base.close(cache::Cache) = close(cache.runner)
 Base.close(::WholeScene) = nothing
@@ -87,18 +85,14 @@ imagepair(::Blocked) = throw(ArgumentError(
 """
     AutoRIFT.init(reference, secondary; kwargs...) -> Cache
 
-Prepare to correlate `reference` against `secondary`, allocating buffers and planning
-transforms once.
+Prepare to correlate `reference` against `secondary`, allocating buffers and planning transforms once.
 
-Accepts the same keywords as [`autorift`](@ref). The images are preprocessed immediately, since
-that is configuration-dependent work that does not need repeating per run — except under
+Accepts the same keywords as [`autorift`](@ref). The images are preprocessed immediately, except under
 `process_block_size`, where each block is filtered from its own read window during the run and no
-whole-scene filtered copy is ever formed. [`AutoRIFT.imagepair`](@ref) therefore has nothing to
-return for such a cache and says so.
+whole-scene filtered copy is formed; [`AutoRIFT.imagepair`](@ref) then throws.
 
-Use this with [`reinit!`](@ref) when processing many pairs: the grid, the output arrays, and
-the FFT plans are then built once rather than per pair. For a single pair, call
-[`autorift`](@ref) instead.
+Use this with [`reinit!`](@ref) when processing many pairs, so the grid, output arrays and FFT plans
+are built once. For a single pair, call [`autorift`](@ref).
 """
 function CommonSolve.init(reference::AbstractMatrix, secondary::AbstractMatrix;
               reference_valid = nothing, secondary_valid = nothing,
@@ -148,26 +142,23 @@ _block_size(bs) = throw(ArgumentError(
 
 Point `cache` at a new image pair, reusing its grid, output arrays, and transform plans.
 
-The new images must match the shape of the originals — the grid and outputs are sized to it.
+Throws `DimensionMismatch` unless the new images have the shape of the originals.
 
-An omitted image keeps its current value, so `reinit!(cache; secondary = next)` advances one
-image of a time series while holding the other fixed. An omitted *mask* follows its image: it
-is kept only if that image was also omitted, and otherwise re-derived from finiteness. A mask
-describes particular pixels, and carrying one over to a different image would silently mask the
-wrong ones.
+An omitted image keeps its current value, so `reinit!(cache; secondary = next)` advances one image of
+a time series while holding the other fixed. An omitted mask is kept only if its image was also
+omitted, and otherwise is re-derived from finiteness, since a mask describes particular pixels of one
+image.
 
-Only the images that actually changed are re-filtered, and an image already prepared in either
-slot is reused — so a walk along consecutive acquisitions, where each new reference is the
-previous secondary, filters each image once rather than twice.
+For a whole-scene cache, only changed images are re-filtered, and an image already prepared in either
+slot is reused. Walking consecutive acquisitions, where each new reference is the previous secondary,
+filters each image once.
 
-!!! warning "`Params` is not reinitialised, which matters for `about`"
-    The cache keeps its `Params`, and that is the point — the plans and buffers depend on it. But
-    [`RotationSearch`](@ref)'s `about` is a **per-pair** quantity, so a cache built with
-    `about = scene_rotation(guess)` from the first pair applies that pair's ice rotation to every
-    later one, and `reinit!` cannot update it. For a rotating time series, call [`autorift`](@ref)
-    per pair with a freshly fitted `about` instead of walking a cache.
+!!! warning "`Params` is not reinitialized"
+    The cache keeps its `Params`. [`RotationSearch`](@ref)'s `about` is a per-pair quantity, so a
+    cache built with `about = scene_rotation(guess)` applies the first pair's rotation to every later
+    pair. For a rotating time series, call [`autorift`](@ref) per pair with a freshly fitted `about`.
 
-Returns the cache, so it composes with [`autorift!`](@ref).
+Returns the cache.
 """
 function reinit!(cache::Cache; reference = nothing, secondary = nothing,
                  reference_valid = nothing, secondary_valid = nothing)
@@ -203,9 +194,8 @@ end
 
 Correlate the cache's current image pair, reusing its buffers and plans.
 
-The batch path. A driver that processes many pairs should hold one cache per task and reuse
-it, which avoids repeating the allocation and transform planning that would otherwise dominate
-when each pair is small:
+The batch path: hold one cache per task and reuse it across pairs, which avoids repeating allocation
+and transform planning.
 
 ```julia
 Threads.@sync for chunk in Iterators.partition(pairs, cld(length(pairs), nworkers))
@@ -219,13 +209,11 @@ Threads.@sync for chunk in Iterators.partition(pairs, cld(length(pairs), nworker
 end
 ```
 
-Note `threaded = false` there. For batch work, one pair per task beats threading within a
-pair: there is no serial fraction to bound the speedup and no load imbalance from the sparse
-search, and each task keeps its own working set in cache. Intra-pair threading is for the
-single-pair case, where it is the only parallelism available.
+With many pairs, one pair per task with `threaded = false` is faster than threading within a pair.
+Intra-pair threading is for a single pair.
 
-Calling this twice without an intervening [`reinit!`](@ref) returns the same result rather
-than recomputing it.
+Calling this twice without an intervening [`reinit!`](@ref) returns the same result object without
+recomputing. Copy what you need before the next `reinit!`.
 """
 function autorift!(cache::Cache)
     cache.isfresh || isnothing(cache.result) || return cache.result
@@ -544,69 +532,64 @@ end
 Estimate the displacement of surface features between two images of the same scene, on a grid,
 to sub-pixel precision.
 
-Both images must be co-registered to a common grid and the same size. The result carries `dx`
-and `dy` in pixels, the peak `correlation`, the `peak_ratio` of that peak to the best rival on the
-same surface, the `chip_size` that produced each point, and an `interpolated` mask — see
-[`MultichipResult`](@ref). Points where no scale could produce a coherent estimate are `NaN`, which
-is deliberately distinct from a measured displacement of zero.
+Both images must be the same size and co-registered to a common grid. The result carries `dx` and `dy`
+in pixels, the peak `correlation`, the `peak_ratio` of that peak to the best rival on the same surface,
+the `chip_size` that produced each point, and an `interpolated` mask; see [`MultichipResult`](@ref).
+Points where no chip size produced a coherent estimate are `NaN`, which is distinct from a measured
+displacement of zero.
 
 # Keywords
 
 All of [`AutoRIFT.params`](@ref)'s, plus:
 
-- `reference_valid`, `secondary_valid`: per-pixel validity masks. Defaults to finiteness. Pass
-  these for sensors with a fill value, or to apply a cloud or shadow mask — an invalid pixel
-  never contributes to a correlation.
-- `process_block_size`: `(X, Y)` **pixels** per block, or `nothing` (the default) for one block over
-  the whole scene. Filters the images a block at a time, so the filtered scene is never formed, which
-  bounds peak memory by the block rather than the scene. `(1024, 1024)` is a good default at a narrow
-  halo and must grow with the halo; a tuple and only a tuple, since the shape is the caller's to
-  choose. See [Correlating scenes larger than memory](@ref) for sizing.
+- `reference_valid`, `secondary_valid`: per-pixel validity masks. Default: finiteness of the image.
+  Pass these for sensors with a fill value or to apply a cloud or shadow mask. An invalid pixel never
+  contributes to a correlation.
+- `process_block_size`: `(X, Y)` pixels per block, or `nothing` (the default) for one block over the
+  whole scene. The images are filtered a block at a time, so the filtered scene is never formed and
+  peak memory is bounded by the block rather than the scene. Only a pair is accepted, not a scalar.
+  `(1024, 1024)` is a reasonable choice at a narrow halo and must grow with the halo; see
+  [Correlating scenes larger than memory](@ref).
 
-  Two things are promised under semantic versioning, and only these two: the result is
-  **bit-identical** to the untiled run, and the *filtered* pair — `Float32` whatever the input type,
-  and what the untiled path holds resident — is never formed at scene size. The halo formula, the
-  number and shape of the blocks, buffer reuse, the threading shape and where the raw imagery is read
-  from are all free to change.
+  Under semantic versioning, only two properties are guaranteed: the result is bit-identical to the
+  untiled run, and the filtered pair (`Float32` for any input type) is never formed at scene size. The
+  halo formula, the number and shape of the blocks, buffer reuse, the threading shape and where the raw
+  imagery is read from can change.
 
-  A block reads its own extent grown by a halo, so it reads more than it writes — see
-  [`AutoRIFT.halo`](@ref). A block smaller than that halo is rejected, as is a preprocessing filter
-  that estimates from the whole image: it cannot be reproduced block by block, and is rejected rather
-  than approximated — see [`AutoRIFT.filter_reach`](@ref).
-- `cache_budget`: how many bytes of disk-backed input a blocked run may hold in memory, as `:auto`
-  (the default), a byte count, or `nothing`.
+  A block reads its own extent grown by a halo; see [`AutoRIFT.halo`](@ref). A block smaller than that
+  halo is rejected. So is a preprocessing filter that estimates from the whole image, since it cannot
+  be reproduced block by block; see [`AutoRIFT.filter_reach`](@ref).
+- `cache_budget`: bytes of disk-backed input a blocked run may hold in memory: `:auto` (the default), a
+  byte count, or `nothing`.
 
-  `:auto` compares the pair's own bytes against the sum of every block's read window, once per pass,
-  and caches when the first is smaller — capped at an eighth of free memory, divided by the thread
-  count for `threaded = false`. A count caps it explicitly; `nothing` caches nothing and reads a
-  window per block per pass. Either the whole pair is cached or none of it is, so a count between the
-  two reads windows. Input already in memory is never copied whatever this says, and the result does
-  not depend on it. [Correlating scenes larger than memory](@ref) measures what it costs and buys.
+  `:auto` caches the pair when its own bytes are fewer than the sum of every block's read window over
+  all passes, capped at an eighth of free memory (divided by the thread count for `threaded = false`).
+  A count sets the cap explicitly. `nothing` caches nothing and reads a window per block per pass. The
+  whole pair is cached or none of it, so a count smaller than the pair reads windows. Input already in
+  memory is never copied, and the result does not depend on this keyword. See
+  [Correlating scenes larger than memory](@ref).
 - `filter_cache_tile`: `nothing` (the default) to filter every block fresh, or a tile side in pixels to
-  keep each tile's filtered result in a scratch file once derived — see [`FilterTileCache`](@ref).
-- `filter_cache_io`: how that scratch file is accessed — `:mmap` (the default) maps it into the process;
-  `:pread` reads and writes each tile with positioned I/O, so the cached pages stay in the kernel's file
-  cache rather than counting toward the process's resident size.
-- `filter_cache_dir`: an existing directory to hold that scratch file, in a directory of its own, or
-  `nothing` (the default) for the system's temporary directory. Pass one on a host whose temporary
-  directory is a RAM-backed `tmpfs`, as `/tmp` is on Amazon Linux 2023: a file there counts against
-  memory, and a NISAR pair's runs to gigabytes.
+  keep each tile's filtered result in a scratch file; see [`FilterTileCache`](@ref).
+- `filter_cache_io`: access mode for that scratch file. `:mmap` (the default) maps it into the process.
+  `:pread` reads and writes each tile with positioned I/O, so cached pages stay in the kernel file
+  cache and do not count toward the process's resident size.
+- `filter_cache_dir`: an existing directory to hold the scratch file, or `nothing` (the default) for
+  the system temporary directory. Pass one when the temporary directory is RAM-backed (`/tmp` is a
+  `tmpfs` on Amazon Linux 2023), where the file counts against memory.
 
 ```julia
 out = autorift(image1, image2; chip_size = 32, search_radius = 25)
 out.dx, out.dy, out.correlation
 ```
 
-For many pairs, [`AutoRIFT.init`](@ref) and [`autorift!`](@ref) reuse buffers and transform
-plans across calls.
+For many pairs, [`AutoRIFT.init`](@ref) and [`autorift!`](@ref) reuse buffers and transform plans.
 
 !!! note "Sign convention"
-    `dx` and `dy` are the offset from `secondary` back to `reference`, which is the *negative* of the
-    motion of the imaged features — a feature moving east gives a negative `dx`. `dy` increases
-    downward, matching array indexing.
+    `dx` and `dy` are the offset from `secondary` back to `reference`, the negative of the motion of
+    the imaged features: a feature moving east gives a negative `dx`. `dy` increases downward,
+    matching array indexing.
 
-    This is the *array* convention, and deliberately not what the `Raster` method returns: given a
-    CRS, `autorift` returns map-oriented `vx`/`vy` for feature motion instead. See
+    The `Raster` method returns map-oriented `vx`/`vy` for feature motion instead. See
     [Conventions](@ref).
 """
 function autorift(reference::AbstractMatrix, secondary::AbstractMatrix; kwargs...)
@@ -622,18 +605,13 @@ end
 """
     autorift(reference, secondary, p::Params) -> MultichipResult
 
-Correlate with an already-resolved [`Params`](@ref), bypassing keyword resolution.
+Correlate with an already-resolved [`Params`](@ref), without keyword resolution.
 
-Same computation and same result as the keyword form. What differs is that nothing between the
-call and the correlation is a runtime value: `Params`'s method choices are type parameters, so
-when `p` is built from method *objects* the whole pipeline below this call is statically
-resolvable.
-
-That matters in two places. It is the entry point a `--trim`ed binary needs, since
-[`AutoRIFT.params`](@ref) resolves Symbols through a `Dict{Symbol,Any}` and the constructor call
-after that lookup cannot be resolved at compile time. And it lets a caller who builds `Params`
-once reuse it across pairs without re-validating keywords — though [`AutoRIFT.init`](@ref) is
-the better tool for that, since it also reuses buffers.
+Same computation and result as the keyword form. `Params`'s method choices are type parameters, so
+when `p` is built from method objects the pipeline below this call is statically resolvable. This is
+the entry point a `juliac --trim` binary needs, because [`AutoRIFT.params`](@ref) resolves Symbols
+through a `Dict{Symbol,Any}`. It also lets a caller reuse one `Params` across pairs without
+re-validating keywords, though [`AutoRIFT.init`](@ref) additionally reuses buffers.
 
 ```julia
 p = AutoRIFT.Params((ZNCC(),), Highpass(), (PyramidRefine(),), GardnerFilter(),
@@ -642,17 +620,15 @@ p = AutoRIFT.Params((ZNCC(),), Highpass(), (PyramidRefine(),), GardnerFilter(),
 out = autorift(image1, image2, p)
 ```
 
-`Params` has no keyword constructor deliberately: `params()` is the documented way to build one
-with defaults, and a second spelling of the defaults would be a second place for them to drift.
-The positional form is stable API — the field order is `Params`'s own, in declaration order, and
+`Params` has no keyword constructor; [`AutoRIFT.params`](@ref) builds one with defaults. The
+positional form is stable API, with arguments in `Params`'s field declaration order;
 `app/src/AutoRIFTApp.jl`'s `app_params` is a complete call.
 
 Omitting the trailing `backend` field defaults it to `AutoRIFT.CPU()`. Pass `AutoRIFT.MetalGPU()` or
-`AutoRIFT.CUDAGPU()` as a twentieth argument to select a device; see [`AutoRIFT.Backend`](@ref).
+`AutoRIFT.CUDAGPU()` as the last argument to select a device; see [`AutoRIFT.Backend`](@ref).
 
-Validity masks are not accepted here. They are per-image data rather than configuration, and the
-keyword form or [`ImagePair`](@ref) is where they belong; this overload exists for the case where
-*nothing* is a runtime value.
+Validity masks are not accepted here. Use the keyword form, or pass an [`ImagePair`](@ref) to the
+`grid` forms.
 """
 function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, p::Params)
     pair = _prepare(ImagePair(reference, secondary), p)
@@ -666,17 +642,14 @@ end
 
 Correlate at `grid`'s points with an already-resolved [`Params`](@ref).
 
-The production input path: a caller with a geogrid result has both halves of the handoff already —
-`AutoRIFT.pointset` gives the per-point grid and `AutoRIFT.params` the scene-wide settings — and this
-is where the two meet. The keyword form builds a `Params` from keywords instead, which a caller holding
-one would have to take apart to use.
+The production input path, for a caller that already holds a per-point grid from
+[`AutoRIFT.pointset`](@ref) and scene-wide settings from [`AutoRIFT.params`](@ref).
 
-`grid` carries the per-point coordinates, priors, search radii and chip-size bounds; `p` carries what
-is uniform over the scene. Where the two overlap, `grid` wins for the points it names, exactly as in
+`grid` carries the per-point coordinates, priors, search radii and chip-size bounds; `p` carries what is
+uniform over the scene. Where the two overlap, `grid` takes precedence for the points it names, as in
 the keyword form.
 
-Validity masks belong to the images rather than to either argument, so pass an [`ImagePair`](@ref) as
-`reference` to supply them.
+To supply validity masks, pass an [`ImagePair`](@ref) in place of `reference, secondary`.
 """
 autorift(reference::AbstractMatrix, secondary::AbstractMatrix, grid::PointSet, p::Params) =
     _run(ImagePair(reference, secondary), grid, p, _block_size(nothing), :auto)
@@ -691,22 +664,17 @@ autorift(pair::ImagePair, grid::PointSet, p::Params) =
 
 Correlate at `grid`'s points, a block at a time, with an already-resolved [`Params`](@ref).
 
-The whole production handoff in one call: a geogrid supplies `grid` and `p`, and `block_size` bounds
-the imagery held at once — which is what makes a granule larger than memory correlatable at all.
-[`AutoRIFT.block_size_for`](@ref) chooses one from `grid`, `p` and the scene size.
+`block_size` is `(X, Y)` pixels per block and bounds the imagery held at once.
+[`AutoRIFT.block_size_for`](@ref) chooses one from `grid`, `p` and the scene size. `cache_budget` is
+the number of bytes of disk-backed input this run may hold in memory; `0` windows every read. Both are
+positional so that a `juliac --trim` binary can reach this method.
 
-`block_size` is `(X, Y)` pixels per block and `cache_budget` the bytes of disk-backed input this run
-may hold, as in the grid-free positional form above; both are positional for the same reason, so a
-`--trim`ed binary can reach this path. `filter_cache_tile` is `nothing` (the default — filter every
-block fresh) or a tile side in pixels: persist each tile's *filtered* result to a scratch file the
-first time it is derived, so the coarse and fine passes of every chip-size level read it back rather
-than refiltering. Worth it once a scene is too large for `cache_budget` to hold in memory — see
-[`FilterTileCache`](@ref). `filter_cache_io` is how that scratch file is accessed: `:mmap` maps it,
-`:pread` reads and writes each tile with positioned I/O, which keeps its pages out of the process's
-resident size. `filter_cache_dir` is the directory it goes under, as for [`autorift`](@ref)'s keyword
-form; `nothing` is the system's temporary directory.
+`filter_cache_tile` is `nothing` (filter every block fresh) or a tile side in pixels: each tile's
+filtered result is saved to a scratch file the first time it is derived, and later passes read it back
+rather than refiltering. See [`FilterTileCache`](@ref). `filter_cache_io` (`:mmap` or `:pread`) and
+`filter_cache_dir` are as for [`autorift`](@ref)'s keyword form.
 
-Pass an [`ImagePair`](@ref) as `reference` to supply validity masks.
+To supply validity masks, pass an [`ImagePair`](@ref) in place of `reference, secondary`.
 """
 autorift(reference::AbstractMatrix, secondary::AbstractMatrix, grid::PointSet, p::Params,
          block_size::Tuple{Int,Int}, cache_budget::Int = 0, filter_cache_tile::Union{Nothing,Int} = nothing;
@@ -725,17 +693,13 @@ autorift(pair::ImagePair, grid::PointSet, p::Params, block_size::Tuple{Int,Int},
 
 Correlate a block at a time, with an already-resolved [`Params`](@ref).
 
-`block_size` is `(X, Y)` pixels per block, as the `process_block_size` keyword takes — see
-[`autorift`](@ref)'s keyword form for what blocking promises and costs. The result is bit-identical
-to the unblocked run.
+`block_size` is `(X, Y)` pixels per block, as the `process_block_size` keyword takes; see
+[`autorift`](@ref)'s keyword form for what blocking guarantees. The result is bit-identical to the
+unblocked run.
 
-`cache_budget` is the bytes of disk-backed input this run may hold in memory, and defaults to `0` —
-window every read. An `Int` rather than the keyword form's `:auto`, because a `Symbol` reaching a
-decision is what `--trim` cannot follow; the automatic choice needs [`autorift`](@ref)'s keyword form.
-
-Positional throughout, for the same reason the three-argument form is: nothing between the call and
-the correlation is a runtime value, so a `--trim`ed binary can reach it. The keyword form resolves
-its Symbols through [`AutoRIFT.params`](@ref)'s lookup tables, which `--trim` cannot follow.
+`cache_budget` is the number of bytes of disk-backed input this run may hold in memory (default `0`:
+window every read). It is an `Int`; `:auto` needs [`autorift`](@ref)'s keyword form. All arguments are
+positional so that a `juliac --trim` binary can reach this method.
 """
 function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, p::Params,
                   block_size::Tuple{Int,Int}, cache_budget::Int = 0,
@@ -754,16 +718,14 @@ end
 """
     autorift(reference, secondary, grid::PointSet; kwargs...) -> MultichipResult
 
-Correlate at a caller-supplied set of search points rather than a grid synthesized from
-`grid_spacing`.
+Correlate at a caller-supplied set of search points instead of a grid built from `grid_spacing`.
 
-This is the production path: the eight per-pixel fields a grid generator produces — coordinates,
-a-priori displacement, per-point search radius and chip-size bounds — cannot be expressed as
-scalar keywords, and a [`PointSet`](@ref) is how they arrive.
+Per-point coordinates, priors, search radii and chip-size bounds cannot be expressed as scalar
+keywords; a [`PointSet`](@ref) supplies them. Accepts the keywords of the matrix form.
 
-A gridded `PointSet{2}` runs the full multi-chip-size search. A scattered `PointSet{1}` runs a
-single scale via [`track`](@ref), since the chip-size loop's coarse pass and merge are neighbourhood
-operations that need a layout.
+A gridded `PointSet{2}` runs the full multi-chip-size search. A scattered `PointSet{1}` runs a single
+chip size via [`track`](@ref), because the coarse pass and merge need a grid layout. A scattered set
+combined with `process_block_size` throws `ArgumentError`.
 """
 function autorift(reference::AbstractMatrix, secondary::AbstractMatrix, grid::PointSet;
                   reference_valid = nothing, secondary_valid = nothing,
@@ -815,13 +777,13 @@ end
 
 Whether reading an element of `a` costs I/O.
 
-`false` for any array the core knows about. `AutoRIFTDiskArraysExt` answers `true` for a
-`DiskArrays.AbstractDiskArray` — the chunked backends: Zarr, NetCDF, HDF5 — and
-`AutoRIFTRastersExt` for a file-backed `Raster`, so [`autorift`](@ref) can refuse the unblocked
-path for input it would otherwise read a pixel at a time.
+`false` for any array the core knows about. `AutoRIFTDiskArraysExt` returns `true` for a
+`DiskArrays.AbstractDiskArray` (chunked backends such as Zarr, NetCDF and HDF5) and
+`AutoRIFTRastersExt` for a file-backed `Raster`. [`autorift`](@ref) throws for such input on the
+unblocked path, which would read it one pixel at a time; pass `process_block_size`.
 
-Add a method for a disk-backed type neither recognizes. A wrapper needs one even when what it wraps
-is already recognized, since the property does not follow from the wrapper's supertype.
+Add a method for a disk-backed type that neither extension recognizes. A wrapper needs its own method
+even when what it wraps is recognized.
 """
 ondisk(::AbstractArray) = false
 
@@ -878,12 +840,10 @@ _run(::ImagePair, ::PointSet{1}, ::Params, ::Extent, _cache, _filter_cache_tile 
 
 Correlate, and return the search grid alongside the result.
 
-The same computation as [`autorift`](@ref), which discards the grid. A coordinate-aware caller
-needs it: the result is indexed by grid point, and only the grid knows where those points sit in
-the image — so mapping a displacement back to a map coordinate is impossible without it.
-
-Exists so the DimensionalData and Rasters extensions share one path into the core rather than
-each rebuilding the grid and hoping it matches. Not exported: the array API has no use for it.
+The same computation as [`autorift`](@ref), which discards the grid. The result is indexed by grid
+point and only the grid holds the pixel position of each point, so mapping a displacement to a map
+coordinate needs it. The DimensionalData and Rasters extensions call this method. Takes the same
+keywords as the matrix form of [`autorift`](@ref).
 """
 function autorift_with_grid(reference::AbstractMatrix, secondary::AbstractMatrix;
                             reference_valid = nothing, secondary_valid = nothing,

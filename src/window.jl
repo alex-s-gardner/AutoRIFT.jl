@@ -60,11 +60,9 @@ Maximum over a `w`-wide sliding window, ignoring `NaN` and out-of-bounds neighbo
 `w` is an `Int` or a `(width, height)` tuple. A window containing only `NaN` yields
 `NaN`.
 
-O(1) per pixel in the window width, via the monotone-deque decomposition: separable
-into a pass along each axis, and each pass amortises to a constant number of
-comparisons per element however wide the window. This matters because the search
-dilates masks with windows up to 48 across, where an O(w²) implementation is two
-orders of magnitude slower.
+O(1) per pixel in the window width, using a monotone deque along each axis in turn. The search
+dilates masks with windows up to 48 across, where an O(w²) implementation is two orders of
+magnitude slower.
 """
 windowmax(A::AbstractMatrix, w) = windowmax!(similar(A, Float32), A, w)
 windowmax!(out, A, w) = _window_extremum!(out, A, w, >)
@@ -84,9 +82,8 @@ windowmin!(out, A, w) = _window_extremum!(out, A, w, <)
 
 Maximum minus minimum over a `w`-wide sliding window, ignoring `NaN`.
 
-The morphological gradient. Used to measure the spread of a-priori
-displacements inside a coarse cell, which determines how far the coarse search must
-reach.
+The morphological gradient. It measures the spread of a-priori displacements inside a coarse cell,
+which sets how far the coarse search must reach.
 """
 function windowrange(A::AbstractMatrix, w)
     hi = windowmax(A, w)
@@ -211,29 +208,15 @@ Mean over a `w`-wide sliding window, ignoring `NaN` and out-of-bounds neighbours
 
 A window containing only `NaN` yields `NaN`.
 
-Separable running sums, O(1) per pixel: a NaN-aware box filter, which is the one
-reduction here that no available package provides. Sums accumulate in `Float64` because
-a running sum over a large window is a long accumulation chain.
+A NaN-aware box filter using separable running sums, O(1) per pixel in the window width. Sums
+accumulate in `Float64`. Both paths work in bands of 16 rows to keep the column-sum scratch in cache.
 
-Both paths work in bands of 16 rows rather than over the whole array, which is what keeps
-the column-sum scratch in cache — 0.13 MiB on 1024² rather than 8 MiB, and faster for it.
-See the implementation notes below.
+`hasnan = false` asserts that the input has no `NaN`, which skips the detection scan (12% on 1024²)
+and the per-pixel count array. `hasnan = true` forces the masked path. The default `nothing`
+detects. Results are bit-identical on either path.
 
-Pass `hasnan = false` when the caller already knows the input is gap-free. That skips both
-the detection scan (12% on 1024²) and the per-pixel count array — the count is then a
-function of position alone. Results are bit-identical either way, since the sums are
-`Float64` on both paths: this trades memory traffic, never precision. The default
-`nothing` detects, for callers that do not know.
-
-!!! note "The choice is per-array, not per-window"
-    A single `NaN` anywhere forfeits the saving for the whole array, so a scene with a
-    no-data border costs 1.38x one without — and that is the common case, since
-    reprojection to a common grid routinely leaves such a border.
-
-    That ratio was 2.4x before both paths were banded, which is why the obvious next step
-    is no longer worth taking: degrading gracefully would mean detecting per column inside
-    the recurrence, and there is now much less to recover for the complexity. The masked
-    path's own scratch is already down to 0.11 MiB.
+A single `NaN` anywhere selects the masked path for the whole array, so a scene with a no-data border
+takes 1.38x as long as one without.
 """
 windowmean(A::AbstractMatrix, w; hasnan = nothing) =
     windowmean!(similar(A, Float32), A, w; hasnan)
@@ -252,14 +235,10 @@ end
 
 How far a window of `(wx, wy)` reaches left/up and right/down from its centre.
 
-For an even width the extra element goes to the **left**, matching
-`scipy.ndimage.generic_filter` at its default origin — which is what the reference's filter does,
-and what `LocalFilters.localmap` does, so the whole file agrees on one convention. Getting this
-backwards shifts even-window results by one pixel, and the chip-size search uses even windows at
-every level above the base.
-
-One transcription of that convention rather than four. The file header warns this is the thing
-easiest to get backwards; four copies is four chances to.
+For an even width the extra element goes to the left, matching `scipy.ndimage.generic_filter` at its
+default origin, the reference's filter, and `LocalFilters.localmap`. The opposite convention shifts
+even-window results by one pixel, and the chip-size search uses even windows at every level above the
+base. All window reductions in this file use this function.
 """
 @inline function _window_margins(wx::Int, wy::Int)
     lx, ly = wx ÷ 2, wy ÷ 2
@@ -475,33 +454,12 @@ end
 
 Median over a `w`-wide sliding window, ignoring `NaN` and out-of-bounds neighbours.
 
-O(w² log w) per pixel, which is acceptable here and only here: the chip-size loop's median
-windows are always 3 or 5 across. A running-median structure would win asymptotically
-but lose badly at 9 or 25 elements.
-
-!!! note "Windowed histograms via integral images, and why they are not used"
-    Gupta & Sintorn (2024), *Efficient high-resolution template matching with vector quantized
-    nearest neighbour fields* (Pattern Recognition 151:110386), builds an integral image over a
-    one-hot encoding so that any rectangle's histogram is available in O(1) regardless of window
-    size — which would make this median and MAD constant-time rather than O(w² log w).
-
-    It is not worth doing, and the deciding measurement is where the time actually is. This filter
-    runs on the **output grid**, not the image: 27x27 points for a 1024² scene. Measured at 975 us
-    against a 99 ms pass, so **1.0%** of it, with the coarse pass another 1.9%. Amdahl's law caps
-    the whole win at one percent, and a histogram median is quantized where this one is exact.
-
-    The paper's larger method — vector-quantize the template into `k` codewords, then compare
-    *distributions* of codewords through coarse filters — is a different similarity measure rather
-    than a faster ZNCC, and its own results show it losing below ~0.5 scale factor. Its geometry is
-    also inverted relative to ours: it amortizes one template's codebook over a large query image,
-    where AutoRIFT has hundreds of independent chips each with its own search window.
-
-Hand-written rather than delegated. `LocalFilters.localmap` supplies exactly the right
-boundary and NaN contract, but routing a general median through it costs 119 ms on
-512² where the same traversal with a trivial reducer costs 3.6 ms — the median is
-essentially all of the time, not the window machinery. Gathering into a stack buffer
-and insertion-sorting the live prefix is 1.8x faster than that, and beats scipy at
-width 3.
+O(w² log w) per pixel (gather the window into a stack buffer and insertion-sort it), which is
+acceptable because the chip-size loop's median windows are 3 or 5 across. It runs on the output grid
+(27x27 points for a 1024² scene), where it takes 1.0% of a pass (975 us of 99 ms), so a faster
+histogram-based median — such as the integral-histogram construction of Gupta & Sintorn (2024),
+Pattern Recognition 151:110386 — would gain at most that. It is 1.8x faster than `LocalFilters.localmap` with
+a median reducer and beats scipy at width 3.
 """
 windowmedian(A::AbstractMatrix, w) = _window_sorted(A, w, _median_of!)
 
@@ -510,11 +468,9 @@ windowmedian(A::AbstractMatrix, w) = _window_sorted(A, w, _median_of!)
 
 Median absolute deviation over a `w`-wide sliding window, ignoring `NaN`.
 
-`median(|x - median(x)|)`, the robust scale estimate the outlier filter compares
-displacements against. Two sorts of the gathered values rather than one, so roughly twice
-the cost of [`windowmedian`](@ref), and subject to the same window-size caveat.
-
-When both statistics are wanted, [`windowmedmad`](@ref) returns them from one traversal.
+`median(|x - median(x)|)`, the robust scale estimate the outlier filter compares displacements
+against. It costs about twice [`windowmedian`](@ref), with the same window-size limits. When both
+statistics are wanted, [`windowmedmad`](@ref) returns them from one traversal.
 """
 windowmad(A::AbstractMatrix, w) = _window_sorted(A, w, _mad_of!)
 
@@ -523,12 +479,8 @@ windowmad(A::AbstractMatrix, w) = _window_sorted(A, w, _mad_of!)
 
 Median and median absolute deviation over the same `w`-wide sliding window, in one pass.
 
-Both are needed together by the outlier filter, and computing them separately gathers and
-sorts each window twice. Fusing them is 1.67x faster, and identical to calling
-[`windowmedian`](@ref) and [`windowmad`](@ref) in turn by construction rather than by
-coincidence: all three route through the same traversal, and the singles are this
-function's reducer with one result dropped. The MAD already computes the median on its
-way, so the fusion adds no work and needs no extra scratch.
+Equivalent to [`windowmedian`](@ref) and [`windowmad`](@ref) in turn, and 1.67x faster because each
+window is gathered and sorted once.
 """
 windowmedmad(A::AbstractMatrix, w) = _window_sorted(A, w, _medmad_of!, Val(2))
 
@@ -692,12 +644,9 @@ end
 """
     count_agreeing(A, w, tol) -> Matrix{Float32}
 
-Number of neighbours within `tol` of the window's centre value, itself included.
-
-The reference calls this "displacement distance count". It is the agreement measure
-the outlier filter thresholds: a displacement supported by enough of its neighbours
-is kept, one that stands alone is rejected. `NaN` neighbours never agree, and a `NaN`
-centre agrees with nothing, so both yield a count of zero.
+Number of neighbors within `tol` of the window's center value, the center included. The reference
+calls this the "displacement distance count". `NaN` neighbors never agree, and a `NaN` center agrees
+with nothing, so its count is zero.
 """
 function count_agreeing(A::AbstractMatrix, w, tol::Real)
     wx, wy = _window_size(w, A)
@@ -735,11 +684,8 @@ end
 """
     _window_size(w, A) -> (wx, wy)
 
-Normalise a window specification to `(width, height)`, clamped to the array.
-
-Clamping matches the reference, and it matters for the coarse chip-size levels: a
-48-wide dilation applied to a grid only 20 across would otherwise index out of
-bounds.
+Normalize a window specification to `(width, height)`, clamped to the array size as in the
+reference, so a 48-wide window on a grid 20 across does not index out of bounds.
 """
 function _window_size(w, A::AbstractMatrix)
     wx, wy = w isa Tuple ? (Int(w[1]), Int(w[2])) : (Int(w), Int(w))
