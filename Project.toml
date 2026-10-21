@@ -56,7 +56,6 @@ FastGeoProjections = "0.1, 0.2"
 ImageCore = "0.10"
 ImageFeatures = "0.5"
 ImagePairGeometry = "0.1"
-JET = "0.9, 0.10"
 JSON3 = "1"
 KernelAbstractions = "0.9"
 LinearAlgebra = "1"
@@ -82,7 +81,6 @@ FastGeoProjections = "981663e8-0c94-46dd-b2cf-efc8480900ec"
 ImageCore = "a09fc81d-aa75-5fe9-8630-4744c3626534"
 ImageFeatures = "92ff4b2b-8094-53d3-b29d-97f740f06cef"
 ImagePairGeometry = "7d3defa8-4bb6-45cf-b5d0-7628f127c0fd"
-JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
@@ -95,4 +93,4 @@ Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test", "Aqua", "ArchGDAL", "JET", "JSON3", "Random", "Statistics", "Rasters", "DimensionalData", "DiskArrays", "ImageFeatures", "ImageCore", "NearestNeighbors", "Serialization", "Metal", "KernelAbstractions", "ImagePairGeometry", "FastGeoProjections", "StaticArrays"]
+test = ["Test", "Aqua", "ArchGDAL", "JSON3", "Random", "Statistics", "Rasters", "DimensionalData", "DiskArrays", "ImageFeatures", "ImageCore", "NearestNeighbors", "Serialization", "Metal", "KernelAbstractions", "ImagePairGeometry", "FastGeoProjections", "StaticArrays"]

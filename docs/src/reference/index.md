@@ -4,7 +4,7 @@ CurrentModule = AutoRIFT
 
 # API reference
 
-Every name AutoRIFT.jl covers by semantic versioning, grouped by what you reach for it to do.
+Every name covered by semantic versioning, grouped by purpose.
 
 | page | contents |
 |---|---|
@@ -17,7 +17,7 @@ Every name AutoRIFT.jl covers by semantic versioning, grouped by what you reach 
 | [First guess](first-guess.md) | sparse feature matching for priors and scene rotation |
 | [Geospatial](geospatial.md) | the raster and dimensional methods |
 
-Names not listed here are internal: they can change in any release.
+Names not listed here are internal and can change in any release.
 
 ## Index
 

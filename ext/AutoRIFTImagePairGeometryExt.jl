@@ -75,23 +75,22 @@ _dy_prior_sign(coordinate) = -y_displacement_sign(coordinate)
 
 The search grid in `g`, as a [`PointSet`](@ref).
 
-Pixel positions gain `1.5` — one for the index base, since geogrid's indices are zero-based, and a half
-for the offset `runAutorift` bakes into its grid before correlating — and a point that fell outside the
-image gets a search radius of zero, which is how a point is marked to skip.
+Pixel positions gain `1.5`: one for the index base (geogrid's indices are zero-based) and a half for
+the offset `runAutorift` bakes into its grid before correlating. A point that fell outside the image
+gets a search radius of zero, which marks it to be skipped. Throws `ArgumentError` if every search
+radius is zero.
 
-Bands are **transposed**: a `PairGeometry` is indexed `[x, y]` over its grid window, and `PointSet` is
-`[row, col]`. On a square grid the difference is invisible and costs two thirds of the agreement with the
-reference, so it is not left to the caller.
+Bands are transposed: a `PairGeometry` is indexed `[x, y]` over its grid window, and a `PointSet` is
+`[row, col]`.
 
-`chip_size` sets the base chip extent in pixels. Given `pixel_size` instead, it is derived as the
-reference does — `ceil(chip_size_0 / pixel_size / 4) * 4` — from a chip size in meters. One of the two
-is required, since neither is recoverable from `g`.
+`chip_size` sets the base chip extent in pixels. Alternatively `pixel_size` (meters) derives it from
+`chip_size_0` as the reference does, `ceil(chip_size_0 / pixel_size / 4) * 4`. One of the two is
+required, otherwise `ArgumentError` is thrown.
 
-`coordinate` decides the sign of the y prior, and defaults to the one `g` carries; pass it only to
-override that.
+`coordinate` decides the sign of the y prior, and defaults to the one `g` carries.
 
-Only part of `g` fits a `PointSet`. `ImagePairGeometry.velocity_conversion` returns the operator, the
-scale factors and the mask, which converting a measured displacement to a velocity needs.
+Only part of `g` fits a `PointSet`. `ImagePairGeometry.velocity_conversion` returns the operator,
+scale factors and mask needed to convert a measured displacement to a velocity.
 """
 function AutoRIFT.pointset(g::PairGeometry; chip_size = nothing, chip_size_0 = 240.0,
                            pixel_size = nothing, coordinate = g.coordinate)
@@ -154,10 +153,8 @@ end
 """
     AutoRIFT.chip_size_scale(g::PairGeometry) -> Float64
 
-The median of `chip_min_y / chip_min_x` over the points carrying both bounds.
-
-Over the points where *both* bounds are present, which is the reference's own condition: a point
-missing either would contribute a ratio of zero or a division by zero.
+The median of `chip_min_y / chip_min_x` over the points where both bounds are present, as in the
+reference.
 """
 function AutoRIFT.chip_size_scale(g::PairGeometry)
     sentinel = Int32(g.nodata.output)
@@ -173,46 +170,36 @@ end
 """
     AutoRIFT.params(g::PairGeometry; chip_size_0 = 240.0, optical, kwargs...) -> Params
 
-The correlator settings the ITS_LIVE driver derives from a geogrid result.
-
-Five keywords a caller would otherwise have to re-derive, each read out of `g` rather than configured
+The correlator settings the ITS_LIVE driver derives from a geogrid result
 (`testautoRIFT.py:245-250, 330-334`):
 
-  * `chip_size.X = ceil(chip_size_0 / pixel_size / 4) * 4` — the base chip is a fixed *distance*
-    divided by the image's pixel size, rounded up to a multiple of four.
-  * `chip_size.Y = round(chip_size.X * scale / 2) * 2`, where `scale` is the median of
-    `chip_min_y / chip_min_x` over the points where both bounds are present. The parameter chip sizes
-    are square on the ground, so that ratio is the y:x *pixel size* ratio — 1.0 wherever the pixel is
-    square and about 0.25 on a Sentinel-1 pair, varying per acquisition with the azimuth:range ratio.
-  * `chip_size_max` from the largest per-point bound `g` carries over the points that fall inside the
-    image, with the same `scale` on Y. Both bounds carry it, not just the minimum: the pyramid doubles
-    the two axes together, so a maximum scaled on one axis only is reached after a different number of
-    doublings on each.
+  * `chip_size.X = ceil(chip_size_0 / pixel_size / 4) * 4`: the base chip is a fixed ground distance
+    divided by the image's ground pixel size (for radar, the ground range pixel size, not the slant
+    spacing), rounded up to a multiple of four.
+  * `chip_size.Y = round(chip_size.X * scale / 2) * 2`, where `scale` is
+    `AutoRIFT.chip_size_scale`. Chips are square on the ground, so `scale` is the y:x pixel
+    size ratio: 1.0 for a square pixel and about 0.25 on a Sentinel-1 pair, varying with the
+    azimuth:range ratio.
+  * `chip_size_max`: the largest per-point maximum bound in `g` over the points inside the image, with
+    the same `scale` applied to Y. Throws `ArgumentError` if every maximum is missing or zero.
 
-    **The ITS_LIVE driver's effective maximum can be lower than this one.** It zeroes the bound
-    wherever its no-data mask is set (`testautoRIFT.py:402`), and that mask is the *imagery's* zero
-    mask sampled at each grid point (`:349`) rather than anything geometric — so a pair whose overlap
-    is largely scan-line gap or fill loses its coarsest level, and reaches three pyramid levels where
-    the geometry alone implies four. Measured on the golden cross-path Landsat 7 pair
-    `LE07_L1TP_061018_20120428`: the geometry reaches 128 px at 70,898 in-image points and the driver
-    hands the correlator 64. A `PairGeometry` carries no imagery, so pass `chip_size_max` explicitly to
-    reproduce a level count that depends on one.
-  * `grid_spacing.X = chip_size.X * grid_spacing_m / chip_size_0`, in pixels — written this way
-    rather than as `grid_spacing_m / pixel_size`, which is the same number only when the first
-    division is exact.
-  * `subpixel`, as the reference's per-level ladder: `16, 32, 64, 64` for optical and
-    `32, 64, 128, 128` for radar. A single factor cannot express it, and the reference looks the
-    factor up per chip size. Always four entries: past the run's last level each repeats that
-    level's factor, which is what the ladder's own last-entry rule would give, so the `Params` type
-    is the same whatever `chip_size_max` turns out to be.
+    The ITS_LIVE driver's effective maximum can be lower. It zeroes the bound wherever its no-data
+    mask is set (`testautoRIFT.py:402`), and that mask is the imagery's zero mask sampled at each
+    grid point (`:349`), so a pair whose overlap is largely scan-line gap or fill loses its coarsest
+    level. On the golden cross-path Landsat 7 pair `LE07_L1TP_061018_20120428` the geometry reaches
+    128 px at 70,898 in-image points and the driver hands the correlator 64. A `PairGeometry` carries
+    no imagery, so pass `chip_size_max` explicitly to reproduce such a level count.
+  * `grid_spacing.X = chip_size.X * grid_spacing_m / chip_size_0` pixels, truncated. This equals
+    `grid_spacing_m / pixel_size` only when the first division is exact.
+  * `subpixel`: the reference's per-level ladder, `16, 32, 64, 64` for optical and
+    `32, 64, 128, 128` for radar. It always has four entries; past the run's last level each entry
+    repeats that level's factor, so the `Params` type does not depend on `chip_size_max`.
 
-`optical` selects that last pair, matching the driver's `optflag`; it defaults from `g`'s coordinate
-system, which is what decides it in production.
+`optical` selects the ladder, as the driver's `optflag` does. It defaults from `g`'s coordinate system.
 
-Every other keyword is forwarded to [`AutoRIFT.params`](@ref) unchanged, so a caller overrides any of
-the above by passing it. The method choices this does not set are passed as objects — `ZNCC()`,
-`GardnerFilter()`, `CPU()` — rather than left to their Symbol defaults, so that with object-valued
-keywords from the caller the result's type is known where `params` is called.
+Other keywords are forwarded to [`AutoRIFT.params`](@ref) and override the above. `similarity`,
+`outliers` and `backend` default to `ZNCC()`, `GardnerFilter()` and `CPU()` as objects, so the type of
+the result is known where `params` is called.
 """
 function AutoRIFT.params(g::PairGeometry; chip_size_0 = 240.0,
                          optical::Bool = g.coordinate isa ProjectedCoordinate, kwargs...)

@@ -1,11 +1,11 @@
 
 # Choosing a preprocessing filter
 
-Correlation compares brightness patterns. Anything that changes brightness *without* the ground moving —
-a different sun angle, a gain change, haze, a sensor artifact — is a difference the correlator has to see
-past. Preprocessing removes that before the comparison.
+Correlation compares brightness patterns. A different sun angle, a gain change, haze or a sensor artifact
+changes brightness without the ground moving, and the correlator has to see past it. Preprocessing
+removes that before the comparison.
 
-One keyword selects it, by symbol or by instance:
+One keyword selects the filter, by symbol or by instance:
 
 ```julia
 autorift(reference, secondary; preprocess = :highpass)        # the default
@@ -15,18 +15,17 @@ autorift(reference, secondary; preprocess = Highpass(; width = 11))
 ## Why the default is not `:none`
 
 The similarity measure already removes some of this. [`ZNCC`](@ref) subtracts the mean and divides by the
-standard deviation of each chip, so a uniform brightening or a gain change is invisible to it — a
-filter cannot improve on that. What ZNCC cannot absorb is variation *within* a chip, and a gradient
-across the scene is exactly that.
+standard deviation of each chip, so a uniform brightening or a gain change is invisible to it. It cannot
+absorb variation *within* a chip, and a gradient across the scene is that kind of variation.
 
 Here is a pair where the secondary image carries an illumination gradient the reference does not:
 
 ```@example prep
 using AutoRIFT
-include("../../figures.jl")  # plotting helpers and the synthetic scenes; see [Plotting](@ref)
+include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 using Statistics: median, quantile
 
-reference, clean, truth_dx, _ = warped_pair(512, (row, col) -> (6.0, -2.0); seed = 13)
+reference, clean, truth_dx, _ = warped_pair(photo(), 512, (row, col) -> (6.0, -2.0))
 # Brightness rising left to right, plus a weak vertical trend. Only the secondary image has it.
 secondary = Float32[clean[row, col] * (0.4f0 + 1.2f0 * (col / 512)) + 0.3f0 * (row / 512)
                     for row in axes(clean, 1), col in axes(clean, 2)]
@@ -34,7 +33,7 @@ secondary = Float32[clean[row, col] * (0.4f0 + 1.2f0 * (col / 512)) + 0.3f0 * (r
 image_panels(reference, secondary; titles = ("reference", "secondary, gradient added"))
 ```
 
-The truth is a uniform 6-pixel shift everywhere, so the error is measurable:
+The true shift is `dx = 6` pixels everywhere, so the error can be measured:
 
 ```@example prep
 settings = (; chip_size = 16, chip_size_max = 64, grid_spacing = 8)
@@ -55,25 +54,20 @@ for method in (:none, :highpass, :wallis, :sobel, :laplacian)
 end
 ```
 
-Read that table carefully, because it contains the one result most likely to mislead you:
+`:none` has a higher median correlation (0.838) than `:highpass` (0.582), `:wallis` (0.53) and
+`:laplacian` (0.702). Only `:sobel` (0.863) is higher. It also has the largest 99th percentile error, 0.09
+px against 0.03 to 0.06 px for the filters, and a median error of 0.016 px against 0.0 for `:highpass` and
+`:wallis`.
 
-**`:none` has the highest correlation of any option and the worst accuracy.** Median correlation 0.965
-against `:highpass`'s 0.812, and median error 0.062 px against 0.016 — four times worse, with a 99th
-percentile of 0.31 px against 0.05.
+Correlation therefore does not rank filters. Part of the unfiltered correlation comes from broad
+brightness structure common to both images, which says little about where small features moved. Filtering
+removes it and the coefficient falls. Compare filters by error against known motion, or, without a truth
+field, by the spatial coherence of the result.
 
-The gradient is itself a strong, smoothly varying signal that both chips share, so it inflates the
-correlation coefficient while contributing nothing about where the features went. Filtering removes that
-shared low-frequency agreement, and the correlation *falls* to reflect what is actually being matched.
+## What each filter does
 
-So: **correlation is not how you choose a filter.** It compares points within one run, not one filter
-against another. Judge a filter by accuracy against known motion if you have it, and by the spatial
-coherence of the field if you do not.
-
-## What each filter actually does
-
-The table names five filters without showing any of them. Each panel below is the same gradient-afflicted
-secondary image, filtered — on its own grayscale, since the outputs differ in units by three orders of
-magnitude:
+Each panel below is the gradient-added secondary image after one filter, on its own grayscale because
+the outputs differ in scale:
 
 ```@example prep
 mask = trues(size(secondary))
@@ -84,8 +78,9 @@ image_panels([first(AutoRIFT.preprocess(secondary, mask, m)) for (_, m) in metho
              titles = first.(methods), size = (1700, 380), shared = false)
 ```
 
-`:none` shows the gradient as the dominant structure in the frame. The three filters that remove it do
-not remove the same thing, which the table's numbers cannot show:
+`:none` shows the gradient as the dominant structure in the frame. The filters differ in how much of the
+gradient's effect on contrast they remove. The ratio below is the standard deviation of the right third of
+the image over the left third:
 
 ```@example prep
 using Statistics: std
@@ -96,14 +91,11 @@ for (name, m) in methods
 end
 ```
 
-The gradient multiplies the texture, so it makes the right side both brighter *and* more contrasty.
-`:highpass` subtracts a local mean, which removes the brightness and leaves the contrast trend standing
-at 2.3 — higher than the 1.5 it started with, because the brightness that partly masked it is gone. `:wallis` normalizes local variance as well, and lands at 1.00: that is the difference between the
-two, and it is invisible in the images above but plain in the number.
-
-`:sobel` keeps the trend too (2.1), being a derivative of an amplitude that still grows. `:laplacian`
-looks nearly blank because it is: only about 1.7% of its pixels exceed a tenth of its maximum, so a
-handful of extremes set the range and the rest of the field is compressed toward zero.
+The gradient multiplies the texture, so it makes the right side both brighter and higher in contrast.
+`:highpass` subtracts a local mean. That removes the brightness difference and leaves the contrast ratio at
+2.2, above the unfiltered 1.8. `:wallis` also normalizes local variance and gives 1.0. `:sobel` keeps most
+of the trend (2.1). `:laplacian` gives 1.1 because it takes the logarithm first, which turns a
+multiplicative gradient into an additive one that the second derivative removes.
 
 ```@example prep
 none_out = autorift(reference, secondary; preprocess = :none, settings...)
@@ -112,10 +104,12 @@ field_panels(blank(none_out.dx, measured(none_out)), blank(high_out.dx, measured
              titles = ("dx, preprocess = :none", "dx, preprocess = :highpass"))
 ```
 
-Both fields look like a uniform 6-pixel shift. The difference is in the tail, not in the picture — which
-is the usual case, and the reason to have a truth field or a gate rather than an opinion.
+Both fields show a uniform 6-pixel shift. The difference is in the tail of the error distribution, which a
+map does not show.
 
-## Filter width has the same inversion
+## Filter width
+
+Correlation and error also trade off with the width of `Highpass`:
 
 ```@example prep
 for width in (3, 5, 11, 21)
@@ -128,34 +122,35 @@ for width in (3, 5, 11, 21)
 end
 ```
 
-Correlation climbs steadily with width — 0.664 at 3, up to 0.953 at 21 — while the 99th percentile of the
-error nearly doubles, 0.05 to 0.09 px. A wider highpass passes more of the low-frequency content, so it
-approaches `:none` from below in both respects. The default of 5 is near the accuracy optimum here.
+Correlation rises with width, from 0.437 at 3 to 0.812 at 21, while the 99th percentile error doubles,
+from 0.03 to 0.06 px. A wider highpass passes more low-frequency content, so it moves toward `:none` in
+both respects. The default width of 5 has a 99th percentile error 0.02 px above the most accurate width
+here, which is 3.
 
 ## Which filter for which imagery
 
-| filter | what it does | reach | reach for |
+| filter | what it does | reach | use for |
 |---|---|---:|---|
-| [`NoPreprocess`](@ref) | nothing; ZNCC alone | 0 | already-normalized imagery, or a deliberate baseline |
-| [`Highpass`](@ref) | removes a windowed local mean | 2 | the default. Optical imagery, most cases |
-| [`Wallis`](@ref) | normalizes local mean *and* variance | 2 | scenes mixing high- and low-contrast ground — shadow beside snow |
-| [`WallisGapfill`](@ref) | `Wallis`, filling gaps with matched noise | 37 | imagery with holes you would rather fill than mask |
-| [`Sobel`](@ref) | gradient magnitude | 2 | edge-dominated scenes; discards flat texture |
-| [`Laplacian`](@ref) | isotropic second derivative | 2 | as `Highpass`, with a sharper cut |
-| [`Decibel`](@ref) | log of amplitude | 0 | **SAR amplitude**, whose dynamic range is multiplicative |
-| [`Destripe`](@ref) | notches periodic stripes in the Fourier domain | 0 | **push-broom detector striping** |
+| [`NoPreprocess`](@ref) | nothing; ZNCC alone | 0 | already-normalized imagery, or a baseline |
+| [`Highpass`](@ref) | subtracts a windowed local mean | 2 | the default; optical imagery, most cases |
+| [`Wallis`](@ref) | normalizes local mean and variance | 4 | scenes mixing high- and low-contrast ground, such as shadow beside snow |
+| [`WallisGapfill`](@ref) | `Wallis`, filling interior gaps with matched noise | 37 | imagery with interior holes, such as Landsat 7 after the scan line corrector failure |
+| [`Sobel`](@ref) | sum of the x and y Sobel derivatives; directional, not a gradient magnitude | 2 | edge-dominated scenes; discards flat texture |
+| [`Laplacian`](@ref) | second derivative of the decibel image | 2 | radar amplitude |
+| [`Decibel`](@ref) | `20 log10` of amplitude | 0 | **SAR amplitude**, whose dynamic range is multiplicative |
+| [`Destripe`](@ref) | rejects banding in the Fourier domain | **-1** | Landsat 4 and 5 scan-direction banding |
 | [`Deramp`](@ref) | removes the linear phase ramp | **-1** | **complex (SLC) input only** |
 
-The last three are domain-specific by construction: a decibel transform on optical reflectance, or a
-deramp on real-valued imagery, is not a tuning choice but a category error. `Destripe` also requires
-explicit `along_track` and `cross_track` keywords — there is no sensible default for which axis carries
-the stripes.
+`Decibel`, `Laplacian`, `Destripe` and `Deramp` are tied to a data type. `Decibel` and `Laplacian` mask
+pixels whose amplitude is not positive. `Deramp` throws on real input, and the windowed amplitude filters
+throw on complex input. `Destripe` requires explicit `along_track` and `cross_track` keywords, the scan
+directions in degrees on the raster's grid.
 
-## The reach column, and why `Deramp` cannot be blocked
+## The reach column, and why `Deramp` and `Destripe` cannot be blocked
 
 [`AutoRIFT.filter_reach`](@ref) is how many pixels beyond a region must be read for the filter's output
-*inside* that region to match what filtering the whole scene would give. Blocked processing sizes its halo
-from it:
+inside that region to match what filtering the whole scene would give. It is an upper bound. Blocked
+processing sizes its halo from it:
 
 ```@example prep
 for method in (NoPreprocess(), Highpass(), Highpass(; width = 21), Wallis(), Sobel(), Laplacian())
@@ -163,23 +158,24 @@ for method in (NoPreprocess(), Highpass(), Highpass(; width = 21), Wallis(), Sob
 end
 ```
 
-Note that reach is not the window's half-width: `WallisGapfill`'s 37 comes from its fill *decisions*
-depending on how far the nearest real data lies, which no window bounds.
+Reach is not the window's half-width. `WallisGapfill`'s 37 comes from its fill decisions, which depend on
+how far the nearest real data lies, and no window bounds that.
 
-`Deramp` returns **-1**, meaning no finite reach. It estimates from the whole image, so no halo can
-reproduce it. Check the sign before using a reach as a width — [`AutoRIFT.halo`](@ref) throws rather than
-silently returning a halo shorter than the correlation alone. In practice: `Deramp` and
-`process_block_size` are incompatible, and blocking a complex scene means deramping it yourself first.
+`Deramp` and `Destripe` return **-1**, meaning no finite reach. Each estimates from the whole image, so no
+halo can reproduce the result. Check the sign before using a reach as a width. [`AutoRIFT.halo`](@ref)
+throws on a negative reach rather than returning a halo shorter than the correlation alone. Neither filter
+can be combined with `process_block_size`; apply it to the whole scene yourself before blocking.
 
-## Preprocessing is per-pair, not per-image
+## Filtering is reused across pairs in a cache
 
-Both images get the same filter, and the filtered result is cached on the pair — so reusing one image
-across several pairs does not re-filter it. That is what makes a time series cheap; see
-[Correlating many pairs](@ref).
+Both images get the same filter. A [`AutoRIFT.Cache`](@ref) keeps the filtered result of each image, and
+[`reinit!`](@ref) reuses it for an image that is already in either slot, so a time series filters each
+acquisition once. See [Correlating many pairs](@ref). A run with `process_block_size` filters each block
+from the raw input during the run instead.
 
 ## See also
 
-- [Judging a result](@ref) — the gate to use once a filter is chosen, and why `correlation` is not it here
-- [Masking invalid pixels](@ref) — filters respect the mask, and their reach spreads a masked region
-- [How feature tracking works](@ref) — where preprocessing sits relative to the correlation itself
-- [`AutoRIFT.preprocess`](@ref) — the filter reference, and every filter's full docstring
+- [Judging a result](@ref): the correlation gate to apply once a filter is chosen
+- [Masking invalid pixels](@ref): filters respect the mask, and their reach spreads a masked region
+- [How feature tracking works](@ref): where preprocessing sits relative to the correlation itself
+- [`AutoRIFT.preprocess`](@ref): the filter reference, and every filter's full docstring

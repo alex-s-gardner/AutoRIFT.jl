@@ -1,55 +1,36 @@
 # Memory
 
-Measured on an Apple M2 Max against autoRIFT v2.1.2 under Python 3.11, on Julia 1.12.5 — the toolchain
-has since moved to 1.13.0, which leaves the S2B untiled point count unchanged at 612,607 but has not been
-used to re-time any row here. Reproduce with `julia --project=benchmark benchmark/memory.jl` and
+Peak memory per configuration, what each cache holds resident, and which settings reduce it. AutoRIFT
+runs on batches of tens of millions of image pairs, and a scheduler packing them onto small instances is
+bounded by resident memory per worker.
+
+Measured on an Apple M2 Max, on Julia 1.12.5. The reference is autoRIFT v2.1.2. No row has been re-timed
+on Julia 1.13. Reproduce the pair-level numbers with `julia --project=benchmark benchmark/memory.jl` and
 `mamba run -n arift-ref python tools/python_ref/bench_reference.py`.
 
-Runtime was M8's subject. This is the other axis, and it matters for a specific reason: AutoRIFT is
-built for batch runs of tens of millions of image pairs, and a scheduler packing those onto small
-instances is bounded by resident memory per worker, not by the speed of any one pair.
+## Resident memory and live heap
 
-## The two questions, and why one number cannot answer both
-
-Peak RSS and live heap disagree, and the disagreement is the useful part.
+Peak resident set size (RSS) and live heap disagree, so both are reported.
 
 | Over 30 consecutive 512² pairs through one `Cache` | AutoRIFT | autoRIFT v2.1.2 |
 |---|---:|---:|
 | peak RSS growth | +41.2 MiB | — |
-| live heap growth (`gc_live_bytes`, after full GC) | **+0.0 MiB** | — |
+| live heap growth (after full GC) | **+0.0 MiB** | — |
 | current RSS after `gc.collect()` | — | **+5.7 MiB/pair, no plateau** |
 
-Read `rss` alone and AutoRIFT looks like it accumulates the way the reference does. It does not:
-the live heap is flat, so the 41.2 MiB is allocator slack the collector has not returned to the OS.
-A long batch run does **not** need process recycling.
+The AutoRIFT live heap is flat, so the 41.2 MiB RSS growth is allocator slack that the collector has not
+returned to the OS. A long batch run does not need process recycling.
 
-The reference does. 376.9 MiB after the first pair, 542.3 MiB after thirty, as *current* RSS after
-an explicit collect — so it is retention, not slack. Extrapolated, a thousand-pair worker needs
-several GiB. That is why `benchmark/memory.jl` reports both quantities: reporting only `rss` would
-have implied the wrong conclusion about our own code, and only `live` would have hidden what an
-instance's memory limit actually sees.
+The reference retains memory: 376.9 MiB after the first pair and 542.3 MiB after thirty, measured as
+current RSS after an explicit collect. Below about ten pairs Python uses less memory because Julia's floor
+is higher; above that, Python's growth continues without bound.
 
-Note the crossover. Below roughly ten pairs Python uses *less* memory, because Julia's floor is
-higher; above it, Python's growth dominates and never stops.
+Peak RSS is a high-water mark for the process. A benchmark that measures several configurations in one
+process reports the first one's peak for all of them, so `benchmark/memory.jl` runs one fresh subprocess
+per configuration. `@allocated` counts cumulative allocation, not residency: it reported 140 MiB for a
+2048² pair whose peak was 32 MiB.
 
-## Three ways to measure this wrong
-
-Recorded because each failed in a different direction, and two produced numbers that looked like
-bugs in the correlator rather than in the measurement.
-
-- **`@allocated` counts cumulative churn, not residency.** It reported 140 MiB for a 2048² pair
-  whose actual peak was 32 MiB — it sums every temporary ever created, including ones freed
-  immediately. Useful for allocation pressure; meaningless for "will this fit".
-- **`Sys.maxrss()` is a high-water mark.** Measuring several configurations in one process gives
-  the first one's peak and then near-zero for every later one. That produced ratios of 0.05× and
-  0.00×, which read as a broken code path.
-- **Subtracting a settled baseline in-process fails for the same reason.** The mark is already set.
-
-Hence the design in `benchmark/memory.jl`: one fresh subprocess per configuration, `maxrss` read
-once at the end, and the baseline established by a matching process that allocates the inputs but
-skips the correlation.
-
-## The floor is the Julia runtime, not AutoRIFT
+## The floor is the Julia runtime
 
 | Cumulative RSS after | MiB |
 |---|---:|
@@ -57,16 +38,14 @@ skips the correlation.
 | `+ using FFTW` | 400.6 |
 | `+ using AutoRIFT` | 408.0 |
 
-**97% of the floor is the runtime.** AutoRIFT itself is ~7 MiB. There is no optimization inside
-this package that reaches the other 397; `--compile=min` recovers 18 MiB, which is not the right
-order of magnitude. That is what makes a trimmed binary the only real lever — see
-[`app/`](https://github.com/alex-s-gardner/AutoRIFT.jl/tree/main/app), which runs the same
-correlation at **27.2 MiB peak against 424.2 MiB**.
+97% of the floor is the runtime, and AutoRIFT itself is about 7 MiB. No change inside the package reaches
+the rest, and `--compile=min` recovers 18 MiB. A trimmed executable is the only way below it.
+[`app/`](https://github.com/alex-s-gardner/AutoRIFT.jl/tree/main/app) runs the same correlation at
+27.2 MiB peak against 424.2 MiB.
 
 ## Per-pair peak
 
-Scene size is the only knob that scales peak memory, and it does so roughly linearly in pixel count
-— 4× the pixels for 4× the peak, twice over.
+Peak grows roughly linearly with pixel count for a single pair:
 
 | Scene | serial | threaded |
 |---|---:|---:|
@@ -74,105 +53,66 @@ Scene size is the only knob that scales peak memory, and it does so roughly line
 | 1024² | 18.8 MiB | 9.9 MiB |
 | 2048² | 42.4 MiB | 26.5 MiB |
 
-The threaded column carries the scatter described under "The non-knobs" below and should not be
-read as a trend against the serial one.
+The threaded column varies by several MiB between repetitions (see "Settings that do not change peak"
+below) and is not a trend against the serial one.
 
-### The images are correlated in the caller's own element type
+Images are correlated in the caller's element type. An `Int16` product stays `Int16`, and only the chip
+is widened to `Float32` because it is stored mean-removed. Rescaling to `UInt8` first with
+`AutoRIFT.bytescale` would lower the 2048² serial peak to 34.2 MiB. It does not change speed (27.8
+against 27.9 µs per chip on 200²) and it does not improve accuracy: on a 1024² pair with a known
+fractional shift, the `dx` RMS error is 0.02463 without it and 0.02482 with it.
 
-There is no conversion step: an `Int16` sensor product is correlated as `Int16`, and only the
-chip is widened, to `Float32`, because it is stored mean-removed. An earlier 8-bit rescaling stage
-mapped `mean ± 3σ` of each image onto `0..255` first, and removing it **costs 8.1 MiB of peak at
-2048²** — 34.2 against the 42.4 above, measured serial.
+### Allocation per pair
 
-That is the honest price of three things. The rescale claimed to buy exact integer accumulation,
-which it never did — the numerator accumulates in `Float64` either way — and the repo's own
-measurement put 8-bit and `Float32` chips at 27.8 against 27.9 µs on 200², i.e. equal. Accuracy is
-marginally *better* without it, since quantizing ahead of a `Float64` accumulation can only lose
-information: on a 1024² pair against a known fractional shift, `dx` RMS error 0.02463 against
-0.02482. And its scale came from a whole-image statistic, which is the kind of quantity that makes
-a block of a scene disagree with the scene.
+The sliding-window mean used by the filters (`windowmean`) works in bands of 16 rows so its scratch stays
+in cache, which is both faster and smaller than a full-image scratch (1024²: 3.3 ms and 0.13 MiB dense,
+3.7 ms and 0.11 MiB masked). Allocation per whole pair:
 
-## Allocation per pair, and where it went
+| Pair | allocated |
+|---|---:|
+| 512² dense | 4.20 MiB |
+| 1024² dense | 16.70 MiB |
+| 2048² dense | 66.34 MiB |
+| 1024² masked | 48.87 MiB |
+| 2048² masked | 194.67 MiB |
 
-`preprocess` was 92% of a pair's allocations — 31.5 of 34.0 MiB on 1024² — and almost all of that was
-`windowmean` scratch. The column pass produces one `Float64` sum per pixel and the row pass consumes
-one row of them at a time, so a full-image scratch was written entirely before any of it was read:
-every value evicted from cache before use. The NaN-aware path carried two such arrays, `Float64` sums
-and `Int32` counts, 12 MiB on 1024² to produce 4 MiB of output.
+A single `NaN` anywhere in an image sends the whole array down the masked path, and reprojection to a
+common grid routinely leaves a no-data border. Expect the masked rows, not the dense ones, for reprojected
+data.
 
-Processing a band of 16 rows at a time keeps the scratch in L2. It is **faster and smaller at once**,
-which is unusual enough to be worth stating plainly — the locality is worth more than the cost of
-restarting each band's running sum:
+## Settings that do not change peak
 
-| `windowmean` on 1024² | before | after |
-|---|---:|---:|
-| dense (gap-free) | 5.6 ms / 8.01 MiB | **3.3 ms / 0.13 MiB** |
-| masked (any NaN) | 9.8 ms / 12.01 MiB | **3.7 ms / 0.11 MiB** |
+**Thread count.** Repeated measurement at 512² gives 7.4, 8.0 and 8.9 MiB at one thread and 7.8, 9.3 and
+6.2 MiB at eight. The 6.2 to 9.7 MiB scatter has no order by thread count. Workspaces are pooled and few
+exist at once, so threading does not trade memory against speed in either direction.
 
-Per whole pair, allocation roughly halves:
+**`upsampling`.** Peak is 30.2 MiB at 8× and 27.4 MiB at 128× on 1024², although the refinement workspace
+grows from 0.2 to 62.5 MiB. Higher `upsampling` costs time (31 ms to 64 ms), not memory.
 
-| Pair | before | after |
-|---|---:|---:|
-| 512² dense | 8.08 MiB | **4.20 MiB** |
-| 1024² dense | 32.45 MiB | **16.70 MiB** |
-| 2048² dense | 129.84 MiB | **66.34 MiB** |
-| 1024² masked | 72.49 MiB | **48.87 MiB** |
-| 2048² masked | 289.92 MiB | **194.67 MiB** |
+**A `max_memory` budget does not exist.** An estimate of peak derived from the configuration was off by
+1.6 to 4.1× in no consistent direction, because peak follows allocation rate and GC timing rather than
+buffer sizes. Scene size is the setting that does scale; for large scenes use `process_block_size`
+below.
 
-Bit-identical throughout, which is the property that makes banding safe: each band reseeds its
-running sum from exactly the window its first row sees, so no value is the result of a longer or
-differently-ordered accumulation. Verified exactly rather than to a tolerance, end to end, across
-dense, masked and Wallis paths at 512² and 1024².
+## Block size
 
-The masked path is not a corner case worth less attention than the dense one — a single NaN anywhere
-sends the whole array down it, and reprojection to a common grid routinely leaves a no-data border.
+`process_block_size` is the main setting that bounds peak memory. Nine arrays sized to the largest read
+window are held per task (`AutoRIFT.BlockBuffers`), and the task count is `min(nblocks, nthreads)`. Peak
+is therefore set by block area times threads, not by the number of blocks.
 
-## The non-knobs
+For an array input the default is `nothing` (one block). For file-backed Rasters input the default comes
+from [`AutoRIFT.block_size_for`](@ref): the halo, floored at 1024 px, rounded up to the file's chunking
+and clamped to the scene.
 
-Measured because they are what one would expect to expose, and they do not. Recorded so they are
-not re-proposed — and, in the first case, so a false positive is not either.
-
-**Thread count does not move peak memory.** Repeated measurement at 512² gives 7.4, 8.0, 8.9 MiB at
-one thread and 7.8, 9.3, 6.2 MiB at eight — a 6.2–9.7 MiB scatter with no ordering by thread count.
-An earlier reading of this suite appeared to show peak *falling* from 14.3 to 5.1 MiB with more
-threads, and a plausible mechanism was available (more threads, earlier collection, less slack).
-That reading was noise: three repetitions do not reproduce the trend or its direction. Workspaces
-are pooled and few exist at once, so there is nothing here to scale. Threading is not a
-memory-versus-speed tradeoff in either direction.
-
-**`upsampling` has no trend** — measured 30.2 MiB at 8× against 27.4 MiB at 128× on 1024² before the
-banding change, and the *absence* of a trend is what matters, not the absolute figures, despite the
-refinement workspace itself growing from 0.2 MiB to 62.5 MiB. Pooling again: few exist
-simultaneously. It costs time (31 ms → 64 ms), not memory. Tracked in the suite so the claim stays
-true rather than being remembered.
-
-Two of these are why a single subprocess measurement is not enough to assert a trend on. The suite
-records one figure per configuration for regression detection; a *claim* about a knob needs
-repetition, and the thread-count entry above is what happens without it.
-
-**A `max_memory` budget was designed and rejected.** A configuration-derived estimate of peak came
-out 1.6–4.1× off, and unsystematically — the gap *shrank* as the estimate grew, so it could not be
-corrected with a constant factor. The cause is that peak tracks allocation *rate* and GC timing,
-not the resident size of the buffers a configuration implies. A knob that mis-predicts by 4× in an
-unpredictable direction is worse than no knob: a caller would size an instance from it and get
-OOM-killed. **Tiling large scenes** is the honest version of this, since scene size is the one thing
-that does scale, and it is deferred rather than dismissed.
-
-## Block size: peak scales with block area, not with block count
-
-`process_block_size` is the one knob a caller has over peak memory, and the figure that decides
-whether it is usable is peak against runtime at each size. Measured on the full Landsat 8/9 overlap —
-17121×16961 px, a 2127×2107 grid, 922,784 measured points — at 10 worker threads, from a
-memory-mapped input. Reproduce with `tools/ab/mem_blocks.jl`.
-
-Configuration first, since the block sizes below are only meaningful against it: `chip_size = 16`,
-`chip_size_max = 64` (3 levels), `grid_spacing = 8`, `search_radius = 20`, which give a **halo of 69×69
-px**. The halo is the floor on a legal block size and the width of the skirt every block reads around
-itself, so it is the number every row in this table is implicitly relative to.
+The sweep below is the full Landsat 8/9 overlap (17121×16961 px, a 2127×2107 grid, 922,784 measured
+points) at 10 threads from a memory-mapped input. The configuration is `chip_size = 16`,
+`chip_size_max = 64` (3 levels), `grid_spacing = 8` and `search_radius = 20`, which gives a halo of
+69×69 px. Reproduce with `tools/ab/mem_blocks.jl`. `dx` and `dy` are bit-identical and all 922,784
+points are measured at every size.
 
 | block | blocks | peak MiB | vs untiled | runtime | read amplification |
 |---|---:|---:|---:|---:|---:|
-| untiled | 1 | 4958 | 1.00× | **20.5 s** | 1.00× |
+| untiled | 1 | 4958 | 1.00× | 20.5 s | 1.00× |
 | 8192 px | 9 | 14856 | 3.00× | 42.0 s | 1.03× |
 | 4096 px | 25 | 6995 | 1.41× | 30.3 s | 1.06× |
 | 2048 px | 81 | 3116 | 0.63× | 24.4 s | 1.13× |
@@ -180,344 +120,100 @@ itself, so it is the number every row in this table is implicitly relative to.
 | 512 px | 1089 | 2248 | 0.45× | 22.3 s | 1.55× |
 | 256 px | 4160 | 2042 | 0.41× | 24.0 s | 2.21× |
 
-`dx`/`dy` are bit-identical at every size and all 922,784 points are measured at every size, so
-nothing below is a quality trade.
+1024 px cuts peak 2.3× for a 10% longer runtime, and peak is flat from there down to 256 px.
 
-**1024 px is the default.** It cuts peak 2.3× for a 10% runtime cost, and the curve is flat from
-there to 256 px — 2140, 2248, 2042 MiB across a 14× range of block *counts*. That flatness is the
-finding: peak is set by a block's **area**, not by how many blocks there are. Nine arrays sized to the
-largest read window are held per task (`AutoRIFT.BlockBuffers`), and the task count is capped at
-`min(nblocks, nthreads)`, so the footprint is area × threads however finely the scene is cut.
+**The halo sets the smallest useful block.** Each block reads its extent plus a fixed-width halo, computed
+from the parameters before any block size is applied:
+`chip_size_max/2 + radius + |prior| + 2 + filter_reach + level_centre_offset`, which is 69 px here. See
+[`AutoRIFT.halo`](@ref). The imagery a run reads grows as `((block + 2·halo) / block)²`: 1.26× at 1024 px,
+1.55× at 512, 2.21× at 256 and 3.82× at 128. A block smaller than its halo is rejected. A block only a few
+halos across is mostly overlap, so a wide halo needs a proportionally larger block.
 
-**Runtime is set by the halo, and that is what bounds how small a block can usefully be.** The halo
-is computed from the parameters and the grid *before* any block size is applied, and is the same for
-every block — `chip_size_max/2 + radius + |prior| + 2 + filter_reach + level_centre_offset`, which is
-69 px here. So it is a fixed-width skirt on a shrinking block, and the imagery a run reads grows as
-`((block + 2·halo) / block)²`: 1.26× at 1024 px, 1.55× at 512, 2.21× at 256, 3.82× at 128. Below
-1024 px the memory curve has already flattened while that redundancy keeps climbing, so smaller
-blocks buy nothing and cost reading. **If a configuration has a wide halo, the block size has to
-increase in proportion** — a block only a few halos across is mostly overlap.
+Read amplification is also allocation rate, because every block read allocates a block-sized temporary.
+At 128 px (15,624 blocks) the run became allocation-bound, with 6 of 10 workers waiting on one GC mutex,
+and had not finished in 20 minutes against 22.6 s at 1024 px.
 
-Pushed far enough the redundancy stops being merely wasteful. At 128 px (15,624 blocks, 3.82× read
-amplification) the run becomes allocation-bound rather than compute-bound: sampled stacks put 6 of 10
-workers in `__psynch_mutexwait` beneath `jl_safepoint_start_gc`, all queued on one mutex, and the run
-had not finished in 20 minutes against 22.6 s at 1024 px. Every block read allocates a block-sized
-temporary (`_read_block!` indexes rather than `copyto!`-ing a view, deliberately — a lazy input needs
-one read per window, not one per pixel), so read amplification is also allocation rate.
+**Fewer blocks than threads is the one setting that is bad on every axis.** With 9 blocks on 10 threads
+every block is in flight at once. The 8192 px row holds nine 8331² working sets, 3× the untiled peak, and
+leaves a core idle. Blocks are also the unit of threaded work and their cost varies by orders of magnitude,
+so a small pool waits on its slowest member.
 
-**8192 px is a misconfiguration, not a baseline.** With 9 blocks on 10 threads every block is in
-flight at once, so the run holds nine 8331² working sets — 3× the untiled peak — and it is also one
-core short, since `min(nblocks, nthreads)` caps the tasks at 9. A block size chosen so that blocks are
-fewer than threads inverts what blocking is for. Keep the block count comfortably above the thread
-count.
+**Estimating buffer memory.** For a `UInt8` pair the nine arrays total 18 bytes per pixel (two `UInt8`
+planes, three `Float32` and four `Bool`), and 24 bytes for a `Float32` pair. Buffers alone are about
+`18 bytes × (block + 2·halo)² × min(nblocks, nthreads)`. At 16384 px on NISAR L1 that is 45.5 GiB before
+any imagery or workspace. The 18 bytes are the total over the nine arrays, not per array.
 
-### The same sweep on a wide-halo granule, and what the two have in common
+### Wide-halo granules
 
-The NISAR L2 sweep below is the same measurement on a scene 21× larger with a halo 32× wider. Reading
-them together separates what is general from what is a property of a 69 px halo.
+The NISAR sweeps use a wider halo, so the optimum sits at a different block size.
 
-**Start from the chip size, because that is what sets the halo, and the halo is what sets the smallest
-legal block.** These are the inputs, not results — a block size is only interpretable against them:
-
-| | optical (Landsat 8/9) | NISAR L2 GSLC |
-|---|---:|---:|
-| scene | 17121×16961 px (290 Mpx) | 54885×110085 px (6042 Mpx) |
-| `chip_size` | 16 | 96×48 |
-| `chip_size_max` | 64 | 768×384 |
-| chip levels | 3 | 4 |
-| `grid_spacing` | 8 | 48 |
-| search radius | 20, uniform | median 34, **max 1052×526** |
-| `chip_size_max / 2` — the chip's share of the halo | 32 | 384×192 |
-| **halo** | **69×69 px** | **2216×1103 px** |
-| smallest legal block (halo is the floor) | 69 px | 2224×1110 px |
-| block size chosen | **1024 px** (14.8 halos) | **2304×1152 px** (1.04 halos) |
-
-The halo is `chip_size_max/2 + radius + |prior| + 2 + filter_reach + level_centre_offset`. On the optical
-case the chip dominates it: 32 of 69 px, with the radius adding 20. On NISAR the **radius** dominates:
-collapsing all four chip levels to one (`chip_size_max` 768→96) shrinks the halo only 2216→1711 px,
-because the maximum radius is 1052 and the halo takes the maximum, not the median of 34.
-
-That is why the two cases have floors three orders of magnitude apart in area, and why 512 or 1024 px
-blocks — fine on the optical scene — are rejected outright on NISAR at any chip setting.
-
-It is also why the optical run gets ~15 halos per block edge (1024/69) while NISAR's best row gets
-**1.04** in each axis (2304/2216, 1152/1103) — barely more than the skirt itself. The skirt is
-fixed-width, so `((b + 2h)/b)` per axis predicts the reading: 1.29× against a measured 1.26× on optical,
-which is close. On NISAR it predicts **8.52×** against a measured **3.30×**, and the gap is real rather
-than an error in either — 64% of that grid is nodata fill, and `_searchable_span` gives a block with no
-searchable point an empty read window, so a third of the predicted reads never happen. Use the formula as
-an upper bound on a partly-filled grid.
-
-Both sweeps at 10 worker threads, both bit-identical across sizes. Absolute figures, because a ratio is
-not a cost — an instance is sized from GiB and a schedule from minutes; ratios are against each case's own
-untiled row.
-
-| blocks/thread | optical block | peak MiB | runtime | | NISAR block | peak GiB | runtime | occupancy |
-|---|---|---:|---:|---|---|---:|---:|---:|
-| 0.1 (untiled) | untiled | 4958 (1.00×) | 20.5 s (1.00×) | | untiled | 85.0 (1.00×) | 6.2 min (1.00×) | 6.06 / 10 |
-| ~1 | 8192 px | 14856 (3.00×) | 42.0 s (2.05×) | | — | — | — | — |
-| ~10 | 2048 px | 3116 (0.63×) | 24.4 s (1.19×) | | 8192 px | 47.8 (0.56×) | 11.2 min (1.79×) | **2.96 / 10** |
-| ~30 | **1024 px** | **2140 (0.43×)** | **22.6 s (1.10×)** | | 4096 px | 40.1 (0.47×) | 7.1 min (1.14×) | 5.17 / 10 |
-| ~65–115 | 512 px | 2248 (0.45×) | 22.3 s (1.09×) | | 2304 px | 30.0 (0.35×) | 5.5 min (0.88×) | 7.87 / 10 |
-| ~230–420 | 256 px | 2042 (0.41×) | 24.0 s (1.17×) | | **2304×1152 px** | **28.8 (0.34×)** | **5.2 min (0.83×)** | **9.03 / 10** |
-
-The rows are paired by blocks per thread rather than by block size, since that is the axis the two cases
-share; the optical 4096/6144 and NISAR 3072/6144 rows are omitted from the pairing and appear in each
-case's own table. Every figure here is reproducible from the measurement history — see below.
-
-### Where these measurements are kept
-
-Every row above is on disk, not only in this document.
-
-- **`benchmark/results/nisar/sweep_*.log`** — the console logs of each NISAR sweep, in the repository.
-  These carry the per-stack profile attribution and the progress of each run, and they are the primary
-  record: a figure quoted here should be traceable to one of them.
-- **`$AUTORIFT_GOLDEN_CACHE/mem/prof_<case>.jls`** — an **append-only** history, one file per case,
-  holding every row ever measured for it. `profile_nisar.jl` appends to it and prints the whole table at
-  the end of a run, so a one-configuration re-measurement no longer hides the sweep it belongs to. Each
-  row carries the timestamp and short commit it was taken at, so two rows that disagree can be told
-  apart. Outside the repository because the traces are large and the imagery they describe is larger.
-- **`tools/golden/backfill_history.jl`** recovers rows from a console log into that history.
-
-**It used to overwrite rather than append, and that lost the first L2 sweep.** The file was keyed on the
-case alone and written with just the finishing run's rows, so re-measuring 3072 px on its own replaced a
-five-row sweep with one row; the untiled, 8192, 6144 and 4096 rows survived only because their console
-output happened to be kept, and were parsed back out of it. A measurement that costs an hour of machine
-time should not be destroyed by the next one-line command, which is why the history is append-only and
-why the logs are committed rather than left in a scratch directory.
-
-**Three things hold on both, and they are the transferable rules.**
-
-*Peak flattens once blocks are small.* The optical curve is flat from 1024 px to 256 px — 2140, 2248,
-2042 MiB over a 14× range of block counts — and NISAR does the same thing: cutting block *area* 3.6×
-from 3072² to 2304×1152 moves peak only 8%, 31.2 to 28.8 GiB. The reason is visible in the arithmetic:
-block buffers are just **13–21%** of NISAR's peak at these sizes (3.7 GiB of 28.8 at 2304×1152), so the
-rest — imagery, workspaces, the output field — does not shrink with the block. Below the knee, shrinking
-blocks buys almost no memory.
-
-*Too few blocks is the one configuration that is bad on every axis.* At ~1 block per thread the optical
-run holds every block in flight at once and peaks at **3.00×** its untiled figure; at ~10 the NISAR run
-drops to 2.96 of ten threads busy and takes **1.79×** as long. Both are the same fault — blocks are the
-unit of threaded work, so a pool the size of the thread count cannot balance.
-
-*Runtime is U-shaped in blocks per thread.* Optical bottoms out around 30–110 (1.09–1.10×) and rises
-again by 416 (1.17×), where read amplification has reached 2.21× and the run starts paying for redundant
-reading. NISAR is on the same curve but has not reached its minimum by 230 blocks/thread, because its
-halo is far wider relative to the scene and its blocks are still enormous in absolute terms.
-
-**What differs is only where the optimum sits, and the halo is what moves it.** Optical wants 1024 px
-and NISAR wants 2304×1152 — but "as small as the halo allows, then as many blocks as that gives" picks
-both. The wide-halo case reaches its floor before it reaches the flat part of the read-amplification
-penalty, which is why the earlier reading of the optical sweep — that a wide halo means the block size
-must *increase* — had the direction right for legality and wrong for choice: the halo raises the floor,
-it does not make large blocks desirable.
-
-**The untiled row is a different parallel decomposition, not just a different block size.** It has one
-block, so it uses its threads through the intra-pass path while every blocked run uses them per block
-(`threaded = false` inside each). That is why it is the fastest row here and still not the one to
-choose: 4958 MiB against 2140 is the difference between what fits on an instance and what does not.
-
-**These numbers are for this configuration's 69 px halo.** A wide-halo configuration behaves
-differently in kind, not only in degree. On the whole NISAR L1 grid `halo(grid, p, size)` is
-**2736×1500 px** — about 7 by 6.7 km at that granule's 2.55 m ground-range and 4.44 m along-track
-spacing — because a Geogrid search-radius field is extremely skewed: over the searchable points the
-median x radius is **34** against a maximum of **1905**, a 56× spread, and the halo takes the maximum.
-Only 35% of the grid is searchable at all, so a median over every point is 0 and says nothing.
-`dev/GATES.md` records a per-block halo that was implemented and reverted at a measured
-1.03–1.11× gain, since `chip_size_max/2` alone floors it at 561 px whatever the block.
-
-A 2736 px halo still permits blocks on a 57760×50511 scene, and it now produces them. Two properties
-of a rotated grid had to be handled first, and both used to fail silently rather than loudly.
-
-**A grid's coordinates need not be separable.** `AutoRIFT.block_layout` used to derive its
-block boundaries from `grid.y[:, 1]` and `grid.x[1, :]`, assuming a gridded `PointSet` repeats each
-coordinate down every row and across every column. A NISAR geogrid is a **rotated radar footprint**
-sampled onto a map grid, so `x` varies by 50502 px down a single column and `y` by 43164 px across a
-single row; only 43% of points carry real coordinates, and row 1 and column 1 hold *one* valid point
-each. Walking them spanned 216 px instead of the scene, so every requested block size up to 16384 px
-returned **one block** — an untiled run wearing a block size.
-
-The grid *is* the index-to-pixel mapping, so the block shape now comes from it: four rates, how far `x`
-and `y` each move per row and per column of the index space. A block of `a` rows by `b` columns spans
-about `a·∂x/∂i + b·∂x/∂j` pixels of `x`, and both axes must fit their budget. **Both index directions
-charge both axes**, which a separable calculation gets wrong — sizing rows from the `y` budget and
-columns from the `x` budget alone gives an `x` span of 11187 px at an 8192 px request on this grid, a
-37% overshoot of what the caller asked for. On an axis-aligned grid two of the four rates are zero, the
-constraints decouple, and this reduces to the separable answer, so a Landsat layout is unchanged — a
-full-width band included.
-
-**A block's read window must span only the points it will search.** The window came from
-`AutoRIFT._pixel_span` over every point in the block, and on a rotated grid the points outside
-the footprint carry a *fill* coordinate — zero here, not `NaN`, so a finiteness test does not find
-them. A block straddling the footprint edge therefore spanned from 0 to the real coordinates and read
-`1:57760`, the whole scene. Measured at an 8192 px block: 28 of 209 blocks each read half the scene or
-more, 99× the scene in total. `AutoRIFT._searchable_span` reduces over searchable points only,
-which is sound because `_run_one_block!` returns before any I/O for a block with nothing to search.
-
-**And an index rate has to be measured over the points a block must cover.** The rates above came from
-the median of each axis's *nonzero* first differences, which cannot see a genuinely separable axis: on
-the NISAR L2 grid `x` really is constant down a column, so the only nonzero steps are the two crossing
-the fill boundary, giving `∂x/∂i = 87666 px` from a sample of one and a layout of 5.2 million blocks.
-The median of *every* step fails the other way — both NISAR grids are ~65% fill, so all four rates come
-out zero and a zero rate is an infinite block. Reducing over pairs where both points are searchable
-gives the true rates on both: 33/34/19/19 px on the rotated L1 grid, 0/48/24/0 on the separable L2 one.
-
-With all three fixed, both NISAR granules block. Measured whole-grid at `-t 10` on a 96 GiB machine.
-Chip size and halo first, since they set the floor every block size below is measured against:
-
-| | L1 RSLC | L2 GSLC |
-|---|---:|---:|
-| scene | 57760×50511 px | 54885×110085 px |
-| `chip_size` → `chip_size_max` | 96×52 → 768×416 (4 levels) | 96×48 → 768×384 (4 levels) |
-| `grid_spacing` | 48 | 48 |
-| search radius x: median over searchable / max | 34 / **1905** | 34 / **1052** |
-| search radius y: median over searchable / max | 20 / 830 | 7 / 526 |
-| searchable points | 1,871,119 of 5.36 M (35%) | 1,873,823 of 5.23 M (36%) |
-| `chip_size_max / 2` | 384×208 | 384×192 |
-| **halo** | **2736×1500 px** | **2216×1103 px** |
-| smallest legal block | 2736×1500 | 2224×1110 |
-
-On both, the halo is set by the radius **maximum** — 56× the median over searchable points — rather than
-by the chip. That is why it is so much wider than the optical case's 69 px, and why no chip setting brings
-it below ~1700: dropping `chip_size_max` from 768 to 96 on L2, collapsing four pyramid levels to one,
-moves the halo only 2216 → 1711 px.
-
-
-| case | block | blocks | runtime | peak | vs untiled | read amp |
-|---|---|---:|---:|---:|---:|---:|
-| L1 RSLC, 57760×50511 | untiled | 1 | **9.5 min** | 49.4 GiB | 1.00× | 1.00× |
-| | 16384 px | 100 | 30.9 min | 59.6 GiB | 1.21× | 2.89× |
-| | 8192 px | 380 | 18.0 min | 33.9 GiB | 0.69× | 4.51× |
-| | 8192×4096 px | 760 | 13.8 min | 30.4 GiB | 0.62× | 6.42× |
-| | 4096 px | 1482 | 11.0 min | 27.7 GiB | 0.56× | 8.77× |
-| | 2816×1536 px | 5814 | 12.7 min | **24.4 GiB** | **0.49×** | 21.60× |
-| L2 GSLC, 54885×110085 | untiled | 1 | 6.2 min | **85.0 GiB** | 1.00× | 1.00× |
-| | 8192 px | 98 | 11.2 min | 47.8 GiB | 0.56× | 0.86× |
-| | 6144 px | 162 | 6.2 min | 45.7 GiB | 0.54× | 1.00× |
-| | 4096 px | 378 | 7.1 min | 40.1 GiB | 0.47× | 1.33× |
-| | 3072 px | 648 | 5.8 min | 31.2 GiB | 0.37× | 1.69× |
-| | 2304 px | 1152 | 5.5 min | 30.0 GiB | 0.35× | 2.26× |
-| | 2304×1152 px | 2304 | **5.2 min** | 28.8 GiB | 0.34× | 3.30× |
-| | 2224×1110 px | 2500 | 6.1 min | **25.9 GiB** | **0.30×** | 3.50× |
-
-The L1 rows are re-measured with the fixed harness on an otherwise idle machine; the L2 rows are the
-earlier sweep. **Every earlier L1 timing was invalid, and by my own hand rather than the machine's**: the
-figures they replace came from runs I was concurrently `sample`-ing or loading captures beside. `sample`
-suspends every thread to unwind it, which on a 34 GiB ten-thread process inflated one untiled row from
-~580 s to 2592 s — 4.5×. Two clean back-to-back runs give 587.1 s and 575.5 s, so untiled is ~570 s
-reproducible to 2%. **Do not observe a row while it runs**; poll with `ps` and nothing heavier.
-
-**L1 agrees with L2 after all: smaller blocks win, and blocking is not a loss here.** 4096 px runs at
-0.56× the untiled peak for 1.17× the runtime, and 2816×1536 reaches **0.49×** peak. An earlier reading of
-this case — that blocking is a pure loss on L1 — was an artifact of the invalid timings above.
-
-**16384 px is the one bad configuration, and occupancy says why.** 100 blocks over 10 threads run at
-**2.33 of 10 threads** against 9.21 untiled and 8.94 at 4096 px, because L1's radius field puts 47% of
-all the work in a single block (median radius 34 against a maximum of 1905). Blocking cannot balance a
-pool of 10 blocks per thread when one block is half the scene's cost.
-
-**L2 is the case that makes blocking a production requirement.** 2304×1152 px runs the granule in **28.8
-GiB and 5.2 minutes** against an untiled 85.0 GiB and 6.2 — about a third of the peak *and* faster, at
-99.98% of the untiled point count. The floor, `2224×1110`, trades 18% more runtime for 10% less peak
-(25.9 GiB), so the smallest legal shape is the memory answer and not the overall one. Every blocked row measures the same 1,781,377 points, so the sizes differ in cost alone. On a 96
-GiB machine this is the difference between a memory-optimized instance and a general-purpose one.
-
-**Both axes want sizing separately, because the halo is not square.** At 2216×1103 px it is almost
-exactly 2:1, so a *square* block clears the X halo and then over-provisions Y twofold. `2304×1152`
-follows the halo's own aspect ratio and is the best row measured; the square floor is 2304 (2048 is
-rejected against the 2216 px X halo) while the Y floor is half that.
-
-**Runtime is monotonic in block *count*, not in block size, and the mechanism is thread occupancy.**
-Measured as `cpu_seconds / wall_seconds` (`tools/golden/profile_nisar.jl`):
-
-| block | blocks | blocks/thread | occupancy of 10 |
+| | optical (Landsat 8/9) | NISAR L1 RSLC | NISAR L2 GSLC |
 |---|---:|---:|---:|
-| 8192 px | 98 | 9.8 | **2.96** |
-| 6144 px | 162 | 16.2 | 5.50 |
-| 4096 px | 378 | 37.8 | 5.17 |
-| 3072 px | 648 | 64.8 | 6.77 |
-| 2304 px | 1152 | 115.2 | 7.87 |
-| 2304×1152 px | 2304 | 230.4 | **9.03** |
+| scene (px) | 17121×16961 | 57760×50511 | 54885×110085 |
+| `chip_size` → `chip_size_max` | 16 → 64 | 96×52 → 768×416 | 96×48 → 768×384 |
+| `grid_spacing` | 8 | 48 | 48 |
+| search radius, x: median / max | 20 / 20 | 34 / 1905 | 34 / 1052 |
+| searchable points | — | 35% | 36% |
+| halo (px) | 69×69 | 2736×1500 | 2216×1103 |
 
-Per-block cost spans orders of magnitude — a block whose points a finer level resolved returns before any
-I/O — so a pool with few blocks per thread waits on a handful of expensive ones while the rest idle. Ten
-blocks per thread is not enough.
+On NISAR the halo is set by the maximum radius, not the chip, and a Geogrid radius field is heavily
+skewed. Reducing `chip_size_max` from 768 to 96 on L2 only narrows the halo from 2216 to 1711 px. Blocks
+of 512 or 1024 px are rejected at any chip setting. The halo is not square, so size the two axes
+separately: at 2216×1103 a square block clears the x halo and over-provisions y twofold.
 
-**There is a turning point, and the sweep now brackets it.** An earlier reading of these rows said
-occupancy was still climbing at 230 blocks/thread with no measured maximum. Taking L2 to its actual floor —
-`2224×1110`, the smallest block a 2216×1103 halo permits, at 250 blocks/thread — settles it: occupancy
-*falls* to **7.77** from 9.03, and runtime rises 18% to 365 s. Peak still improves, to 25.9 GiB. So the
-optimum for occupancy sits near 230 blocks/thread on this granule and the floor is past it.
+Measured at 10 threads on a 96 GiB machine. Occupancy is `cpu_seconds / wall_seconds`.
 
-Read amplification rises 0.86× → 3.30× across those rows and does not drive the ranking — the fastest row
-has the *highest* amplification. Allocation follows it (225 GiB untiled to 1727 GiB, since every block
-read allocates a block-sized temporary) and GC still absorbs ≤1.7% of wall clock, so on this granule
-neither reading nor allocation is the constraint that block size trades against. Idle threads are.
+| case | block | blocks | runtime | peak | vs untiled | occupancy of 10 |
+|---|---|---:|---:|---:|---:|---:|
+| L1 | untiled | 1 | **9.5 min** | 49.4 GiB | 1.00× | 9.21 |
+| | 16384 px | 100 | 30.9 min | 59.6 GiB | 1.21× | 2.33 |
+| | 8192 px | 380 | 18.0 min | 33.9 GiB | 0.69× | 4.61 |
+| | 4096 px | 1482 | 11.0 min | 27.7 GiB | 0.56× | 8.94 |
+| | 2816×1536 px | 5814 | 12.7 min | **24.4 GiB** | **0.49×** | 9.03 |
+| L2 | untiled | 1 | 6.2 min | **85.0 GiB** | 1.00× | 6.06 |
+| | 8192 px | 98 | 11.2 min | 47.8 GiB | 0.56× | 2.96 |
+| | 4096 px | 378 | 7.1 min | 40.1 GiB | 0.47× | 5.17 |
+| | 3072 px | 648 | 5.8 min | 31.2 GiB | 0.37× | 6.77 |
+| | 2304×1152 px | 2304 | **5.2 min** | 28.8 GiB | 0.34× | 9.03 |
+| | 2224×1110 px | 2500 | 6.1 min | **25.9 GiB** | **0.30×** | 7.77 |
 
-**The L2 rows above supersede an earlier pass that measured untiled at 80.9 GiB and 12.1 min, and the
-runtime half of that is an instrument artifact.** `src/` is unchanged across the interval and both
-passes count the same points, so nothing about the package moved. The earlier harness had no warmup and
-measured the untiled configuration first, so that row carries the process's JIT compilation; the
-blocked rows it measured afterwards did not, which is why the gap appears on untiled alone and why the
-recorded ordering made blocking look free. `profile_nisar.jl` correlates a small patch of the grid
-before any row is recorded.
+Logs for these runs are in `benchmark/results/nisar/`, with the index in `benchmark/results/nisar/README.md`.
+The rules that hold on both the optical and the NISAR scenes:
 
-Profiler overhead is *not* the explanation, and this is worth stating because it was the first guess.
-Every row here is measured twice — once with the profiler off and once with it on at 2 ms — and the
-profiled run costs **2–4%** (1.02×, 1.03×, 1.03×, 1.04×), nowhere near the factor of two the
-discrepancy would need. Sampling at this rate is cheap enough to ignore; compiling is not.
+- **Peak flattens once blocks are small.** Optical peak is flat from 1024 to 256 px. On L2, cutting block
+  area 3.6× (3072² to 2304×1152) moves peak only 8%, because block buffers are 13 to 21% of peak and the
+  imagery, workspaces and output do not shrink with the block.
+- **Too few blocks per thread is slow.** Measured occupancy of ten threads: 10 blocks/thread gives 2.3,
+  38 gives 4.6, 76 gives 6.6, 148 gives 8.9, 230 gives 9.0, 250 gives 7.8, and 581 gives 9.0 at 21.6×
+  read amplification.
+- **Runtime is U-shaped in blocks per thread.** Optical runtime is lowest at about 30 to 110 blocks per
+  thread. On L2 the fastest row is 230 blocks per thread, and the halo-floor row (250) is 18% slower with
+  10% less peak.
+- **Redundant reading is cheap next to idle threads.** On L2, 3072 px has 1.69× read amplification and
+  runs in 5.8 min at 31.2 GiB, against 0.86× at 8192 px in 11.2 min at 47.8 GiB. The halo gives the
+  smallest permitted block and the thread count picks among the permitted sizes.
+- **Runtime does not track read amplification.** On L2 the fastest row has the highest amplification
+  (3.30×), and GC takes at most 1.7% of wall clock.
+- **The formula bounds amplification on a partly empty grid.** `((b + 2h)/b)` per axis predicts 8.52× for
+  L2 at 2304×1152 against a measured 3.30×, because 64% of that grid is fill and a block with no
+  searchable point reads nothing.
 
-The 4 GiB peak difference is a genuine measurement spread. Peak is sampled from a shared process whose
-floor depends on what the previous configuration left behind, which is why the floor is reported beside
-every peak and why 3072 px was re-measured alone — it reproduced at 347.6 s against 340.9 in the sweep.
+**The untiled run uses a different parallel decomposition.** One block means threads split the points in
+each pass, while a blocked run assigns blocks to threads with `threaded = false` inside each. The untiled
+row is therefore the fastest on L1, but 4958 MiB against 2140 MiB (optical) or 85.0 GiB against 28.8 GiB
+(L2) is the difference between a general-purpose instance and a memory-optimized one.
 
-**A block can also be too large, and the crossover is arithmetic rather than empirical.**
-`AutoRIFT.BlockBuffers` holds nine block-sized arrays totalling **18 bytes per pixel** for a `UInt8`
-pair — two `UInt8` planes, three `Float32` and four `Bool` — and each of `min(nblocks, nthreads)` tasks
-gets its own set. At 16384 px on L1 the read window is 12232×22222, which is 4.56 GiB per set and
-**45.6 GiB across ten tasks** before any imagery or workspace; measured peak was 68.6 GiB against an
-untiled 55.2. Prediction and measurement agree to 1%, so
-`18 bytes × (block + 2·halo)² × min(nblocks, nthreads)` is worth computing before choosing a size.
+**Profiled runs on macOS can hang.** A Julia runtime bug in `src/signals-mach.c` deadlocks the sampling
+profiler against a thread finishing a collection. It is present through Julia 1.13.0 and fixed on master
+(`ca49fc2e2`, not backported). `tools/golden/profiler_gc_deadlock.jl` reproduces it without AutoRIFT code.
+All figures here come from unprofiled runs, and an unprofiled worker cannot reach the path.
 
-The 18 bytes are the total across all nine arrays, not the size of each: `18 bytes` per array would
-predict 410 GiB for that L1 window and reject every block size this granule can actually run.
+## A disk-backed pair is read once, not once per pass
 
-**Read amplification below 1.0 is possible**, and L2 shows it at 0.86×: its halo is small relative to
-the block and 64% of its grid is fill, so those blocks have no searchable point and read nothing at all.
-
-One failure was chased to a root cause and is **not** this package's. Profiled runs on macOS can hang
-outright, and the mechanism is one lock rather than two: `pthread_mach_thread_np` looks a thread up in
-libpthread's global list under an `os_unfair_lock`, so a thread ending a collection holds that lock while
-resuming others from `jl_mach_gc_end`. The profiler then `thread_suspend`s exactly that thread, freezing it
-with the lock held, and blocks on the same lock before it reaches its own resume — deadlocking against a
-thread only it can restart. Every other thread queues at `jl_safepoint_start_gc` behind a collection that
-has begun and can never end, with **no** thread marking or sweeping. It is a Julia runtime bug in `src/signals-mach.c`, present in every release through 1.13.0
-and fixed on master by `ca49fc2e2` (not backported). `tools/golden/profiler_gc_deadlock.jl` reproduces it
-in ~2 runs of 5 with no AutoRIFT code involved, and `dev/GATES.md` holds the traces.
-
-None of the figures here are affected — they come from unprofiled runs — and an unprofiled production
-worker cannot reach the path at all.
-
-The amplification is high because the halo is, not because the layout is loose: at a 2684×1448 px halo
-even a 16384 px block pays 2.6×. That is the arithmetic in "Runtime is set by the halo" applied to a
-wide-halo configuration, and it sets the *floor* on a usable block size — a block below the halo is
-rejected outright.
-
-It does not follow that large blocks are the efficient ones, which is what the amplification argument
-alone suggests. On L2 the highest-amplification row measured is also the fastest and the cheapest:
-1.69× at 3072 px runs in 5.8 min at 31.2 GiB, against 0.86× at 8192 px in 11.2 min at 47.8. Redundant
-reading is cheap next to leaving threads idle, so the halo tells you the smallest block you may use and
-the thread count tells you which of the permitted sizes to pick.
-
-## A disk-backed pair is read once, not a window per pass
-
-Every sweep above reads from memory or a memory-mapped file, where a read is a page touch and the
-amplification column is about the halo. Reading from a **file** makes the same amplification a decode,
-and the halo is then the smaller half of it.
-
-A block reads its window once *per pass*, and a three-level run makes six — a coarse and a fine pass at
-each chip size. So the volume is a multiple of the sum of the read windows, not the sum itself. Measured
-on a 15901×13435 Landsat 8 GeoTIFF pair (`UInt16`, 0.40 GiB for the pair):
+For in-memory or memory-mapped input a read is a page touch. For a file, the same amplification is a
+decode. A block reads its window once per pass, and a three-level run has up to six passes (a coarse and a
+fine pass per chip size), so total reading is a multiple of the sum of the read windows. Measured on a
+15901×13435 Landsat 8 GeoTIFF pair (`UInt16`, 0.40 GiB):
 
 | block | blocks | one pass's windows | whole run | vs one pass |
 |---|---:|---:|---:|---:|
@@ -525,19 +221,13 @@ on a 15901×13435 Landsat 8 GeoTIFF pair (`UInt16`, 0.40 GiB for the pair):
 | 1024 px | 238 | 0.74× | 3.60× | 4.9× |
 | 2048 px | 63 | 0.66× | 3.37× | 5.1× |
 
-The halo contributes the amount by which one pass exceeds 1.0× — which at these block sizes is nothing,
-since the grid does not cover the scene's margins. Almost all of the redundancy is the repeat across
-passes, and **no block size removes it**: a larger block reads less per pass but still reads several
-times. Fewer than six, because a coarse pass sweeps a strided subset of the blocks and a level whose
-points a finer one resolved may not run at all.
+Almost all the redundancy is the repetition across passes, which no block size removes. The count is
+fewer than six because a coarse pass sweeps a strided subset of blocks and a level whose points a finer one
+resolved may not run.
 
-**A pair whose own bytes are less than that can be read once instead.** `cache_budget = :auto` compares
-the two volumes — the pair's bytes against the sum of the read windows times the passes — and caches when
-the first is smaller, capped at an eighth of `Sys.free_memory()`, divided by the thread count when
-`threaded = false` since that is the batch shape where each pair's task decides for itself. Both figures
-follow from the scene and the block layout, so the decision is taken before anything is read.
-
-At 10 threads, one process per arm so each peak belongs to that arm alone:
+`cache_budget = :auto` reads the pair into memory once when the pair's bytes are less than the sum of the
+read windows times the passes. It is capped at an eighth of `Sys.free_memory()`, divided by the thread
+count when `threaded = false`. At 10 threads, one process per arm:
 
 | block | windowed | cached | windowed peak | cached peak |
 |---|---:|---:|---:|---:|
@@ -545,245 +235,78 @@ At 10 threads, one process per arm so each peak belongs to that arm alone:
 | 1024 px | 14.0 s | 13.6 s | 3.56 GiB | 4.07 GiB |
 | 2048 px | 14.1 s | 14.1 s | 4.17 GiB | 4.29 GiB |
 
-**The gain is the smallest block's, and it is gone by 2048 px** — a larger block reads less to begin
-with, so there is less for caching to remove, and a block large enough to amortize its halo reaches the
-same runtime without holding the pair. Where caching earns its place is a block size forced small by
-something else, or a scene read over a network.
+The gain is gone by 2048 px, because a larger block reads less to begin with. Caching earns its place when
+something else forces a small block, or when the scene is read over a network. It costs the raw pair
+(0.5 to 0.6 GiB here against a 0.40 GiB pair), which is half the `Float32` pair for `UInt16` input and a
+quarter for `UInt8`. `dx` and `dy` are identical either way (0 of 3,653,760 points differ).
 
-What it costs is the raw pair: 0.5–0.6 GiB here against a 0.40 GiB pair, the excess being the read's
-own transient. Raw, not filtered — at `UInt16` input the raw pair is half the `Float32` pair an untiled
-run would hold, and a quarter at `UInt8`. `dx`/`dy` are identical either way, 0 of 3,653,760 points
-differing at all three block sizes, since where the raw pixels came from does not reach the correlation.
+Either the whole pair is cached or none of it is. A blocked run sweeps every block once per pass, so a chunk's
+next use is a whole sweep away. Replaying the actual requests through LRU at block 1024 (485 chunks, 121
+MiB) gives 3.4× the scene at half the working set and 5.7× at a twentieth. Random replacement gives 5.6×
+against LRU's 6.0× at the same capacity, so the access order is the cause, not the eviction policy.
 
-**There is no partial cache worth sizing.** A blocked run sweeps every block once per pass, so a chunk's
-next use is a whole sweep away and a cache below the working set has evicted it by then. Replaying the
-actual chunk requests through LRU at block 1024 — 485 chunks touched, 121 MiB — gives 3.4× the scene at
-half the working set and 5.7× at a twentieth, falling below 1× only at the whole of it. The step is the
-access order, not the policy: random replacement holds 5.6× where LRU holds 6.0× at the same capacity.
-Nor can the cache be narrowed to the region actually touched, which is sparse — 475 of the 725 chunks in
-its own bounding box.
+### The read splits on the file's chunk rows
 
-### The read splits on the file's chunk rows, not on an even division
+The prefetch reads the scene in row slabs, one task each. A slab boundary inside a stored chunk makes both
+neighboring slabs decode it, and for a compressed file the decode is the read. On an 8321×8271 DEFLATE
+GeoTIFF at 10 threads with 256-row chunks, an even division into 209-row slabs prefetches in 987 ms
+(5.75 s end to end) and 256-row slabs in 278 ms (5.38 s). The pixels are identical. `AutoRIFT._slab_height`
+rounds the even division up to whole chunk rows, and an unchunked array reports one row.
 
-The prefetch reads the scene in row slabs, one task each. A slab boundary falling inside a stored chunk
-makes both neighbouring slabs decode that chunk, and for a compressed file **the decode is the read** —
-so an evenly-divided read pays for the boundary chunks twice.
+## Transform sizes
 
-Measured on an 8321×8271 DEFLATE GeoTIFF at 10 threads, where four slabs per thread asks for a height of
-209 rows against chunks 256 rows tall:
+A point is correlated at its search radius rounded up to a rung of a ladder, capped at the pass maximum
+(`AutoRIFT._radius_bucket`). The ladder has four rungs per octave (16, 20, 24, 28, 32, 40, ...), set by
+`AutoRIFT.RADIUS_BUCKET_RUNGS`. Distinct radii on the NISAR L1 grid number about 30,000, and the ladder
+reduces them to a few hundred transform sizes, each reused by thousands of points.
 
-| slab height | prefetch | end-to-end |
-|---|---:|---:|
-| 209 rows (even division) | 987 ms | 5.75 s |
-| 256 rows (whole chunks) | **278 ms** | **5.38 s** |
+On NISAR L1 (whole grid, twelve threads) one rung per octave took 590.2 s and four took 467.2 s over the
+same 1,799,742 points, because a coarse rung makes a point compute a larger transform than it needs. The
+cost of finer rungs is planning: 53 buckets become 388, which adds 110 s once per machine and is removed by
+the FFTW wisdom file ([`AutoRIFT.fftw_wisdom_path`](@ref)). Eight rungs per octave would need 996 buckets
+for a smaller gain. The ladder is a constant, not a `Params` setting, so there is nothing to tune.
 
-The same pixels either way — `vx` identical at all 160,394 points. `AutoRIFT._slab_height` rounds the
-even division *up* to whole chunk rows and never below one chunk, so alignment costs slabs rather than
-adding them: a thread count asking for more slabs than the file has chunk rows gets one chunk row.
+## What an untiled pass holds
 
-The chunk height comes from the backend through `AutoRIFT._chunk_rows`, which answers `1` — no
-constraint — for an unchunked one. That guard is load-bearing rather than defensive: `DiskArrays`
-reports the whole extent as a single chunk for an unchunked array, and taking that literally would
-collapse a threaded read to one slab.
+Untiled, NISAR L1 peaks at 32 GiB against a 1.29 GiB floor. Most of it is the scene padded by each pass's
+halo (6.3 GiB) and the concurrent correlation workspaces (4.4 GiB). Blocking removes the per-pass pad, and
+the same granule blocked peaks at 25.2 GiB. Retained correlation workspaces are capped by
+`AutoRIFT.WORKSPACE_POOL_BYTES` (default 2 GiB), and those checked out at once by
+`AutoRIFT.WORKSPACE_LIVE_BYTES` (default unbounded). The term-by-term breakdown and the paired runs behind
+both bounds are in `dev/plan-16gib.md`.
 
-## Transform sizes are already quantized, and coarsening costs more than it saves
+## Timing a large run
 
-The count of distinct FFT sizes a NISAR pass plans looks alarming until it is measured properly. Distinct
-*raw* `(radius_x, radius_y)` pairs on the L1 grid number **29,761** — but that is not what gets planned.
-`AutoRIFT._radius_bucket` rounds every radius up to a power of two and caps it at the pass radius,
-so the ladder actually reached is **37 sizes** on L1 and 44 on L2, each reused by tens of thousands of
-points. Nine rungs per axis: 8, 16, 32 … 1024, cap.
+Three hazards when timing NISAR-sized runs on this machine:
 
-Two alternative ladders measured against the shipping one, on a 400×400 window of the L1 grid
-(`tools/golden/fft_ladder_test.jl`):
-
-| ladder | plan sizes reached | runtime | vs shipping |
-|---|---:|---:|---:|
-| powers of two — ships | 25 | **363.3 s** | **1.00×** |
-| every second power of two | 10 | 452.1 s | 1.24× |
-| multiples of 4 | 25† | 462.0 s | 1.27× |
-
-**Both alternatives are slower, and for opposite reasons.** Coarsening to every second power of two more
-than halves the ladder and still loses 24%, because a coarser rung makes a point compute a *larger*
-transform than it needs — the saving in planning is smaller than the waste in execution. Going finer, to
-multiples of 4, loses 27% while admitting far more plans: 476 × 207 possible size pairs on L1 against the
-power-of-two ladder's 9 × 8.
-
-So the ladder is not the lever. Planning is already amortized — the wisdom file turns three cold plans
-from 822 ms into 0.1 ms — and what remains is execution cost, which a coarser ladder increases.
-
-† The harness rewrites radii and hands them to the unmodified correlator, whose own `_radius_bucket`
-re-rounds to powers of two, so this row measures the *cost* of finer radii rather than the plan count a
-real interval-4 implementation would carry. That cost is the half that matters; the plan count only gets
-worse.
-
-## What a whole-scene pass actually holds, and the one term worth removing
-
-Peak on a whole NISAR L1 grid is 32 GiB against a **1.29 GiB floor** once the imagery is mapped, so
-essentially all of it is live working set. Sizing the candidates from the configuration rather than
-guessing (`-t 10`, grid 2328×2304, scene 57760×50511):
-
-| term | GiB |
-|---|---:|
-| imagery, both images | 5.43 *(mapped, not heap)* |
-| grid arrays | 0.40 |
-| one displacement field, per level | 0.08 |
-| refinement workspaces, 10 tasks | 0.04 |
-| concurrent correlation workspaces, worst level | 4.36 |
-| retained workspace pool | 1.51 |
-| **the scene pad, per pass** | **6.3** |
-
-**Every level pads.** `_pass_geometry` reports `fits = false` at all four chip sizes on this grid — a
-geogrid's points sit near the footprint edge and carry radii up to 1905 px — so each pass copies the
-whole scene grown by its own halo (2231×1149 px at the base level, 2567×1331 at the coarsest). With a
-coarse and a fine pass per level that is eight such copies per run.
-
-That pad is also what **defeats memory-mapping the input**: 5.43 GiB is kept off the heap and then
-copied back onto it, which is why the floor is 1.29 GiB and the peak 32.
-
-### The mask was a third of it, and is now lazy
-
-`_zeropad` allocates `Matrix{T}`, and a validity mask arrives *packed* — `valid` returns the `BitMatrix`
-broadcasting produces. So padding the mask expanded it eightfold: **3.13 GiB against the 0.39 GiB its
-source occupies**, once per pass. Nothing read it densely enough to want that; the mask has exactly one
-consumer, `_valid_fraction` over a chip footprint, which touches each of a chip's pixels once rather than
-the whole padded scene. `AutoRIFT.PaddedMask` pads it lazily instead. Paired runs, identical wisdom, one
-process each:
-
-| arm | wall | CPU | occupancy | peak footprint | allocated |
-|---|---:|---:|---:|---:|---:|
-| `_zeropad`ed mask | 545.0 s | 5215.7 s | 9.57 | 38.33 GiB | 161.5 GiB |
-| **lazy mask** | **538.7 s** | 5195.1 s | **9.64** | **31.97 GiB** | 138.1 GiB |
-
-**Peak footprint −6.36 GiB, −16.6%, at no runtime cost**, and bit-identical: both arms measure 1,799,746
-points and give the same `dx` *and* `dy` checksums over raw bits. The allocation column confirms the
-mechanism arithmetically — 23.4 GiB less, against 3.1 GiB × 8 passes predicted.
-
-**Hoisting the imagery pad across passes is not worth building, and the reason is the GC column.**
-Eight scene-sized copies per run is 136–161 GiB of allocation, which sounds like collection pressure
-and is not: **GC is 1.0–1.4 s, 0.2–0.3% of wall**. Large arrays are cheap to allocate and cheap to
-release, so caching one pad across passes would recover nothing measurable. Removing the copy
-altogether — padding per window rather than per scene, as the blocked path already does per block — is
-the remaining ~6 GiB, and it puts a branch in the loop that feeds the FFT and the integral tables, so it
-needs a kernel benchmark rather than an argument. Blocking is the shipping answer meanwhile: the same
-granule blocked peaked at 25.2 GiB.
-
-## The pool is bounded across keys as well as per geometry
-
-The per-key bound keeps one geometry's retention proportional to its concurrency and says nothing about
-how many geometries a run visits. Measured on a whole NISAR L1 grid, untiled at 10 threads
-(`tools/golden/pool_peak.jl`), the pool ends the run holding **9.9 GiB across 105 keys** — and the widest
-of those are near-duplicates, because `_radius_bucket` clamps to each level's own maximum radius and the
-levels' maxima differ (1905×830, 1918×1015, 1689×907, 1828×972). Each is legitimately needed by its own
-level, and a level that has finished can never ask for its own again.
-
-`AutoRIFT.WORKSPACE_POOL_BYTES` bounds the total, evicting least-recently-used by key so the level being
-correlated is the last candidate. At 2 GiB it is **free**: interleaved runs, one process each, nothing
-differing but the bound.
-
-| arm | wall | CPU | occupancy of 10 | peak footprint | peak resident | pool at end |
-|---|---:|---:|---:|---:|---:|---|
-| unbounded | *615.5*, **537.8** s | 5273, **5186** s | *8.57*, **9.64** | *42.96*, **42.06** GiB | 47.58 GiB | 105 keys, 9.87 GiB |
-| **bounded at 2 GiB** | **538.6, 535.1** s | 5193, 5179 s | **9.64, 9.68** | **39.78, 38.32** GiB | 44.57 GiB | 16 keys, 1.51 GiB |
-
-**Peak footprint 42.06 → 39.05 GiB, −7.2%, at the same wall clock and the same CPU seconds to 0.1%** —
-both bounded samples sit below both unbounded ones. All four runs measure the same 1,799,746 points and
-give the identical `dx` checksum, taken over raw bits so `-0.0` and every `NaN` payload counts, which is
-what makes the bound answer-preserving: a rebuilt workspace is the size of the one dropped, so it runs
-the same transform.
-
-*Italicised* is one anomalous run, and reporting it is the point. **Retention is not peak**, either:
-cutting 8.4 GiB of retained workspace moved peak by 3.0, because peak is set by what a pass holds live
-rather than by what it retains afterwards. The remaining question is whether a tighter bound saves more —
-2 GiB never binds at the end, since retention settles at 1.51 — or starts to churn.
-
-**The bound has to be read cheaply, and getting that wrong cost more than the bound saved.** Summing the
-pool with `sizeof` over `fieldnames` on every return — which is what keeps the figure from drifting out
-of step with the pool — put **9.8% of the whole golden set's serial time** in one reflective closure
-holding `WORKSPACE_LOCK`, since a return happens once per chunk per radius bucket and the pool reaches a
-hundred keys. `CorrelationWorkspace` now records its own byte count at construction, so the same sum is
-a few hundred integer adds. A bound whose *accounting* is O(pool) per operation is not a bound worth
-having; the fix keeps the drift-free derivation and moves the cost to where it is paid once.
-
-### Wall clock on this machine is bimodal, and peak is not
-
-Worth stating because it shaped every timing above. Identical configurations, one process each, land in
-one of two modes: **~538 s at occupancy 9.6, or ~615 s at occupancy 8.6** — a 14% split, seen in both
-arms of every comparison here and in runs where nothing changed at all. Peak footprint is stable across
-it to about 0.5 GiB.
-
-So a single-run wall-clock difference below ~15% on this granule means nothing, and the only conclusions
-drawn above from wall clock are ones where arms were interleaved and repeated. Peak, allocation and CPU
-seconds are the figures that reproduce.
-
-**`dx` is also not bit-reproducible across runs**, for a reason `src/plans.jl` already records:
-`FFTW_MEASURE` selects by measured timing, so a run can persist different wisdom and a later run then
-executes a different algorithm for the same transform size. The same case gave three different `dx`
-checksums across this session. Comparisons of *values* between two configurations are therefore only
-valid within one wisdom state — which is why the mask arms above were run back to back without anything
-in between planning a new size.
-
-### Why an earlier reading of this table rejected the change
-
-The first attempt measured the arms unpaired and recorded **wall clock only**. It drew 623.9 s and
-1268.4 s for the bounded arm against 563.3 s and 558.3 s unbounded, and concluded an erratic 11–125%
-cost for a 6–10% peak gain — a clear reject. Every number in it was real and the conclusion was wrong.
-
-Two instrument faults, both avoidable:
-
-- **No CPU seconds.** Wall alone cannot separate a run that is *waiting* from one running at a lower
-  clock. With the column added, the anomalous runs are unmistakable: 615.5 s at occupancy 8.57 against
-  537.8 s at 9.64 for the *same* configuration, at CPU seconds differing by 1.7%. The machine was
-  power-limited, and a bounded arm that happened to draw that state looked like a 2.25× regression.
-  `cpu_seconds!` in `tools/ab/memtrace.jl` exists for this, and note its units: the kernel reports
-  `ri_user_time` in 24 MHz mach ticks despite the name, so reading it as nanoseconds under-reports 42×.
-- **Unpaired arms.** Each arm ran twice in a block, so a slow period landed entirely inside one of them.
-  Interleaving A,B,A,B is what made the outlier attributable to the machine rather than to the bound.
-
-The transferable rule is the one this file already states about its own L2 sweep, in the other
-direction: **a benchmark whose arms are not interleaved measures the order, and wall clock without CPU
-seconds cannot tell you which.** Both arms were re-run interleaved on mains power before the table above
-was written.
+- **Wall clock is bimodal.** Identical configurations land near 538 s (occupancy 9.6) or near 615 s
+  (occupancy 8.6), a 14% split with peak stable to about 0.5 GiB. A single-run wall-clock difference below
+  about 15% on this granule means nothing. Interleave arms, and record CPU seconds beside wall clock.
+- **Warm up, and do not observe a run while it is timed.** The first row of a sweep carries JIT
+  compilation unless a small patch is correlated first. Sampling a live process with `sample` inflated one
+  untiled L1 row from about 580 s to 2592 s. Poll with `ps` only.
+- **Values are reproducible only within one FFTW wisdom state.** `FFTW_MEASURE` selects by measured
+  timing, so a run can persist different wisdom and a later run then executes a different algorithm for the
+  same transform size (see `src/plans.jl`). Compare outputs only between runs in the same wisdom state.
 
 ## Practical guidance
 
-- **Batch work: one pair per process or per worker, `threaded = false`.** Also 2.7× faster than
-  intra-pair threading (`benchmark/suite/throughput.jl`), so this is not a tradeoff.
-- **Warm the FFTW wisdom before timing anything, and before sizing a production instance's schedule.**
-  On a production-sized grid the cold-plan cost *dominates the correlation*: the same S1A case, same
-  process shape, measured **28.8 s on the first run of a sequence against 6.5 s on the next three**, with
-  CPU seconds 71.9 against 48.3 — the extra is the planner, not the correlation. `performance.md` records
-  0.13 s against 2.35 s for a 1024² pair; at 11.5 M grid points and dozens of radius buckets it is 22
-  seconds. Two consequences: [`AutoRIFT.warm_plans!`](@ref) is worth more than its small-pair figures
-  suggest, and **a benchmark whose arms run in sequence measures the order, not the arms** — which is the
-  same trap the L2 sweep above fell into, in the opposite direction.
-- **`process_block_size` is chosen for you from the halo and the thread count** when the input is a
-  file-backed raster — see [`AutoRIFT.block_size_for`](@ref). Pass one explicitly to override. The rule
-  reproduces the sweeps above: `_block_count` gives the recorded block count exactly on 12 of 12 NISAR
-  rows and 4 of 6 optical ones, the two misses being the grid shape assumed for the check rather than the
-  arithmetic.
-- **`process_block_size = (1024, 1024)` when peak memory matters** and you are choosing by hand, and go
-  small — but not to the floor. Peak falls monotonically as blocks shrink; runtime does not. On NISAR L1
-  the lowest peak is `(2816, 1536)` at 0.49× untiled while the fastest blocked row is `4096` square, 13%
-  quicker for 3 GiB more. Pick by which resource binds.
-- **Budget for the raw pair on top of the blocks when the input is a file.** A pair cheaper to read whole
-  than window is read once, which costs its own bytes of peak and buys 11% of the runtime at 512 px and
-  nothing at 2048 — a large enough block gets there without the memory. Nothing to enable; `cache_budget
-  = nothing` declines it, and a count overrides the automatic choice on a machine where free memory is a
-  poor guide. **To keep the raw pair off the heap entirely, memory-map it** — a resident input is never
-  copied, and the kernel can then reclaim its pages under pressure where an `Array` cannot.
-- **Size the two axes separately against `halo(grid, p, size)`.** A block below its own halo is rejected,
-  and the halo need not be square: L2's is 2216×1103, so `(2304, 1152)` follows it and beats
-  `(3072, 3072)` on peak, runtime and occupancy at once. That is the floor, not the target.
-- **Aim for 100–250 blocks per thread, and do not go to the floor.** Blocks are the unit of threaded work
-  and their cost varies by orders of magnitude, so a small pool waits on its slowest member — but past the
-  optimum, read amplification outruns the occupancy gain. Measured occupancy of ten threads: 10
-  blocks/thread → **2.3**, 38 → 4.6, 76 → 6.6, 148 → **8.9**, 230 → **9.0**, 250 → 7.8, 581 → 9.0 at 21.6×
-  amplification. Both granules are fastest above their floor and lowest-peak at it.
-- **Do not tune the FFT transform-size ladder.** It is already power-of-two quantized to a few dozen
-  sizes; both coarser and finer ladders measure slower. See the section above.
-- **Reuse a `Cache` across pairs** via `init`/`reinit!`/`autorift!`. The live heap is flat, so this
-  is bounded regardless of batch length.
-- **No process recycling needed** — the measurement above is what establishes that.
-- **Small instances: use the trimmed binary.** 27.2 MiB against 424.2 MiB is the difference between
-  3.1% and 43% of a `t3.micro`.
+- **Batch work: one pair per worker, `threaded = false`.** This is 2.6× faster than threading within a
+  pair (`benchmark/suite/throughput.jl`). See [Correlating many pairs](@ref).
+- **Reuse a `Cache`** through `AutoRIFT.init`, `reinit!` and `autorift!`. Memory is bounded regardless of
+  batch length, and no process recycling is needed.
+- **Warm the FFTW wisdom before timing anything or sizing a schedule.** On the 11.5 M-point S1A case the
+  first run of a sequence took 28.8 s against 6.5 s for the next three, with CPU seconds 71.9 against
+  48.3. The difference is planning. See [Performance](@ref) and [`AutoRIFT.warm_plans!`](@ref).
+- **Scenes larger than memory: set `process_block_size`.** For file-backed Rasters input the default from
+  [`AutoRIFT.block_size_for`](@ref) (the halo, floored at 1024 px) is fitted to a sweep of every golden
+  case. For arrays pass a size explicitly. To choose by hand, use `(1024, 1024)` for a narrow halo, size each axis against
+  [`AutoRIFT.halo`](@ref), and aim for 100 to 250 blocks per thread without going to the floor. Peak falls
+  as blocks shrink but runtime does not: on L1 the lowest peak is `(2816, 1536)` at 0.49× untiled, and the
+  fastest blocked row is `4096` square, 13% quicker for 3 GiB more.
+- **Budget for the raw pair on top of the blocks when the input is a file.** `cache_budget = nothing` holds
+  peak to the blocks alone, and a byte count overrides the automatic choice where free memory is a poor
+  guide, such as under a cgroup limit. To keep the raw pair off the heap entirely, memory-map it. A
+  resident input is never copied, and the kernel can reclaim its pages under pressure.
+- **Small instances: use the trimmed binary.** 27.2 MiB against 424.2 MiB is 3.1% against 43% of a
+  `t3.micro`.

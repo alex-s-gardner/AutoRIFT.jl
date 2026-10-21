@@ -27,17 +27,13 @@
 
 One value, indexable at every position of a `size`-shaped array, stored once.
 
-A [`PointSet`](@ref) field the caller gave as a scalar holds this instead of a materialized array.
-The saving is the whole point: on a 2107x2127 grid a dense `Int` field is 34 MiB, and four such fields
-are constant on every grid built from [`params`](@ref) — the two chip extents and the two chip-size
-bounds. `Uniform` stores 24 bytes for each.
+A [`PointSet`](@ref) field given as a scalar holds this instead of a materialized array. On a
+2107x2127 grid a dense `Int` field is 34 MiB; `Uniform` stores 24 bytes.
 
-Read-only, which is why only those four fields use it. `radius_x`/`radius_y` are written per point by
-the coarse pass (see `AutoRIFT._apply_coarse_mask!`), so they stay dense; a caller supplying any field
-as an array gets that array unchanged.
-
-`IndexLinear`, so `eachindex` and `vec` behave as the correlator expects, and the constant read is
-hoisted out of an inner loop rather than fetched per point.
+Read-only, so only the fields nothing writes use it: `chip_size_x`, `chip_size_y`, `chip_size_min_x`,
+`chip_size_max_x` and `positioned`. `radius_x` and `radius_y` are written per point by the coarse pass
+and stay dense. A field supplied as an array is kept unchanged. `vec` of a `Uniform` is a `Uniform`;
+indexing it with ranges returns an ordinary `Array`.
 """
 struct Uniform{T,N} <: AbstractArray{T,N}
     value::T
@@ -81,45 +77,34 @@ end
 """
     PointSet{N}
 
-Where to correlate, and with what geometry. Fields are `N`-dimensional arrays of
-matching shape, one entry per search center.
+Where to correlate, and with what geometry. Fields are `N`-dimensional arrays of matching shape, one
+entry per search center. The constructor throws `DimensionMismatch` if the shapes differ.
 
-`PointSet{1}` holds scattered centers at arbitrary coordinates; `PointSet{2}`
-holds centers on a grid. Correlation treats the two identically — each center is
-independent — while the multi-chip-size search requires `PointSet{2}` because its
-filtering steps are neighbourhood operations.
+`PointSet{1}` holds scattered centers at arbitrary coordinates; `PointSet{2}` holds centers on a grid.
+Correlation treats the two identically, but the multi-chip-size search requires `PointSet{2}` because
+its filtering steps use neighborhoods.
 
 # Fields
-- `x`, `y`: center coordinates in image pixels, as `Float64`. Fractional
-  coordinates are meaningful: a center at `x = 10.5` sits between columns.
-- `radius_x`, `radius_y`: search half-extent per axis, in pixels. The search
-  window spans `2 * radius`. Independent per axis and per point — a surface
-  moving along x warrants a wide `radius_x` and a narrow `radius_y`. A point
-  with either radius zero is skipped.
-- `dx_prior`, `dy_prior`: a-priori displacement in pixels. The search window is
-  centred on the prior rather than on zero, so a modest radius suffices even
-  where motion is large.
-- `chip_size_x`, `chip_size_y`: chip extent in pixels, per point.
-- `chip_size_min_x`, `chip_size_max_x`: the range of chip sizes a point may be searched at, in
-  pixels, bounding the multi-chip-size levels rather than any single pass. A level runs at a point
-  only when its chip size falls within them, so a point over thin, fast ice can be restricted to
-  fine chips while smooth ice admits coarse ones. Default to zero, which means unbounded — every
-  level runs everywhere, and a caller who supplies neither sees no change.
-- `positioned`: whether `x`, `y` are a real position in the images. `false` marks a point whose
-  coordinate is a **placeholder**: a geogrid marks a point outside the image footprint with a nodata
-  sentinel, and since `PointSet` has no missing value such a point is given an arbitrary coordinate
-  and a zero radius, which is what excludes it. Defaults to `true` everywhere.
+- `x`, `y`: center coordinates in image pixels, `Float64`. Fractional coordinates are allowed: `x =
+  10.5` sits between columns.
+- `radius_x`, `radius_y`: search half-extent per axis, in pixels; the search window spans
+  `2 * radius`. A point with either radius zero is skipped.
+- `dx_prior`, `dy_prior`: a-priori displacement in pixels. The search window is centered on the prior
+  rather than on zero.
+- `chip_size_x`, `chip_size_y`: chip extent in pixels, per point. A gridded multi-chip-size search
+  overwrites these at each level; they take effect on a scattered `PointSet{1}`.
+- `chip_size_min_x`, `chip_size_max_x`: the range of chip sizes (x extent, in pixels) at which a point
+  may be searched. A level runs at a point only when its chip size lies within the range. `0` means
+  unbounded and is the default. The finest level ignores these bounds and attempts every point with a
+  positive radius.
+- `positioned`: `false` marks a point whose `x`, `y` are a placeholder, such as a geogrid point outside
+  the image footprint, which is given an arbitrary coordinate and a zero radius. Defaults to `true`.
+  It does not affect whether a point is searched ([`AutoRIFT.issearchable`](@ref) tests the radius
+  alone). Blocked processing uses it to exclude placeholder coordinates when sizing a block's read
+  window.
 
-  It does not affect whether a point is searched — [`AutoRIFT.issearchable`](@ref) is the radius
-  alone, and the coarse pass's radius widening can make a placeholder point searchable. Blocking is
-  what needs this: a block's read window is the span of the coordinates it will search, and a
-  placeholder coordinate belongs to no block's neighbourhood, so the two populations must be spanned
-  separately. Without the distinction a block either misses those points or spans the whole scene.
-
-Every field carries its own type parameter, because a field is an `AutoRIFT.Uniform` exactly
-when the caller gave *that* field as a scalar, and callers mix freely: `chip_size_x` as a per-point
-array beside a scalar `chip_size_y` is ordinary use. One parameter shared across two fields would make
-such a pair a `MethodError`.
+Each field has its own type parameter, because a field is an `AutoRIFT.Uniform` exactly when it was
+given as a scalar, and fields may be mixed.
 
 See also [`pointset`](@ref), [`gridpoints`](@ref), [`npoints`](@ref).
 """
@@ -168,9 +153,8 @@ end
 """
     npoints(pts::PointSet) -> Int
 
-Number of search centers, including those that will be skipped for having a zero
-search radius. See [`nsearchable`](@ref) for the count that will actually be
-correlated.
+Number of search centers, including those skipped for a zero search radius. See
+[`nsearchable`](@ref) for the number that will be correlated.
 """
 npoints(pts::PointSet) = length(pts.x)
 
@@ -183,13 +167,11 @@ Base.isempty(pts::PointSet) = isempty(pts.x)
 """
     nsearchable(pts::PointSet) -> Int
 
-Number of points that will actually be correlated, i.e. those with a non-zero
-search radius in both axes.
+Number of points with a non-zero search radius in both axes, which are the points that will be
+correlated.
 
-Typically far smaller than [`npoints`](@ref): the chip-size loop's coarse pass zeroes
-the radius wherever it found no coherent motion, and a skipped point costs
-almost nothing while a searched one costs microseconds. This ratio is what makes
-dynamic work-scheduling worthwhile.
+Can be much smaller than [`npoints`](@ref), because the coarse pass zeroes the radius wherever it found
+no coherent motion.
 """
 function nsearchable(pts::PointSet)
     n = 0
@@ -202,8 +184,8 @@ end
 """
     issearchable(pts::PointSet, i) -> Bool
 
-Whether point `i` has a search window with extent in both axes. A window with no
-extent in one direction cannot yield a displacement.
+Whether point `i` has a positive search radius in both axes. A window with no extent in one axis
+cannot yield a displacement.
 """
 @inline issearchable(pts::PointSet, i) =
     @inbounds pts.radius_x[i] > 0 && pts.radius_y[i] > 0
@@ -211,12 +193,13 @@ extent in one direction cannot yield a displacement.
 """
     pointset(x, y; kwargs...) -> PointSet
 
-Build a [`PointSet`](@ref) from center coordinates, filling unspecified geometry
-from scalar defaults.
+Build a [`PointSet`](@ref) from center coordinates, filling unspecified geometry from scalar defaults.
 
-`x` and `y` may be vectors of scattered coordinates, matrices of gridded ones,
-or a vector of `Tuple`/`CartesianIndex`. Each geometry keyword accepts a scalar,
-broadcast to every point, or an array matching the shape of `x`.
+`x` and `y` are arrays of the same shape: vectors for scattered points, matrices for gridded ones.
+`pointset(xy; kwargs...)` takes a single vector of `(x, y)` tuples, and `pointset(idx; kwargs...)` a
+vector of `CartesianIndex{2}`, read as `(row, col) = (y, x)`. Each geometry keyword accepts a scalar,
+applied to every point, or an array matching the shape of `x`. A fractional value for an integer field
+throws `ArgumentError`, and a mismatched shape throws `DimensionMismatch`.
 
 ```jldoctest
 julia> pts = AutoRIFT.pointset([10.0, 50.5, 200.0], [20.0, 60.0, 30.25];
@@ -230,19 +213,16 @@ julia> pts.x[2], pts.radius_x[2], pts.chip_size_x[2]
 ```
 
 # Keywords
-- `search_radius = 25`: half-extent of the search window, as an
-  [`AutoRIFT.Extent`](@ref) — a scalar means square, `(X = …, Y = …)` names the axes.
+- `search_radius = 25`: half-extent of the search window, an [`AutoRIFT.Extent`](@ref). A scalar means
+  square; `(X = …, Y = …)` names the axes.
 - `chip_size = 32`: chip extent, likewise.
-- `search_radius_x`, `search_radius_y`, `chip_size_x`, `chip_size_y`: per-axis overrides that also
-  accept a **per-point array**, which an extent cannot express. That is what they are for: a
-  Geogrid-derived search radius varies across the scene.
-- `dx_prior = 0.0`, `dy_prior = 0.0`: a-priori displacement.
-- `chip_size_min_x = 0`, `chip_size_max_x = 0`: the chip sizes this point may be searched at,
-  bounding the multi-chip-size levels. Zero means unbounded. Also accept a per-point array, which
-  is how they are usually supplied — ITS_LIVE ships them as rasters.
-- `positioned = true`: whether each coordinate is a real image position rather than a placeholder
-  standing in for a point outside the footprint. A per-point array, or a scalar for the usual case
-  where every coordinate is real. See [`PointSet`](@ref).
+- `search_radius_x`, `search_radius_y`, `chip_size_x`, `chip_size_y`: per-axis overrides of the
+  extents above. Unlike an extent, they accept a per-point array.
+- `dx_prior = 0.0`, `dy_prior = 0.0`: a-priori displacement, a scalar or per-point array.
+- `chip_size_min_x = 0`, `chip_size_max_x = 0`: the chip sizes at which a point may be searched. `0`
+  means unbounded. A scalar or per-point array.
+- `positioned = true`: whether each coordinate is a real image position. A scalar or per-point array.
+  See [`PointSet`](@ref).
 """
 function pointset(
     x::AbstractArray, y::AbstractArray;
@@ -330,12 +310,13 @@ _exactly(::Type{T}, v::Real) where {T<:AbstractFloat} = T(v)
     gridpoints(imagesize, spacing; kwargs...) -> PointSet{2}
     gridpoints(xs, ys; kwargs...) -> PointSet{2}
 
-Build a gridded [`PointSet`](@ref): centers on a regular lattice, laid out in 2-D
-so that the multi-chip-size search can apply its neighbourhood filters.
+Build a gridded [`PointSet`](@ref): centers on a regular lattice laid out in 2-D, as the
+multi-chip-size search requires.
 
-The first form places centers every `spacing` pixels across an image of size
-`imagesize = (nrows, ncols)`, inset far enough from the edges that a chip and its
-search window fit. The second takes explicit coordinate vectors.
+The first form places centers every `spacing` pixels (an [`AutoRIFT.Extent`](@ref) or scalar) across an
+image of size `imagesize = (nrows, ncols)`, inset from the edges so that a chip and its search window
+fit. It throws `ArgumentError` if `spacing` is not positive or no center fits. The second form takes
+explicit coordinate vectors; rows of the result vary with `ys` and columns with `xs`.
 
 ```jldoctest
 julia> pts = AutoRIFT.gridpoints((512, 512), 32; chip_size = 32, search_radius = 25);
@@ -389,11 +370,8 @@ end
 """
     scatter(pts::PointSet) -> PointSet{1}
 
-View a `PointSet` as a flat list of points, discarding any grid layout.
-
-Free: `vec` of an array shares its memory, so this allocates nothing and mutating
-either view is visible in the other. Used to hand a gridded point set to the
-correlator, which has no use for the layout.
+View a `PointSet` as a flat list of points, discarding the grid layout. Each field is `vec` of the
+original, so the result shares memory with `pts`: mutating either is visible in the other.
 """
 scatter(pts::PointSet{1}) = pts
 scatter(pts::PointSet) = rebuild(pts;
@@ -408,12 +386,8 @@ scatter(pts::PointSet) = rebuild(pts;
 """
     pts[rows, cols] -> PointSet{2}
 
-Decimate or crop a gridded point set, copying every field.
-
-The coarse pass needs a strided subset of its grid, and doing that by indexing
-every field at the call site both repeats the shape and makes it easy to miss one when a
-field is added. A copy rather than a view because the caller then modifies the result — the
-coarse pass overwrites the radii and the chip sizes.
+Decimate or crop a gridded point set, copying every field. `rows` and `cols` index the grid as for a
+matrix. The result is independent of `pts`.
 """
 Base.getindex(pts::PointSet{2}, rows, cols) = PointSet(
     pts.x[rows, cols], pts.y[rows, cols],
@@ -426,12 +400,8 @@ Base.getindex(pts::PointSet{2}, rows, cols) = PointSet(
 """
     rebuild(pts::PointSet; kwargs...) -> PointSet
 
-A copy of `pts` with the named fields replaced, sharing the rest.
-
-Used wherever a point set is derived from another by changing one or two fields — shifting the
-coordinates, overriding the chip size, zeroing a radius. Doing that by listing every
-positional argument means adding a field to `PointSet` silently drops it from every such site,
-which is the failure this exists to prevent.
+A `PointSet` with the named fields replaced. Fields not named are shared with `pts`, not copied. The
+keywords are the field names of [`PointSet`](@ref); the replacements must have matching axes.
 """
 rebuild(pts::PointSet; x = pts.x, y = pts.y,
         radius_x = pts.radius_x, radius_y = pts.radius_y,
@@ -446,19 +416,13 @@ rebuild(pts::PointSet; x = pts.x, y = pts.y,
 """
     sanitize!(pts::PointSet, min_radius) -> Int
 
-Normalise search radii in place and return the number of points left searchable.
+Normalize search radii in place and return the number of points left searchable. Two rules, from the
+reference (`autoRIFT.py:547-551`):
 
-Two rules, both inherited from the reference (`autoRIFT.py:547-551`) and both
-deliberate:
-
-1. **Zero is contagious across axes.** A point whose radius is non-positive in
-   either axis is unsearchable, so both radii are cleared. A search window with
-   no extent in one direction cannot produce a displacement, and leaving a
-   positive radius in the other axis would imply otherwise.
-2. **The floor applies per axis, and only to searchable points.** A point that is
-   searched at all gets at least `min_radius` in each direction, because a
-   correlation surface a few pixels across cannot support subpixel refinement.
-   Points cleared by rule 1 stay cleared rather than being raised to the floor.
+1. A point whose radius is non-positive in either axis is unsearchable, so both of its radii are set
+   to zero.
+2. Every other point gets at least `min_radius` in each axis, since a correlation surface only a few
+   pixels across cannot support sub-pixel refinement. Points zeroed by rule 1 stay zero.
 """
 function sanitize!(pts::PointSet, min_radius::Integer)
     rx, ry = pts.radius_x, pts.radius_y
@@ -481,10 +445,9 @@ end
 
 Pixel ranges of the chip cut from the secondary image at point `i`.
 
-The chip is centred on the point *displaced by its a-priori offset*, so the
-search begins where motion is expected rather than at zero. Extent is
-`chip_size` in each direction, giving an even-sized chip with a well-defined
-half-extent.
+The chip is centered on `floor(x - dx_prior)` and `floor(y - dy_prior)`, so the search begins where
+motion is expected. Its extent is `chip_size_y` rows by `chip_size_x` columns, from `c - h` to
+`c + h - 1` with `h = chip_size ÷ 2`.
 """
 @inline function chip_bounds(pts::PointSet, i)
     @inbounds begin
@@ -501,17 +464,11 @@ end
 
 Pixel ranges of the search window cut from the reference image at point `i`.
 
-Larger than the chip by the search radius in each direction, so that correlating
-the two yields a surface of exactly `(2 * radius_y, 2 * radius_x)` samples with
-zero displacement at its centre.
-
-The window is deliberately **asymmetric**: it extends `radius` pixels below the
-chip but only `radius - 1` above, giving a width of `chip + 2 * radius - 1`
-rather than `chip + 2 * radius`. That is what makes the correlation surface an
-even `2 * radius` samples across, so that zero displacement lands exactly on a
-sample rather than between two. A symmetric window would give an odd surface
-whose centre is a half-sample offset from zero displacement, biasing every
-recovered velocity by half a pixel.
+The window is centered on `floor(x)` and `floor(y)`, without the prior. It is larger than the chip by
+the search radius: it extends `radius` pixels before the chip's first index but only `radius - 1`
+after its last, giving a width of `chip + 2 * radius - 1`. Correlating the chip against it yields a
+surface of `(2 * radius_y, 2 * radius_x)` samples with zero displacement on a sample. A symmetric
+window would give an odd-sized surface whose center is half a sample from zero displacement.
 """
 @inline function search_bounds(pts::PointSet, i)
     @inbounds begin

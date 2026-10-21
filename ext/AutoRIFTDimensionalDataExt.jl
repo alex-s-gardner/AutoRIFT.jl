@@ -1,26 +1,16 @@
 """
     AutoRIFTDimensionalDataExt
 
-Accept `AbstractDimArray` input and return a `DimStack` whose dimensions describe the output
-grid.
+Accept `AbstractDimArray` input and return a `DimStack` whose dimensions describe the output grid.
 
-The core is deliberately array-only, in pixel coordinates, so it loads without any geospatial
-dependency and works equally on map-projected imagery and radar slant-range data. This extension
-is the seam: it reads coordinates off the input lookups, calls the plain-array core, and rebuilds
-the result as a stack on the output grid.
+The extension reads coordinates from the input lookups, calls the plain-array core, and rebuilds the
+result as a stack on the output grid.
 
-# Why this is separate from the Rasters extension
-
-This one handles the *dimensional but unprojected* case, which in practice means radar
-range-Doppler: real coordinates along each axis, no CRS, and dimensions that are not `X` and `Y`
-(`Dim{:range}` and `Dim{:azimuth}` are typical). Nothing here may assume otherwise — an
-extension that reached for `dims(A, Y)` would work on optical imagery and fail on exactly the
-data this exists to support.
-
-Because there is no CRS, there is also no map orientation, so this path reports the core's own
-`dx`/`dy` unchanged: pixel offsets from secondary back to reference, `dy` increasing with row
-index. The sign flip to feature motion belongs where north is known, which is the Rasters
-extension.
+It handles dimensional arrays without a CRS, such as radar range-Doppler data, whose dimensions need
+not be `X` and `Y` (`Dim{:range}` and `Dim{:azimuth}` are typical). The first dimension is rows and the
+second is columns. With no CRS there is no map orientation, so it reports the core's `dx` and `dy`
+unchanged: pixel offsets from secondary back to reference, `dy` increasing with row index. The
+Rasters extension converts these to feature motion.
 """
 module AutoRIFTDimensionalDataExt
 
@@ -35,17 +25,18 @@ using DimensionalData.Lookups: Lookup, isregular
 
 Correlate two dimensional arrays, returning a stack on the output grid.
 
-Layers are `dx`, `dy` (pixels), `correlation`, `peak_ratio`, `chip_size`, and `interpolated` — see
-[`AutoRIFT.MultichipResult`](@ref). Accepts every keyword [`AutoRIFT.params`](@ref) does.
+Layers are `dx`, `dy` (pixels), `correlation`, `peak_ratio`, `chip_size` and `interpolated`; see
+[`AutoRIFT.MultichipResult`](@ref). Accepts the keywords of [`AutoRIFT.params`](@ref), plus
+`reference_valid` and `secondary_valid` (per-pixel validity masks, arrays or dimensional arrays) and
+the blocking keywords of [`AutoRIFT.autorift`](@ref). Throws `ArgumentError` unless both inputs are
+2-D, and `DimensionMismatch` unless their dimension names and lookups are equal.
 
-The first dimension is taken as rows and the second as columns, matching the array core. For a
-projected raster use the Rasters extension instead, which knows which way is north and returns
-map-oriented `vx`/`vy`.
+The first dimension is rows and the second is columns. For a projected raster, load `Rasters` for
+map-oriented `vx` and `vy`.
 
 !!! note "Sign convention"
-    `dx` and `dy` are pixel offsets from `secondary` back to `reference` — the *negative* of
-    feature motion — with `dy` increasing along the first dimension. Unprojected axes have no
-    orientation to correct to, so they are reported as measured.
+    `dx` and `dy` are pixel offsets from `secondary` back to `reference`, the negative of feature
+    motion, with `dy` increasing along the first dimension.
 """
 function AutoRIFT.autorift(reference::AbstractDimArray, secondary::AbstractDimArray;
                            reference_valid = nothing, secondary_valid = nothing, kwargs...)
@@ -76,10 +67,10 @@ end
 
 Throw unless `a` and `b` describe the same grid.
 
-Equal *lookups*, not merely equal sizes. Two acquisitions on different grids are the likeliest
-caller mistake and the most damaging: the correlation succeeds, every displacement is offset by
-the grid difference, and nothing downstream can detect it. Matching sizes are not evidence of
-co-registration.
+Both must be 2-D with equal dimension names and equal lookups; equal sizes are not sufficient. Images
+on different grids would correlate without error and give displacements offset by the grid
+difference. Throws `ArgumentError` for other than two dimensions and `DimensionMismatch` for differing
+names or lookups.
 """
 function check_aligned(a::AbstractDimArray, b::AbstractDimArray)
     da, db = dims(a), dims(b)
@@ -104,11 +95,9 @@ end
 
 Output dimensions: the input's, sampled at the grid's pixel positions.
 
-The grid carries 1-based pixel indices into the input — [`AutoRIFT.gridpoints`](@ref) insets from
-the edges, so the first point is not pixel 1. Indexing the input lookup at those positions is
-what carries the coordinates, the step, and the axis order through to the output in one
-operation, rather than recomputing an origin and spacing here and risking a half-pixel
-disagreement with the input.
+The grid holds 1-based pixel indices into the input; [`AutoRIFT.gridpoints`](@ref) insets from the
+edges, so the first point is not pixel 1. Indexing the input lookup at those positions carries the
+coordinates, step and axis order to the output.
 """
 function grid_dims(reference::AbstractDimArray, grid::AutoRIFT.PointSet{2})
     rowdim, coldim = dims(reference)
@@ -125,15 +114,12 @@ end
 
 Coordinates at the given 1-based pixel positions, as a lookup of the same kind.
 
-`getindex` on a lookup preserves its type, its order, and its CRS, so a `Projected` input yields
-a `Projected` output and a reverse-ordered axis stays reverse-ordered. That is what makes the
-Rasters extension's y handling a question about *signs* rather than about metadata.
+`getindex` on a lookup preserves its type, order and CRS, so a `Projected` input gives a `Projected`
+output and a reverse-ordered axis stays reverse-ordered.
 
-Indexed with a **range** rather than a vector of the same values, which matters more than it
-looks: a vector index produces an `Irregular` span, since `getindex` cannot know the positions
-were evenly spaced, and an irregular output grid has no single pixel size — which is exactly what
-`dt` needs. The grid *is* regular by construction (`AutoRIFT.gridpoints` steps by `grid_spacing`),
-so a range says so and carries `Regular(grid_spacing * input_step)` through.
+The positions are indexed as a range, not a vector. A vector index gives an `Irregular` span, which has
+no single pixel size for `dt` to scale by. The grid is regular (`AutoRIFT.gridpoints` steps by
+`grid_spacing`), so a range gives `Regular(grid_spacing * input_step)`.
 """
 function sample_lookup(l::Lookup, positions)
     first_px = round(Int, first(positions))
@@ -146,11 +132,9 @@ end
 """
     layers(result) -> NamedTuple
 
-The five output layers as plain arrays, ready to become stack layers.
-
-`interpolated` is materialised from its `BitMatrix` into a `Matrix{Bool}`: a packed bit array is
-the right internal representation but an awkward one to hand to a consumer writing NetCDF, which
-expects a byte per value.
+The six output layers (`dx`, `dy`, `correlation`, `peak_ratio`, `chip_size`, `interpolated`) as plain
+arrays. `interpolated` is converted from a `BitMatrix` to a `Matrix{Bool}`, one byte per value, as
+NetCDF writers expect.
 """
 layers(r::AutoRIFT.MultichipResult) = (
     dx = r.dx, dy = r.dy, correlation = r.correlation, peak_ratio = r.peak_ratio,
@@ -171,13 +155,8 @@ unwrap(m) = m
 
 Ground spacing along the axis `l` describes, or `nothing` if it has none.
 
-Only a regularly-spaced axis has a single spacing. An `Irregular` or `Explicit` lookup describes
-an axis whose pixels differ in size, and no scalar can convert those displacements to ground
-units — so this reports that rather than returning a nominal value that would be silently wrong
-across most of the scene.
-
-The guard is what makes this total: `step` throws a `MethodError` on an irregular lookup rather
-than returning anything, so the `nothing` has to come from asking first.
+Only a regularly spaced axis has a single spacing. An `Irregular` or `Explicit` lookup has pixels of
+differing size, so no scalar converts its displacements to ground units and this returns `nothing`.
 """
 pixel_size(l::Lookup) = isregular(l) ? abs(step(l)) : nothing
 

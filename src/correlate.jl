@@ -117,36 +117,20 @@
 
 Preallocated buffers for correlating one chip against one search window.
 
-Everything the per-point kernel touches lives here and is reused across points, so
-the inner loop allocates nothing. Sized for the largest chip and search radius a
-pass will use; points needing less take views of the corner, which is why the
-buffers are plain `Matrix` with runtime extents rather than sized types — a size in
-the type would mean recompiling the kernel per chip size, and real runs use several.
+All buffers the per-point kernel touches, reused across points so the inner loop allocates
+nothing. A workspace is sized for the largest chip and search radius of a pass; points needing less
+use views of the corner. The buffers are plain `Matrix` with runtime extents, so the kernel is
+compiled once rather than per chip size.
 
-Deliberately *not* parametrized on the image element type. None of these buffers has that
-type: the chip is `Float32` because it is stored mean-removed, and the integral images are
-`Float64`. Carrying a `T` that no field uses would make `CorrelationWorkspace{UInt8}` and
-`CorrelationWorkspace{Int16}` distinct types and specialize every downstream method twice for
-identical machine code. The element type reaches the kernel through the image arguments, which
-is where it belongs.
+The type is not parametrized on the image element type. The chip buffer is `Float32` (stored
+mean-removed) and the integral images are `Float64` whatever the image type is.
 
-**The buffers a measure cannot reach are allocated empty**, which is why the type stays concrete
-while the footprint does not carry both paths. A real image dispatches to the `ZNCC`/`NCC` methods of
-`_correlate_surface!` and a complex one to the `Coherence` method, and `Coherence` on a real image is
-an error rather than a fallback — so within one workspace the reachable set is fixed, and the other
-fields are `0x0`. Measured at chip 96x52 radius 1905x830: a 657 MiB workspace holding both paths
-becomes 315 MiB for a real run and 534 MiB for a complex one. That is 52% of every workspace on the
-path production actually takes, and it matters more the more geometries a run visits, since each is a
-separate pool entry.
-
-Which set is live follows from `T` at [`workspace`](@ref), so nothing branches per point: the empty
-buffers are never indexed because dispatch has already chosen the path that would have indexed them.
-`isqsum` is in both sets — a sum of squared *magnitudes* is real either way.
-
-`WORKSPACE_POOL`'s key carries that choice alongside the geometry, and it has to: a process running
-both measures over one geometry would otherwise hand a `Coherence` pass a real-shaped workspace, whose
-complex buffers are empty, and the failure would be an out-of-bounds write rather than a
-`DimensionMismatch`.
+A workspace holds the buffers for either real imagery (`ZNCC`, `NCC`) or complex imagery
+([`Coherence`](@ref)). The other set is empty (`0x0`). At chip 96x52 and radius 1905x830, a 657 MiB
+workspace holding both sets becomes 315 MiB for real imagery and 534 MiB for complex. `isqsum` is
+used by both, since a sum of squared magnitudes is real. `AutoRIFT.WORKSPACE_POOL` keys on this
+choice as well as on the geometry. Correlating real chips with a complex workspace, or the reverse,
+throws `ArgumentError`.
 
 Construct with [`workspace`](@ref).
 """
@@ -280,22 +264,17 @@ end
 Allocate correlation buffers for chips up to `chip_size` and search radii up to
 `search_radius`, each an `Int` or a `(x, y)` tuple.
 
-One workspace per task, never shared: the buffers are written during correlation,
-so two tasks sharing one would corrupt each other.
+Use one workspace per task and do not share it: the buffers are written during correlation.
 
-`T` is the element type of the images to be correlated, and it selects **which buffers are
-allocated**. A real `T` gets the `ZNCC`/`NCC` buffers and a complex one the [`Coherence`](@ref)
-buffers; the other set is allocated `0x0`, since the element type fixes which
-`_correlate_surface!` method a point can reach and the unreachable buffers would never be indexed.
-Roughly half of a both-paths workspace is dead weight on either path, and a run visits one pool
-entry per geometry, so this is the difference between holding one path's buffers and both.
+`T` is the element type of the images to be correlated (default `Float32`). A real `T` allocates
+the `ZNCC`/`NCC` buffers and a complex `T` the [`Coherence`](@ref) buffers; the other set is
+empty. Any `T<:Real` works, including `Int16` and other integer sensor types. The buffer element
+types do not depend on `T`: the chip is `Float32` and the integral images are `Float64`.
 
-Their *element* types still do not depend on `T`: the chip is `Float32` because it is stored
-mean-removed, and the integral images are `Float64` to hold a sum of squares without loss. Any
-`T<:Real` correlates correctly, including `Int16` and other integer sensor types.
+A workspace is interchangeable only with one built for the same kind of `T` (real or complex).
+[`AutoRIFT.take_workspace!`](@ref) carries that in its pool key.
 
-A workspace is therefore only interchangeable with one built for the same `T`-kind, which
-[`AutoRIFT.take_workspace!`](@ref) carries in the pool key.
+Throws `ArgumentError` if a chip size or search radius is not positive.
 """
 workspace(chip_size, search_radius) = workspace(Float32, chip_size, search_radius)
 
@@ -423,26 +402,20 @@ const POOL_SLOTS_PER_KEY = 2
 """
     AutoRIFT.WORKSPACE_POOL_BYTES
 
-Bytes of workspace the pool may retain across every geometry. `typemax(Int)` for no bound beyond
-`POOL_SLOTS_PER_KEY`.
+Bytes of workspace the pool may retain across every geometry, default 2 GiB. `typemax(Int)`
+removes the bound, leaving only `POOL_SLOTS_PER_KEY` per geometry.
 
-**Why a second bound.** The per-key one keeps a geometry's retention proportional to its concurrency and
-says nothing about how many geometries a run visits. A whole NISAR L1 grid visits **105**, retaining
-**9.9 GiB**, and the widest are near-duplicates: `_radius_bucket` clamps to each level's own maximum
-radius, the levels' maxima differ (1905x830, 1918x1015, 1689x907, 1828x972), and a level that has
-finished can never ask for its bucket again.
+The per-geometry limit does not bound the number of geometries a run visits. A whole NISAR L1 grid
+visits 105 and would retain 9.9 GiB. At 2 GiB, peak footprint on that grid fell from 42.06 to
+39.05 GiB (-7.2%) with the same wall clock and CPU time to 0.1%. `docs/src/explanation/memory.md`
+has the table.
 
-Bounding it at 2 GiB is measured as **free**: peak footprint 42.06 -> 39.05 GiB (**-7.2%**) at the same
-wall clock and the same CPU seconds to 0.1%, over interleaved runs on that grid.
-`docs/src/explanation/memory.md` has the table and the reason an earlier reading of it was wrong.
+The bound does not change results: a rebuilt workspace has the same size as the one dropped, so it
+runs the same transform.
 
-Setting it cannot change an answer: a rebuilt workspace is byte-for-byte the size of the one dropped, so
-it runs the same transform. Four runs across both settings give the identical `dx` checksum over
-1,799,746 points, taken on raw bits so `-0.0` and every `NaN` payload counts.
-
-Eviction is least-recently-used by key, so the level being correlated is the last candidate; the key just
-returned is never evicted; and a single geometry whose own slots exceed the bound is kept rather than
-rebuilt per chunk. `tools/golden/pool_peak.jl --budget` is the harness.
+Eviction is least-recently-used by geometry. The geometry just returned is never evicted, so a
+single geometry larger than the bound stays pooled. `tools/golden/pool_peak.jl --budget` measures
+the effect.
 """
 const WORKSPACE_POOL_BYTES = Ref(2 * 1024^3)
 
@@ -466,28 +439,23 @@ const WORKSPACE_POOL = Dict{Tuple{Extent,Extent,Bool},Vector{CorrelationWorkspac
 """
     AutoRIFT.WORKSPACE_LIVE_BYTES
 
-Bytes of correlation workspace that may be **checked out at once**, across all tasks.
-`typemax(Int)` for no bound.
+Bytes of correlation workspace that may be checked out at once, across all tasks. `typemax(Int)`
+(the default) removes the bound.
 
-Distinct from `AutoRIFT.WORKSPACE_POOL_BYTES`, which bounds what the pool *retains* between uses.
-This bounds what is *in use*, and on a skewed radius field that is the larger quantity: a task holds one
-workspace at a time (`src/track.jl` takes one per radius bucket inside a `try`/`finally`), so a run holds
-as many as it has tasks, each sized by whichever bucket that task happens to be in. Measured on NISAR L2
-blocked at `2304x1152`, live workspaces are about 4.5 GiB of 7.8 above the process floor — the largest
-single term left, and three times what the pool retains.
+This differs from `AutoRIFT.WORKSPACE_POOL_BYTES`, which bounds what the pool retains between uses.
+A task holds one workspace at a time, sized by the radius bucket it is in, so a run holds as many
+workspaces as it has tasks. On NISAR L2 blocked at `2304x1152`, live workspaces are about 4.5 GiB
+of 7.8 GiB above the process floor, three times what the pool retains.
 
-**It delays, it never narrows.** A task over the bound waits for another to return its workspace; nothing
-is rebuilt at a different size and no point is correlated differently, so the result cannot change. What it
-trades is occupancy: where every task wants a wide bucket at once, some wait.
+A task that would exceed the bound waits for another task to return its workspace. No workspace is
+resized and no point is correlated differently, so results do not change; some tasks wait when all
+want a wide bucket at once.
 
-**One task always proceeds**, however large its workspace. A bound below a single geometry's size would
-otherwise deadlock, and a run that needs a 4 GiB workspace holds it whatever this is set to.
+One task always proceeds, however large its workspace, so a bound below a single workspace's size
+does not deadlock.
 
-Sized from each geometry's own measured bytes rather than from arithmetic over its extents. `workspace`
-records `bytes` by summing its fields precisely so a buffer added there is counted without a second place
-having to learn about it, and a predictor would be that second place — the drift `pool_bytes` documents
-refusing. The cost is that the first workspace of a geometry is admitted before its size is known, so the
-bound can be exceeded by one workspace until then.
+The size of each geometry is its measured `workspace_bytes`. The first workspace of a geometry is
+admitted before its size is known, so the bound can be exceeded by one workspace until then.
 """
 const WORKSPACE_LIVE_BYTES = Ref(typemax(Int))
 
@@ -545,9 +513,8 @@ end
 
 A workspace for exactly this geometry, from the pool or newly built.
 
-Return it with [`give_workspace!`](@ref) when done. The caller has exclusive use until then, so
-concurrent chunks never share buffers — the same guarantee per-chunk allocation gave, without
-the garbage.
+Return it with [`give_workspace!`](@ref) when done. The caller has exclusive use until then.
+Thread safe. Blocks while `AutoRIFT.WORKSPACE_LIVE_BYTES` is exceeded.
 """
 function take_workspace!(::Type{T}, chip_size, search_radius) where {T<:ImageElement}
     # Normalized through `extent`, so a scalar, a plain tuple and a named tuple all reach the same
@@ -579,14 +546,9 @@ end
 """
     AutoRIFT.give_workspace!(ws)
 
-Return a workspace to the pool, or drop it if that geometry's slots are full. Its buffers are not
-cleared: every one is fully written before being read on the next use, which is what `prepare_chip!`
-and the integral images guarantee.
-
-Dropping rather than growing the pool without limit is what bounds a run's footprint when the radius
-field is skewed — see `POOL_SLOTS_PER_KEY`, which also records what a bound across keys was measured to
-cost. A dropped workspace is ordinary garbage, and the next caller needing that geometry builds one
-identical to it.
+Return a workspace to the pool, or drop it if that geometry already holds `POOL_SLOTS_PER_KEY`
+workspaces. Its buffers are not cleared: each is fully written before it is read on the next use.
+The caller must not use `ws` afterwards.
 """
 function give_workspace!(ws::CorrelationWorkspace)
     lock(WORKSPACE_LOCK) do
@@ -615,13 +577,7 @@ end
 """
     AutoRIFT.pool_bytes() -> Int
 
-Bytes of workspace the pool currently retains.
-
-Summed over the entries rather than tracked incrementally. A running total is cheaper and was tried, and
-it is the wrong trade here: every take, return and eviction has to adjust it, a single missed adjustment
-drifts silently, and the drift shows up as a bound that stops binding rather than as an error. Summing a
-few hundred entries under a lock already held costs nothing next to a chunk's own milliseconds, and it
-cannot disagree with the pool.
+Bytes of workspace the pool currently retains, summed over its entries.
 """
 pool_bytes() = lock(WORKSPACE_LOCK) do
     sum(workspace_bytes, Iterators.flatten(values(WORKSPACE_POOL)); init = 0)
@@ -659,13 +615,7 @@ end
 """
     AutoRIFT.workspace_bytes(ws) -> Int
 
-Bytes of buffer `ws` holds.
-
-Read from the workspace, which recorded it at construction by summing its own fields — so a buffer
-added to `CorrelationWorkspace` is counted without this having to learn about it, and the sum is paid
-once per workspace rather than once per pool operation. `WORKSPACE_POOL_BYTES` reads this on every
-return while holding the pool lock, and computing it reflectively there cost 9.8% of the golden set's
-serial time.
+Bytes of buffer `ws` holds, recorded at construction as the sum of its fields' sizes.
 """
 workspace_bytes(ws::CorrelationWorkspace) = ws.bytes[]
 
@@ -673,11 +623,7 @@ workspace_bytes(ws::CorrelationWorkspace) = ws.bytes[]
     AutoRIFT.iscomplexworkspace(ws) -> Bool
 
 Whether `ws` was built for complex imagery, and so carries the [`Coherence`](@ref) buffers rather
-than the real ones.
-
-Read from the buffers themselves rather than stored, because it is derivable and a stored copy could
-disagree with them. `cchip` is the discriminating field: `workspace` gives it the chip's extent for a
-complex `T` and `0x0` for a real one, and a chip extent is never zero — `workspace` rejects that.
+than the real ones. Read from `cchip`, which is empty for a real workspace.
 """
 iscomplexworkspace(ws::CorrelationWorkspace) = !isempty(ws.cchip)
 
@@ -699,19 +645,13 @@ end
 """
     next_fft_size(n) -> Int
 
-A transform length `>= n` that FFTW handles efficiently.
+A transform length `>= n` that FFTW handles efficiently, at most `1.5n`.
 
-Not simply the smallest product of small primes, which is the obvious rule and the wrong
-one. FFTW's radix-2 codelets are far better optimised than its others, so a 2-heavy length
-beats a smaller but 3-heavy one: at `n = 81`, the smallest smooth size *is* 81 (3⁴) and it
-takes 14.1 µs, while 96 = 2⁵·3 takes 8.7 µs. Measured 1.1–1.5x available across the window
-extents this package uses, always in favour of the more 2-heavy candidate.
-
-So candidates are scored by a cost model rather than by length alone: `m² log₂ m` weighted
-by how 2-heavy the factorisation is. Padding a little further costs arithmetic on zeros and
-saves more on the transform, but only up to a point — a pure power of two is not
-automatically best, because at `n = 81` it would mean padding to 128 where 96 is faster and
-smaller. The search is capped at `1.5n` so the padding can never dominate.
+Candidates are products of 2, 3, 5 and 7, scored by `m² log₂ m` weighted by how much of `m` is a
+power of two, since FFTW's radix-2 codelets are the fastest. The result is not always the smallest
+smooth length: `next_fft_size(81)` is 84 = 2²·3·7, not 81 = 3⁴, which measures 14.1 µs against 8.7 µs
+for 96 = 2⁵·3. 2-heavy lengths are 1.1 to 1.5 times faster across the window extents this package
+uses. A power of two is not always chosen either (not 128 for `n = 81`).
 """
 function next_fft_size(n::Integer)
     n <= 1 && return 1
@@ -763,26 +703,18 @@ _padded_fft_size(chip, ry::Integer, rx::Integer) =
 """
     AutoRIFT.RADIUS_BUCKET_RUNGS
 
-Rungs per octave on the ladder [`AutoRIFT._radius_bucket`](@ref) rounds a search radius up to.
+Rungs per octave (4) on the ladder [`AutoRIFT._radius_bucket`](@ref) rounds a search radius up to.
 
-The ladder trades transform work against the size of the plan set. Coarse rungs waste work — a point
-is correlated through the next rung's transform, so the padding between its own radius and that rung
-is arithmetic on zeros — while fine rungs reach more distinct transform lengths, each needing its own
-`FFTW_MEASURE` plan and `WORKSPACE_POOL` entry.
+Coarse rungs correlate a point through a larger transform than it needs. Fine rungs produce more
+distinct transform lengths, each needing its own `FFTW_MEASURE` plan and `WORKSPACE_POOL` entry.
+Search radius is skewed on a Geogrid-derived grid: on the NISAR L1 golden pair the median searched
+point has radius 34 against a maximum of 1905, and the 1% of points above 1024 carry 40% of the
+transform work.
 
-Four, because the waste is worst exactly where the work is. Search radius is skewed on a
-Geogrid-derived grid: on the NISAR L1 golden pair the median searched point has radius 34 against a
-maximum of 1905, and the **1% of points above 1024 carry 40% of the transform work**. One rung per
-octave sends all of them through the widest transform in the pass, a 1792x4096 for a 96x52 chip.
-
-Measured on that pair, whole grid, twelve threads, at the block `block_size_for` picks: **590.2 s at
-one rung per octave against 467.2 s at four**, the same 1,799,742 points. Modelled over all 22 golden
-cases the transform work is 0.692x, and no case rises. The cost is the plan set — 53 buckets to 388 on
-that pair — which is one-off per machine: the first run pays the extra planning, 110 s of it on that
-grid, and [`fftw_wisdom_path`](@ref) removes it from every run after.
-
-Finer rungs keep paying off in work and stop paying off in plans: eight per octave models 0.614x
-against four's 0.661x, for 996 buckets against 388.
+On that pair, whole grid, twelve threads, the run took 590.2 s with one rung per octave and 467.2 s
+with four, over the same 1,799,742 points. Four rungs raise the plan set from 53 to 388 buckets. The
+extra planning is a one-time cost per machine (110 s on that grid), which [`fftw_wisdom_path`](@ref)
+removes from later runs. Eight rungs per octave would need 996 buckets.
 """
 const RADIUS_BUCKET_RUNGS = 4
 
@@ -792,29 +724,21 @@ const RADIUS_BUCKET_RUNGS = 4
 The search radius a point of radius `r` is correlated at: `r` rounded up to the next rung of the
 `AutoRIFT.RADIUS_BUCKET_RUNGS`-per-octave ladder, never above `cap`.
 
-The rungs are the powers of two and the evenly-spaced steps between consecutive ones, so at four per
-octave they run 16, 20, 24, 28, 32, 40, 48, 56, 64. Integer arithmetic throughout: a rung is
-`h * (k + s) ÷ k` for the power of two `h` below `r`, so the ladder is exact rather than a rounding of
-a logarithm.
+The rungs are the powers of two and the evenly spaced steps between consecutive ones, so at four per
+octave they run 16, 20, 24, 28, 32, 40, 48, 56, 64. The arithmetic is integer.
 
-**Why a point is not correlated at its own exact radius.** A workspace sizes its FFT buffers from its
-extents, so an exact radius would mean a distinct transform length — and therefore a distinct FFTW
-plan and a distinct pool entry — per point. `WORKSPACE_POOL` is keyed on geometry, so that defeats
-pooling entirely, and planning a size never seen before costs 116-347 ms at the sizes `plan_flags` gives
-`FFTW_PATIENT` and far more above its threshold. A bounded ladder keeps both amortised: a real scene
-reaches a few hundred buckets, each reused by thousands of points.
+A point is not correlated at its own exact radius because each distinct radius would need its own
+FFTW plan (116 to 347 ms for a new size at the `FFTW_PATIENT` sizes) and its own `WORKSPACE_POOL`
+entry. A real scene reaches a few hundred buckets, each reused by thousands of points.
 
-**Why the cap, which is the pass maximum.** Without it the rounding can land *above* the extent the
-pass was sized for — radius 1905 rounds to 2048, needing a 2304x4608 transform where the point itself
-needs 1792x4096 — which would make a bucket cost more memory and more work than correlating that point
-at the pass geometry. With the cap the widest bucket is exactly the pass's own workspace, so bucketing
-can only reduce work and footprint, never raise either.
+`cap` is the pass maximum. Without it, rounding can exceed the extent the pass was sized for (radius
+1905 rounds to 2048, which needs a 2304x4608 transform where the pass geometry needs 1792x4096). With
+it, bucketing never costs more memory or work than the pass geometry.
 
-Zero maps to zero: a non-positive radius marks an unsearchable point (see [`AutoRIFT.sanitize!`](@ref))
-and such a point is skipped before any workspace is taken.
-
-The bucket is a function of the point alone, which is what makes a subset of a point set correlate as
-the whole set does — see [`AutoRIFT.PassGeometry`](@ref).
+Zero maps to zero: a non-positive radius marks an unsearchable point (see [`AutoRIFT.sanitize!`](@ref)),
+which is skipped before any workspace is taken. The bucket depends on the point alone, so a subset
+of a point set is correlated as it would be within the whole set (see
+[`AutoRIFT.PassGeometry`](@ref)).
 """
 @inline function _radius_bucket(r::Integer, cap::Integer)
     r <= 0 && return 0
@@ -841,13 +765,11 @@ end
 Copy `chip` into the workspace with its mean removed, and return the Euclidean
 norm of the result together with whether the chip carries any signal.
 
-`ok` is `false` for a constant chip. Such a chip has zero variance, so the
-correlation coefficient is undefined at every shift — the numerator and the chip's
-contribution to the denominator both vanish. It is *not* a peak at the surface
-origin, which is what the reference implementation reports: v2.0.0 removed the
-guard that used to skip these points, so a masked or featureless area now yields a
-displacement pinned to the corner of the search window. A constant chip carries no
-information about displacement, so the honest answer is no measurement.
+`ok` is `false` for a constant chip. Such a chip has zero variance, so the correlation coefficient
+is undefined at every shift. The reference implementation (v2.0.0 onward) reports a peak at the
+corner of the surface for these chips, giving a displacement pinned to the corner of the search
+window. Here the chip is reported as having no measurement. Throws `ArgumentError` if `ws` was built
+for complex imagery, and `DimensionMismatch` if `chip` exceeds the workspace's chip extent.
 """
 function prepare_chip!(ws::CorrelationWorkspace, chip::AbstractMatrix)
     ch, cw = size(chip)
@@ -994,21 +916,19 @@ end
 """
     correlate!(ws, search, chip, radius; measure = ZNCC()) -> surface
 
-Correlate `chip` against `search`, returning a view of the workspace's surface
-buffer holding the similarity at every candidate shift.
+Correlate `chip` against `search`, returning a view of the workspace's surface buffer holding the
+similarity at every candidate shift.
 
-The returned surface is `(2 * radius_y, 2 * radius_x)`, with zero displacement at
-its centre — see `AutoRIFT.peak_offset` for converting an index to a
-displacement. `search` must be `(chip + 2 * radius - 1)` in each dimension, the
-asymmetric extent that makes the surface an even size.
+`radius` is `(radius_x, radius_y)` or an `Int`. The returned surface is `(2 * radius_y, 2 * radius_x)`
+with zero displacement at its center; see `AutoRIFT.peak_offset` for converting an index to a
+displacement. `search` must be `chip + 2 * radius - 1` in each dimension, otherwise
+`DimensionMismatch` is thrown, as it is when the radius exceeds the workspace's.
 
-Returns a surface of zeros if the chip is constant, and sets
-[`AutoRIFT.degenerate`](@ref) so the caller can tell that from a genuine zero
-correlation; `AutoRIFT.prepare_chip!` explains why zeros are the right answer rather than
-a peak at the origin.
+Returns a surface of zeros if the chip is constant, and sets [`AutoRIFT.degenerate`](@ref) so the
+caller can tell that from a genuine zero correlation.
 
-Allocation-free. The result aliases the workspace, so it must be consumed or
-copied before the next call on the same workspace.
+Allocation-free. The result aliases the workspace, so it must be consumed or copied before the next
+call on the same workspace.
 """
 function correlate!(
     ws::CorrelationWorkspace, search::AbstractMatrix, chip::AbstractMatrix,
@@ -1050,13 +970,12 @@ correlate!(ws, search, chip, radius::Integer; kw...) =
 [`AutoRIFT.correlate!`](@ref) for a window [`AutoRIFT.prepare_window!`](@ref) has already been
 called on with the same `search` and `measure`.
 
-Skips the window's forward transform and its integral tables, which is a third of the work and
-none of it dependent on the chip. The result is bit-identical to `correlate!`: the same
-spectrum and the same tables, computed once instead of once per chip.
+Skips the window's forward transform and integral tables, about a third of the work, which do not
+depend on the chip. The result is bit-identical to `correlate!`.
 
-Correctness is the caller's to maintain — passing a `search` that `prepare_window!` did not see
-reads a stale spectrum and returns a surface for the wrong window. Only
-`_correlate_rotations!` uses this, where the two calls sit in one function.
+The caller must pass the same `search` that `prepare_window!` saw. Nothing checks this, and a
+different window reads a stale spectrum and returns a surface for the wrong window. The size check
+of `correlate!` is not repeated.
 """
 function correlate_prepared!(
     ws::CorrelationWorkspace, search::AbstractMatrix, chip::AbstractMatrix,
@@ -1084,9 +1003,8 @@ correlate_prepared!(ws, search, chip, radius::Integer; kw...) =
 
 Whether the last [`correlate!`](@ref) on `ws` was given a chip with no signal.
 
-A constant chip has zero variance, so the correlation coefficient is undefined at every
-shift and the surface is filled with zeros. Those zeros are not a measurement of zero
-displacement, and this is how a caller tells the two apart without scanning the surface.
+A constant chip has zero variance, so the correlation coefficient is undefined at every shift and
+the surface is filled with zeros. Those zeros are not a measurement of zero displacement.
 """
 @inline degenerate(ws::CorrelationWorkspace) = ws.was_degenerate[]
 
@@ -1241,20 +1159,16 @@ end
 """
     COMPLEX_DIRECT_THRESHOLD
 
-Work below which the *complex* numerator is evaluated directly, in the same
-`nshifts * chip_area` units as [`DIRECT_THRESHOLD`](@ref).
+Work below which the complex numerator is evaluated directly, in the same `nshifts * chip_area`
+units as [`DIRECT_THRESHOLD`](@ref).
 
-Much lower than the real threshold, and measured rather than inherited. The direct complex loop
-does four real multiplies and four adds per sample where the real one does one of each, so it falls
-behind the transform far sooner. Swept at radius 1-4 and chip 4-12: the crossover sits between 256
-work (direct wins, 217 ns against 254) and 576 (FFT wins, 406 against 477).
+The direct complex loop does four real multiplies and four adds per sample where the real one does
+one of each, so the crossover with the transform is much lower: between 256 work (direct 217 ns,
+FFT 254) and 576 (FFT 406 ns, direct 477), at radius 1 to 4 and chip 4 to 12.
 
-512 therefore, which is *below every configuration the public API can reach* — the smallest legal
-chip is 4 and the default `min_search_radius` is 6, giving 4x4x12x12 = 2304 — so in practice the
-complex path always transforms. That is deliberate: sharing the real path's 20,000 would have sent
-every real configuration down the direct branch, where the FFT is 5.8x faster at the smallest
-reachable size and 113x faster at chip 128. The direct path survives for verification, which is
-what `test/complex.jl` uses it for.
+The threshold is below every configuration the public API can reach (the smallest legal chip is 4
+and the default `min_search_radius` is 6, giving 4x4x12x12 = 2304), so the complex path always
+transforms. The direct path is used by `test/complex.jl` for verification.
 """
 const COMPLEX_DIRECT_THRESHOLD = 512
 
@@ -1320,24 +1234,16 @@ end
 """
     DIRECT_THRESHOLD
 
-Work below which the numerator is evaluated directly rather than by FFT, measured
-as `nshifts * chip_area` multiply-accumulates.
+Work below which the numerator is evaluated directly rather than by FFT, measured as
+`nshifts * chip_area` multiply-accumulates.
 
-Set from measurement, and the measurement was one-sided: FFT won at every
-combination tried, from chip 16 with radius 6 (2x) out to chip 64 with radius 50
-(53x). The direct loop is not the problem — it sustains ~13 GFLOP/s, close to what
-this machine can do — it is simply asked to perform far more arithmetic. At chip 32
-with radius 25 the direct path is 5.2 million multiply-accumulates against roughly
-fifty thousand butterflies for the transform, and no constant factor closes a gap
-like that.
+The FFT was faster at every combination tried, from chip 16 with radius 6 (2x) to chip 64 with
+radius 50 (53x). At chip 32 with radius 25 the direct path is 5.2 million multiply-accumulates
+against roughly fifty thousand butterflies for the transform. The threshold is therefore below any
+configuration real data uses. The direct path remains for very small chips, for verification
+(`test/correlate.jl`), and as a fallback needing no FFT plan.
 
-So the threshold sits below any configuration real data uses, and the direct path
-survives for three narrower reasons: very small chips where the transform's fixed
-cost would dominate, verification (the two paths must agree, which is a test in
-`test/correlate.jl`), and as a fallback needing no FFT plan.
-
-Re-measure with `benchmark/suite/correlate.jl` if the numerator implementation
-changes; the crossover is a property of the two implementations, not of the math.
+Re-measure with `benchmark/suite/correlate.jl` if the numerator implementation changes.
 """
 const DIRECT_THRESHOLD = 20_000
 

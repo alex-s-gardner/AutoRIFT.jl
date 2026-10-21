@@ -27,15 +27,15 @@ features:
 ---
 ```
 
-Fast, dense image motion tracking by normalized cross-correlation.
-
-Two images of the same scene, differing by motion, in. A grid of sub-pixel displacements out.
+AutoRIFT.jl tracks image motion by normalized cross-correlation. It takes two images of the same
+scene that differ by motion and returns a grid of sub-pixel displacements.
 
 ```@example home
 using AutoRIFT
 include("../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 
-# A surface sliding sideways, fastest down the middle: the crowd shifts left, Ali's shoulders barely do.
+# Sideways motion that is fastest in the middle rows (16 px) and slowest at the top and bottom edges
+# (4 px), with a 2 px downward drift.
 reference, secondary, _, _ =
     warped_pair(photo(), 512, (row, col) -> (4.0 + 12.0 * sin(pi * row / 512), -2.0))
 out = autorift(reference, secondary)
@@ -47,13 +47,12 @@ image_panels(reference, secondary)
 displacement_panels(out)
 ```
 
-That is the whole interface for the common case: `autorift(reference, secondary)`, and a result carrying
-`dx`, `dy` and `correlation` at every grid point.
+`autorift(reference, secondary)` returns `dx`, `dy` and `correlation` at every grid point.
 
 ## What it is for
 
-Anywhere two images record the same scene at different times and you want to know what moved, and by how
-much, everywhere rather than at a few tracked points:
+Any pair of images of one scene, taken at different times, where you want to know what moved and by how
+much at every grid point:
 
 - glacier and ice-sheet velocity
 - sea-ice drift
@@ -62,20 +61,10 @@ much, everywhere rather than at a few tracked points:
 - cell and tissue motion
 - video motion estimation
 
-The core knows nothing about any of these. It takes two matrices and returns pixel offsets. Coordinates,
-map projections and physical units are a layer on top, reached by passing rasters instead of arrays.
-
-## What it does
-
-- **Sub-pixel, multi-chip-size correlation.** Several chip sizes in one pass, each point answered at the
-  finest size that worked — resolution where the imagery supports it, coverage where it does not.
-- **Coordinate-agnostic core.** Plain arrays give pixels. Rasters give velocities in map units, with the
-  sign and axis conventions handled.
-- **Points, not necessarily grids.** A regular grid is the default, but scattered points work, and any
-  per-point setting — chip size, search radius, prior — may vary across the scene.
-- **Scenes larger than memory.** Blocked processing bounds peak memory by the block rather than the
-  scene, reading lazily from disk, with the same answer.
-- **Built for batches.** Reusable caches, one pair per task, and no global state.
+The core takes two matrices and returns pixel offsets. Coordinates, map projections and physical units
+come from passing rasters instead of arrays. Points may lie on a regular grid, the default, or be
+scattered, and any per-point setting (chip size, search radius, prior) may vary across the scene. A cache
+reuses buffers and FFT plans across a batch of pairs.
 
 ## Start here
 
@@ -84,17 +73,16 @@ map projections and physical units are a layer on top, reached by passing raster
 | **[Getting started](@ref)** | install, one correlation, read the result |
 | **[A guided walkthrough](@ref)** | eight steps over one scene, adding a capability at a time |
 | **[Geospatial data](@ref)** | rasters in, velocities out |
-| **[Judging a result](@ref)** | which points to trust, measured |
+| **[Judging a result](@ref)** | which points to trust |
 | **[API reference](@ref)** | every public name |
 
 ## Heritage
 
 AutoRIFT.jl descends from NASA JPL's [autoRIFT](https://github.com/nasa-jpl/autoRIFT) and produces the
-[ITS_LIVE](https://its-live.jpl.nasa.gov/) glacier velocity products, its largest deployment. The
-algorithm is that lineage: multi-chip-size normalized cross-correlation with the outlier filter of
-Gardner et al. (2018).
+[ITS_LIVE](https://its-live.jpl.nasa.gov/) glacier velocity products. The algorithm is multi-chip-size
+normalized cross-correlation with the outlier filter of Gardner et al. (2018).
 
-The implementation, the API, the geospatial handling and the test suite are this package's own, validated
+The implementation, API, geospatial handling and test suite are this package's own. They are validated
 against synthetic ground truth and against production output.
 
 ## Citing

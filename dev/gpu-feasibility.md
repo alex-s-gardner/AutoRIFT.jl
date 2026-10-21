@@ -200,3 +200,102 @@ Metal.jl 1.10.3 in a throwaway environment:
 | `endtoend_probe.jl` | full GPU numerator + tables vs `correlate!` |
 | `numerator_probe.jl` | FFTW vs MPSGraph, raw vs centered |
 | `share_probe.jl` | per-point cost breakdown |
+
+## Kernel design
+
+The device path is a batched version of `_track_chunk!`. Each of the eight per-point steps is a kernel over
+the whole batch, the buffers stay on the device between them, and only a few short vectors, one value per
+point, return to the host. No correlation surface crosses the bus.
+
+Kernels are written against KernelAbstractions.jl and transforms go through AbstractFFTs, so `ext/gpu/`
+does not depend on the vendor. A second device would need only an adapter file like
+`ext/AutoRIFTMetalExt.jl`.
+
+### Apple GPUs have no Float64
+
+`src/integral.jl` requires the summed-area tables to be `Float64`, because the variance subtracts two large,
+nearly equal quantities. Metal has no `Float64`, so the gather subtracts the search window's own mean.
+This is exact for the numerator (`Σ T′·(W − c) = Σ T′·W`, since `Σ T′ = 0` by construction) and for the
+variance (shift invariance), and the tables then hold values of the size of the image contrast instead of
+the image's mean level.
+
+Worst relative error in the denominator, over chips 16–128, DC 1 to 1e4 and contrast 1.0 down to 0.001,
+against a two-pass `Float64` computation:
+
+| | worst |
+|---|---:|
+| `Float64` tables (the CPU path) | 2.8e-8 |
+| `Float32` tables, raw window | **8.4** |
+| `Float32` tables, centered window | 3.6e-6 |
+| `Float32` **double-single**, centered window | **3.9e-8** |
+
+Centering removes all but a factor of about 100 of the error. A double-single accumulator, an unevaluated
+`Float32` pair summed with Knuth's `twosum`, removes the rest and reaches `Float64` accuracy. `twosum` is
+exact only under round-to-nearest with no reassociation. On the Metal device it is bit-identical to the
+host, with the error term nonzero on 97% of entries. A compiler that reassociated it would zero the error
+term and leave a kernel no better than plain `Float32`.
+
+Centering also makes the numerator more accurate than the CPU's:
+
+| numerator arm | worst relative error |
+|---|---:|
+| FFTW, raw window (the CPU path) | 6.05e-5 |
+| MPSGraph, raw window | 6.41e-5 |
+| FFTW, centered window | 3.88e-5 |
+| MPSGraph, centered window | **3.91e-5** |
+
+### A GPU thread is slow; only width helps
+
+A kernel that gives one workitem to each point and loops over many elements is slow on the device, because
+the work is serial on a slow thread:
+
+| | one workitem per point | parallel over elements |
+|---|---:|---:|
+| subpixel cascade, 64× | 973 µs/pt | 14 µs/pt |
+| the cascade's final 320×320 argmax | 113 µs/pt | ~2 µs/pt |
+| refinement total | **1012 µs/pt** | **46 µs/pt** |
+
+The one-workitem cascade took 97% of the correlator and made the device 7× slower than the CPU. Its cost
+tracked the element count exactly (4× per doubling of the upsampling) and was flat in the point count,
+which identifies serial work on one thread rather than launch overhead.
+
+The argmax splits exactly even though its tie rule depends on order, because `peak_index`'s rule is a total
+order on `(value, row, column)`. The kernel reduces within each column and then over the column winners,
+which gives the same result as the serial scan.
+
+### Out-of-bounds reads on the device
+
+The search radius is a per-point field, so a point whose surface is narrower than the 5-wide refinement
+patch is valid input, and `subpixel_peak` returns its integer peak unrefined. The device kernels handle this
+with a per-point `refinable` flag. A read past a surface on the host is a `BoundsError` that names a line.
+On the device, with bounds checking enabled, it appears as `KernelException: A BoundsError was thrown on
+device Apple M2 Max` from whichever later call synchronizes, with no indication of which kernel or index.
+Single-radius tests cannot show it, so `test/gpu.jl` runs a pass that mixes refinable and unrefinable
+points.
+
+Two budgets control batch sizes, because the cost is per launch rather than per element.
+`GPU_MEMORY_BUDGET` (512 MiB) sizes the correlation batch, and `REFINE_MEMORY_BUDGET` (1 GiB) sizes the
+cascade's tile. Neither changes the answer: `test/gpu.jl` asserts that a pass split into several batches is
+bit-identical to one batch.
+
+### Where the time goes
+
+Per point at 1024², chip 32, radius 25, with a batch of 1024:
+
+| stage | µs/point |
+|---|---:|
+| subpixel cascade, 64× | 46.0 |
+| gather (chip + window, both mean-removed) | 12.6 |
+| peak, boundary, peak ratio | 5.6 |
+| zero-fill and place the transform buffers | 3.5 |
+| forward transforms (×2) | 2.2 |
+| inverse transform | 2.3 |
+| summed-area tables (two passes) | 3.8 |
+| normalize | 1.2 |
+| spectral multiply | 0.5 |
+| **total** | **77.6** |
+
+`gather` and `peak` still use one workitem per point, and together take 18 of the 78 µs. The cascade is the
+largest stage. On the CPU it is also the largest: `dev/gpu-feasibility.md` measures 78 µs of a 97 µs point
+at chip 16. Its cost does not depend on chip size, because it upsamples a 5×5 patch to 320×320 whatever the
+surface was.

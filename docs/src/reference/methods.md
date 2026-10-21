@@ -5,7 +5,7 @@ CurrentModule = AutoRIFT
 # Methods
 
 Five choices a pass makes, each a small type hierarchy. Pass an instance as the corresponding
-`params` keyword; the abstract type is the trait a new method would subtype.
+`params` keyword. A new method subtypes the abstract type.
 
 ## Similarity
 
@@ -59,7 +59,7 @@ AutoRIFT.angles
 
 ## Outlier rejection
 
-Which measured vectors are discarded as inconsistent with their neighbors.
+Which measured vectors are discarded for disagreeing with their neighbors.
 
 ```@docs
 OutlierMethod

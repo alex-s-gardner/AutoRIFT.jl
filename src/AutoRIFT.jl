@@ -45,27 +45,23 @@ using Random: Random
 Estimate the displacement of surface features between two images of the same
 scene, on a grid, to sub-pixel precision.
 
-Returns layers on the output grid: the displacement, `correlation` (the peak
-similarity), `chip_size` recording which chip-size level produced each estimate,
-and `interpolated` marking values filled from neighbours rather than measured.
-
-What the input is determines both the return type and the displacement convention,
-because only some inputs know which way is north:
+The input type determines the return type and the displacement convention:
 
 | input | returns | displacement |
 |---|---|---|
-| `Matrix` | [`AutoRIFT.MultichipResult`](@ref) | `dx`, `dy` — pixel offset, `dy` down rows |
-| `AbstractDimArray` | `DimStack` | `dx`, `dy` — as above, with coordinates |
-| `AbstractRaster` | `RasterStack` | `vx`, `vy` — feature motion, `+vy` north |
+| `Matrix` | [`AutoRIFT.MultichipResult`](@ref) | `dx`, `dy`: pixel offset, `dy` down rows |
+| `AbstractDimArray` | `DimStack` | `dx`, `dy`: as above, with coordinates |
+| `AbstractRaster` | `RasterStack` | `vx`, `vy`: feature motion, `+vy` north |
 
-Every form also carries `correlation`, `peak_ratio`, `chip_size` and `interpolated` per point.
+Every form carries `correlation` (the peak similarity), `peak_ratio`, `chip_size` (the chip-size level
+that produced each estimate) and `interpolated` (values filled from neighbors rather than measured)
+per point.
 
-The last two need `DimensionalData` or `Rasters` loaded. The raster path is the only
-one that can orient the result, so it is the only one that reports `vx`/`vy`: the
-sign flip from the correlator's secondary-to-reference offset to actual feature
-motion, and the flip from row-down to north-up, both happen there. A north-up and a
-south-up raster of one scene therefore give the same answer. Radar slant-range
-geometry has no CRS and takes the `DimStack` path unchanged.
+The `AbstractDimArray` and `AbstractRaster` methods need `DimensionalData` or `Rasters` loaded. Only
+the raster path knows the map orientation, so only it reports `vx`/`vy`: it negates the correlator's
+secondary-to-reference offset to give feature motion and flips row-down to north-up. A north-up and a
+south-up raster of one scene give the same answer. Radar slant-range geometry has no CRS and takes the
+`DimStack` path.
 
 See [`AutoRIFT.params`](@ref) for the full keyword list.
 """
@@ -74,13 +70,11 @@ function autorift end
 """
     autorift!(cache)
 
-Run the correlator using preallocated buffers and FFT plans, writing into
-`cache.result`.
+Run the correlator on `cache`'s current pair, reusing its buffers and FFT plans, and return the
+`MultichipResult` (also stored in `cache.result`).
 
-The path for batch processing: `AutoRIFT.init` allocates and plans once,
-`reinit!` swaps in the next image pair, and `autorift!` reuses everything. Across
-many pairs this avoids repeating the allocation and FFT planning that would
-otherwise dominate.
+For batch processing: `AutoRIFT.init` allocates and plans once, `reinit!` swaps in the next image
+pair, and `autorift!` reuses both. See [`AutoRIFT.Cache`](@ref).
 
 ```julia
 cache = AutoRIFT.init(first_pair...)
@@ -162,13 +156,9 @@ export RotationMethod, RotationSearch, NoRotationSearch
 
 Names that are API but not exported: callable as `AutoRIFT.name`, and covered by semantic versioning.
 
-Exports are the names a user needs in scope. These are the ones they may reach for deliberately —
-the production input path, the pipeline steps `src/multichip.jl` promises are separately callable, and
-the preprocessing functions `src/preprocess.jl` says must be usable ahead of reprojection.
-
-One list rather than a `public` declaration scattered through the files, because three things have to
-agree about it: this declaration, the documentation, and the test that every public name has a
-docstring. A name absent here is internal and may change in a patch release.
+These include the production input path, the pipeline steps that are separately callable, and the
+standalone preprocessing functions. On Julia 1.11 and later they are declared `public`. A name absent
+here and from the exports is internal and may change in a patch release.
 """
 const PUBLIC_NAMES = (
     # Configuration.

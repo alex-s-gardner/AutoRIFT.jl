@@ -1,21 +1,19 @@
 
 # Correlating many pairs
 
-A single pair is one call. A time series, or a tile of a large production run, is many — and there the
-question is how to organize the work rather than how to make one correlation faster.
-
-Three things matter, in this order: run **one pair per task** rather than threading inside a pair; reuse a
-[`AutoRIFT.Cache`](@ref) to hold the allocations down; and know that neither changes the answer.
+A single pair is one call. A time series, or a tile of a large production run, is many calls, and the
+question is how to organize them. Run one pair per task rather than threading inside a pair, and reuse a
+[`AutoRIFT.Cache`](@ref) to reduce allocation. Neither changes the result.
 
 ## One pair per task
 
-The parallelism to reach for first is across pairs, not within one:
+Parallelize across pairs rather than within one:
 
 ```@example batch
 using AutoRIFT
-include("../../figures.jl")  # plotting helpers and the synthetic scenes; see [Plotting](@ref)
+include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 
-pairs = [warped_pair(256, (row, col) -> (3.0, 1.0); seed = s)[1:2] for s in 1:4]
+pairs = [warped_pair(photo(), 256, (row, col) -> (Float64(s), 1.0))[1:2] for s in 1:4]
 settings = (; chip_size = 16, chip_size_max = 32, search_radius = 12, grid_spacing = 8)
 
 results = Vector{Any}(undef, length(pairs))
@@ -25,13 +23,12 @@ end
 map(AutoRIFT.nmeasured, results)
 ```
 
-Note `threaded = false` inside the task. Measured on sixteen 512² pairs across eight threads, one pair per
-task with intra-pair threading off runs **1.32× faster** than processing pairs one at a time with
-`threaded = true`. Per-pair threading has a serial fraction to bound it and load imbalance from the sparse
-search; across pairs there is neither, and each task keeps its own working set in cache.
+Each task sets `threaded = false`. On sixteen 512² pairs across eight threads, one pair per task with
+intra-pair threading off ran 1.32× faster than processing the pairs one at a time with `threaded = true`.
+Threading within a pair has a serial fraction and load imbalance from the sparse search. Across pairs
+there is neither, and each task keeps its own working set in cache.
 
-`threaded = true` is for the case where one pair is all you have. It does not change the result — the
-threaded and serial paths agree exactly.
+Use `threaded = true` when one pair is all there is. The threaded and serial paths give identical results.
 
 ## Reusing a cache
 
@@ -57,24 +54,22 @@ direct = autorift(pairs[2]...; settings..., threaded = false)
  correlation = isequal(second_result.correlation, direct.correlation))
 ```
 
-Use `isequal` rather than `==` — unmeasured points are `NaN`, and `NaN == NaN` is false, so `==` reports a
-difference between a result and itself.
+Compare with `isequal` rather than `==`: unmeasured points are `NaN`, and `NaN == NaN` is false.
 
-## What the cache actually buys, and what it does not
+## What the cache saves
 
-**It is not a wall-clock speedup.** Measured on 512² pairs at `grid_spacing = 8`, building the cache costs
-about 2.7 ms while the correlation costs about 340 ms — so a walk of five consecutive pairs runs at
-**1.00×** either way, and so does a fan-out of sixteen pairs across one, two, four, or eight tasks.
+The cache does not shorten wall-clock time on a dense grid. On 512² pairs at `grid_spacing = 8`, building
+the cache costs about 2.7 ms and the correlation about 340 ms. A walk of five consecutive pairs, and a
+fan-out of sixteen pairs across one, two, four or eight tasks, run at the same speed with or without it.
 
-What it buys is **allocation**: 4.7 MiB per pair fresh against 1.4 MiB reused, a factor of **3.3**. That
-is what matters when many tasks run at once, since allocation rate is shared and garbage collection
-stops every thread.
+It reduces allocation: 4.7 MiB per pair fresh against 1.4 MiB reused, a factor of 3.3. This matters when
+many tasks run at once, because allocation rate is shared and garbage collection stops every thread.
 
-`init`'s cost is roughly flat while the correlation's scales with the number of points, so the cache's
-share of the work grows as the grid gets coarser:
+The cost of `init` is roughly constant while the correlation cost scales with the number of points, so
+the cache's share of the work grows as the grid gets coarser:
 
 ```@example batch
-big_reference, big_secondary, _, _ = warped_pair(512, (row, col) -> (3.0, 1.0); seed = 21)
+big_reference, big_secondary, _, _ = warped_pair(photo(), 512, (row, col) -> (3.0, 1.0))
 for spacing in (8, 16, 32, 64)
     out = autorift(big_reference, big_secondary; settings..., grid_spacing = spacing,
                    threaded = false)
@@ -82,19 +77,18 @@ for spacing in (8, 16, 32, 64)
 end
 ```
 
-Correlation cost tracks those point counts — 334 ms, 81 ms, 22 ms, 6.2 ms — while `init` stays near
-2.6 ms throughout. Its share of the total therefore climbs 0.8%, 3.0%, 10.5%, 28.7%. A coarse grid over
-many pairs is where reuse is worth arranging; a dense grid is dominated by correlation and the cache is a
-memory optimization only.
+The correlation cost follows those point counts (334 ms, 81 ms, 22 ms, 6.2 ms) while `init` stays near
+2.6 ms, so `init` is 0.8%, 3.0%, 10.5% and 28.7% of the total. Reuse pays off most on a coarse grid over
+many pairs. On a dense grid the correlation dominates and the cache only saves memory.
 
 ## Walking a time series
 
-Consecutive acquisitions share an image — each new reference is the previous secondary. `reinit!` reuses an
-image already prepared in *either* slot, so a walk filters each acquisition once rather than twice:
+In a time series, each new reference is the previous secondary. `reinit!` reuses an image that was already
+filtered in either slot, so a walk filters each acquisition once rather than twice:
 
 ```@example batch
-# One texture, progressively warped: consecutive frames genuinely correlate.
-frames = [warped_pair(256, (row, col) -> (3.0 * (k - 1), 1.0 * (k - 1)); seed = 5)[2] for k in 1:4]
+# One photograph, progressively warped, so consecutive frames correlate.
+frames = [warped_pair(photo(), 256, (row, col) -> (3.0 * (k - 1), 1.0 * (k - 1)))[2] for k in 1:4]
 
 walk = AutoRIFT.init(frames[1], frames[2]; settings..., threaded = false)
 counts = [AutoRIFT.nmeasured(autorift!(walk))]
@@ -105,11 +99,11 @@ end
 counts
 ```
 
-Omitting an argument keeps the current image, so `reinit!(cache; secondary = next)` advances one image
-while holding the other fixed — the right form when every pair shares a common reference.
+An omitted argument keeps the current image, so `reinit!(cache; secondary = next)` advances one image and
+holds the other fixed, which suits pairs that share a reference.
 
-A mask follows its image. An omitted mask is kept only if its image was also omitted, and otherwise
-re-derived from finiteness: carrying a mask onto a different image would mask the wrong pixels.
+A mask follows its image. An omitted mask is kept only if its image was also omitted. Otherwise it is
+derived from finiteness, because a mask carried onto a different image would mask the wrong pixels.
 
 ## The production shape
 
@@ -125,22 +119,21 @@ Threads.@sync for chunk in Iterators.partition(pairs, cld(length(pairs), Threads
 end
 ```
 
-One cache per task, never one shared across tasks — a cache holds mutable buffers and is not thread-safe.
+Use one cache per task. A cache holds mutable buffers and is not thread-safe.
 
-## Three things that will surprise you
+## Behavior to know
 
-- **`autorift!` twice returns the same object**, not a recomputation. It is the cached result until the
-  next `reinit!`. If you need to keep a result past the next pair, copy what you need out of it: the
-  arrays are reused.
-- **Image size is fixed at `init`.** `reinit!` throws on a change of shape, because the grid and output
-  arrays are sized to it. A different size needs a new cache.
-- **`Params` is not reinitialised**, which matters for exactly one keyword. [`RotationSearch`](@ref)'s
-  `about` is a per-pair quantity, so a cache built with `about = scene_rotation(guess)` applies the first
-  pair's rotation to every later one. For a rotating series, call `autorift` per pair with a freshly
-  fitted `about`. See [Giving the search a first guess](@ref).
+- Calling `autorift!` twice without a `reinit!` returns the same result object without recomputing. To
+  keep a result past the next pair, copy it out: the arrays are reused.
+- The image size is fixed at `init`. `reinit!` throws a `DimensionMismatch` on a different shape, because
+  the grid and output arrays are sized to it. A different size needs a new cache.
+- `reinit!` does not change the cache's `Params`. [`RotationSearch`](@ref)'s `about` is a per-pair
+  quantity, so a cache built with `about = scene_rotation(guess)` applies the first pair's rotation to
+  every later pair. For a rotating series, call `autorift` per pair with a freshly fitted `about`. See
+  [Giving the search a first guess](@ref).
 
 ## See also
 
-- [Correlating scenes larger than memory](@ref) — blocking, which composes with everything here
-- [`AutoRIFT.init`](@ref), [`reinit!`](@ref), [`autorift!`](@ref) — the three docstrings
-- [Memory](@ref) — the measured record, including what a cache holds resident
+- [Correlating scenes larger than memory](@ref): blocking, which works with everything here
+- [`AutoRIFT.init`](@ref), [`reinit!`](@ref), [`autorift!`](@ref): the three docstrings
+- [Memory](@ref): measurements, including what a cache holds resident

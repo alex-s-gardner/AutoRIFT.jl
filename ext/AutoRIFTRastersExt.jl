@@ -1,37 +1,28 @@
 """
     AutoRIFTRastersExt
 
-Accept `Raster` input and return a `RasterStack` carrying the output grid's coordinates, CRS, and
+Accept `Raster` input and return a `RasterStack` carrying the output grid's coordinates, CRS and
 per-layer `missingval`.
 
-Builds on `AutoRIFTDimensionalDataExt` rather than repeating it: a `Raster` is an
-`AbstractDimArray`, so grid alignment checking and output-dimension construction are shared. What
-this adds is everything that needs a *map*: CRS validation between the two inputs, the y-flip, and
-conversion from pixel offsets to velocity.
+A `Raster` is an `AbstractDimArray`, so grid alignment checking and output-dimension construction come
+from `AutoRIFTDimensionalDataExt`. This extension adds CRS validation between the two inputs, the
+y-orientation correction, and conversion from pixel offsets to velocity.
 
-# The y-flip, and why it gets its own boundary
+# Y orientation
 
-A north-up GeoTIFF stores y **decreasing** — the first row is the northernmost. A south-up file
-stores it increasing. `parent()` hands the core whichever order the file used, so the same scene
-written both ways produces `dy` of opposite sign: `dx` is unchanged, `dy` is negated. Measured, not
-assumed.
-
-That is a bad failure because it stays plausible. A velocity field with `vy` inverted still looks
-like ice flow; nothing downstream can detect it, and the error is in the *file*, not the code. So
-this extension is where the y direction is read and corrected, exactly once, and the tests assert
-that both storage orders give the identical field.
+A north-up GeoTIFF stores y decreasing (the first row is the northernmost) and a south-up file stores it
+increasing. The same scene written both ways gives `dy` of opposite sign from the core. This extension
+reads the direction of the row lookup and corrects it, so both storage orders give the same field.
 
 # `vx`/`vy`, not `dx`/`dy`
 
-Two conversions happen here, and the names record that they did:
+The names record two conversions from the core's output:
 
-  * **Orientation.** `dy` becomes north-positive rather than row-positive.
-  * **Sign.** The core reports the offset from secondary back to reference, which is the negative
-    of how the ground moved. Here it becomes feature motion: `+vx` east, `+vy` north.
+  * Orientation: `dy` becomes north-positive rather than row-positive.
+  * Sign: the core reports the offset from secondary back to reference, the negative of ground motion.
+    Here the result is feature motion: `+vx` east, `+vy` north.
 
-`dx`/`dy` are reserved for raw pixel offsets in the array and `DimStack` paths, matching
-ITS_LIVE's published naming. A caller who wants the unconverted offsets can correlate
-`parent(raster)` directly.
+To get the unconverted pixel offsets, correlate `parent(raster)` directly.
 """
 module AutoRIFTRastersExt
 
@@ -66,22 +57,22 @@ const MS_PER_YEAR = 365.25 * 24 * 60 * 60 * 1000
 
 Correlate two rasters, returning a `RasterStack` on the output grid.
 
-Layers are `vx`, `vy`, `correlation`, `peak_ratio`, `chip_size`, and `interpolated`, each with its own
-`missingval`. The output grid inherits the inputs' CRS and axis order, at `grid_spacing` times
-their pixel size.
+Layers are `vx`, `vy`, `correlation`, `peak_ratio`, `chip_size` and `interpolated`, each with its own
+`missingval`. The output grid has the inputs' CRS and axis order, at `grid_spacing` times their pixel
+size. Throws `ArgumentError` if the inputs have different CRSs.
 
 # Keywords
 
 All of [`AutoRIFT.params`](@ref)'s, plus:
 
-- `dt = nothing`: the interval between acquisitions. `nothing` leaves `vx`/`vy` in **pixels**; a
-  `Dates.Period` such as `Day(16)`, or a `Real` count of years, converts them to **CRS units per
-  year** — metres per year for a projected raster.
+- `dt = nothing`: the interval between acquisitions. `nothing` leaves `vx` and `vy` in pixels. A
+  `Dates.Period` such as `Day(16)`, or a `Real` number of years, converts them to CRS units per year
+  (meters per year for a projected raster). `Year` and `Month` throw, having no fixed length.
 - `reference_valid`, `secondary_valid`: per-pixel validity masks, as arrays or rasters.
-- `process_block_size`: `(X, Y)` pixels per block. Defaults to a halo-derived size, rounded up to the
-  rasters' own chunking, for file-backed input; `nothing` — one block — for input already in memory.
-- `cache_budget = :auto`: bytes of file-backed imagery the run may hold in memory, or `nothing` to
-  read a window per block per pass instead. See [`AutoRIFT.autorift`](@ref).
+- `process_block_size`: `(X, Y)` pixels per block. Default: for file-backed input, a size derived from
+  the halo and rounded up to the rasters' chunking; for input in memory, `nothing` (one block).
+- `cache_budget = :auto`: bytes of file-backed imagery the run may hold in memory, or `nothing` to read
+  a window per block per pass. See [`AutoRIFT.autorift`](@ref).
 
 ```julia
 using AutoRIFT, Rasters, ArchGDAL, Dates
@@ -89,25 +80,22 @@ out = autorift(Raster("early.tif"), Raster("late.tif"); grid_spacing = 32, dt = 
 out.vx, out.vy, out.correlation
 ```
 
-`ArchGDAL` has to be loaded to open a file: it is what carries GDAL, through `RastersArchGDALExt`,
-and this extension requires it for that reason.
+`ArchGDAL` must be loaded to open a file.
 
-`lazy = true` correlates from the file rather than materializing it, and is the case the defaults are
-tuned for. Such a run is **blocked**, so the filtered `Float32` scene is never formed, and a GDAL
-raster's `missingval` becomes mask rather than number. The answer is bit-identical to the same pair
-in memory. [Correlating scenes larger than memory](@ref) has the memory and the knobs.
+With `lazy = true` the correlation reads from the file rather than materializing it. Such a run is
+blocked, so the filtered `Float32` scene is never formed, and a raster's `missingval` is turned into a
+validity mask. The result is bit-identical to the same pair in memory. See
+[Correlating scenes larger than memory](@ref).
 
 !!! note "Sign convention"
-    `vx` and `vy` are **feature motion in map orientation**: `+vx` points east, `+vy` north. Both
-    conversions from the core's convention — the orientation and the sign — happen here, so a
-    north-up and a south-up raster of one scene give the same answer.
+    `vx` and `vy` are feature motion in map orientation: `+vx` east, `+vy` north. A north-up and a
+    south-up raster of one scene give the same answer.
 
 !!! warning "Velocity is exact only for an axis-aligned grid"
-    `dt` scales by the lookup's own pixel size, which assumes displacement along a pixel axis is
-    displacement along a map axis. True for any north-up projected raster, so for essentially all
-    optical Landsat and Sentinel-2 imagery. It is *not* true for a rotated grid or for radar
-    geometry, where the conversion needs Geogrid's per-pixel matrices — not yet implemented, so
-    pass `dt = nothing` and convert externally in that case.
+    `dt` scales by the lookup's pixel size, which assumes displacement along a pixel axis is
+    displacement along a map axis. That holds for a north-up projected raster, including essentially
+    all Landsat and Sentinel-2 optical imagery. It does not hold for a rotated grid or for radar
+    geometry. Pass `dt = nothing` in those cases and convert the pixel offsets separately.
 """
 function AutoRIFT.autorift(reference::AbstractRaster, secondary::AbstractRaster;
                            dt = nothing, reference_valid = nothing, secondary_valid = nothing,

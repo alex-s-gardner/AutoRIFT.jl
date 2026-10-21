@@ -308,111 +308,93 @@ end
 """
     AutoRIFT.params(; kwargs...) -> Params
 
-Resolve and validate user keywords into a concrete [`Params`](@ref).
+Resolve and validate keywords into a concrete [`Params`](@ref).
 
-Called once per `autorift` invocation. Every `Symbol` is mapped to a method
-object and every number range-checked here, so failures surface at the API
-boundary naming the offending keyword rather than deep inside a chip-size level.
-
-Defaults match the autoRIFT reference driver, except for a few of its choices that are defects;
-`dev/REFERENCE.md` lists them.
+Every `Symbol` is mapped to a method object and every number is range-checked, so an invalid value
+throws `ArgumentError` naming the keyword. Defaults match the autoRIFT reference driver, except for
+a few of its defects; `dev/REFERENCE.md` lists them.
 
 # Keywords
 
 ## Method selection
-- `similarity = :zncc`: [`ZNCC`](@ref), [`NCC`](@ref), or [`Coherence`](@ref).
-
-  A **tuple** assigns measures to chip-size levels in order, with the last repeated for any
-  remaining levels — so `(:coherence, :zncc)` tries complex coherence at the finest chip and
-  falls back to amplitude at every coarser one. Requires complex input; see [`Coherence`](@ref).
-- `preprocess = :highpass`: pre-correlation filter; see [`PreprocessMethod`](@ref).
-- `subpixel = :pyramid`: peak refinement; see [`SubpixelMethod`](@ref).
+- `similarity = :zncc`: [`ZNCC`](@ref), [`NCC`](@ref), or [`Coherence`](@ref). A tuple assigns
+  measures to chip-size levels in order, repeating the last for the remaining levels, so
+  `(:coherence, :zncc)` uses coherence at the finest chip size and ZNCC at every coarser one. A tuple
+  longer than the number of levels throws when the levels are known. `Coherence` requires complex
+  input.
+- `preprocess = :highpass`: pre-correlation filter; one of `:highpass`, `:wallis`, `:wallis_gapfill`,
+  `:sobel`, `:laplacian`, `:decibel`, `:deramp`, `:none`, or a [`PreprocessMethod`](@ref).
+- `filter_width`: window width for a `preprocess` given as a Symbol. Default: the method's own
+  (`5`). Ignored by methods without a window.
+- `subpixel = :pyramid`: peak refinement (`:pyramid`, `:none`, a [`SubpixelMethod`](@ref), or a tuple
+  of either, one per level with the last repeated); see [`SubpixelMethod`](@ref).
+- `upsampling`: upsampling factor for a `subpixel` given as a Symbol. Default: `64`. Cannot be combined
+  with a tuple `subpixel`.
 
 ## Chip and grid geometry, in pixels
 
-Each of these is an **extent** — a quantity with an x and a y component. A scalar means square, and
-`(X = …, Y = …)` names the axes:
+Each of these is an extent: a scalar means square and `(X = …, Y = …)` names the axes.
 
 ```julia
 chip_size = 32                 # 32 by 32
 chip_size = (X = 16, Y = 32)   # taller than wide
 ```
 
-- `chip_size = 32`: the finest chip-size level. Each axis must be a multiple of 4, so a chip's
-  centre lands on a pixel boundary and a chip halved once still has an even half-extent.
-- `chip_size_max = 4 * chip_size`: the coarsest level. Levels are `chip_size .* 2^k` up to this, so
-  `chip_size_max` must be the **same** power-of-two multiple of `chip_size` in both axes — the chip's
-  aspect ratio is therefore the same at every level, which is what makes a coarse grid point exactly
-  a block of fine ones.
+- `chip_size = 32`: the finest chip-size level. Each axis must be a multiple of 4.
+- `chip_size_max = 4 * chip_size`: the coarsest level. Levels are `chip_size .* 2^k` up to this, so it
+  must be the same power-of-two multiple of `chip_size` in both axes.
 - `grid_spacing = chip_size`: spacing of output grid points.
 
 ## Search geometry, in pixels
 - `search_radius = 25`: half-extent of the search window, as an extent. The window spans
-  `2 * radius` in each direction. Zero in one axis searches along the other only; zero in both is an
-  error, since no pixel could be searched.
+  `2 * radius`. Zero in one axis searches along the other only; zero in both throws.
 - `min_search_radius = 6`: floor applied to non-zero radii, per axis.
-- `dx_prior = 0.0`, `dy_prior = 0.0`: a-priori displacement the search window is
-  centred on.
-- `coarse_stride = 4`: how sparsely the coarse pass samples, as a rate against one point per chip.
-  The step in grid points is this times the chip-to-spacing ratio, so on a grid posted finer than its
-  chips the coarse pass is sparser than this number alone suggests — see `AutoRIFT._sparse_stride`.
-- `coarse_buffer = 8`: dilation radius applied to the coarse validity mask
-  before it restricts the fine search, in coarse cells.
-- `min_coarse_valid_fraction = 0.01`: skip a chip-size level whose coarse pass
-  validates a smaller fraction than this.
-- `min_chip_valid_fraction = 0.65`: correlate a point only if more than this fraction of its own chip
-  footprint is valid — not the larger search window around it, which may legitimately reach the image
-  edge. `dev/CORRECTNESS.md` item 1: on `NISAR_L1_PR_RSLC` at chip 768, `tools/golden/level_replay.jl`
-  finds a swath-boundary ring of 292 nodes whose chips straddle the valid/nodata edge, rms 3.26 px
-  against the reference with 20 of 292 off by more than a pixel. Sweeping the threshold on that same
-  ring: agreement does not improve from 0.0 to 0.5 (still rms 3.3), falls to rms 0.6 at 0.6, and is
-  clean by 0.65 (rms 0.002, max 0.023, zero nodes beyond a pixel) — and stays clean up to 0.9 without
-  declining a single one of the level's 2,817 interior nodes. `0.65` sits just past the point
-  agreement stops improving, trading the least boundary coverage for it.
+- `dx_prior = 0.0`, `dy_prior = 0.0`: a-priori displacement the search window is centered on.
+- `coarse_stride = 4`: how sparsely the coarse pass samples, as a rate against one point per chip. The
+  step in grid points is this times the chip-to-spacing ratio, clamped to 1 to 2, so on a grid finer
+  than its chips the coarse pass samples more sparsely in grid points than this number alone suggests.
+- `coarse_buffer = 8`: dilation radius, in coarse cells, applied to the coarse validity mask before it
+  restricts the fine search.
+- `min_coarse_valid_fraction = 0.01`: a chip-size level is skipped when its coarse pass validates a
+  smaller fraction of the coarse grid than this.
+- `min_chip_valid_fraction = 0.65`: a point is correlated only if more than this fraction of its own
+  chip footprint is valid. The search window around the chip may reach the image edge. The value comes
+  from `dev/CORRECTNESS.md` item 1, which sweeps the threshold on the swath-boundary nodes of a NISAR
+  L1 scene.
 
 ## Outlier rejection and filling
-- `rotation = nothing`: try several chip rotations and keep the best, per
-  [`RotationSearch`](@ref). `nothing` or `false` disables it, which is the default because it
-  multiplies correlation cost by the number of angles. `true` uses ±3°; a tuple names the angles.
-  Only useful where the surface itself rotates — see [`RotationSearch`](@ref), and
-  [Giving the search a first guess](@ref) for centring a narrow angle window on a scene that is
-  already rotated.
-- `outliers = :gardner`: which implausible displacements to drop. `:gardner` is the
-  two-stage filter of Gardner et al. (2018) that autoRIFT uses; `:none` keeps everything,
-  which is useful for telling the correlator's failures from the filter's rejections. An
-  [`OutlierMethod`](@ref) instance is also accepted.
-- `outlier_window = 5`: neighbourhood width for the filter. Must be odd.
+- `rotation = nothing`: correlate each chip at several rotations and keep the strongest peak; see
+  [`RotationSearch`](@ref). `nothing` or `false` disables it. `true` uses ±3°; a collection of angles
+  in degrees or a [`RotationMethod`](@ref) is also accepted. Disabled by default because it
+  multiplies correlation cost by the number of angles. See [Giving the search a first guess](@ref) for
+  centering the angle window on a scene that is already rotated.
+- `outliers = :gardner`: `:gardner` (the filter of Gardner et al. (2018), [`GardnerFilter`](@ref)),
+  `:none` (keep everything), or an [`OutlierMethod`](@ref) instance.
+- `outlier_window = 5`: neighborhood width for the filter, in grid points. Odd and at least 3.
 - `outlier_iterations = 3`: iterations of the filter's first stage.
-- `min_agree_fraction = 8/25`: fraction of neighbours that must agree.
+- `min_agree_fraction = 8/25`: fraction of the window area that must agree.
 - `agree_tolerance = 0.2`: agreement threshold, as a fraction of search radius.
 - `mad_scale = 4.0`: median-absolute-deviation multiplier.
 - `fill_window = 3`: window for median hole filling. Must be odd.
-- `fill_min_hole = 5`: a connected hole smaller than this is filled whatever its neighbour
-  count, which is what closes a hole whose shape leaves every point short of the window
-  criterion. Exclusive, so the default closes holes of one to four points. `0` disables it and
-  leaves filling to the window criterion alone.
+- `fill_min_hole = 5`: a connected hole smaller than this is filled regardless of its neighbor count.
+  Exclusive, so the default closes holes of one to four points. `0` leaves filling to the window
+  criterion alone.
 
-The five keywords after `outliers` are [`GardnerFilter`](@ref)'s own parameters, offered at
-the top level for convenience. They cannot be combined with an `outliers` *instance*, which
-already carries its own — that is an error rather than a silent override.
+The five keywords from `outlier_window` to `mad_scale` are [`GardnerFilter`](@ref)'s parameters. They
+cannot be combined with an `outliers` instance or with `outliers = :none`; either throws.
 
 ## Misc
-- `threaded = false`: parallelise over grid points within one image pair. For
-  batch processing, leaving this `false` and running one pair per worker is
-  usually faster — see [Correlating many pairs](@ref).
-- `backend = :cpu`: where the correlation kernels run. `:metal` needs `using Metal`, `:cuda`
-  needs `using CUDA`; both correlate every point of a pass in batches on the device. Cannot be
-  combined with `threaded = true`, which parallelises the same loop. The GPU path reports
-  `dx`/`dy` identical to the CPU's and `correlation` to within 1e-5, an asymmetry that is a
-  property of Float32 transforms rather than of the device. There is no `:gpu`: a machine may
-  have more than one kind of device, and naming the vendor is the whole content of the keyword.
-
-  **The GPU backends are experimental and do not currently outperform the CPU.** Prefer
-  `threaded = true` unless the cores are already committed and the device is idle, which is the
-  batch-driver case [Correlating on a GPU](@ref) describes and measures.
-- `progress = false`: show a progress meter.
-- `rng_seed = 0`: seed for the noise [`WallisGapfill`](@ref) fills gaps with, so a run is
-  reproducible. Read by that filter alone; every other `preprocess` choice ignores it.
+- `threaded = false`: parallelize over grid points within one image pair. For many pairs, one pair
+  per task with `threaded = false` is usually faster; see [Correlating many pairs](@ref).
+- `backend = :cpu`: where the correlation kernels run, `:cpu`, `:metal` (needs `using Metal`) or
+  `:cuda` (accepted but not implemented; correlating with it throws), or an [`AutoRIFT.Backend`](@ref)
+  instance. A GPU backend cannot be combined with `threaded = true`, which parallelizes the same loop.
+  The GPU path reports `dx`/`dy` identical to the CPU's and `correlation` within 1e-5. The GPU backend
+  is experimental and does not outperform a threaded CPU run on one pair; see
+  [Correlating on a GPU](@ref).
+- `progress = false`: stored in `Params.progress`. No pass reads it, so it currently has no effect.
+- `rng_seed = 0`: seed for the noise [`WallisGapfill`](@ref) fills gaps with, making a run
+  reproducible. No other `preprocess` choice reads it.
 """
 function params(;
     similarity = :zncc,
@@ -491,16 +473,12 @@ end
 """
     chip_size_scale(g) -> Float64
 
-The y:x chip-size ratio `g` implies.
+The y:x chip-size ratio `g` implies: the median of `chip_min_y / chip_min_x` over the points carrying
+both bounds. Chips are square on the ground, so this is the y:x pixel size ratio, `1.0` for a square
+pixel and about `0.25` on a Sentinel-1 pair.
 
-The median of `chip_min_y / chip_min_x` over the points carrying both bounds. Because the parameter
-chip sizes are square on the ground, that ratio is the y:x *pixel size* ratio — `1.0` wherever the
-pixel is square, and about `0.25` on a Sentinel-1 pair, varying per acquisition with the
-azimuth:range ratio.
-
-[`params`](@ref) derives the base level's chip extent from this same value, but rounds it to an even
-pixel count on the way. The unrounded ratio is exposed separately because a caller re-applying the
-scale to every chip size, rather than to the base alone, needs it unrounded.
+`params(g)` derives the base chip extent from this value rounded to an even pixel count; this function
+returns it unrounded.
 
 Defined when `ImagePairGeometry` is loaded, for `g::ImagePairGeometry.PairGeometry`.
 """

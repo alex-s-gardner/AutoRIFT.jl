@@ -62,31 +62,25 @@
 Displacement over the full grid, assembled from all chip-size levels.
 
 `dx`, `dy`, `correlation`, and `peak_ratio` are as in [`DisplacementField`](@ref). `chip_size` records
-which level produced each point — `0` where none did — and `interpolated` marks points
-filled from their neighbours rather than measured.
+which level produced each point (`0` where none did), and `interpolated` marks points filled from
+their neighbors rather than measured.
 
-`peak_ratio` measures whether the displacement was *unique* where `correlation` measures how strong it
-was. **Gate on `correlation`** and use this to diagnose an ambiguous surface; [Judging a result](@ref)
-has the measurements behind that.
+`peak_ratio` measures whether the displacement was unique, where `correlation` measures how strong
+the match was. Gate on `correlation` and use `peak_ratio` to diagnose an ambiguous surface; see
+[Judging a result](@ref).
 
-At an `interpolated` point `peak_ratio` is the median of the neighbourhood the displacement was taken
-from, since that is what stands behind the value; `correlation` is `NaN` there instead, having no
-surface of its own to report.
+At an `interpolated` point `peak_ratio` is the median over the neighborhood the displacement was
+taken from, and `correlation` is `NaN`.
 
-`peak_ratio` is **zero** where the correlation peak lay against the search boundary: the displacement is
-a lower bound and its sub-pixel part is quantized to whole pixels, so any positive threshold excludes
-those points without the caller needing to know about them, zero being below the 1 a real ratio cannot go
-under. Select them with `peak_ratio .== 0` to find where `search_radius` is too small.
+`peak_ratio` is zero where the correlation peak lay against the search boundary. The displacement
+there is a lower bound, and any positive threshold excludes the point. Select these points with
+`peak_ratio .== 0` to find where `search_radius` is too small.
 
-`chip_size` holds the level's **x** extent, which identifies the level on its own since the aspect is
-constant across levels. It says how much spatial averaging is behind each estimate, so a consumer can
-tell a sharply-resolved displacement from a smoothed one.
+`chip_size` holds the level's x extent, which identifies the level since the aspect is constant
+across levels. It indicates how much spatial averaging is behind each estimate.
 
-`interpolated` is a `BitMatrix` here, unlike `searched` on [`DisplacementField`](@ref), which
-is a `Matrix{Bool}`. The difference is deliberate and is about concurrency, not taste: this
-one is written only by the single-threaded merge, so the packed representation is safe, while
-that one is written from the threaded grid loop where a read-modify-write on a shared word
-could lose a neighbour.
+`interpolated` is a `BitMatrix`, whereas `searched` on [`DisplacementField`](@ref) is a
+`Matrix{Bool}`, because `interpolated` is written only by the single-threaded merge.
 """
 struct MultichipResult
     dx::Matrix{Float32}
@@ -153,15 +147,10 @@ end
 
 Correlate each pass in one call, over a whole filtered scene. See `AutoRIFT.PassRunner`.
 
-`prepared` is the **filtered** pair — the pair `_prepare` produced. The blocked runner takes an
-unfiltered one instead, and holding the pair here is what keeps the two from being confused.
+`prepared` is the filtered pair. The blocked runner takes an unfiltered one instead.
 
-`okmask` is [`valid`](@ref) of that pair: the pixels usable in both images. Held rather than
-recomputed because it is a property of the pair, which does not change within a run, while
-[`track!`](@ref) needs it once per pass — six times over a three-level run. At a full Landsat
-scene the intersection is 35 MiB a call, so recomputing it is ~208 MiB of churn for an answer
-already in hand. `Blocked` needs no equivalent: its blocks read mask windows into dense buffers
-per block, so there is no whole-scene mask to hold.
+`okmask` is [`valid`](@ref) of that pair, computed once and passed to each [`track!`](@ref) call. At
+a full Landsat scene the intersection is 35 MiB per call.
 """
 struct WholeScene{P<:ImagePair,M<:AbstractMatrix{Bool}} <: PassRunner
     prepared::P
@@ -199,15 +188,14 @@ _warn_coarse_fallback(::WholeScene, ::Extent) = nothing
 
 Correlate `pair` over `grid` at every chip-size level, finest chip first.
 
-`grid` must be a gridded [`PointSet`](@ref) — the coarse pass decimates it and the merge
-resamples between levels, both of which need a spatial layout. Its `chip_size_x` field is
-ignored: the level sets it.
+`grid` must be a gridded [`PointSet`](@ref), since the coarse pass decimates it and the merge
+resamples between levels. Its `chip_size_x` field is ignored: the level sets it.
 
 Each level runs [`chipsize_level`](@ref) and contributes only where no finer level already
 succeeded, so the smallest chip that yields a coherent estimate wins at every point.
 
-`pair` is the **filtered** pair. `AutoRIFT.correlate_tiled` runs the same loop over an
-unfiltered one, filtering per block; both go through `_multichip` so the level sequence exists once.
+`pair` is the filtered pair. `AutoRIFT.correlate_tiled` runs the same loop over an unfiltered one,
+filtering per block.
 """
 correlate_multichip(pair::ImagePair, grid::PointSet{2}, p::Params) =
     _multichip(WholeScene(pair), grid, p)
@@ -245,40 +233,29 @@ end
 """
     chipsize_level(pair, grid, p, chip_size, wanted) -> Union{Nothing,NamedTuple}
 
-One chip-size level: a coarse pass to find where motion is coherent, then a fine pass
-restricted to that neighbourhood, then hole filling.
+One chip-size level: a coarse pass to find where motion is coherent, then a fine pass restricted to
+that neighborhood, then hole filling. Callable on its own to run one chip size without the loop.
 
-Returns `(; field, filled)` — the displacement field, and the linear indices that were filled
-from neighbours rather than measured — or `nothing` if the level found nothing worth
-continuing.
+Returns `(; field, filled)`, the displacement field and the linear indices that were filled from
+neighbors rather than measured. Returns `nothing` if the coarse pass validated less than
+`min_coarse_valid_fraction` of the grid, or found nothing worth continuing.
 
-`measure` is the similarity measure for this level, and `subpixel` its refinement method. Positional
-rather than keywords because `p.similarity` and `p.subpixel` are tuples and a keyword carrying an
-abstract type is unresolvable under `--trim` — see [`measure_at`](@ref) and `subpixel_at`.
+`chip_size` is an [`AutoRIFT.Extent`](@ref); a scalar means square. `wanted` marks the points this
+level should attempt, which in the level loop are those no finer level resolved. `measure` and
+`subpixel` are this level's similarity measure and refinement method (see [`measure_at`](@ref)). They
+are positional because `p.similarity` and `p.subpixel` are tuples with one entry per level, and the
+subpixel refinement factor depends on the level's chip size.
 
-`subpixel` is per level because the reference's subpixel denominator is a function of chip size: a
-coarse level locates its peak to a finer fraction of a pixel than the base level does.
+`prior_dx`/`prior_dy` are the finer levels' answer over `grid`, from which a decimated level fills
+its own holes before interpolating back up (see [`AutoRIFT.correlate_multichip`](@ref)). Without
+them holes are filled from the level's own neighbors alone, which is correct for a level run in
+isolation.
 
-`wanted` marks the points this level should attempt — in the loop, those no finer level
-resolved. Returns `nothing` if the coarse pass found too little to be worth continuing,
-which is what `min_coarse_valid_fraction` decides.
+`phase` is `grid`'s sub-pixel phase as `(x, y)`, to which a decimated level snaps its coarse nodes.
+`nothing` computes it from `grid`; a caller running several levels over one grid can compute it once
+with `AutoRIFT._grid_phases`.
 
-`prior_dx`/`prior_dy` are the finer levels' standing answer over `grid`, which a decimated level
-fills its own holes from before interpolating back up — see [`AutoRIFT.correlate_multichip`](@ref).
-Omitting them fills from the level's own neighbours alone, which is right for a level run in
-isolation and wrong inside the loop, where a finer answer at that very point is available.
-
-`phase` is `grid`'s sub-pixel phase as `(x, y)`, which a decimated level snaps its coarse nodes to —
-see `AutoRIFT._cell_means`. It depends on `grid` alone, so a caller running several levels over one
-grid can read it once with `AutoRIFT._grid_phases` and pass it to each. `nothing` reads it from
-`grid` here.
-
-Separately callable so a caller can run one chip size without the loop.
-
-`chip_size` is an [`AutoRIFT.Extent`](@ref); a scalar is accepted and means square.
-
-`pair` is the **filtered** pair, which this wraps in an `AutoRIFT.WholeScene` runner. The
-`AutoRIFT.PassRunner` form below is what a blocked run uses, with the same body.
+`pair` is the filtered pair. A blocked run uses the `AutoRIFT.PassRunner` form instead.
 """
 chipsize_level(pair::ImagePair, grid::PointSet{2}, p::Params, chip_size,
                wanted::AbstractMatrix{Bool},

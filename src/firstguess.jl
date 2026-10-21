@@ -59,18 +59,12 @@
 
 Abstract supertype for sparse feature-tracking methods used to seed the dense search.
 
-Concrete subtypes: [`ORBGuess`](@ref) and [`AKAZEGuess`](@ref), declared here but only *working* once
-`ImageFeatures` or `AkazeFeatures` respectively is loaded — the detector is a heavy dependency the optical path has no
-use for, so the methods live in a package extension.
+Concrete subtypes are [`ORBGuess`](@ref) and [`AKAZEGuess`](@ref). The types are defined here, and
+the detector methods are in package extensions that load with `ImageFeatures` or `AkazeFeatures`
+respectively.
 
-The types are declared in the core rather than in the extension deliberately. An extension may add
-methods to the parent but must not `eval` new bindings into it: that "breaks incremental compilation
-because the side effects will not be permanent", which Julia reports as an error rather than
-tolerating. So the type is core and the behaviour is the extension, which is also the arrangement
-that lets this docstring exist without a conditional dependency.
-
-See [`first_guess`](@ref) for the entry point and [`consistent_matches`](@ref) for why the raw
-matches cannot be used directly.
+See [`first_guess`](@ref) for the entry point and [`consistent_matches`](@ref) for the filter applied
+to the raw matches.
 """
 abstract type FirstGuess end
 
@@ -79,9 +73,8 @@ abstract type FirstGuess end
 
 Sparse first guess from ORB features. Needs `ImageFeatures` loaded to do anything.
 
-Fast and unencumbered, and the default first-guess detector. [`AKAZEGuess`](@ref) costs about 5× as
-much and is far more precise once the scene rotates; [Giving the search a first guess](@ref) compares
-them.
+The default first-guess detector. [`AKAZEGuess`](@ref) costs about 5× as much and is far more
+precise once the scene rotates; [Giving the search a first guess](@ref) compares them.
 
 Keywords are forwarded to `ImageFeatures.ORB`.
 """
@@ -95,22 +88,21 @@ ORBGuess(; kwargs...) = ORBGuess(kwargs)
 
 Sparse first guess from A-KAZE features. Needs `AkazeFeatures` loaded.
 
-More precise than [`ORBGuess`](@ref) under rotation and about five times slower — see the table in
-`ORBGuess`. The reason is the scale space: A-KAZE diffuses *nonlinearly*, so edges survive smoothing
-while speckle does not, where a Gaussian pyramid blurs both equally. On SAR that difference is the
-whole game, and it is why Demchev et al. (2017) chose it.
+More precise than [`ORBGuess`](@ref) under rotation and about five times slower; see
+[Giving the search a first guess](@ref). A-KAZE diffuses nonlinearly, so edges survive smoothing
+while speckle does not, where a Gaussian pyramid blurs both equally. On SAR this is the reason
+Demchev et al. (2017) chose it.
 
 !!! warning "Unregistered dependency"
-    `AkazeFeatures.jl` is a pure-Julia port of Alcantarilla's original, actively maintained, and
-    **not in the General registry** — it must be installed by URL:
+    `AkazeFeatures.jl` is a pure-Julia port of Alcantarilla's original. It is not in the General
+    registry and must be installed by URL:
 
     ```julia
     Pkg.add(url = "https://github.com/nlw0/AkazeFeatures.jl")
     ```
 
-    That is why `ORBGuess` is the documented default despite being less precise: a registered
-    dependency can be a `[weakdeps]` entry that resolves for every user, and an unregistered one
-    cannot. Use this when the extra precision matters and you control the environment.
+    A registered dependency can be a `[weakdeps]` entry that resolves for every user and an
+    unregistered one cannot, so `ORBGuess` is the default.
 """
 struct AKAZEGuess{K} <: FirstGuess
     kwargs::K
@@ -128,13 +120,8 @@ AKAZEGuess(; kwargs...) = AKAZEGuess(kwargs)
     AutoRIFT.required_package(x) -> String
 
 Which package must be loaded for `x` to work: a [`FirstGuess`](@ref) detector or an
-[`AutoRIFT.Backend`](@ref), both of which are implemented in package extensions.
-
-Exists so the "you forgot a dependency" error names the *right* dependency. The first version of that
-error hardcoded `ImageFeatures` for every subtype, so `AKAZEGuess` without `AkazeFeatures` told the
-caller to load a package that would not have helped.
-
-The backend methods are in `src/types.jl`, where the backends themselves are declared.
+[`AutoRIFT.Backend`](@ref), both of which are implemented in package extensions. The error raised
+when the package is missing names it. The backend methods are in `src/types.jl`.
 """
 required_package(::ORBGuess) = "ImageFeatures"
 required_package(::AKAZEGuess) = "AkazeFeatures"
@@ -187,18 +174,12 @@ end
     AutoRIFT._match_features(reference, secondary, method::FirstGuess; kwargs...)
         -> (points, dx, dy)
 
-Detect, describe and match features between two images. **The one method an extension supplies.**
+Detect, describe and match features between two images. This is the one method a
+[`FirstGuess`](@ref) extension supplies.
 
 `points` is a vector of `(row, col)`; `dx`/`dy` are the matched displacements, reference minus
-secondary to match `track!`'s convention. Everything around this call — scaling, the shape check, the
-consistency filter, `min_matches`, building the `PointSet` — belongs to [`first_guess`](@ref) and is
-written once.
-
-That split is the whole reason the abstract [`FirstGuess`](@ref) exists. It was not the first
-arrangement: each extension originally owned a whole `first_guess` method, which duplicated the
-keyword defaults, the sign convention, the NaN policy and two error messages per detector — so adding
-a third meant a third copy, and one of them dispatched on the *abstract* type and silently claimed
-every future subtype.
+secondary, matching `track!`'s convention. [`first_guess`](@ref) does everything else: scaling, the
+shape check, the consistency filter, `min_matches`, and building the `PointSet`.
 """
 function _match_features end
 
@@ -214,27 +195,27 @@ guess = first_guess(a, b, AutoRIFT.ORBGuess())      # needs ImageFeatures loaded
 out = autorift(a, b, guess)                         # dense search, centred on the guess
 ```
 
-Requires `ImageFeatures` to be loaded — the methods are in a package extension. See
-[`FirstGuess`](@ref).
+Requires the package for `method` to be loaded (`ImageFeatures` for [`ORBGuess`](@ref),
+`AkazeFeatures` for [`AKAZEGuess`](@ref)). See [`FirstGuess`](@ref).
 
 # Keywords
 
-- `search_radius = 6`: the radius the *dense* stage will use at each returned point. Small on
-  purpose: the whole reason for a first guess is that the prior does the reaching, so the dense
-  search only has to refine. This is what makes a 100 km/day displacement affordable.
+- `search_radius = 6`: the radius the dense stage uses at each returned point. It is small because
+  the prior supplies the displacement and the dense search only refines it.
 - `chip_size = 32`: chip size for the dense stage.
-- `min_matches = 8`: below this many surviving matches, throw rather than return a `PointSize` that
-  will silently produce nothing. A first guess that found almost nothing is a signal about the data
-  — decorrelated pair, wrong time gap — not a result to pass on.
-- Filtering keywords are forwarded to [`consistent_matches`](@ref).
-- Detector-specific keywords are forwarded to the matcher; see [`ORBGuess`](@ref) and
+- `min_matches = 8`: if fewer matches survive the consistency filter, throw `ArgumentError`. Few
+  surviving matches indicate a decorrelated pair or too long a time gap.
+- `neighbours`, `tolerance`, `min_agree`: forwarded to [`consistent_matches`](@ref).
+- Other keywords are forwarded to the detector's matcher; see [`ORBGuess`](@ref) and
   [`AKAZEGuess`](@ref).
 
+Throws `DimensionMismatch` if the images differ in size, and `ArgumentError` if no matches are found.
+
 !!! tip "Load `NearestNeighbors` too"
-    The consistency filter's neighbour search is O(n²) without it and O(n log n) with — 90x at 20000
-    matches, and A-KAZE produces tens of thousands. It is a weak dependency of this package but *not*
-    installed by loading a detector, so `using NearestNeighbors` is a separate step and worth taking
-    for anything beyond a few thousand matches.
+    Without `NearestNeighbors` the consistency filter's neighbor search is O(n²); with it, O(n log n),
+    which is 90x faster at 20000 matches. A-KAZE produces tens of thousands of matches. Loading a
+    detector does not load `NearestNeighbors`, so add `using NearestNeighbors` for anything beyond a
+    few thousand matches.
 """
 function first_guess(reference::AbstractMatrix, secondary::AbstractMatrix, method::FirstGuess;
                      search_radius = 6, chip_size = 32, min_matches::Integer = 8,
@@ -267,28 +248,26 @@ end
     consistent_matches(points, dx, dy; neighbours = 12, tolerance = 6.0, min_agree = 5)
         -> Vector{Int}
 
-Indices of the matches whose displacement agrees with their spatial neighbours.
+Indices of the matches whose displacement agrees with their spatial neighbors.
 
-A match survives if at least `min_agree` of its `neighbours` nearest neighbours have a displacement
+A match survives if at least `min_agree` of its `neighbours` nearest neighbors have a displacement
 within `tolerance` pixels of its own. This is the "consistency check in the local field of motion"
 of Demchev et al. (2017) and the "homogeneity criteria" of `xdenisx/ice_drift_pc_ncc`.
 
-The premise is physical rather than statistical: ice moves as a field, so a *correct* match has
-neighbours that agree with it, while a descriptor mismatch lands somewhere unrelated to its
-neighbourhood. That distinction survives rotation and shear, which is what makes it the right filter
-here — a global median does not, because there is no global displacement to take a median of.
+Ice moves as a field, so a correct match has neighbors that agree with it, while a descriptor
+mismatch lands somewhere unrelated to its neighborhood. This holds under rotation and shear, where a
+global median does not.
 
-**This is not the Gardner filter.** [`GardnerFilter`](@ref) rejects outliers from a *gridded*
-displacement field using window reductions; these points are scattered, so neighbourhoods come from
-a nearest-neighbour search rather than a window. The two also answer different questions: this one
-decides which matches are real, the other decides which measurements to keep.
+This is not [`GardnerFilter`](@ref), which rejects outliers from a gridded displacement field using
+window reductions. These points are scattered, so neighborhoods come from a nearest-neighbor search.
 
-Measured on synthetic speckle with known ground truth, this takes raw ORB matching from 9.5-62.5%
-correct to **100% correct** in every case tried, at the cost of most of the matches — see the
-discussion at the top of `src/firstguess.jl`.
+On synthetic speckle with known ground truth, filtering raised raw ORB matching from 9.5 to 62.5%
+correct to 100% correct in every case tried, keeping a small fraction of the matches (see the
+comments at the top of `src/firstguess.jl`).
 
 `points` is a vector of `(row, col)`; `dx`/`dy` are the matched displacements. Returns indices into
-all three.
+all three. Throws `DimensionMismatch` if their lengths differ, and `ArgumentError` if
+`min_agree > neighbours`. Returns an empty vector if there are too few points to judge consistency.
 """
 function consistent_matches(points::AbstractVector, dx::AbstractVector, dy::AbstractVector;
                             neighbours::Integer = 12, tolerance::Real = 6.0,
@@ -329,36 +308,31 @@ end
 
 The single rotation, in degrees, that best explains a sparse displacement field.
 
-Feed it to [`RotationSearch`](@ref)'s `about` so the narrow per-chip angle search is centred on the
-scene's actual rotation rather than on zero:
+Pass it as [`RotationSearch`](@ref)'s `about` so the per-chip angle search is centered on the
+scene's rotation rather than on zero:
 
 ```julia
 guess = first_guess(a, b, AKAZEGuess())
 out = autorift(a, b, guess; rotation = RotationSearch(; about = scene_rotation(guess)))
 ```
 
-!!! warning "Only for priors that measure *this* pair"
+!!! warning "Only for priors that measure this pair"
     A `PointSet`'s priors are not always measured displacements. [`Params`](@ref)'s `dx_prior`/
-    `dy_prior` and a Geogrid-supplied `PointSet` carry an a-priori *velocity model* projected onto
-    the image axes, and fitting a rotation to those returns a confident nonzero angle describing the
-    model's projection geometry rather than the pair's rotation — after which every chip in the run
-    is rotated by it.
+    `dy_prior` and a Geogrid-supplied `PointSet` carry an a-priori velocity model projected onto the
+    image axes. Fitting a rotation to those returns a nonzero angle that describes the model's
+    projection geometry rather than the pair's rotation, and every chip in the run is then rotated
+    by it. Nothing in the `PointSet` type distinguishes the two, so the pipeline does not fit a
+    rotation itself: passing `about` asserts that the priors came from matching these images.
 
-    Nothing in the `PointSet` type distinguishes the two, which is why `about` is something the
-    caller passes explicitly rather than something the pipeline fits for itself: passing it is the
-    assertion that these particular priors came from matching these particular images.
+# Limitations
 
-# Limitations, stated because they are the reason this is a separate opt-in step
-
-- **Translation is removed, scale is not fitted.** A rigid rotation plus translation is the model;
-  divergence and shear are residuals. That is the same model `RotationSearch` itself assumes.
-- **One rotation for the whole scene.** A field with two regions rotating opposite ways fits to
-  something near their average, which describes neither. The per-chip search is what handles that,
-  and `about` only moves where it starts looking.
-- **Returns `nothing`**, not `NaN`, when there is nothing to fit: fewer than two points, or a
-  degenerate configuration — all points coincident, or a field with no rotational component, where
-  both sums vanish and `atan(0, 0)` would report a confident zero. `nothing` fails at first use, so a
-  mistake surfaces at the line that made it.
+- Translation is removed and scale is not fitted. The model is a rigid rotation plus translation;
+  divergence and shear are residuals. `RotationSearch` assumes the same model.
+- The fit is one rotation for the whole scene. A field with two regions rotating opposite ways fits
+  to something near their average. The per-chip search handles that case; `about` only sets where
+  it starts.
+- Returns `nothing` rather than `NaN` when there is nothing to fit: fewer than two points, all
+  points coincident, or a field with no rotational component.
 
 The angle carries secondary orientation onto reference, so `about` takes it with no negation at the
 call site. [Giving the search a first guess](@ref) has the fit itself and the sign argument.

@@ -50,9 +50,8 @@ end
 Device buffers for correlating a batch of points at one geometry.
 
 Every array's trailing dimension is the batch, so a kernel indexes its point with the last index
-and the transform plans see a `(fy, fx, B)` array they reduce over region `(1, 2)`. Allocated once
-per geometry and pooled, for the reason `AutoRIFT.take_workspace!` documents: a pass acquires and
-returns rather than allocating, so the device allocator is not on the hot path.
+and the transform plans see a `(fy, fx, B)` array they reduce over region `(1, 2)`. Pooled per
+geometry like `AutoRIFT.take_workspace!`.
 """
 struct GPUWorkspace{T,M<:AbstractArray{T,3},C<:AbstractArray{Complex{T},3},
                     V<:AbstractVector{T},I<:AbstractVector{Int32},B<:AbstractVector{Bool}}
@@ -115,8 +114,7 @@ _devpair(proto, ::Type{T}, dims...) where {T} =
 
 Allocate device buffers for `batch` points at one chip size and search radius.
 
-`proto` is any array on the target device; every buffer is `similar` to it, which is what keeps
-this file free of a vendor array type.
+`proto` is any array on the target device; every buffer is `similar` to it.
 """
 function gpu_workspace(proto, chip_size::Tuple{Int,Int}, radius::Tuple{Int,Int}, batch::Int)
     csx, csy = chip_size
@@ -168,17 +166,11 @@ end
 
 A transform length `>= n` that the device's FFT handles efficiently.
 
-`AutoRIFT.next_fft_size`'s rule, reused rather than replaced: it was calibrated against FFTW's
-radix-2 codelets, and measurement on MPSGraph shows its choices are also good there — powers of two
-are modestly faster per point (64 at 0.83 ms against 56 at 0.91 ms for a 1024-batch) but not enough
-to justify transforming a larger array.
-
-What it protects against is sharper than a few percent. A prime-heavy length is *catastrophic* on
-MPSGraph rather than merely slow: 177 measures 27.7 ms against 192's 3.53 ms, an **8x** penalty
-where FFTW's is a fraction. `next_fft_size` already returns 192 there, since it admits only
-products of 2, 3, 5 and 7 — so the rule that made FFTW fast is what keeps the device off a cliff.
-Any future change to the padding rule has to preserve that, which is why this is a named function
-with this comment rather than a call at the one site that needs it.
+Uses `AutoRIFT.next_fft_size`. On MPSGraph a power of two is modestly faster per point (64 at 0.83 ms
+against 56 at 0.91 ms for a 1024-batch), but not enough to justify a larger array. A length with a
+large prime factor is much slower: 177 measures 27.7 ms against 3.53 ms for 192. `next_fft_size`
+returns 192 there because it admits only products of 2, 3, 5 and 7, and any change to the padding
+rule must preserve that.
 """
 gpu_fft_size(n::Integer) = AutoRIFT.next_fft_size(n)
 
@@ -206,9 +198,8 @@ const GPU_IRFFT_PLANS = Dict{Tuple{DataType,Int,Int,Int},Any}()
 The forward real-to-complex plan for `ws`'s transform shape, from the cache.
 
 Reduces over region `(1, 2)` of an `(fy, fx, batch)` array, so one call transforms every point of
-the batch. Measured 8-17x FFTW's throughput for the same total work at batch 1024 and above, and
-*slower* below batch 256 — which is why a sparse pass stays on the CPU rather than being batched
-onto the device.
+the batch. At batch 1024 and above it measures 8 to 17 times FFTW's throughput for the same work, and
+below batch 256 it is slower, so a sparse pass stays on the CPU.
 """
 function gpu_rfft_plan(ws::GPUWorkspace)
     key = (typeof(ws.fbuf_a), ws.fftsize[1], ws.fftsize[2], ws.batch)
@@ -224,10 +215,8 @@ end
 
 The inverse plan matching [`gpu_rfft_plan`](@ref).
 
-**Unnormalised**, like FFTW's c2r transform: this is `plan_brfft`, so the `1/(fy*fx)` is applied
-when the numerator is read out. Scaling on the read rather than in a pass over the whole buffer is
-what `_cnumerators_fft!` does on the CPU, and for the same reason — only `2*radius` squared of
-`fy*fx` values are ever used.
+Unnormalized, like FFTW's c2r transform: this is `plan_brfft`, and the `1/(fy*fx)` is applied when
+the numerator is read out, since only `2*radius` squared of the `fy*fx` values are used.
 """
 function gpu_irfft_plan(ws::GPUWorkspace)
     key = (typeof(ws.fspec_a), ws.fftsize[1], ws.fftsize[2], ws.batch)
@@ -270,9 +259,8 @@ end
 """
     give_gpu_workspace!(ws)
 
-Return a device workspace to the pool. Buffers are not cleared: the gather fully writes every one
-before it is read, and the transform buffers are zeroed by the gather kernel because only part of
-them is written.
+Return a device workspace to the pool. Buffers are not cleared: the gather kernel writes each one
+before it is read, and zeroes the transform buffers because it writes only part of them.
 """
 function give_gpu_workspace!(ws::GPUWorkspace)
     key = (typeof(ws.fbuf_a), ws.chip_size, ws.radius, ws.batch)
@@ -302,15 +290,13 @@ end
 
 How many points to correlate at once, from a device-memory budget.
 
-Derived rather than fixed, because the per-point footprint grows with the transform size: about
-215 kB at chip 32 and radius 25, four times that at chip 128. **The result must not depend on
-this** — a pass split into two batches has to agree bitwise with one batch, which is what makes
-the budget free to change and is asserted in `test/gpu.jl`.
+The per-point footprint grows with the transform size: about 215 kB at chip 32 and radius 25, four
+times that at chip 128. The result is at least 1 and at most `GPU_MAX_BATCH`. A pass split into
+several batches is bit-identical to one batch (asserted in `test/gpu.jl`), so the budget does not
+change results.
 
-Floored at a size where the device still wins. Batched transforms measure *slower* than FFTW below
-batch 256 at small transform sizes, since per-launch overhead dominates; a pass with fewer
-searchable points than [`GPU_MIN_BATCH`](@ref) is better run on the CPU, which is what
-`_gpu_worth_it` decides.
+A pass with fewer searchable points than [`GPU_MIN_BATCH`](@ref) runs on the CPU, since batched
+transforms are slower than FFTW below batch 256 at small sizes (see `_gpu_worth_it`).
 """
 function gpu_batch_size(chip_size::Tuple{Int,Int}, radius::Tuple{Int,Int},
                         budget_bytes::Int = GPU_MEMORY_BUDGET[])
@@ -335,15 +321,13 @@ end
 Device bytes a single batch of correlation buffers may occupy, which is what
 [`gpu_batch_size`](@ref) divides by the per-point footprint.
 
-512 MiB: large enough that chip 32 batches thousands of points and so clears the size at which the
-batched transform beats FFTW by an order of magnitude, and small enough to leave the imagery and
-the caller's own arrays resident on a shared-memory device, where the GPU has no separate pool to
-draw on.
+512 MiB (the default). At chip 32 this batches thousands of points, enough for the batched transform to
+beat FFTW by an order of magnitude, and it leaves room for the imagery and the caller's arrays on a
+shared-memory device.
 
-A `Ref` so it can be lowered to force a small batch. **The result must not depend on it** — a pass
-split into several batches is bit-identical to one batch — and driving the batch count from the one
-knob that controls it is how `test/gpu.jl` asserts that. Lower it and call
-[`clear_gpu_workspaces!`](@ref), since a pooled workspace is keyed on its batch size.
+A `Ref`, so it can be lowered to force small batches; the result does not change (`test/gpu.jl`
+asserts this). After lowering it, call [`clear_gpu_workspaces!`](@ref), since a pooled workspace is
+keyed on its batch size.
 """
 const GPU_MEMORY_BUDGET = Ref(512 * 1024 * 1024)
 
@@ -353,15 +337,13 @@ const GPU_MEMORY_BUDGET = Ref(512 * 1024 * 1024)
 Device bytes the sub-pixel cascade's scratch may occupy, which sets how many points it refines per
 tile.
 
-Separate from [`GPU_MEMORY_BUDGET`](@ref) and larger, because the two buy different things. The
-correlation's budget bounds a footprint that scales with the transform; this one buys **launch
-amortization**: the cascade is 12 kernel launches per tile whatever the tile holds, so a small tile
-pays them per handful of points. Measured at 64x upsampling, the same cascade costs 17.6 us per point
-at a 131-point tile against 13.5 at 2048, and a tile of 131 made the refinement 164 us per point of a
-195 us pass.
+Separate from, and larger than, [`GPU_MEMORY_BUDGET`](@ref). The cascade is 12 kernel launches per
+tile whatever the tile holds, so a small tile pays the launch cost per few points. At 64x upsampling the
+cascade costs 17.6 us per point at a 131-point tile against 13.5 at 2048, and a tile of 131 made the
+refinement 164 us per point of a 195 us pass.
 
-1 GiB, which at 64x holds ~1000 points (820 kB each) and at 16x ~16,000. A `Ref` for the same reason
-the correlation budget is one — the result must not depend on it.
+1 GiB (the default), which holds about 1000 points at 64x (820 kB each) and about 16,000 at 16x. A `Ref`;
+the result does not depend on it.
 """
 const REFINE_MEMORY_BUDGET = Ref(1024 * 1024 * 1024)
 
@@ -370,9 +352,8 @@ const REFINE_MEMORY_BUDGET = Ref(1024 * 1024 * 1024)
 
 Points per batch, whatever the memory budget allows.
 
-A cap on the transform's trailing dimension rather than on memory. Throughput is already saturated
-well before this — 4096 measures within 20% of 1024 per point — so a larger batch buys nothing and
-costs a longer tail when the final batch of a pass is partly empty.
+A cap on the transform's trailing dimension. Throughput saturates earlier (4096 is within 20% of 1024
+per point), and a larger batch lengthens the tail when the final batch of a pass is partly empty.
 """
 const GPU_MAX_BATCH = 4096
 
@@ -381,9 +362,8 @@ const GPU_MAX_BATCH = 4096
 
 Searchable points below which a pass runs on the CPU instead of the device.
 
-Measured rather than chosen: a batched transform is *slower* than the equivalent FFTW calls below
-batch 256 at the smaller transform sizes — 0.16x at 64 points and a 28-point transform — because
-per-launch overhead dominates. A coarse pass or a late chip-size level can easily fall here, since
-the search deliberately zeroes most of the grid, so this is a routine case rather than a corner.
+A batched transform is slower than the equivalent FFTW calls below batch 256 at small transform sizes
+(0.16x at 64 points and a 28-point transform), because per-launch overhead dominates. A coarse pass
+or a late chip-size level often falls below this threshold, since the search zeroes most of the grid.
 """
 const GPU_MIN_BATCH = 256

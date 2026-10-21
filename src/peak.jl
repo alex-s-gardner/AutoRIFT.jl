@@ -19,12 +19,9 @@
 """
     peak_index(surface) -> (row, col)
 
-Index of the maximum of `surface`, scanning row-major and keeping the first strict
-maximum — matching OpenCV's `minMaxLoc`.
-
-Deliberately not `argmax`, which scans column-major. On a plateau the two return
-different elements, and because both are legitimate maxima the difference would
-show up only as a systematic bias in the output.
+Index of the maximum of `surface`, with ties resolved to the first element in row-major order,
+matching OpenCV's `minMaxLoc`. This differs from `argmax`, which resolves ties column-major, so the
+two return different elements on a plateau.
 
 Returns 1-based indices. `NaN` is never selected, since every comparison against it
 is false; an all-`NaN` surface returns `(1, 1)`.
@@ -65,9 +62,7 @@ end
 
 [`peak_index`](@ref) together with the value at that index.
 
-The value is the peak correlation coefficient, a per-point quality measure. The
-reference implementation computes it and throws it away at all four call sites, so
-returning it is free and it is the most-requested missing autoRIFT output.
+The value is the peak correlation coefficient, a per-point quality measure.
 """
 @inline function peak(surface::AbstractMatrix)
     i, j = peak_index(surface)
@@ -81,23 +76,14 @@ Displacement in pixels of the correlation peak, relative to zero displacement.
 
 The surface is `(2 * radius_y, 2 * radius_x)` with zero displacement at index
 `(radius_y + 1, radius_x + 1)`, so the offset is the peak index minus that origin.
-`dx` is along columns and `dy` along rows, both in image orientation — `dy`
-increases downward, matching array indexing. The sign flip to a cartesian
-convention, if wanted, happens once at the output boundary rather than in three
-places as it does in the reference.
+`dx` is along columns and `dy` along rows, both in image orientation: `dy` increases downward.
 
 !!! note "Sign of the returned offset"
-    This is where the chip's content sits **within the search window**, which is
-    not the same as the motion of the imaged features.
-
-    With the chip cut from the secondary (later) image and the window from the
-    reference (earlier) one — the arrangement the reference implementation uses —
-    the returned offset points from secondary back to reference, so it is the
-    **negative** of the feature displacement. A surface that moved `+10` pixels
-    in x between acquisitions gives `dx = -10` here.
-
-    The negation is applied once, at the output boundary, so that everything below
-    it works in one consistent convention.
+    This is where the chip's content sits within the search window, which is not the motion of the
+    imaged features. With the chip cut from the secondary (later) image and the window from the
+    reference (earlier) one, the offset points from secondary back to reference and is the
+    negative of the feature displacement. A feature that moved `+10` pixels in x between
+    acquisitions gives `dx = -10` here. The negation is applied once, at the output boundary.
 """
 @inline function peak_offset(surface::AbstractMatrix, radius::Tuple{Int,Int})
     i, j, v = peak(surface)
@@ -135,28 +121,23 @@ const PEAK_EXCLUSION = 3
 
 Whether the integer peak of `surface` lies on its first or last row or column.
 
-The surface spans `-radius … radius - 1`, so this means the true displacement is at or beyond the search
-limit: the reported value is a lower bound, and its sub-pixel part along that axis is unrecoverable because
-the peak's far side was never sampled. Measured on known translations at chip 16, radius 20, refining such
-a peak is *worse* than keeping the integer one — 1.34 px against 0.40 px at a true shift of −18.6, and
-0.94 px against exact at −19.0.
+The surface spans `-radius … radius - 1`, so a peak on the boundary means the true displacement is at
+or beyond the search limit. The reported value is a lower bound, and its sub-pixel part along that axis
+cannot be recovered because the far side of the peak was not sampled. At chip 16, radius 20, refining
+such a peak is worse than keeping the integer one: 1.34 px error against 0.40 px at a true shift of
+−18.6, and 0.94 px against exact at −19.0.
 
-`track!` therefore reports **both** `correlation` and `peak_ratio` as zero at such a point, so any positive
-threshold on either rejects it without the caller having to know the condition exists. Zero is otherwise
-unreachable for both: a real ZNCC peak is strictly positive, and a real ratio is at least 1, the primary
-being the surface maximum. The displacement itself is still reported, being the best available bound.
-Select these points with `correlation .== 0` to find where `search_radius` needs raising — at the
-ITS_LIVE configuration over Jakobshavn 4.2% of points that correlate above 0.3 are affected, and
+`track!` therefore reports `correlation` and `peak_ratio` as zero at such a point, so any positive
+threshold on either rejects it. Zero is otherwise unreachable for both: a real ZNCC peak is positive
+and a real ratio is at least 1. The displacement is still reported, as the best available bound.
+Select these points with `correlation .== 0` to find where `search_radius` needs raising. At the
+ITS_LIVE configuration over Jakobshavn, 4.2% of points that correlate above 0.3 are affected, and
 0.12% at chip 32.
-
-One function rather than the test written out at each site: the two outputs must agree about which points
-are railed, and a copy of the condition is how they would drift apart.
 
     peak_at_boundary(surface, i, j) -> Bool
 
 The same test on a peak the caller has already located. `(i, j)` must be what
-[`peak_index`](@ref) would return; the one-argument form is this composed with that call. The
-correlator uses this form, having located the peak once for every quantity it derives.
+[`peak_index`](@ref) would return.
 """
 @inline peak_at_boundary(surface::AbstractMatrix, i::Int, j::Int) =
     (i == 1) | (j == 1) | (i == size(surface, 1)) | (j == size(surface, 2))
@@ -170,43 +151,30 @@ correlator uses this form, having located the peak once for every quantity it de
 The primary-to-secondary peak ratio: the correlation peak divided by the highest rival peak
 elsewhere on the surface.
 
-The rival — the secondary peak — is the largest sample lying more than `exclusion` samples from the
-primary along either axis. Excluding a box rather than a single sample is what makes the two peaks
-*distinct*: the samples immediately around the primary are its own shoulder, and dividing by those
-would return a number near 1 at every point regardless of how clean the surface was.
+The rival is the largest sample more than `exclusion` samples from the primary along either axis
+(`exclusion` defaults to `PEAK_EXCLUSION = 3`). The excluded box keeps the primary's own shoulder from
+counting as a rival.
 
-The result is `>= 1` by construction, since the primary is the surface maximum. A ratio near 1 means
-some other displacement matched nearly as well, so the reported one is a coin flip between them; a
-large ratio means the chosen displacement was the only candidate. This is the measure of an
-*ambiguous* surface, and ambiguity is the failure mode a peak height cannot see: periodic texture —
-crevasse fields, dune trains, crop rows — produces rival peaks one wavelength apart, each as tall as
-the true one.
+The result is `>= 1`, since the primary is the surface maximum. A ratio near 1 means another
+displacement matched nearly as well, so the reported one is ambiguous; a large ratio means the chosen
+displacement was the only candidate. Periodic texture (crevasse fields, dune trains, crop rows)
+produces rival peaks one wavelength apart, each as tall as the true one, which a peak height cannot
+reveal.
 
-`Inf32` when no rival is positive at all, meaning the primary is the only candidate the surface
-offers. `NaN32` when the surface is too small to have anything outside the exclusion box, which says
-"no ratio could be computed" rather than a low ratio. The two are distinct and a caller testing
-`isfinite` separates both from a real value.
+Returns `Inf32` when no rival is positive. Returns `NaN32` when the surface is too small to have a
+sample outside the exclusion box, or when the primary is not positive.
 
-**Gate on `correlation`, not on this.** The two answer different questions and only peak height
-predicts reliability; this ratio has essentially no skill as a threshold, measured. Use it to
-diagnose ambiguity instead — see [Judging a result](@ref).
+Gate on `correlation` rather than on this ratio: only peak height predicts reliability, and the ratio
+has essentially no skill as a threshold. Use it to diagnose ambiguity; see [Judging a result](@ref).
 
-`exclusion` is `PEAK_EXCLUSION` by default; see that constant for why it is fixed rather than
-tunable.
-
-This is a property of the surface alone. The search-boundary condition — where the reported ratio is
-forced to zero, below the 1 a real ratio cannot go under — is applied by the caller; see
-[`AutoRIFT.peak_at_boundary`](@ref).
+This is a property of the surface alone. `track!` sets the reported ratio to zero where the peak
+lies on the search boundary; see [`AutoRIFT.peak_at_boundary`](@ref).
 
     peak_ratio(surface, i, j[, exclusion = $PEAK_EXCLUSION]) -> Float32
 
 The same measure on a peak the caller has already located. `(i, j)` must be what
-[`peak_index`](@ref) would return; the form without them is this composed with that call.
-
-The correlator uses this form. Every point needs the displacement, the peak value, the boundary
-flag and this ratio, and the four naive calls locate the same peak four times over —
-`peak_index` is the top self-time frame in a profiled pass, so at chip 16 and radius 20, the
-geometry ITS_LIVE runs Landsat at, that is 3.92 us against 2.15 us, 6% of a whole point.
+[`peak_index`](@ref) would return. This form avoids locating the peak again, which at chip 16 and
+radius 20 costs 3.92 us against 2.15 us.
 """
 @inline function peak_ratio(surface::AbstractMatrix, i::Int, j::Int,
                             exclusion::Int = PEAK_EXCLUSION)
@@ -383,15 +351,13 @@ end
 One Gaussian-pyramid upsampling step: `dst` becomes `src` at twice the size in each
 dimension.
 
-Zeros are injected at odd output positions and the result is convolved with the
-separable 5-tap kernel `[1,4,6,4,1]/16`, scaled by 4 so that brightness is
-preserved rather than quartered. Border samples are reflected without repeating the
-edge (OpenCV's `BORDER_REFLECT_101`), which matters here more than it usually does
-because the patch is only 5x5 — the border is most of it.
+Zeros are injected at odd output positions and the result is convolved with the separable 5-tap
+kernel `[1,4,6,4,1]/16`, scaled by 4 to preserve brightness. Border samples are reflected without
+repeating the edge (OpenCV's `BORDER_REFLECT_101`).
 
-`dst` must be exactly `2 .* size(src)`. `scratch` is an optional buffer of at least
-`(2 * size(src, 1), size(src, 2))` for the intermediate of the two-pass form; the
-refinement cascade supplies one from its workspace so the hot path allocates nothing.
+`dst` must be exactly `2 .* size(src)`, otherwise `DimensionMismatch` is thrown. `scratch` is an
+optional buffer of at least `(2 * size(src, 1), size(src, 2))` for the intermediate of the two-pass
+form; without it one is allocated.
 """
 pyrup!(dst::AbstractMatrix{Float32}, src::AbstractMatrix{Float32}) =
     pyrup!(dst, src, Matrix{Float32}(undef, 2 * size(src, 1), size(src, 2)))
@@ -504,13 +470,12 @@ const W_H = 4.0f0 / 8      # both taps, odd output position
 """
     _pyrup_taps(k, n) -> (minus, centre, plus, ntaps)
 
-Source indices contributing to 1-based output position `k` of an axis of length `n`,
-and how many of them there are.
+Source indices contributing to 1-based output position `k` of an axis of length `n`, and how many
+of them there are.
 
-An even upsampled position sits on a source sample and takes three taps; an odd one
-sits between two and takes two, in which case `centre` and `plus` are the pair and
-`minus` is unused. Indices are reflected in the upsampled space (see
-[`pyrup!`](@ref)), which is what makes the trailing edge behave as OpenCV's does.
+An even upsampled position sits on a source sample and takes three taps; an odd one sits between
+two and takes two, in which case `centre` and `plus` are the pair and `minus` is unused. Indices are
+reflected in the upsampled space (see [`pyrup!`](@ref)), as OpenCV does.
 """
 @inline function _pyrup_taps(k::Int, n::Int)
     p = k - 1                       # 0-based upsampled position
@@ -545,11 +510,8 @@ _pyrup_row_taps(n::Int) = [_pyrup_taps(i, n) for i in 1:(2n)]
 Reflect index `i` into `1:n` without repeating the edge element: `…3 2 | 1 2 3 … n |
 n-1 n-2…`. OpenCV's `BORDER_REFLECT_101`.
 
-Distinct from the reflection that *does* repeat the edge, which Julia calls
-`:symmetric` and OpenCV calls `BORDER_REFLECT`. The two differ by one sample at
-every boundary, and confusing them is the most common error in ported image code —
-so both conventions are named explicitly wherever they appear rather than left to
-the reader.
+This differs from the reflection that repeats the edge, which Julia calls `:symmetric` and OpenCV
+calls `BORDER_REFLECT`, by one sample at every boundary.
 """
 @inline function reflect101(i::Int, n::Int)
     n == 1 && return 1
@@ -566,13 +528,7 @@ end
 [`reflect101`](@ref) on 0-based positions: reflect `p` into `0:(n-1)` without
 repeating the edge.
 
-The 0-based form is what the upsampling kernel needs, because it reflects in the
-*upsampled* coordinate space where positions are naturally 0-based offsets from the
-output origin. Converting to 1-based first and back afterwards would work but reads
-worse than having both forms named.
-
-Reflection preserves parity, which is what lets [`pyrup!`](@ref) skip the injected
-zeros before reflecting rather than after.
+Reflection preserves parity, so [`pyrup!`](@ref) can skip the injected zeros before reflecting.
 """
 @inline function reflect101_0(p::Int, n::Int)
     n == 1 && return 0
@@ -589,9 +545,9 @@ end
 
 Ping-pong buffers for the sub-pixel upsampling cascade.
 
-Two buffers, alternated, sized for the deepest cascade the configured upsampling
-requires. Allocated once per task rather than per point: at 128x upsampling each
-buffer is 640x640, so allocating per point would dominate everything else.
+Two alternating buffers sized for the deepest cascade the configured upsampling requires, plus the
+patch and `pyrup!` scratch. At 128x upsampling each buffer is 640x640, so a workspace is allocated
+once per task. Construct with `AutoRIFT.refinement_workspace`.
 """
 struct RefinementWorkspace
     a::Matrix{Float32}
@@ -611,21 +567,19 @@ end
 """
     AutoRIFT.REFINE_PATCH
 
-Side length of the correlation-surface neighbourhood the sub-pixel cascade upsamples.
-
-The reference's 5, and load-bearing rather than a tunable. A 3x3 patch has no interior at all
-under a 5-tap kernel, so every output would depend on reflected border: measured, 155 of 200
-surfaces gave a different answer, by up to 3 pixels.
-
-Named because the cascade is implemented twice — here and as a device kernel — and the two must
-agree about it, since the refined `dx`/`dy` are asserted bit-identical between them.
+Side length of the correlation-surface neighborhood the sub-pixel cascade upsamples (5, as in the
+reference). It is not tunable: a 3x3 patch has no interior under a 5-tap kernel, so every output
+would depend on reflected border, and 155 of 200 test surfaces gave a different answer, by up to
+3 pixels. The CPU cascade and the device kernel both use this value, and their refined `dx`/`dy`
+are bit-identical.
 """
 const REFINE_PATCH = 5
 
 """
     refinement_workspace(upsampling; patch = AutoRIFT.REFINE_PATCH) -> RefinementWorkspace
 
-Allocate cascade buffers for up to `upsampling`-fold refinement.
+Allocate cascade buffers for up to `upsampling`-fold refinement. `upsampling` must be a power of 2,
+otherwise `ArgumentError` is thrown.
 """
 function refinement_workspace(upsampling::Integer; patch::Integer = REFINE_PATCH)
     upsampling >= 1 || throw(ArgumentError(
@@ -660,15 +614,12 @@ end
 
 Displacement of the correlation peak, located to `1/upsampling` of a pixel.
 
-A `patch`-sized neighbourhood of the integer peak is upsampled by a cascade of
-[`pyrup!`](@ref) steps and its argmax taken. The neighbourhood is clamped to lie
-within the surface, so a peak at the edge is refined against an off-centre window
-rather than being rejected — the reference does the same, and it matters because a
-peak at the search-window edge means the true displacement may be outside the
-search range, which the outlier filter is better placed to judge than this
-function.
+A 5x5 (`AutoRIFT.REFINE_PATCH`) neighborhood of the integer peak is upsampled by a cascade of
+[`pyrup!`](@ref) steps and its argmax taken. The neighborhood is clamped to lie within the surface,
+so a peak at the edge is refined against an off-center window, as in the reference. `upsampling`
+must not exceed the workspace maximum, otherwise `ArgumentError` is thrown.
 
-With `upsampling == 1` this is exactly `peak_offset`.
+With `upsampling == 1` this is `peak_offset`.
 """
 subpixel_peak(rw::RefinementWorkspace, surface::AbstractMatrix{Float32},
               radius::Tuple{Int,Int}, upsampling::Integer) =
@@ -680,9 +631,7 @@ subpixel_peak(rw::RefinementWorkspace, surface::AbstractMatrix{Float32},
 [`subpixel_peak`](@ref) refining about an integer peak the caller has already located.
 
 `(pi, pj)` must be what [`peak_index`](@ref) would return for `surface`; the four-argument form
-is this with that call supplied, and is what the tests and benchmarks use. The correlator calls
-this one: it has already located the peak to derive the displacement, the boundary flag and the
-peak ratio, and refining would otherwise scan the surface again for a peak it holds.
+calls `peak_index` and passes the result here.
 """
 function subpixel_peak(
     rw::RefinementWorkspace, surface::AbstractMatrix{Float32},
@@ -772,8 +721,7 @@ const REFINEMENT_POOL = Dict{Int,Vector{RefinementWorkspace}}()
 """
     AutoRIFT.take_refinement!(upsampling) -> RefinementWorkspace
 
-As [`take_workspace!`](@ref), for the sub-pixel cascade's buffers. Keyed on `upsampling` alone,
-since that and the fixed 5x5 patch determine every extent.
+As [`take_workspace!`](@ref), for the sub-pixel cascade's buffers. Keyed on `upsampling` alone.
 """
 function take_refinement!(up::Int)
     rw = lock(WORKSPACE_LOCK) do
@@ -786,7 +734,7 @@ end
 """
     AutoRIFT.give_refinement!(rw)
 
-Return a refinement workspace to the pool.
+Return a refinement workspace to the pool. The caller must not use `rw` afterwards.
 """
 function give_refinement!(rw::RefinementWorkspace)
     lock(WORKSPACE_LOCK) do

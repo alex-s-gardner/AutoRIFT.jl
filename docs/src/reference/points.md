@@ -4,8 +4,8 @@ CurrentModule = AutoRIFT
 
 # Points and grids
 
-A `PointSet` says where a pass measures and, per point, how large a chip to use, how far to search,
-and what displacement to search around. Building one is how you vary those fields across the scene —
+A `PointSet` gives the points where a pass measures and, for each point, the chip size, the search
+radius and the displacement to search around. Build one to vary those fields across the scene;
 `autorift`'s scalar keywords cannot.
 
 ```@docs

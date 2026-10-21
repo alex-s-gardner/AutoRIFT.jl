@@ -5,7 +5,7 @@ CurrentModule = AutoRIFT
 # Parameters
 
 `params` builds the `Params` a pass reads. Its keywords are the whole configuration surface:
-`autorift`'s own keywords are forwarded to it.
+`autorift` forwards its keywords to it.
 
 ```@docs
 params

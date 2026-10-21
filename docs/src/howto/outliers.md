@@ -1,33 +1,34 @@
 
 # Filtering outliers
 
-A correlation returns a displacement at every searched point, including the points where the peak was
-noise. Those are not small errors — they are arbitrary vectors, and one of them can dominate any fit
-downstream. What separates them from real motion is that real motion is spatially coherent: neighbouring
-points move similarly, while a false match agrees with nothing around it.
+A correlation returns a displacement at every searched point, including points where the peak was
+noise. Those are arbitrary vectors, and one of them can dominate a fit downstream. Real motion is
+spatially coherent, so neighboring points move similarly, while a false match agrees with nothing around
+it.
 
-[`GardnerFilter`](@ref) asks that question, and `autorift` runs it by default. This page is about what it
+[`GardnerFilter`](@ref) tests for this, and `autorift` runs it by default. This page describes what it
 does and when to change its settings.
 
 ## What it removes
 
-A scene with one badly decorrelated patch — texture in one image that is simply not in the other, so the
-correlation there has nothing to lock onto:
+The scene below has one decorrelated patch, where noise added to the secondary image leaves the
+correlation nothing to lock onto, in addition to the two speed transitions at the edges of the fast
+band:
 
 ```@example outliers
 using AutoRIFT
-include("../../figures.jl")  # plotting helpers and the synthetic scenes; see [Plotting](@ref)
+include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 using Statistics: median, quantile
 
 band(row) = clamp((108 - abs(row - 256)) / 28, 0, 1)
-reference, clean, truth_dx, _ = warped_pair(512, (row, col) -> (2 + 20 * band(row), 0.0); seed = 11)
+reference, clean, truth_dx, _ = warped_pair(photo(), 512, (row, col) -> (2 + 20 * band(row), 0.0))
 patch(row, col) = (300 <= row <= 400 && 120 <= col <= 260) ? 1.0 : 0.0
 secondary = decorrelate(clean, patch; amplitude = 2.5, seed = 7)
 
 image_panels(reference, secondary)
 ```
 
-The same call with the filter on and off:
+The same call with the filter on and off. The counts include points filled by [Hole filling](@ref):
 
 ```@example outliers
 settings = (; chip_size = 16, chip_size_max = 64, grid_spacing = 8)
@@ -42,19 +43,21 @@ field_panels(blank(raw.dx, measured(raw)), blank(filtered.dx, measured(filtered)
              titles = ("dx, outliers = :none", "dx, GardnerFilter (default)"))
 ```
 
-And the rejection mask itself — which points the filter dropped:
+The points the filter dropped:
 
 ```@example outliers
 rejected = measured(raw) .& .!measured(filtered)
 input_field(Float64.(rejected), "rejected by the filter"; colormap = :grays)
 ```
 
-The rejections concentrate in the decorrelated patch, which is the point: the filter found a region where
-the displacements disagree with their neighbours, without being told the region existed.
+The rejections fall in two places. One is the decorrelated patch, which the filter finds without being
+told it exists. The other is the two edges of the fast band, where the speed changes by 20 pixels over
+28 rows and a chip straddles two speeds; this is the case described under
+[When the filter is the wrong tool](@ref).
 
-## How much it is worth
+## Effect on error
 
-This scene has a known truth field, so the improvement is measurable rather than visual:
+This scene has a known true displacement field, so the error can be computed:
 
 ```@example outliers
 _, grid = AutoRIFT.autorift_with_grid(reference, secondary; settings...)
@@ -69,47 +72,43 @@ summary(out) = (n = length(error_of(out)),
 (unfiltered = summary(raw), filtered = summary(filtered))
 ```
 
-The **median is identical** — 0.016 px either way, one refinement quantization step. The filter changes
-nothing about the points that were already right. What it changes is the tail: the 99th percentile falls
-from about 40 pixels to 0.06, and the worst point from 47 pixels to 2.
-
-That shape is worth internalizing. A filter that improved the median would be smoothing the field, which
-is a different operation with different costs. This one removes points; the ones it keeps are untouched.
+The median barely changes: 0.016 px unfiltered and 0.0 filtered, which is one refinement quantization
+step. The filter does not alter the points it keeps. It removes the tail: the 99th percentile falls from
+about 38 pixels to 0.06, and the worst point from 47 pixels to 3.6. The filter rejects points; it does
+not smooth the field.
 
 ## The two stages
 
-Both are from autoRIFT's `DISP_FILT`, and a point must pass both.
+Both stages are from autoRIFT's `DISP_FILT`, and a point must pass both.
 
-1. **Agreement.** Keep a point only if at least `min_agree_fraction` of its `window`×`window`
-   neighbourhood lies within `agree_tolerance` of it. Cheap, and removes isolated wild vectors.
-2. **Median deviation.** Keep a point only if it lies within `mad_scale` median absolute deviations of its
-   neighbourhood median. Catches the subtler case of a false match sitting among other false matches,
-   where stage 1's neighbours corroborate each other.
+1. **Agreement.** Keep a point only if at least `min_agree_fraction` of the full `window`×`window`
+   neighborhood, counting the point itself, lies within `agree_tolerance` of it. The required count is
+   not reduced for truncated windows at the grid border. This removes isolated wild vectors.
+2. **Median deviation.** Keep a point only if it lies within `mad_scale` median absolute deviations
+   (MAD) of its neighborhood median, with the tolerance floored at two refinement steps. This catches a
+   false match sitting among other false matches, where stage 1's neighbors corroborate each other.
 
-Both stages compare displacements **normalized by the local search radius**, and that is what gives
+Stage 1 runs `outlier_iterations` times and stage 2 one fewer (at least once). A rejected point stays
+rejected and no longer counts as an agreeing neighbor, so a rejection can expose its neighbors in the
+next pass.
+
+Both stages compare displacements normalized by the local search radius. This is what gives
 `agree_tolerance` its meaning: a five-pixel disagreement is negligible where the search reached fifty
-pixels and decisive where it reached six. Since the radius can vary across a scene, a fixed absolute
-tolerance would mean different things in different places.
+pixels and decisive where it reached six, and the radius can vary across a scene. Stage 2 gives the same
+result with or without normalization, because the deviation and the MAD scale together. Only its
+refinement-step floor depends on the radius.
 
-Stage 2 is radius-*invariant* by construction — its tolerance is `mad_scale` times the neighbourhood MAD,
-and both the deviation and the MAD scale as one over the radius, so the ratio does not move. Normalizing
-there buys consistency of units rather than of behaviour.
+## The five settings
 
-The two stages also differ in whether a rejection is final. Stage 1 recomputes its mask from scratch each
-iteration, so a point rejected in one pass can return in the next once its neighbours' own rejections
-change the counts. Stage 2 intersects with the mask it inherits, so a rejection there sticks.
-
-## The five knobs
-
-Every setting is a keyword to `autorift` directly, or to [`GardnerFilter`](@ref) if you want an instance.
+Each is a keyword to `autorift`, or to [`GardnerFilter`](@ref) if you want an instance.
 
 | keyword | default | raising it |
 |---|---:|---|
-| `outlier_window` | 5 | wider neighbourhood — more evidence per point, and more rejections near any boundary |
-| `outlier_iterations` | 3 | more passes of stage 1, letting a rejection expose its neighbours |
-| `min_agree_fraction` | 8/25 | more neighbours must agree — stricter |
-| `agree_tolerance` | 0.2 | looser definition of agreement — more permissive |
-| `mad_scale` | 4.0 | wider deviation allowance — more permissive |
+| `outlier_window` | 5 | wider neighborhood: more evidence per point, and more rejections near any boundary |
+| `outlier_iterations` | 3 | more passes of stage 1, letting a rejection expose its neighbors |
+| `min_agree_fraction` | 8/25 | more neighbors must agree (stricter) |
+| `agree_tolerance` | 0.2 | looser definition of agreement (more permissive) |
+| `mad_scale` | 4.0 | wider deviation allowance (more permissive) |
 
 Measured on the scene above, against the same truth field:
 
@@ -128,39 +127,43 @@ for (label, f) in variants
 end
 ```
 
-Three things to read out of that:
+The runs on this page use `chip_size = 16` and `grid_spacing = 8`, so `autorift` rescales the filter
+before applying it (see [Grids finer than the chip](@ref)): a window of 5 becomes 9 and the agreement
+fraction 8/25 becomes 0.41, and a window of 9 becomes 17. In the table:
 
-- **`agree_tolerance` and `mad_scale` trade coverage against the tail**, and the trade is not symmetric.
-  Loosening either keeps a few dozen more points and costs an order of magnitude in the 99th percentile;
-  tightening `mad_scale` to 1.5 halves the tail again for about 20 points. Which side to err on depends
-  on whether your consumer can tolerate a wrong vector or a missing one.
-- **`iterations = 1` is the worst setting here** — it keeps the most points and has by far the worst tail.
-  Stage 1's iteration is doing real work: one pass cannot see an outlier whose neighbours are also
-  outliers.
-- **`window = 9` costs a quarter of the coverage** for no gain in the tail. A wider neighbourhood demands
-  agreement across more ground, and near the edge of any coherent region that agreement is not there.
+- `agree_tolerance` and `mad_scale` trade coverage against the tail. Loosening either keeps 39 to 110
+  more points and raises the 99th percentile from 0.06 px to 2.0–3.5 px. Tightening `mad_scale` to 1.5
+  removes 23 points and lowers the 99th percentile slightly. Which direction to err depends on whether
+  the consumer tolerates a wrong vector or a missing one better.
+- `iterations = 1` keeps the most points and has the worst tail (6.3 px). One pass cannot reject an
+  outlier whose neighbors are also outliers.
+- `window = 9` keeps a quarter fewer points than the default with no improvement in the tail. A wider
+  neighborhood requires agreement across more ground, and near the edge of a coherent region that
+  agreement is absent.
 
-The exception to that last point is when grid spacing is finer than the chip size, where a wider window is
-*correct* rather than merely strict — adjacent points then share most of their imagery. `autorift`
-already handles that: it calls [`AutoRIFT.rescale`](@ref) to widen the window and raise the agreement
-fraction to match. Whatever you pass is the setting for one point per chip, and the scaling is applied on
-top.
+## Grids finer than the chip
+
+When `grid_spacing` divides `chip_size`, adjacent grid points share most of their imagery, so a wider
+window is appropriate. `autorift` calls [`AutoRIFT.rescale`](@ref), which widens the window and raises
+the agreement fraction to match. The ratio of `chip_size` to `grid_spacing` used is capped at 2. The
+settings you pass are those for one point per chip, and the rescaling is applied on top of them.
 
 ## Turning it off
 
-`outliers = :none` keeps everything. It is not a production setting — the table above is what it costs —
-but it is the right tool for deciding *which* stage dropped a point, since it separates the correlator's
-failures from the filter's rejections. That is what the figures on this page use it for.
+`outliers = :none` keeps every measured point. It is not suitable for production, since the table above
+shows what it admits, but it shows which points the correlator failed on and which the filter rejected.
+The figures on this page use it for that.
 
 ## Hole filling
 
-Rejection leaves gaps, and small gaps are filled from their neighbours rather than left empty. Two
-keywords control it:
+Rejection leaves gaps, and small gaps are filled from their neighbors. Two keywords control this:
 
-- `fill_window = 3` — the median window a fill is computed over. Must be odd.
-- `fill_min_hole = 5` — a connected hole smaller than this is filled whatever its neighbour count, which
-  closes a hole whose shape leaves every point short of the window criterion. Exclusive, so the default
-  closes holes of one to four points. `0` disables it and leaves filling to the window criterion alone.
+- `fill_window = 3`: the width of the median window a fill is computed over. Must be odd. A point is
+  filled if at least `2 * fill_window^2 ÷ 3` of its neighbors are measured (6 of 9 by default).
+- `fill_min_hole = 5`: a connected hole smaller than this is also filled, whatever its neighbor count, as
+  long as it has at least one measured neighbor. This closes holes whose shape leaves every point short
+  of the window criterion. The bound is exclusive, so the default closes holes of one to four points. `0`
+  disables it, leaving only the window criterion.
 
 ```@example outliers
 for (w, h) in ((3, 5), (3, 0), (7, 25))
@@ -170,43 +173,41 @@ for (w, h) in ((3, 5), (3, 0), (7, 25))
 end
 ```
 
-Filled points are marked in the `interpolated` layer and are not measurements — their `correlation` is
-`NaN`, having no surface of their own. See [Judging a result](@ref) for whether to keep them.
-
-Raising `fill_min_hole` to 25 closes the ragged edges of the rejected region, which is a visual
-improvement and an epistemic loss: those points are now interpolated across a region the correlator
-could not resolve. The default is small deliberately.
+Filled points are marked in the `interpolated` layer. They are not measurements, and their
+`correlation` is `NaN`. See [Judging a result](@ref) for whether to keep them. A larger `fill_window` and
+`fill_min_hole` (the last row) close more of the ragged edge of the rejected region, at the cost of
+interpolating over ground the correlator could not resolve. Filling runs for three passes, each filling
+only points that qualify, so a large hole closes from its edge inward.
 
 ## When the filter is the wrong tool
 
-The filter's premise is that the field is spatially coherent at the grid's scale. Where it genuinely is
-not, the filter rejects real motion:
+The filter assumes the field is spatially coherent at the grid's scale. Where it is not, the filter
+rejects real motion:
 
-- **A sharp discontinuity** — a shear margin, a crack, an object boundary — has neighbouring points with
-  legitimately different displacements. Expect rejections along it, and a finer grid spacing does not help
-  because the discontinuity stays sharp relative to the spacing.
-- **Genuinely turbulent motion**, where the correlation length is at or below the grid spacing. The filter
-  has no way to distinguish that from noise, because at that scale there is no difference to detect.
-- **Scattered points** rather than a grid. A `PointSet{1}` has no neighbourhood at all, so there is
-  nothing for the filter to work with.
+- A sharp discontinuity (a shear margin, a crack, an object boundary) has neighboring points with
+  different true displacements. Expect rejections along it. A finer grid spacing does not help, because
+  the discontinuity stays sharp relative to the spacing.
+- Turbulent motion with a correlation length at or below the grid spacing cannot be distinguished from
+  noise.
+- Scattered points: a `PointSet{1}` has no neighborhood, and `autorift` does not apply the filter to it.
 
-In each case the answer is `outliers = :none` plus a `correlation` gate, which is a per-point test and
-makes no coherence assumption. It catches less, and what it catches it catches honestly.
+For the first two, use `outliers = :none` with a `correlation` threshold, which tests each point alone
+and assumes no coherence. It rejects fewer bad points.
 
 ## Relation to the normalized median test
 
-If you come from PIV, this resembles the universal outlier detection of Westerweel & Scarano (2005) but is
-not it, and the differences change which points survive. The centre point is included in both the median
-and the MAD here, where Westerweel & Scarano exclude it — excluding it is what makes their test ask
-whether a vector agrees with its neighbours rather than with a set it partly defines. The normalization is
-by local search radius rather than by `MAD + ε`; the threshold is 4 rather than their universal 2; and the
-agreement pre-pass has no counterpart there at all.
+The filter resembles the universal outlier detection of Westerweel & Scarano (2005) but differs from it
+in ways that change which points survive. The center point is included in both the median and the MAD,
+where Westerweel & Scarano exclude it so that the test asks whether a vector agrees with its neighbors
+rather than with a set it partly defines. The normalization is by local search radius rather than by
+`MAD + ε`, the threshold is 4 rather than their universal 2, and the agreement stage has no counterpart
+in their test.
 
-`OutlierMethod` is the extension point if you want the other test — see
+[`OutlierMethod`](@ref) is the extension point for adding another test; see
 [`AutoRIFT.reject_outliers`](@ref).
 
 ## See also
 
-- [Judging a result](@ref) — the per-point gate, which the filter does not replace
-- [`GardnerFilter`](@ref) — every keyword and its contract
-- [`AutoRIFT.rescale`](@ref) — why a fine grid gets a wider window automatically
+- [Judging a result](@ref): the per-point threshold, which the filter does not replace
+- [`GardnerFilter`](@ref): every keyword and its contract
+- [`AutoRIFT.rescale`](@ref): why a fine grid gets a wider window

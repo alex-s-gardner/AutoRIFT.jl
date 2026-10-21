@@ -1,29 +1,29 @@
 
 # Masking invalid pixels
 
-Imagery has pixels that are present but not usable: cloud, shadow, saturation, water, the ragged edge of
-a swath, the no-data border left by a reprojection. They carry a number, and correlating that number
-against real texture produces a displacement with nothing behind it.
+Imagery can contain pixels that are present but not usable: cloud, shadow, saturation, water, the ragged
+edge of a swath, the no-data border left by a reprojection. Correlating their values against real texture
+produces a displacement with no basis.
 
-Two keywords exclude them, and both take an array or a raster:
+Two keywords exclude them. Each takes an array or a raster, and either may be omitted:
 
 ```julia
 autorift(reference, secondary; reference_valid = a_bool_matrix, secondary_valid = another)
 ```
 
-`true` means usable. Either may be omitted.
+`true` means usable.
 
-## The default already handles non-finite pixels
+## Non-finite pixels are masked by default
 
-Without a mask, [`ImagePair`](@ref) derives one from finiteness — a pixel that is `NaN` or infinite is
-invalid. So if your reader already converts no-data to `NaN`, masking is done:
+Without a mask, [`ImagePair`](@ref) treats a `NaN` or infinite pixel as invalid. If your reader already
+converts no-data to `NaN`, no further masking is needed:
 
 ```@example masks
 using AutoRIFT
-include("../../figures.jl")  # plotting helpers and the synthetic scenes; see [Plotting](@ref)
+include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 using Statistics: median, quantile
 
-reference, secondary, truth_dx, _ = warped_pair(512, (row, col) -> (6.0, -2.0); seed = 13)
+reference, secondary, truth_dx, _ = warped_pair(photo(), 512, (row, col) -> (6.0, -2.0))
 settings = (; chip_size = 32, chip_size_max = 32, search_radius = 20, grid_spacing = 8)
 
 patch = (236:276, 236:276)   # a 41x41 cloud in the reference image
@@ -38,21 +38,23 @@ as_nan[patch...] .= NaN32
  nan = AutoRIFT.nmeasured(autorift(as_nan, secondary; settings...)))
 ```
 
-The same count, because they are the same mask by a different route. What the default does **not** do is
-treat zero as no-data — zero is a legitimate dark radiance, and conflating the two throws away genuinely
-dark ground. A sensor that writes `0` or `-9999` needs an explicit mask.
+The counts are equal because the two routes give the same mask. The default does not treat zero as
+no-data, since zero is a valid dark radiance and treating it as no-data would discard dark ground. A
+sensor that writes `0` or `-9999` needs an explicit mask.
 
 ```@example masks
 input_field(Float64.(explicit), "reference_valid (false = masked)"; colormap = :grays)
 ```
 
-## A masked chip is skipped only when it is entirely masked
+## A masked chip is skipped when most of it is masked
 
-This is the rule that governs everything else on this page. A point is abandoned when its chip contains
-**no** valid pixel; a chip with even one valid pixel is correlated.
+A point is correlated only if more than `min_chip_valid_fraction` (0.65 by default) of its own chip is
+valid. The search window around it may hold any amount of masked ground. The fraction is taken from the
+mask after preprocessing, which a filter with spatial extent has enlarged (see
+[Filters and masks interact](@ref)).
 
-So the hole in the output is *smaller* than you would get from excluding any overlap, and a bigger chip
-loses less ground to a small cloud, not more — a large chip is harder to cover completely:
+The hole in the output is therefore smaller than the set of points whose chip overlaps the mask, and a
+larger chip has a smaller fraction of itself masked by a given cloud:
 
 ```@example masks
 for chip in (16, 32, 64)
@@ -65,19 +67,23 @@ for chip in (16, 32, 64)
 end
 ```
 
-Chip 64 loses nothing at all: no 64×64 chip fits inside a 41×41 hole, so every chip keeps some valid
-ground. That also means a multi-chip-size search *recovers* a masked region — the coarse level answers
-where the fine level had nothing to work with, and those points come back marked with their own
-`chip_size`. See [Multiple chip sizes](@ref).
+Every size loses a few dozen points, for different reasons. A 16-pixel chip centered in or near the
+41×41 cloud is mostly masked, so those points have little valid data to correlate. A 64-pixel chip is at
+most 41% masked by the cloud (about 49% once the default 5-pixel highpass widens the mask), so the chip
+test removes only the points nearest the cloud's center. The remaining losses at that size come from
+other stages, such as the outlier filter, which the counts above do not separate. A multi-chip-size
+search can fill a masked region: with `chip_size = 16, chip_size_max = 64`, the 64-pixel level can answer
+over the cloud where the 16-pixel level could not, and those points carry their own `chip_size`. See
+[Multiple chip sizes](@ref).
 
 ## What a partially masked chip reports
 
-Masked pixels become zeros in the filtered scene, and the mask is what records that they are not
-measurements. The effect on a partially covered chip is a loss of *confidence*, not of accuracy:
+Masked pixels become zeros in the filtered scene, and the mask records that they are not measurements.
+On a partially masked chip, the correlation falls and the error does not rise:
 
 ```@example masks
 masked = autorift(reference, secondary; reference_valid = explicit, settings...)
-_, grid = AutoRIFT.autorift_with_grid(reference, secondary; settings...)
+unmasked, grid = AutoRIFT.autorift_with_grid(reference, secondary; settings...)
 truth = reshape([truth_dx[round(Int, grid.y[i]), round(Int, grid.x[i])] for i in eachindex(grid.x)],
                 Base.size(masked.dx))
 
@@ -91,26 +97,28 @@ covered = map(eachindex(grid.x)) do i
 end
 covered = reshape(covered, Base.size(masked.dx))
 
-ok = measured(masked)
-for (lo, hi) in ((0.0, 0.0), (0.0, 0.1), (0.1, 0.3), (0.3, 0.6))
-    sel = lo == hi ? (covered .== 0) .& ok : (covered .> lo) .& (covered .<= hi) .& ok
+# Points measured both with and without the mask, so each bin compares the same chips.
+ok = measured(masked) .& measured(unmasked)
+for (lo, hi) in ((0.0, 0.1), (0.1, 0.3), (0.3, 0.6))
+    sel = (covered .> lo) .& (covered .<= hi) .& ok
     count(sel) == 0 && continue
     err = filter(isfinite, abs.(masked.dx[sel] .- truth[sel]))
-    corr = filter(isfinite, masked.correlation[sel])
-    println("chip ", lpad(lo == hi ? "unmasked" : "$(round(Int, 100lo))-$(round(Int, 100hi))% masked", 16),
-            "  n = ", lpad(count(sel), 4),
-            "   median correlation ", round(median(corr); digits = 3),
+    corr(out) = round(median(filter(isfinite, out.correlation[sel])); digits = 3)
+    println("chip ", lpad("$(round(Int, 100lo))-$(round(Int, 100hi))% masked", 12),
+            "  n = ", lpad(count(sel), 3),
+            "   median correlation ", corr(unmasked), " → ", corr(masked),
             "   median |error| ", round(median(err); digits = 3), " px")
 end
 ```
 
-Median error is one refinement quantization step — the same as an unmasked chip — while correlation falls
-from about 0.81 to 0.71 as coverage grows. The correlation drop is the honest signal here, and it is
-another reason to gate on `correlation` rather than on the mask: see [Judging a result](@ref).
+The median error is within one refinement quantization step in both bins, while the median correlation of
+the same chips falls once the mask covers part of them. Thresholding on `correlation` therefore also
+removes partially masked chips that carry less information; see [Judging a result](@ref).
 
 ## What happens if you do not mask
 
-Leaving a fill value in the imagery is worse than masking, and the damage is local rather than global:
+A fill value left in the imagery loses more points than masking it. The effect is local to the chips that
+overlap the fill:
 
 ```@example masks
 as_fill = Float32.(copy(reference))
@@ -127,40 +135,39 @@ near_patch("explicit mask", masked)
 near_patch("-9999 left as data", autorift(as_fill, secondary; settings...))
 ```
 
-Every point whose chip touches the fill value is lost, where masking keeps most of them. A constant
-block has no texture, so the correlation there is degenerate and `autorift` declines to report it — which
-is the right outcome, but it costs the partially covered points that a mask would have measured. The
-reference implementation reports the search-window corner in this situation, a systematic bias toward one
-direction over masked ground.
+With the mask, 23 points whose chip overlaps the patch are measured. With the fill value left as data,
+none are. A chip with no texture, such as one wholly inside a constant block, has a degenerate
+correlation, and `autorift` reports no measurement for it. Where the Python reference meets such a chip,
+it reports the search-window corner, a systematic bias in one direction over masked ground.
 
-Fill values are not always constant. A block of near-constant noise is not degenerate, and then it does
-produce numbers — arbitrary ones. Mask it.
+A block of near-constant noise is not degenerate, so it produces arbitrary displacements. Mask it.
 
 ## Where a mask does not reach
 
-- **Both images need one.** A cloud present in only the secondary image still destroys the match.
-  `reference_valid` and `secondary_valid` are independent, and correlation uses the intersection —
-  [`AutoRIFT.valid`](@ref) of the pair.
-- **A mask is not an outlier filter.** It excludes pixels you already know about. Points that fail for
-  reasons you cannot enumerate in advance are [Filtering outliers](@ref).
-- **Masks do not move.** A cloud shadow displaced between acquisitions needs masking in both images at
+- **Mask each image where it is invalid.** `reference_valid` and `secondary_valid` are independent. The
+  chip validity test uses their intersection ([`AutoRIFT.valid`](@ref) of the pair), but each image is
+  filtered with its own mask, so a cloud masked in only one image is still correlated as data in the
+  other.
+- **A mask is not an outlier filter.** It excludes pixels you know about. Points that fail for other
+  reasons are handled by [Filtering outliers](@ref).
+- **Masks do not move.** A cloud shadow that moves between acquisitions must be masked in both images at
   both positions.
-- **A lazy raster's `missingval` is already handled.** Reading a GDAL raster with `lazy = true` turns its
-  nodata value into mask rather than into a dark measurement, with no keyword from you. See
+- **A lazy raster's `missingval` is masked automatically.** A raster read with `lazy = true` has its
+  nodata value turned into a mask rather than a dark measurement, with no keyword needed. See
   [Correlating scenes larger than memory](@ref).
 
 ## Filters and masks interact
 
-Preprocessing runs before correlation, and a filter with any spatial extent spreads a masked pixel's
-influence into its neighbours. The filters respect the mask — output is zeroed outside the valid
-domain — but the reach is real, and [`AutoRIFT.filter_reach`](@ref) reports it in pixels. A wide
-[`Highpass`](@ref) beside a large masked region affects more ground than a narrow one.
-[`WallisGapfill`](@ref) exists for the opposite approach: fill the gaps with noise matched to the
-surrounding statistics rather than zeroing them.
+Preprocessing runs before correlation. A filter with spatial extent treats an output computed partly from
+masked pixels as invalid, so the mask grows by the filter width. Output is zeroed outside the valid
+domain, and the grown mask is what the chip validity test sees. [`AutoRIFT.filter_reach`](@ref) reports
+the reach in pixels, and a wide [`Highpass`](@ref) invalidates more ground around a masked region than a
+narrow one. [`WallisGapfill`](@ref) takes the other approach for interior gaps: it fills them with noise
+matched to the surrounding statistics rather than zeroing them.
 
 ## See also
 
-- [Judging a result](@ref) — why `correlation` is the gate, including over partially masked chips
-- [Filtering outliers](@ref) — rejecting the points a mask could not predict
-- [Choosing a preprocessing filter](@ref) — `filter_reach` and the gap-filling option
-- [`ImagePair`](@ref) — the finiteness default and what it deliberately does not assume
+- [Judging a result](@ref): thresholding on `correlation`, including over partially masked chips
+- [Filtering outliers](@ref): rejecting points a mask could not anticipate
+- [Choosing a preprocessing filter](@ref): `filter_reach` and the gap-filling option
+- [`ImagePair`](@ref): the finiteness default, and that zero is not treated as no-data

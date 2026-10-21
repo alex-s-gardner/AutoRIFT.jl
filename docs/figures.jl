@@ -1,9 +1,9 @@
-# Plotting helpers shared by the documentation pages, and the synthetic scenes the examples
-# correlate. Included by each page's first `@example` block.
+# Plotting helpers shared by the documentation pages, and the scenes the examples correlate. Included
+# by each page's first `@example` block.
 #
-# Nothing here is part of AutoRIFT's API. The scenes are built in code rather than read from files so
-# that every figure on the site is the output of a live `autorift` call on data the page itself
-# produced — a wrong figure then requires a wrong package, which a stored array would not.
+# Nothing here is part of AutoRIFT's API. Every pair is one photograph and a copy of it warped in code,
+# so every figure on the site is the output of a live `autorift` call against a displacement the page
+# itself applied — a wrong figure then requires a wrong package, which a stored pair would not.
 
 using CairoMakie
 import FileIO
@@ -195,7 +195,7 @@ function field_panels(fields...; titles, size = (1100, 400), colormap = :balance
 end
 
 # ---------------------------------------------------------------------------
-# Synthetic scenes
+# Scenes
 # ---------------------------------------------------------------------------
 
 # Bilinear sample of `img` at `(row, col)`, zero outside. Bilinear and not nearest-neighbour so a
@@ -214,71 +214,21 @@ function _sample(img, y, x)
     return v
 end
 
-# One octave: random values on a grid of `cell`-pixel spacing, interpolated up to `sz`.
-function _octave(sz, cell; seed)
-    nr, nc = cld(sz[1], cell) + 2, cld(sz[2], cell) + 2
-    coarse = randn(MersenneTwister(seed), Float64, nr, nc)
-    out = Matrix{Float64}(undef, sz)
-    for j in 1:sz[2], i in 1:sz[1]
-        out[i, j] = _sample(coarse, 1 + (i - 1) / cell, 1 + (j - 1) / cell)
-    end
-    return out
-end
-
 """
-    texture(sz; seed, cells, weights) -> Matrix{Float64}
+    warped_pair(source, sz, offset; pad) -> (reference, secondary, truth_dx, truth_dy)
 
-A random texture with features at several scales, scaled to `[0, 1]`.
-
-Each entry of `cells` is a feature size in pixels, weighted by the matching entry of `weights`.
-Several scales rather than one: white noise correlates only at exactly zero lag, so it says nothing
-about the shape of the correlation surface, while a single smooth scale has no fine detail for a small
-chip to lock onto. A real surface has both.
-"""
-function texture(sz::Tuple{Int,Int}; seed::Integer = 0, cells = (24, 8, 3),
-                 weights = (1.0, 0.55, 0.3))
-    out = zeros(Float64, sz)
-    for (k, (cell, w)) in enumerate(zip(cells, weights))
-        a = _octave(sz, cell; seed = seed + 100k)
-        s = maximum(abs, a)
-        out .+= (w / (s > 0 ? s : 1)) .* a
-    end
-    out .-= minimum(out)
-    m = maximum(out)
-    m > 0 && (out ./= m)
-    return out
-end
-
-texture(n::Integer; kw...) = texture((Int(n), Int(n)); kw...)
-
-"""
-    warped_pair(sz, offset; seed, pad) -> (reference, secondary, truth_dx, truth_dy)
-
-A texture and a warped copy of it, together with the displacement `autorift` should report, sampled
-on the same grid as the images.
+`source` center-cropped, and a warped copy of it, together with the displacement `autorift` should
+report, sampled on the same grid as the images.
 
 `offset(row, col) -> (dx, dy)` is in pixels and in `autorift`'s own convention, so `truth_dx` and
 `truth_dy` compare directly against a result's `dx` and `dy`. That convention is the offset from
 secondary back to reference, which is the negative of how the surface moved: `offset = (6, 0)` puts
 a feature six columns to the *left* in the secondary image. See [Conventions](@ref).
 
-The texture is generated oversized and cropped, so warping it never pulls in out-of-image data — an
-artificial edge inside a search window would make the correlation there a measurement of the crop
-rather than of the motion.
-"""
-function warped_pair(sz::Tuple{Int,Int}, offset; seed::Integer = 0, pad::Integer = 48)
-    return _warp(texture((sz[1] + 2pad, sz[2] + 2pad); seed), sz, offset, pad)
-end
-
-warped_pair(n::Integer, offset; kw...) = warped_pair((Int(n), Int(n)), offset; kw...)
-
-"""
-    warped_pair(source::AbstractMatrix, sz, offset; pad) -> (reference, secondary, truth_dx, truth_dy)
-
-[`warped_pair`](@ref) over a supplied image rather than generated texture.
-
-`source` must be at least `sz .+ 2pad` in each dimension, and is center-cropped to exactly that; the
-margin is what the warp samples from, so a displacement near the edge still reads real image data.
+`source` must be at least `sz .+ 2pad` in each dimension, and is center-cropped to exactly that. The
+margin is what the warp samples from, so warping never pulls in out-of-image data — an artificial edge
+inside a search window would make the correlation there a measurement of the crop rather than of the
+motion.
 """
 function warped_pair(source::AbstractMatrix, sz::Tuple{Int,Int}, offset; pad::Integer = 48)
     need = (sz[1] + 2pad, sz[2] + 2pad)
@@ -293,8 +243,8 @@ end
 warped_pair(source::AbstractMatrix, n::Integer, offset; kw...) =
     warped_pair(source, (Int(n), Int(n)), offset; kw...)
 
-# The crop-and-warp both `warped_pair` methods share: `big` is the oversized field, and the returned
-# pair is its centre with `offset` applied to the secondary.
+# `big` is the oversized field, and the returned pair is its centre with `offset` applied to the
+# secondary.
 function _warp(big, sz::Tuple{Int,Int}, offset, pad::Integer)
     rows, cols = (pad + 1):(pad + sz[1]), (pad + 1):(pad + sz[2])
     reference = big[rows, cols]
@@ -313,9 +263,9 @@ end
 
 The documentation's example photograph, as a 640x640 grey field in `[0, 1]`.
 
-A real photograph rather than generated texture for the pages whose point is that a reader can *see*
-the displacement: a recognizable subject moving against a fixed crowd is legible at a glance, where
-two panels of noise are not. `docs/src/assets/ali_liston.png` — Muhammad Ali over Sonny Liston,
+Every page's pair is this photograph and a warped copy of it, rather than generated texture, so a
+reader can *see* the displacement: a recognizable subject moving against a fixed crowd is legible at a
+glance, where two panels of noise are not. `docs/src/assets/ali_liston.png` — Muhammad Ali over Sonny Liston,
 John Rooney / AP, 1965, public domain (published in the US without a copyright notice).
 """
 photo() = Float64.(FileIO.load(joinpath(@__DIR__, "src", "assets", "ali_liston.png")))
