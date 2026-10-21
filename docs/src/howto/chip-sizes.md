@@ -8,7 +8,7 @@ Four settings determine what a run costs and what it can resolve: `chip_size`, `
 using AutoRIFT
 include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 
-reference, secondary, _, _ = warped_pair(photo(), 512, (row, col) -> (6.0, -2.0))
+reference, secondary, _, _ = warped_pair(photo(), 512, (row, col) -> (20.0, -8.0))
 
 image_panels(reference, secondary)
 ```

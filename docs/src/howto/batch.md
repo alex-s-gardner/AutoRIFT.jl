@@ -13,8 +13,8 @@ Parallelize across pairs rather than within one:
 using AutoRIFT
 include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 
-pairs = [warped_pair(photo(), 256, (row, col) -> (Float64(s), 1.0))[1:2] for s in 1:4]
-settings = (; chip_size = 16, chip_size_max = 32, search_radius = 12, grid_spacing = 8)
+pairs = [warped_pair(photo(), 256, (row, col) -> (12.0 + 2s, -8.0))[1:2] for s in 1:4]
+settings = (; chip_size = 16, chip_size_max = 32, search_radius = 24, grid_spacing = 8)
 
 results = Vector{Any}(undef, length(pairs))
 Threads.@sync for (i, (reference, secondary)) in enumerate(pairs)
@@ -69,7 +69,7 @@ The cost of `init` is roughly constant while the correlation cost scales with th
 the cache's share of the work grows as the grid gets coarser:
 
 ```@example batch
-big_reference, big_secondary, _, _ = warped_pair(photo(), 512, (row, col) -> (3.0, 1.0))
+big_reference, big_secondary, _, _ = warped_pair(photo(), 512, (row, col) -> (20.0, -8.0))
 for spacing in (8, 16, 32, 64)
     out = autorift(big_reference, big_secondary; settings..., grid_spacing = spacing,
                    threaded = false)
@@ -88,7 +88,7 @@ filtered in either slot, so a walk filters each acquisition once rather than twi
 
 ```@example batch
 # One photograph, progressively warped, so consecutive frames correlate.
-frames = [warped_pair(photo(), 256, (row, col) -> (3.0 * (k - 1), 1.0 * (k - 1)))[2] for k in 1:4]
+frames = [warped_pair(photo(), 256, (row, col) -> (12.0 * (k - 1), -4.0 * (k - 1)))[2] for k in 1:4]
 
 walk = AutoRIFT.init(frames[1], frames[2]; settings..., threaded = false)
 counts = [AutoRIFT.nmeasured(autorift!(walk))]

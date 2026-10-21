@@ -41,7 +41,7 @@ function moved_pair(n, motion; pad = 40)
     return Float32.(big[rows, cols]), Float32.(big[rows .- move_row, cols .- move_col])
 end
 
-reference, secondary = moved_pair(512, (12, 5))
+reference, secondary = moved_pair(512, (24, 10))
 image_panels(reference, secondary)
 ```
 
@@ -51,10 +51,10 @@ The position of the blob in each image shows the motion:
 (reference = Tuple(argmax(reference)), secondary = Tuple(argmax(secondary)))
 ```
 
-Row 256 → 261 and column 170 → 182: down 5, right 12. And what `autorift` reports:
+Row 256 → 266 and column 170 → 194: down 10, right 24. And what `autorift` reports:
 
 ```@example conventions
-out = autorift(reference, secondary; chip_size = 32, search_radius = 20, grid_spacing = 16)
+out = autorift(reference, secondary; chip_size = 32, search_radius = 30, grid_spacing = 16)
 (dx = median(filter(!isnan, out.dx)), dy = median(filter(!isnan, out.dy)))
 ```
 
