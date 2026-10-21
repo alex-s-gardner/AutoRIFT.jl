@@ -22,6 +22,10 @@ jobs:
     # 20 minutes on identical code. A job hitting this limit means something hung, not that the
     # suite grew.
     timeout-minutes: 60
+    # An unreleased Julia regularly lacks a dependency's binaries (LLVMExtra_jll for a new LLVM, which
+    # stops GPUCompiler and Metal precompiling) before any test of ours runs. The `pre` job reports
+    # such a failure on its own row without failing the workflow.
+    continue-on-error: ${{ matrix.version == 'pre' }}
     strategy:
       fail-fast: false
       matrix:
