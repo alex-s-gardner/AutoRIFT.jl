@@ -49,30 +49,49 @@ function symlimits(fields...)
     return (-lim, lim)
 end
 
+# A percentile range rather than the extremes: added noise puts a few pixels far outside the surface's
+# own range, and scaling to those flattens the features the figure exists to show.
+_span(vals) = (quantile(vals, 0.01), quantile(vals, 0.99))
+
+"""
+    overlay(reference, secondary) -> Matrix{RGBf}
+
+The two images as one color image in image orientation: the reference in magenta, the secondary in
+green. Where the two agree the result is gray; a feature that moved appears twice, magenta where it was
+and green where it went.
+"""
+function overlay(reference, secondary)
+    lo, hi = _span(vcat(vec(Float64.(reference)), vec(Float64.(secondary))))
+    unit(v) = clamp((Float64(v) - lo) / (hi - lo), 0, 1)
+    return mapshow(map((r, s) -> RGBf(unit(r), unit(s), unit(r)), reference, secondary))
+end
+
 """
     image_panels(images...; titles, shared = true) -> Figure
 
-A row of input images on a shared grayscale.
+A row of input images on a shared grayscale. A reference/secondary pair (two images, shared scale) gets
+a third panel, the [`overlay`](@ref) of the two, so the motion is visible even where it is a few pixels.
 
-`shared = false` scales each panel to its own range instead, and drops the colorbar — for comparing
-images whose units differ, where one shared scale would crush every panel but the widest-ranging one.
-A shared scale is the default because for two images of the same scene a brightness difference between
-them is a real difference the figure should show.
+`shared = false` scales each panel to its own range instead, and drops the colorbar and the overlay —
+for comparing images whose units differ, where one shared scale would crush every panel but the
+widest-ranging one. A shared scale is the default because for two images of the same scene a brightness
+difference between them is a real difference the figure should show.
 """
-function image_panels(images...; titles = ("reference", "secondary"), size = (900, 420),
+function image_panels(images...; titles = ("reference", "secondary"), size = nothing,
                       shared::Bool = true)
+    pair = shared && length(images) == 2
+    size = something(size, pair ? (1350, 420) : (900, 420))
     fig = Figure(; size, figure_padding = 10)
-    # A percentile range rather than the extremes: added noise puts a few pixels far outside the
-    # surface's own range, and scaling to those flattens the features the figure exists to show.
-    span(vals) = (quantile(vals, 0.01), quantile(vals, 0.99))
-    lim = shared ? span(mapreduce(vec, vcat, images)) : nothing
+    lim = shared ? _span(mapreduce(vec, vcat, images)) : nothing
     local hm
     for (i, (img, title)) in enumerate(zip(images, titles))
         hm = heatmap!(panel(fig, (1, i), title), mapshow(Float64.(img));
                       colormap = :grays,
-                      colorrange = isnothing(lim) ? span(vec(Float64.(img))) : lim)
+                      colorrange = isnothing(lim) ? _span(vec(Float64.(img))) : lim)
     end
     shared && Colorbar(fig[1, length(images) + 1], hm)
+    pair && image!(panel(fig, (1, 4), "overlay: reference magenta, secondary green"),
+                   overlay(images...); interpolate = false)
     return fig
 end
 

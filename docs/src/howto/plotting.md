@@ -27,6 +27,10 @@ include("../../figures.jl")  # the helpers this page describes
 reference, secondary, _, _ = warped_pair(photo(), 512, (row, col) -> (20.0, 0.0))
 out = autorift(reference, secondary; chip_size = 32, search_radius = 28, grid_spacing = 8)
 
+image_panels(reference, secondary)
+```
+
+```@example plotting
 fig = Figure(; size = (900, 420))
 heatmap!(Axis(fig[1, 1]; title = "dx, raw heatmap!", aspect = DataAspect()), out.dx)
 heatmap!(Axis(fig[1, 2]; title = "dx, through mapshow", aspect = DataAspect()), mapshow(out.dx))
@@ -129,7 +133,8 @@ is not part of the package API. Copy what you need:
 | `mapshow(A)` | returns a field in image orientation |
 | `blank(A, keep)` | returns `A` as `Float64` with `NaN` where `keep` is false |
 | `measured(out)` | marks the points that carry a displacement |
-| `image_panels(images...; titles, shared)` | draws input images on a shared grayscale, or one scale per panel |
+| `image_panels(images...; titles, shared)` | draws input images on a shared grayscale, or one scale per panel; a pair gets an overlay panel |
+| `overlay(reference, secondary)` | returns the pair as one color image, reference magenta and secondary green |
 | `displacement_panels(out)` | draws `dx` and `dy` on one symmetric scale |
 | `quality_panels(out)` | draws `correlation` on `(0, 1)` and the chip size |
 | `field_panels(fields...; titles)` | draws several displacement-like fields on one symmetric scale |

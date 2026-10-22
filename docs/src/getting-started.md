@@ -42,8 +42,10 @@ reference, secondary, true_dx, true_dy = warped_pair(photo(), 512, flow)
 image_panels(reference, secondary)
 ```
 
-The displacement varies with row: 4 px at the top and bottom edges, 20 px in the middle rows. One
-number for the whole frame cannot describe it. The applied field, which the result below should
+The third panel overlays the two images, the reference in magenta and the secondary in green. Where
+nothing moved the overlay is gray; a feature that moved shows twice, magenta where it was and green
+where it went. The displacement varies with row: 4 px at the top and bottom edges, 20 px in the middle
+rows. One number for the whole frame cannot describe it. The applied field, which the result below should
 reproduce:
 
 ```@example start

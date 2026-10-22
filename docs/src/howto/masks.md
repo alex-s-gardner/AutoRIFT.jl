@@ -43,6 +43,10 @@ no-data, since zero is a valid dark radiance and treating it as no-data would di
 sensor that writes `0` or `-9999` needs an explicit mask.
 
 ```@example masks
+image_panels(reference, secondary)
+```
+
+```@example masks
 input_field(Float64.(explicit), "reference_valid (false = masked)"; colormap = :grays)
 ```
 
