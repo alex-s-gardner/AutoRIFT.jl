@@ -34,11 +34,11 @@ scene that differ by motion and returns a grid of sub-pixel displacements.
 using AutoRIFT
 include("../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 
-# Sideways motion that is fastest in the middle rows (20 px) and slowest at the top and bottom edges
-# (4 px), with a 2 px downward drift.
+# The secondary is the reference turned about 3.4° and shifted, so `dx` runs from about 31 px at the
+# top to 1 px at the bottom and `dy` from about -27 px at the left to 3 px at the right.
 reference, secondary, _, _ =
-    warped_pair(photo(), 512, (row, col) -> (4.0 + 16.0 * sin(pi * row / 512), -2.0))
-out = autorift(reference, secondary)
+    warped_pair(photo(), 512, (row, col) -> (16.0 - 0.06 * (row - 256.5), -12.0 + 0.06 * (col - 256.5)))
+out = autorift(reference, secondary; search_radius = 36, grid_spacing = 16)
 
 image_panels(reference, secondary)
 ```
@@ -47,7 +47,8 @@ image_panels(reference, secondary)
 displacement_panels(out)
 ```
 
-`autorift(reference, secondary)` returns `dx`, `dy` and `correlation` at every grid point.
+`autorift` returns `dx`, `dy` and `correlation` at every grid point. Both components vary across the
+scene.
 
 ## What it is for
 
@@ -65,16 +66,6 @@ The core takes two matrices and returns pixel offsets. Coordinates, map projecti
 come from passing rasters instead of arrays. Points may lie on a regular grid, the default, or be
 scattered, and any per-point setting (chip size, search radius, prior) may vary across the scene. A cache
 reuses buffers and FFT plans across a batch of pairs.
-
-## Start here
-
-| | |
-|---|---|
-| **[Getting started](@ref)** | install, one correlation, read the result |
-| **[A guided walkthrough](@ref)** | eight steps over one scene, adding a capability at a time |
-| **[Geospatial data](@ref)** | rasters in, velocities out |
-| **[Judging a result](@ref)** | which points to trust |
-| **[API reference](@ref)** | every public name |
 
 ## Heritage
 
