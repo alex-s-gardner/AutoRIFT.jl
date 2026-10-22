@@ -93,23 +93,6 @@ out.vx, out.vy   # feature motion in CRS units per year, in the inputs' CRS
   than the scene size, reading lazily from disk, and returns the same result as an unblocked run.
 - **Batches.** `AutoRIFT.init`, `reinit!`, and `autorift!` reuse buffers and FFT plans across pairs.
 
-## Documentation
-
-The [documentation](https://alex-s-gardner.github.io/AutoRIFT.jl/dev/) starts from four pages:
-
-- **[Getting started](https://alex-s-gardner.github.io/AutoRIFT.jl/dev/getting-started)**: install,
-  one correlation, reading the result.
-- **[A guided walkthrough](https://alex-s-gardner.github.io/AutoRIFT.jl/dev/tutorials/walkthrough)**:
-  one scene in eight steps, each adding a capability, up to chip sizes, search radii, and priors
-  that vary across the scene.
-- **[Conventions](https://alex-s-gardner.github.io/AutoRIFT.jl/dev/explanation/conventions)**: the
-  sign of `dx`/`dy`, where the y flip happens, and the half pixel.
-- **[API reference](https://alex-s-gardner.github.io/AutoRIFT.jl/dev/reference/index)**: every
-  public name.
-
-Run times and memory against the Python reference are on the
-[Benchmarks](https://alex-s-gardner.github.io/AutoRIFT.jl/dev/benchmarks) page.
-
 ## Heritage
 
 AutoRIFT.jl descends from NASA JPL's [autoRIFT](https://github.com/nasa-jpl/autoRIFT) and produces
