@@ -35,14 +35,14 @@ include("../figures.jl")  # plotting helpers and the example scenes; see [Plotti
 
 # Sideways motion that is fastest in the middle rows and slower toward the top and bottom edges,
 # with a 2 px downward drift. Ice in a valley moves like this.
-flow(row, col) = (4.0 + 12.0 * sin(pi * row / 512), -2.0)
+flow(row, col) = (4.0 + 16.0 * sin(pi * row / 512), -2.0)
 
 reference, secondary, true_dx, true_dy = warped_pair(photo(), 512, flow)
 
 image_panels(reference, secondary)
 ```
 
-The displacement varies with row: 4 px at the top and bottom edges, 16 px in the middle rows. One
+The displacement varies with row: 4 px at the top and bottom edges, 20 px in the middle rows. One
 number for the whole frame cannot describe it. The applied field, which the result below should
 reproduce:
 
@@ -81,7 +81,7 @@ using Statistics: median
 ```
 
 `dy` is −2, the value applied to the whole scene. `dx` runs from about 4 at the top and bottom edges to
-16 in the middle rows, so its median describes no part of the scene. Compare the `dx` panel against the
+20 in the middle rows, so its median describes no part of the scene. Compare the `dx` panel against the
 true field instead.
 
 The grid is 11×11 points by default, coarser than the 512×512 input, so the panels look blocky.

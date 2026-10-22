@@ -24,8 +24,8 @@ using AutoRIFT, CairoMakie
 include("../../figures.jl")  # the helpers this page describes
 
 # A pair that moved only along x, so the correct picture has structure in dx and none in dy.
-reference, secondary, _, _ = warped_pair(photo(), 512, (row, col) -> (8.0, 0.0))
-out = autorift(reference, secondary; chip_size = 32, search_radius = 20, grid_spacing = 8)
+reference, secondary, _, _ = warped_pair(photo(), 512, (row, col) -> (20.0, 0.0))
+out = autorift(reference, secondary; chip_size = 32, search_radius = 28, grid_spacing = 8)
 
 fig = Figure(; size = (900, 420))
 heatmap!(Axis(fig[1, 1]; title = "dx, raw heatmap!", aspect = DataAspect()), out.dx)
@@ -38,8 +38,8 @@ the displacement is larger in a band of rows:
 
 ```@example plotting
 striped, striped_sec, _, _ =
-    warped_pair(photo(), 512, (row, col) -> (2 + 12 * (abs(row - 256) < 60), 0.0))
-out2 = autorift(striped, striped_sec; chip_size = 32, search_radius = 20, grid_spacing = 8)
+    warped_pair(photo(), 512, (row, col) -> (2 + 20 * (abs(row - 256) < 60), 0.0))
+out2 = autorift(striped, striped_sec; chip_size = 32, search_radius = 28, grid_spacing = 8)
 
 fig = Figure(; size = (900, 420))
 heatmap!(Axis(fig[1, 1]; title = "raw: the band runs vertically", aspect = DataAspect()), out2.dx)

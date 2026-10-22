@@ -23,8 +23,8 @@ using AutoRIFT
 include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 using Statistics: median, quantile
 
-reference, secondary, truth_dx, _ = warped_pair(photo(), 512, (row, col) -> (6.0, -2.0))
-settings = (; chip_size = 32, chip_size_max = 32, search_radius = 20, grid_spacing = 8)
+reference, secondary, truth_dx, _ = warped_pair(photo(), 512, (row, col) -> (20.0, -8.0))
+settings = (; chip_size = 32, chip_size_max = 32, search_radius = 28, grid_spacing = 8)
 
 patch = (236:276, 236:276)   # a 41x41 cloud in the reference image
 
@@ -58,7 +58,7 @@ larger chip has a smaller fraction of itself masked by a given cloud:
 
 ```@example masks
 for chip in (16, 32, 64)
-    one_level = (; chip_size = chip, chip_size_max = chip, search_radius = 20, grid_spacing = 8)
+    one_level = (; chip_size = chip, chip_size_max = chip, search_radius = 28, grid_spacing = 8)
     base = autorift(reference, secondary; one_level...)
     masked = autorift(reference, secondary; reference_valid = explicit, one_level...)
     println("chip ", lpad(chip, 2), ": measured ", AutoRIFT.nmeasured(base), " → ",
@@ -79,7 +79,7 @@ over the cloud where the 16-pixel level could not, and those points carry their 
 ## What a partially masked chip reports
 
 Masked pixels become zeros in the filtered scene, and the mask records that they are not measurements.
-On a partially masked chip, the correlation falls and the error does not rise:
+On a chip that is partly masked, the error does not rise:
 
 ```@example masks
 masked = autorift(reference, secondary; reference_valid = explicit, settings...)
@@ -111,9 +111,10 @@ for (lo, hi) in ((0.0, 0.1), (0.1, 0.3), (0.3, 0.6))
 end
 ```
 
-The median error is within one refinement quantization step in both bins, while the median correlation of
-the same chips falls once the mask covers part of them. Thresholding on `correlation` therefore also
-removes partially masked chips that carry less information; see [Judging a result](@ref).
+The median error is within one refinement quantization step in both bins. The median correlation of the
+same chips changes little, because only chips more than 65% valid are correlated at all. The chip
+validity test, not a `correlation` threshold, is what excludes heavily masked chips; see
+[Judging a result](@ref) for the threshold.
 
 ## What happens if you do not mask
 
@@ -135,9 +136,10 @@ near_patch("explicit mask", masked)
 near_patch("-9999 left as data", autorift(as_fill, secondary; settings...))
 ```
 
-With the mask, 23 points whose chip overlaps the patch are measured. With the fill value left as data,
-none are. A chip with no texture, such as one wholly inside a constant block, has a degenerate
-correlation, and `autorift` reports no measurement for it. Where the Python reference meets such a chip,
+With the mask, 31 points whose chip overlaps the patch are measured. With the fill value left as data,
+21 are, and they are the points whose chips lie mostly outside the fill. A chip with no texture, such as
+one wholly inside a constant block, has a degenerate correlation, and `autorift` reports no measurement for
+it. Where the Python reference meets such a chip,
 it reports the search-window corner, a systematic bias in one direction over masked ground.
 
 A block of near-constant noise is not degenerate, so it produces arbitrary displacements. Mask it.
@@ -167,7 +169,7 @@ matched to the surrounding statistics rather than zeroing them.
 
 ## See also
 
-- [Judging a result](@ref): thresholding on `correlation`, including over partially masked chips
+- [Judging a result](@ref): thresholding on `correlation`
 - [Filtering outliers](@ref): rejecting points a mask could not anticipate
 - [Choosing a preprocessing filter](@ref): `filter_reach` and the gap-filling option
 - [`ImagePair`](@ref): the finiteness default, and that zero is not treated as no-data

@@ -34,10 +34,10 @@ scene that differ by motion and returns a grid of sub-pixel displacements.
 using AutoRIFT
 include("../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 
-# Sideways motion that is fastest in the middle rows (16 px) and slowest at the top and bottom edges
+# Sideways motion that is fastest in the middle rows (20 px) and slowest at the top and bottom edges
 # (4 px), with a 2 px downward drift.
 reference, secondary, _, _ =
-    warped_pair(photo(), 512, (row, col) -> (4.0 + 12.0 * sin(pi * row / 512), -2.0))
+    warped_pair(photo(), 512, (row, col) -> (4.0 + 16.0 * sin(pi * row / 512), -2.0))
 out = autorift(reference, secondary)
 
 image_panels(reference, secondary)

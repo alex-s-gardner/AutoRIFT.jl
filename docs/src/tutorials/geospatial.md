@@ -30,10 +30,10 @@ true displacement is known. The structure is the same as a GeoTIFF's: a north-up
 **decreasing**, with a CRS.
 
 ```@example geo
-# Features move 8 pixels east and 4 pixels north. In `autorift`'s reporting convention that is a
+# Features move 20 pixels east and 8 pixels north. In `autorift`'s reporting convention that is a
 # negative `dx` and a positive `dy`, since the offset points from secondary back to reference and
 # north is toward *decreasing* row on a north-up grid. See [Conventions](@ref).
-reference_array, secondary_array, _, _ = warped_pair(photo(), 513, (row, col) -> (-8.0, 4.0))
+reference_array, secondary_array, _, _ = warped_pair(photo(), 513, (row, col) -> (-20.0, 8.0))
 
 const RES = 30.0  # metres per pixel
 
@@ -61,7 +61,7 @@ CRS, otherwise `autorift` throws.
 
 ```@example geo
 out = autorift(reference, secondary; chip_size = 32, chip_size_max = 32,
-               search_radius = 20, grid_spacing = 16)
+               search_radius = 28, grid_spacing = 16)
 (type = typeof(out).name.name, layers = propertynames(out))
 ```
 
@@ -91,7 +91,7 @@ needed:
 ```@example geo
 using CairoMakie
 fig = Figure(; size = (960, 420))
-lim = (-10, 10)
+lim = (-24, 24)
 for (i, (layer, title)) in enumerate(((out.vx, "vx (px east)"), (out.vy, "vy (px north)")))
     ax = Axis(fig[1, i]; title, aspect = DataAspect(), xlabel = "x (m)", ylabel = "y (m)")
     hm = heatmap!(ax, layer; colormap = :balance, colorrange = lim)
@@ -117,13 +117,13 @@ The same data through both methods:
 
 ```@example geo
 array_out = autorift(reference_array, secondary_array; chip_size = 32, chip_size_max = 32,
-                     search_radius = 20, grid_spacing = 16)
+                     search_radius = 28, grid_spacing = 16)
 mid(A) = median(filter(isfinite, collect(A)))
 (array = (dx = mid(array_out.dx), dy = mid(array_out.dy)),
  raster = (vx = mid(out.vx), vy = mid(out.vy)))
 ```
 
-`dx = -8` becomes `vx = +8`: the sign flips, giving eastward motion. `dy = +4` becomes `vy = +4`: the
+`dx = -20` becomes `vx = +20`: the sign flips, giving eastward motion. `dy = +8` becomes `vy = +8`: the
 sign flips and the axis direction flips, and the two cancel. On a north-up raster `vy` therefore equals
 `dy`, so a y-sign error in the conversion is invisible in the numbers.
 
@@ -145,7 +145,7 @@ function southup(A; epsg = 3413)
 end
 
 flipped = autorift(southup(reference_array), southup(secondary_array);
-                   chip_size = 32, chip_size_max = 32, search_radius = 20, grid_spacing = 16)
+                   chip_size = 32, chip_size_max = 32, search_radius = 28, grid_spacing = 16)
 (north_up = (mid(out.vx), mid(out.vy)), south_up = (mid(flipped.vx), mid(flipped.vy)),
  y_orders = (order(dims(out, Y)), order(dims(flipped, Y))))
 ```
@@ -160,7 +160,7 @@ units per year**, meters per year for a projected raster:
 
 ```@example geo
 velocity = autorift(reference, secondary; dt = Day(16), chip_size = 32, chip_size_max = 32,
-                    search_radius = 20, grid_spacing = 16)
+                    search_radius = 28, grid_spacing = 16)
 (pixels = mid(out.vx), m_per_yr = mid(velocity.vx))
 ```
 
@@ -183,7 +183,7 @@ same way:
 5000 * (16 / 365.25) / RES
 ```
 
-That is about 7 pixels, so a radius of 20 is generous for a 16-day pair. Over a one-year pair the same
+That is about 7 pixels, so the radius of 28 used here is generous for that glacier over a 16-day pair. Over a one-year pair the same
 glacier moves about 167 pixels, and the radius, the chip size, or a prior has to change. A radius
 smaller than the motion is the most common reason a correlation returns nothing; see
 [Judging a result](@ref).

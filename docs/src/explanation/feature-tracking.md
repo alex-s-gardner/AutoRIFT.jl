@@ -22,9 +22,9 @@ is computed. Those scores make up the **correlation surface**.
 using AutoRIFT
 include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 
-reference, secondary, _, _ = warped_pair(photo(), 512, (row, col) -> (6.4, -3.2))
+reference, secondary, _, _ = warped_pair(photo(), 512, (row, col) -> (18.4, -9.2))
 
-chip_size, radius = 32, 16
+chip_size, radius = 32, 24
 centre = (256, 256)
 h = chip_size ÷ 2
 
@@ -52,7 +52,7 @@ AutoRIFT.peak_offset(surface, (radius, radius))
 ```
 
 The values are the offset in x, the offset in y, and the correlation at the peak. The pair was built
-with an offset of `(6.4, -3.2)`, so the whole-pixel result is within one pixel and the fractional part
+with an offset of `(18.4, -9.2)`, so the whole-pixel result is within one pixel and the fractional part
 is missing. The sub-pixel stage below recovers it.
 
 The correlation surface is not part of the public API. `autorift` does not return one, because a
@@ -85,7 +85,7 @@ scaled_window = scaled[(centre[1] - h - radius):(centre[1] + h + radius - 2),
 AutoRIFT.peak_offset(AutoRIFT.correlate!(ws, scaled_window, chip, radius), (radius, radius))
 ```
 
-The peak offset is the same for an image five times darker, and the correlation differs by about 2e-6. Because amplitude is normalized away, low contrast does not defeat a small chip.
+The peak offset is the same for an image five times darker, and the correlation differs by about 3e-7. Because amplitude is normalized away, low contrast does not defeat a small chip.
 *Decorrelation* does: texture present in one image and absent in the other because the surface changed
 between acquisitions. It limits the correlation a small chip can reach however bright the imagery is.
 
@@ -133,8 +133,8 @@ Gaussian-pyramid steps and takes the argmax. This is the reference implementatio
 suits correlation so weak that a fractional part would be noise.
 
 ```@example tracking
-refined = autorift(reference, secondary; chip_size = 32, search_radius = 20, grid_spacing = 32)
-whole = autorift(reference, secondary; chip_size = 32, search_radius = 20, grid_spacing = 32,
+refined = autorift(reference, secondary; chip_size = 32, search_radius = 28, grid_spacing = 32)
+whole = autorift(reference, secondary; chip_size = 32, search_radius = 28, grid_spacing = 32,
                  subpixel = NoRefine())
 
 using Statistics: median
@@ -142,8 +142,8 @@ mid(A) = median(filter(!isnan, A))
 (refined = (mid(refined.dx), mid(refined.dy)), whole = (mid(whole.dx), mid(whole.dy)))
 ```
 
-The true offset is `(6.4, -3.2)`. Refinement lands within a tenth of a pixel of both components.
-Without it the answer is the whole-pixel `(6, -3)`.
+The true offset is `(18.4, -9.2)`. Refinement lands within a tenth of a pixel of both components.
+Without it the answer is the whole-pixel `(18, -9)`.
 
 ## Why the peak can be wrong
 

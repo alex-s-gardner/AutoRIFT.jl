@@ -25,7 +25,7 @@ using AutoRIFT
 include("../../figures.jl")  # plotting helpers and the example scenes; see [Plotting](@ref)
 using Statistics: median, quantile
 
-reference, clean, truth_dx, _ = warped_pair(photo(), 512, (row, col) -> (6.0, -2.0))
+reference, clean, truth_dx, _ = warped_pair(photo(), 512, (row, col) -> (20.0, -8.0))
 # Brightness rising left to right, plus a weak vertical trend. Only the secondary image has it.
 secondary = Float32[clean[row, col] * (0.4f0 + 1.2f0 * (col / 512)) + 0.3f0 * (row / 512)
                     for row in axes(clean, 1), col in axes(clean, 2)]
@@ -33,7 +33,7 @@ secondary = Float32[clean[row, col] * (0.4f0 + 1.2f0 * (col / 512)) + 0.3f0 * (r
 image_panels(reference, secondary; titles = ("reference", "secondary, gradient added"))
 ```
 
-The true shift is `dx = 6` pixels everywhere, so the error can be measured:
+The true shift is `dx = 20` pixels everywhere, so the error can be measured:
 
 ```@example prep
 settings = (; chip_size = 16, chip_size_max = 64, grid_spacing = 8)
@@ -54,8 +54,8 @@ for method in (:none, :highpass, :wallis, :sobel, :laplacian)
 end
 ```
 
-`:none` has a higher median correlation (0.838) than `:highpass` (0.582), `:wallis` (0.53) and
-`:laplacian` (0.702). Only `:sobel` (0.863) is higher. It also has the largest 99th percentile error, 0.09
+`:none` has a higher median correlation (0.842) than `:highpass` (0.574), `:wallis` (0.527) and
+`:laplacian` (0.701). Only `:sobel` (0.86) is higher. It also has the largest 99th percentile error, 0.11
 px against 0.03 to 0.06 px for the filters, and a median error of 0.016 px against 0.0 for `:highpass` and
 `:wallis`.
 
@@ -93,8 +93,8 @@ end
 
 The gradient multiplies the texture, so it makes the right side both brighter and higher in contrast.
 `:highpass` subtracts a local mean. That removes the brightness difference and leaves the contrast ratio at
-2.2, above the unfiltered 1.8. `:wallis` also normalizes local variance and gives 1.0. `:sobel` keeps most
-of the trend (2.1). `:laplacian` gives 1.1 because it takes the logarithm first, which turns a
+2.0, above the unfiltered 1.7. `:wallis` also normalizes local variance and gives 1.0. `:sobel` keeps most
+of the trend (1.9). `:laplacian` gives 1.1 because it takes the logarithm first, which turns a
 multiplicative gradient into an additive one that the second derivative removes.
 
 ```@example prep
@@ -104,7 +104,7 @@ field_panels(blank(none_out.dx, measured(none_out)), blank(high_out.dx, measured
              titles = ("dx, preprocess = :none", "dx, preprocess = :highpass"))
 ```
 
-Both fields show a uniform 6-pixel shift. The difference is in the tail of the error distribution, which a
+Both fields show a uniform 20-pixel shift. The difference is in the tail of the error distribution, which a
 map does not show.
 
 ## Filter width
@@ -122,7 +122,7 @@ for width in (3, 5, 11, 21)
 end
 ```
 
-Correlation rises with width, from 0.437 at 3 to 0.812 at 21, while the 99th percentile error doubles,
+Correlation rises with width, from 0.433 at 3 to 0.813 at 21, while the 99th percentile error doubles,
 from 0.03 to 0.06 px. A wider highpass passes more low-frequency content, so it moves toward `:none` in
 both respects. The default width of 5 has a 99th percentile error 0.02 px above the most accurate width
 here, which is 3.
