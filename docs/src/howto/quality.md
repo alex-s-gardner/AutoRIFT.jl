@@ -47,6 +47,12 @@ good = out.correlation .> 0.3
 (measured = AutoRIFT.nmeasured(out), above_threshold = count(good))
 ```
 
+The pair: a band across the middle moved 22 pixels and has noise added in the secondary; the rest moved 2.
+
+```@example quality
+image_panels(reference, secondary)
+```
+
 ```@example quality
 field_panels(blank(out.dx, measured(out)), blank(out.dx, good);
              titles = ("dx, all measured", "dx, correlation > 0.3"))

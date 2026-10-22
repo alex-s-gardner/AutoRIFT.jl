@@ -1,6 +1,6 @@
 name = "AutoRIFT"
 uuid = "52cb0ed0-aa80-430c-bd04-c52888a79add"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Alex S. Gardner, JPL/NASA"]
 
 [deps]

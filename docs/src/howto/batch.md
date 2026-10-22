@@ -23,6 +23,12 @@ end
 map(AutoRIFT.nmeasured, results)
 ```
 
+The first of the four pairs:
+
+```@example batch
+image_panels(pairs[1]...)
+```
+
 Each task sets `threaded = false`. On sixteen 512² pairs across eight threads, one pair per task with
 intra-pair threading off ran 1.32× faster than processing the pairs one at a time with `threaded = true`.
 Threading within a pair has a serial fraction and load imbalance from the sparse search. Across pairs
