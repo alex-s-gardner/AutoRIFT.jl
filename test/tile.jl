@@ -508,6 +508,28 @@ end
     end
 end
 
+@testset "a blocked run equals an untiled one on a grid that starts part-way along its lattice" begin
+    # The coarse passes sample at lattice positions set by the grid's origin rather than by its first
+    # point, so the blocks must restrict onto those positions too. An origin that is a multiple of
+    # every level stride but not of the sparse stride moves every coarse sample point.
+    n = 1536
+    ref, sec = split_pair(n)
+    p = params(; chip_size = 32, chip_size_max = 64, grid_spacing = 16, search_radius = 12)
+    raw = ImagePair(ref, sec)
+    pair = AutoRIFT._prepare(raw, p)
+    grid = AutoRIFT.rebuild(AutoRIFT._build_grid(size(raw), p); origin = (6, 10))
+    AutoRIFT._warm_grid_plans(grid, p)
+    untiled = AutoRIFT.correlate_multichip(pair, grid, p)
+    # The origin moves the points the coarse pass samples, which is what the blocks must follow.
+    level = AutoRIFT._level_points(grid, p, AutoRIFT.extent(32), trues(size(grid)))
+    moved = AutoRIFT._coarse_points(level, p, AutoRIFT.extent(32))
+    still = AutoRIFT._coarse_points(AutoRIFT.rebuild(level; origin = (0, 0)), p, AutoRIFT.extent(32))
+    @test moved.rows != still.rows && moved.cols != still.cols
+    for bs in ((1488, 752), (320, 320), (128, 128))
+        assert_same_result(untiled, AutoRIFT.correlate_tiled(raw, grid, p, bs), "origin (6, 10), block $bs")
+    end
+end
+
 @testset "a blocked run equals an untiled one on a caller-supplied grid" begin
     # The production path: a grid the caller built, at a chip size below `chip_size_max`. The halo
     # has to be sized by what the levels run rather than by what this grid carries, so this is the

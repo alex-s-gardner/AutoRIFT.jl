@@ -39,6 +39,9 @@
 # `chip_size * 2^k`, which is what makes the grids nest: a coarse grid point is exactly a
 # block of fine ones.
 #
+# Where those blocks and the coarse pass's sample points fall is set by the grid's `origin`; see
+# [`PointSet`](@ref).
+#
 # That correspondence is defined in exactly one place, `_cell_max_radius!`, and inverted in exactly
 # one other, `_expand_coarse_mask`. Both directions must use the same cell boundaries — a mask that
 # restricts the fine search has to sit on the evidence that produced it.
@@ -378,6 +381,11 @@ end
 function _decimate_level(grid::PointSet{2}, wanted::AbstractMatrix{Bool}, stride::Int,
                          phase::Union{Nothing,Tuple{Float64,Float64}} = nothing)
     nr, nc = size(grid)
+    # A level's cells are blocks of `stride` points starting at the grid's first point, so they are
+    # blocks of the grid's lattice only if that point is on a block boundary of it.
+    all(iszero, mod.(grid.origin, stride)) || throw(ArgumentError(
+        "the grid's origin " * string(grid.origin) * " is not a multiple of the level stride " *
+        string(stride) * "; start the grid on a whole block of every level's stride"))
     rows = 1:stride:nr
     cols = 1:stride:nc
     (length(rows) < 3 || length(cols) < 3) && return nothing
@@ -668,20 +676,15 @@ end
 # `INTER_AREA` at an integer scale — what the reference resizes a level's coordinate arrays with — is exactly
 # this block mean, and the snap puts the result back on the lattice `offset` names.
 #
-# **The offset is subtracted before rounding, and the opposite order is not equivalent.** Both reach the
-# same lattice and agree everywhere except where `s / n` falls midway between two of its points — but
-# `round` breaks such a tie to even, so there the two orders land a *whole step* apart: at an integral `x`
-# with `offset = 0.5`, this form gives `x + 0.5` for even `x` where `round(x + 0.5) - 0.5` gives `x - 0.5`.
-# Neither is rare nor self-cancelling in effect: 11.1% of the `x` cells of a stride-2 level over
-# `S1B_IW_SLC__1SDH_20180809T204617`'s grid sit exactly on a tie, 15.6% over NISAR L1's, and the direction
-# follows the parity of the cell rather than the data, so the population mean of the difference is zero and
-# only the exact-match rate shows it.
+# **A mean midway between two lattice points goes to the upper one**, so shifting every coordinate by
+# a whole step shifts the snapped mean by exactly that step, and two products of one acquisition framed
+# a whole number of lines apart place each coarse chip at the same image position. Ties are common — the
+# cell averages an even number of coordinates on one lattice. The reference's `round` breaks them to the
+# even neighbour, which this reproduces everywhere but at the ties; `dev/CORRECTNESS.md` records the
+# difference.
 #
-# This order is the one that reproduces the reference's own resized coordinate arrays — MAD 0.0000 and
-# 100.00% within 1 px against the captured chip-768 lattice, which `tools/golden/level_replay.jl` measures.
-# Swapping it costs 8.3 points of exact `dx` agreement on the golden `S1B_IW_SLC__1SDH_20180809T204617`
-# case (76.40% to 68.06%) and doubles the median residual, so `round(x + 0.5) - 0.5` read off
-# `autoRIFT.py:120-122` does not describe what the reference does to a *decimated* level.
+# The offset is subtracted before rounding, as for the reference's resized coordinate arrays
+# (`tools/golden/level_replay.jl`).
 #
 # **The cell is averaged whole, nodata fill included, and that is matched rather than endorsed.** `cv2.resize`
 # has no concept of nodata, and the fill is an in-band constant — `0.5` on a coordinate array after the
@@ -701,7 +704,7 @@ function _cell_mean(x::AbstractMatrix, r::Int, c::Int, stride::Int, nr::Int, nc:
         s += Float64(x[i, j])
         n += 1
     end
-    return round(s / n - offset) + offset
+    return round(s / n - offset, RoundNearestTiesUp) + offset
 end
 
 # `A` with every `NaN` replaced by its nearest finite neighbour, so an interpolant reading a
@@ -1034,6 +1037,11 @@ end
 # against the rate rather than against the step.
 _sparse_stride(p::Params) = p.coarse_stride * _oversample(p)
 
+# The coarse pass's sample points along one axis: the indices `1:n` whose lattice index
+# `origin + i - 1` is one short of a multiple of `stride`. At origin 0 that is `stride:stride:n`, the
+# reference's `rIdxC = range(rate - 1, n, rate)` (`autoRIFT.py:553-571`, zero-based).
+_lattice_nodes(origin::Int, stride::Int, n::Int) = (stride - mod(origin, stride)):stride:n
+
 # How wide a window the coarse radius is reduced over: the sparse stride, rounded **up to odd**.
 #
 # The reference does exactly this and says why by construction — `filtWidth = stride + 1` when the
@@ -1057,8 +1065,8 @@ _sparse_filter_width(stride::Int) = iseven(stride) ? stride + 1 : stride
 function _coarse_points(pts::PointSet{2}, p::Params, chip_size::Extent)
     stride = _sparse_stride(p)
     nr, nc = size(pts)
-    rows = stride:stride:nr
-    cols = stride:stride:nc
+    rows = _lattice_nodes(pts.origin[1], stride, nr)
+    cols = _lattice_nodes(pts.origin[2], stride, nc)
     # Two adjustments, both the reference's (`autoRIFT.py:484-496`). `relax` loosens for the
     # decimation: a coarse point's neighbours span several times more ground and are genuinely
     # less like it. `rescale` matches the neighbourhood to a grid finer than its chips.
@@ -1096,7 +1104,7 @@ end
 # assembled coarse grid rather than one block of it.
 function _coarse_decide(cd::DisplacementField, coarse::PointSet{2}, p::Params,
                         filt::OutlierMethod, gridsize::Tuple{Int,Int}, stride::Int,
-                        subpixel::SubpixelMethod)
+                        subpixel::SubpixelMethod, origin::NTuple{2,Int})
     measured = map(!isnan, cd.dx)
     any(measured) || return nothing
 
@@ -1123,7 +1131,7 @@ function _coarse_decide(cd::DisplacementField, coarse::PointSet{2}, p::Params,
     # so grow it before it restricts the fine search.
     grown = dilate_within(keep, p.coarse_buffer)
     # Back to the full grid, on the same lattice the radii were reduced over.
-    return _expand_coarse_mask(grown, gridsize, stride)
+    return _expand_coarse_mask(grown, gridsize, stride, origin)
 end
 
 # A coarse-grid mask on the full grid, inverting the cell assignment `_cell_max_radius!` makes.
@@ -1135,11 +1143,12 @@ end
 # independent derivations of one correspondence is the defect; the offset is the symptom.
 #
 # Inverting `_cell_max_radius!` instead makes the two agree by construction: it centres cell `k` on
-# fine index `k * stride` with `lo = stride ÷ 2` before and `hi = stride - 1 - lo` after, so the cell
-# containing fine index `i` is `fld(i + lo, stride)`, clamped to the ends where the coarse grid stops
-# short of the fine one. That also keeps this in integer arithmetic, where `resample` needed a
-# `Float32` round trip and a `> 0.5f0` threshold on a Boolean quantity.
-function _expand_coarse_mask(mask::AbstractMatrix{Bool}, gridsize::Tuple{Int,Int}, stride::Int)
+# fine index `k * stride - mod(origin, stride)` (`_lattice_nodes`) with `lo = stride ÷ 2` before and
+# `hi = stride - 1 - lo` after, so the cell containing fine index `i` is
+# `fld(i + mod(origin, stride) + lo, stride)`, clamped to the ends where the coarse grid stops short of
+# the fine one, in integer arithmetic throughout.
+function _expand_coarse_mask(mask::AbstractMatrix{Bool}, gridsize::Tuple{Int,Int}, stride::Int,
+                             origin::NTuple{2,Int})
     nr, nc = gridsize
     sr, sc = size(mask)
     # The same left margin `_cell_max_radius!` reduces over, from the same helper. This is the
@@ -1147,10 +1156,11 @@ function _expand_coarse_mask(mask::AbstractMatrix{Bool}, gridsize::Tuple{Int,Int
     # margin from one place; `test/multichip.jl` pins the round trip.
     lo, _, _, _ = _window_margins(stride, stride)
     out = Matrix{Bool}(undef, nr, nc)
+    pr, pc = mod.(origin, stride)
     @inbounds for j in 1:nc
-        cj = clamp(fld(j + lo, stride), 1, sc)
+        cj = clamp(fld(j + pc + lo, stride), 1, sc)
         for i in 1:nr
-            out[i, j] = mask[clamp(fld(i + lo, stride), 1, sr), cj]
+            out[i, j] = mask[clamp(fld(i + pr + lo, stride), 1, sr), cj]
         end
     end
     return out
@@ -1193,7 +1203,7 @@ function _coarse_mask(runner::PassRunner, pts::PointSet{2}, p::Params, chip_size
     # `subpixel` is this level's *fine* method even though the pass above ran `NoRefine`: the outlier
     # threshold is expressed in units of the quantization step the level's estimates will carry
     # (`reject_outliers`), which is the fine method's, not the coarse pass's.
-    return _coarse_decide(cd, coarse, p, setup.filt, size(pts), _sparse_stride(p), subpixel)
+    return _coarse_decide(cd, coarse, p, setup.filt, size(pts), _sparse_stride(p), subpixel, pts.origin)
 end
 
 # How far `_cell_max_radius!` can reach, in points of the grid a caller supplies.

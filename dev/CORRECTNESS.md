@@ -874,7 +874,32 @@ Recorded in full, with per-item evidence and revisit conditions, in **`tools/gol
 | The level-grid snap assumes a half-integer grid | `round(x + 0.5) - 0.5` moves an integer-valued grid by half a pixel. **Not matched** — `_cell_centres` reads the phase from the grid |
 | Which side's coarse value is more nearly correct is unsettled | judged against a local truth neither wins: the reference is closer on `dx`, while its `dy` carries ~2x our rms at a comparable median |
 
-One difference runs the **other** way, where AutoRIFT.jl is more nearly correct and deliberately does not
-match: a seeded gap-fill RNG, which is gated on tolerance rather than equality because the reference draws
-from NumPy's unseeded global generator and so cannot match itself either. The Wallis variance used to be
-the second such difference and is now item 4 above, adopted for agreement.
+Two differences run the **other** way, where AutoRIFT.jl is more nearly correct and deliberately does
+not match.
+
+**Coarse lattices are anchored to the grid's `origin`, not its first point.** `autoRIFT.py` places each
+coarser chip level's cells (`cv2.resize`, `autoRIFT.py:507-524`) and each coarse pass's sample points
+(`rIdxC`, `:553-571`) by the grid array's own first element, so two products cut from one map grid at
+different windows measure their coarse levels at different map positions and disagree where they overlap.
+On `S1B_IW_SLC__1SSH_20180630T095929` × `20180712T095930`, placed that way, the ESA and OPERA framings of
+the same bursts agree exactly at 98.6% of the pixels both measure with the finest chip and at 1–2% of those
+measured with a 500 m or 1000 m chip. The ITS_LIVE grid is laid out by `dispGrid` (`markf6/its_live`,
+`Gridcorr_v0_py3.py:28-215`) so that coarser chips nest in a lattice shared by every product. A
+`PointSet`'s `origin` is its first point's index on that lattice (`ImagePairGeometry.lattice_origin` for a
+geogrid), and `_decimate_level` and `_coarse_points` place their points by it. At origin `(0, 0)` both
+place their points as the reference does, which is what every captured-grid rung of the ladder runs.
+
+With them goes the snap of a coarse cell's mean coordinate (`_cell_mean`), at every origin. The
+reference's `round` breaks a tie to the even image index, so the same coarse chip lands a line apart in two
+products framed an odd number of lines apart; ties are 54–60% of the stride-2 cells, 6–10% of the stride-4
+and 2.5–3% of the stride-8 cells on the pair above. Here a tie goes to the upper index, which moves with
+the image. It sits half a step from the cell's mean, where the reference's errs half a step either way,
+which against a displacement field varying 0.01 px per line is below any measurement. The captured-grid
+level rungs therefore differ from the reference at the tied cells.
+
+With both, that pair's ESA and OPERA framings are 96% identical over their overlap, against 55% placed as
+the reference places them, and 99.9% identical beyond 32 points from its edge. What differs is within 2 km
+of a product's edge, where each product's neighbourhood filters see different extents.
+
+The other is a seeded gap-fill RNG, which is gated on tolerance rather than equality because the
+reference draws from NumPy's unseeded global generator and so cannot match itself either.
