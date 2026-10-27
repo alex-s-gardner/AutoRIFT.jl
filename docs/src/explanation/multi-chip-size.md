@@ -28,6 +28,13 @@ AutoRIFT.chip_sizes(AutoRIFT.params(; chip_size = 16, chip_size_max = 64))
 There are three levels. `chip_size` is the finest and `chip_size_max` the coarsest. `chip_size_max`
 must be the same power-of-two multiple of `chip_size` in both axes, which the nesting requires.
 
+Where the blocks fall is set by the grid's `origin` (see [`AutoRIFT.PointSet`](@ref)): its first
+point's index on a lattice shared by every grid laid out on it. Two grids cut from one map grid at
+different windows then measure each level at the same map positions, so where they overlap they agree. A
+grid built by [`AutoRIFT.gridpoints`](@ref) has origin `(0, 0)`, which places the blocks from its first
+point, as `autoRIFT.py` does; for a grid on the ITS_LIVE map grid, pass `pointset` the origin
+`ImagePairGeometry.lattice_origin` gives.
+
 The only pyramid in the algorithm is in [`PyramidRefine`](@ref), which upsamples the neighborhood of a
 correlation peak to find its sub-pixel position. It acts on a correlation surface, not an image.
 

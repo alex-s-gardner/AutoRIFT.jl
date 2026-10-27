@@ -71,7 +71,7 @@ _dy_prior_sign(coordinate) = -y_displacement_sign(coordinate)
 
 """
     AutoRIFT.pointset(g::PairGeometry; chip_size = nothing, chip_size_0 = 240.0,
-                      pixel_size = nothing, coordinate = g.coordinate) -> PointSet{2}
+                      pixel_size = nothing, coordinate = g.coordinate, origin = (0, 0)) -> PointSet{2}
 
 The search grid in `g`, as a [`PointSet`](@ref).
 
@@ -89,11 +89,15 @@ required, otherwise `ArgumentError` is thrown.
 
 `coordinate` decides the sign of the y prior, and defaults to the one `g` carries.
 
+`origin` is the grid's [`PointSet`](@ref) origin. `reverse(ImagePairGeometry.lattice_origin(g))`
+places the coarser lattices on the DispGrid lattice, the same map positions in every product cut from
+one map grid; the default places them by the window's own first point, as the reference does.
+
 Only part of `g` fits a `PointSet`. `ImagePairGeometry.velocity_conversion` returns the operator,
 scale factors and mask needed to convert a measured displacement to a velocity.
 """
 function AutoRIFT.pointset(g::PairGeometry; chip_size = nothing, chip_size_0 = 240.0,
-                           pixel_size = nothing, coordinate = g.coordinate)
+                           pixel_size = nothing, coordinate = g.coordinate, origin = (0, 0))
     base = if chip_size !== nothing
         Int(chip_size)
     elseif pixel_size !== nothing
@@ -147,7 +151,7 @@ function AutoRIFT.pointset(g::PairGeometry; chip_size = nothing, chip_size_0 = 2
                              dy_prior = prior(g.offset_y, dy_flip),
                              chip_size_min_x = bound(g.chip_min_x),
                              chip_size_max_x = bound(g.chip_max_x),
-                             positioned = valid)
+                             positioned = valid, origin)
 end
 
 """

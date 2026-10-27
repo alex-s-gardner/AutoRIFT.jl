@@ -102,6 +102,12 @@ its filtering steps use neighborhoods.
   It does not affect whether a point is searched ([`AutoRIFT.issearchable`](@ref) tests the radius
   alone). Blocked processing uses it to exclude placeholder coordinates when sizing a block's read
   window.
+- `origin`: for a gridded set, the `(row, column)` index of point `[1, 1]` on a lattice shared by
+  every grid laid out on it, `(0, 0)` by default. The multi-chip-size search places each coarser
+  level's cells and each coarse pass's sample points by this index rather than by the grid's own first
+  point, so two grids cut from one map grid at different windows measure every level at the same map
+  positions. It must be a multiple of every level's stride on both axes. At `(0, 0)` the lattices
+  start at the grid's first point, as in the reference.
 
 Each field has its own type parameter, because a field is an `AutoRIFT.Uniform` exactly when it was
 given as a scalar, and fields may be mixed.
@@ -125,12 +131,14 @@ struct PointSet{N,X<:AbstractArray{Float64,N},Y<:AbstractArray{Float64,N},
     chip_size_min_x::CN
     chip_size_max_x::CM
     positioned::PO
+    origin::NTuple{2,Int}
 
     function PointSet(x::X, y::Y, radius_x::RX, radius_y::RY, dx_prior::DX,
                       dy_prior::DY, chip_size_x::CX, chip_size_y::CY,
                       chip_size_min_x::CN = Uniform(0, size(chip_size_x)),
                       chip_size_max_x::CM = Uniform(0, size(chip_size_x)),
-                      positioned::PO = Uniform(true, size(chip_size_x))) where {
+                      positioned::PO = Uniform(true, size(chip_size_x)),
+                      origin::NTuple{2,Integer} = (0, 0)) where {
                           N,X<:AbstractArray{Float64,N},Y<:AbstractArray{Float64,N},
                           RX<:AbstractArray{Int,N},RY<:AbstractArray{Int,N},
                           DX<:AbstractArray{Float64,N},DY<:AbstractArray{Float64,N},
@@ -146,7 +154,7 @@ struct PointSet{N,X<:AbstractArray{Float64,N},Y<:AbstractArray{Float64,N},
                          positioned = positioned))
         return new{N,X,Y,RX,RY,DX,DY,CX,CY,CN,CM,PO}(
             x, y, radius_x, radius_y, dx_prior, dy_prior,
-            chip_size_x, chip_size_y, chip_size_min_x, chip_size_max_x, positioned)
+            chip_size_x, chip_size_y, chip_size_min_x, chip_size_max_x, positioned, Int.(origin))
     end
 end
 
@@ -223,6 +231,7 @@ julia> pts.x[2], pts.radius_x[2], pts.chip_size_x[2]
   means unbounded. A scalar or per-point array.
 - `positioned = true`: whether each coordinate is a real image position. A scalar or per-point array.
   See [`PointSet`](@ref).
+- `origin = (0, 0)`: the lattice index of the first point, for a gridded set. See [`PointSet`](@ref).
 """
 function pointset(
     x::AbstractArray, y::AbstractArray;
@@ -237,6 +246,7 @@ function pointset(
     chip_size_min_x = 0,
     chip_size_max_x = 0,
     positioned = true,
+    origin = (0, 0),
 )
     size(x) == size(y) || throw(DimensionMismatch(
         "`x` and `y` must have the same shape, got $(size(x)) and $(size(y))"))
@@ -269,7 +279,7 @@ function pointset(
     # grid-sized array — which is every caller but a geogrid.
     pos = _toconstfield(Bool, positioned, x, :positioned)
 
-    return PointSet(xs, ys, rx, ry, dx, dy, csx, csy, cmin, cmax, pos)
+    return PointSet(xs, ys, rx, ry, dx, dy, csx, csy, cmin, cmax, pos, origin)
 end
 
 # Coordinates given as points rather than as parallel arrays.
@@ -395,7 +405,13 @@ Base.getindex(pts::PointSet{2}, rows, cols) = PointSet(
     pts.dx_prior[rows, cols], pts.dy_prior[rows, cols],
     pts.chip_size_x[rows, cols], pts.chip_size_y[rows, cols],
     pts.chip_size_min_x[rows, cols], pts.chip_size_max_x[rows, cols],
-    pts.positioned[rows, cols])
+    pts.positioned[rows, cols], _sub_origin(pts.origin, rows, cols))
+
+# The lattice index of `pts[rows, cols]`'s first point. A selection of every `step`-th point is on the
+# lattice of every `step`-th lattice index, where fine index `i` lies in node `fld(i, step)`; a crop is
+# the case `step = 1`.
+_sub_origin(o::NTuple{2,Int}, rows::AbstractRange, cols::AbstractRange) =
+    (fld(o[1] + first(rows) - 1, step(rows)), fld(o[2] + first(cols) - 1, step(cols)))
 
 """
     rebuild(pts::PointSet; kwargs...) -> PointSet
@@ -409,9 +425,9 @@ rebuild(pts::PointSet; x = pts.x, y = pts.y,
         chip_size_x = pts.chip_size_x, chip_size_y = pts.chip_size_y,
         chip_size_min_x = pts.chip_size_min_x,
         chip_size_max_x = pts.chip_size_max_x,
-        positioned = pts.positioned) =
+        positioned = pts.positioned, origin = pts.origin) =
     PointSet(x, y, radius_x, radius_y, dx_prior, dy_prior, chip_size_x, chip_size_y,
-             chip_size_min_x, chip_size_max_x, positioned)
+             chip_size_min_x, chip_size_max_x, positioned, origin)
 
 """
     sanitize!(pts::PointSet, min_radius) -> Int

@@ -820,36 +820,36 @@ end
     @test 0.0 < sub.grid.x[3, 4] < 54.0
 end
 
-@testset "the snap subtracts the phase before rounding, and the other order differs" begin
-    # `_cell_mean` snaps with `round(x - offset) + offset`. Reading `autoRIFT.py:120-122` literally gives
-    # `round(x + 0.5) - 0.5`, which reaches the same lattice and agrees everywhere except where the cell
-    # mean falls midway between two of its points — and there `round` breaks the tie to even, which is a
-    # *different* point on each side, a whole grid step away.
-    #
-    # Ties are the common case rather than a pathology, since averaging an even number of half-integers
-    # always lands on a whole one: every cell below is on one, as are 11.1% of the `x` cells of a stride-2
-    # level over the golden `S1B_IW_SLC__1SDH_20180809T204617` grid and 15.6% over NISAR L1's.
+@testset "a tied cell mean rounds up, so the snap moves with the image" begin
+    # Averaging an even number of coordinates on one lattice lands midway between two of its points, so
+    # ties are the common case: every cell below is one. `_cell_mean` sends a tie to the upper point.
     x = Float64[1.5 + (c - 1) for _ in 1:8, c in 1:8]
     @test AutoRIFT._grid_phase(x) == 0.5
     nr, nc = size(x)
     for c in 1:(nc - 1), r in 1:(nr - 1)
         raw = (x[r, c] + x[r, c + 1]) / 2
-        @test raw == round(raw)                         # the trap: every one of these cells is a tie
-        @test AutoRIFT._cell_mean(x, r, c, 2, nr, nc, 0.5) == round(raw - 0.5) + 0.5
+        @test raw == round(raw)                         # every one of these cells is a tie
+        @test AutoRIFT._cell_mean(x, r, c, 2, nr, nc, 0.5) == raw + 0.5
+    end
+    # A mean off a tie snaps to its nearest point, as `round` would.
+    @test AutoRIFT._cell_mean(reshape([1.5, 2.5, 3.5], 3, 1), 1, 1, 3, 3, 1, 0.5) == 2.5   # mean 2.5
+    @test AutoRIFT._cell_mean(reshape([1.5, 2.5, 4.5], 3, 1), 1, 1, 3, 3, 1, 0.5) == 2.5   # mean 2.83
+
+    # The property the rule exists for: shifting every coordinate by a whole step shifts every snapped
+    # mean by exactly that step. Rounding a tie to even fails it for an odd shift, which is how two
+    # products of one acquisition framed an odd number of lines apart placed the same coarse chip a line
+    # apart.
+    for k in (-3, 1, 8053)
+        for c in 1:(nc - 1)
+            @test AutoRIFT._cell_mean(x .+ k, 1, c, 2, nr, nc, 0.5) == AutoRIFT._cell_mean(x, 1, c, 2, nr, nc, 0.5) + k
+        end
     end
 
-    # Stated as values, because the difference runs both ways and a mean over a level hides it: columns 1-2
-    # average to 2.0 and columns 2-3 to 3.0, and the other order would put them at 1.5 and 3.5 — one step
-    # below and one step above what this one gives.
-    @test AutoRIFT._cell_mean(x, 1, 1, 2, nr, nc, 0.5) == 2.5
-    @test AutoRIFT._cell_mean(x, 1, 2, 2, nr, nc, 0.5) == 2.5
-
-    # An integer grid is on the one phase where the two orders cannot differ, so reading the phase off the
-    # grid leaves `gridpoints` coordinates wherever the rounding alone puts them.
+    # An integer grid takes its own phase, 0, and the same rule.
     xi = Float64[Float64(c) for _ in 1:8, c in 1:8]
     @test AutoRIFT._grid_phase(xi) == 0.0
-    @test AutoRIFT._cell_mean(xi, 1, 1, 2, 8, 8, 0.0) == 2.0     # mean 1.5, tie to even
-    @test AutoRIFT._cell_mean(xi, 1, 2, 2, 8, 8, 0.0) == 2.0     # mean 2.5, tie to even
+    @test AutoRIFT._cell_mean(xi, 1, 1, 2, 8, 8, 0.0) == 2.0     # mean 1.5
+    @test AutoRIFT._cell_mean(xi, 1, 2, 2, 8, 8, 0.0) == 3.0     # mean 2.5
 end
 
 @testset "an even sparse stride reduces over an odd window" begin
@@ -912,7 +912,7 @@ end
         for k in 1:ncoarse
             onehot = falses(ncoarse, 1)
             onehot[k, 1] = true
-            expanded = AutoRIFT._expand_coarse_mask(onehot, (n, 1), stride)
+            expanded = AutoRIFT._expand_coarse_mask(onehot, (n, 1), stride, (0, 0))
             for i in 1:n
                 expanded[i, 1] && (mask_cell[i] = k)
             end
@@ -930,11 +930,11 @@ end
     # And the case that exposed the defect, asserted concretely rather than only as a property.
     onehot = falses(3, 1)
     onehot[1, 1] = true
-    @test vec(AutoRIFT._expand_coarse_mask(onehot, (13, 1), 4)) ==
+    @test vec(AutoRIFT._expand_coarse_mask(onehot, (13, 1), 4, (0, 0))) ==
           [true, true, true, true, true, false, false, false, false, false, false, false, false]
     # `resample` disagrees here, which is why it is not used for this.
     viaresample = vec(resample(Float32.(onehot), (13, 1), Nearest())) .> 0.5f0
-    @test viaresample != vec(AutoRIFT._expand_coarse_mask(onehot, (13, 1), 4))
+    @test viaresample != vec(AutoRIFT._expand_coarse_mask(onehot, (13, 1), 4, (0, 0)))
 
     # A coarse point's own fine index always lands in its own cell, at any stride.
     for stride in (2, 3, 4, 7)
@@ -943,7 +943,63 @@ end
         for (k, r) in enumerate(rows)
             onehot = falses(length(rows), 1)
             onehot[k, 1] = true
-            @test AutoRIFT._expand_coarse_mask(onehot, (n, 1), stride)[r, 1]
+            @test AutoRIFT._expand_coarse_mask(onehot, (n, 1), stride, (0, 0))[r, 1]
         end
     end
+
+    # The same round trip on a grid that starts part-way along its lattice: the sample points move to
+    # `_lattice_nodes`, and the mask must follow them to the same cells.
+    for stride in (2, 3, 4, 8), origin in (1, 3, 5, 13), n in (13, 40)
+        rows = AutoRIFT._lattice_nodes(origin, stride, n)
+        isempty(rows) && continue
+        lo, _, hi, _ = AutoRIFT._window_margins(stride, stride)
+        radius_cell = zeros(Int, n)
+        for (k, r) in enumerate(rows), i in max(r - lo, 1):min(r + hi, n)
+            radius_cell[i] = k
+        end
+        for (k, r) in enumerate(rows)
+            onehot = falses(length(rows), 1)
+            onehot[k, 1] = true
+            expanded = AutoRIFT._expand_coarse_mask(onehot, (n, 1), stride, (origin, 0))
+            @test expanded[r, 1]
+            @test all(expanded[i, 1] == (radius_cell[i] == k) for i in 1:n if radius_cell[i] != 0)
+        end
+    end
+end
+
+@testset "coarse lattices sit at the same map positions in every window" begin
+    # Two grids cut from one map grid at different windows: the second starts `d` points further
+    # along. Every coarse sample point of either is at a lattice index that is one short of a
+    # multiple of the stride, so where the two overlap they sample exactly the same map points.
+    stride = 8
+    n = 200
+    a = AutoRIFT._lattice_nodes(0, stride, n)
+    for d in (0, 3, 8, 21)
+        # On the indices both grids cover, the second grid's nodes are the first grid's.
+        b = AutoRIFT._lattice_nodes(d, stride, n) .+ d
+        @test filter(<=(n), b) == filter(>(d), a)
+    end
+    # At origin 0 the lattice is the reference's `stride:stride:n`.
+    @test AutoRIFT._lattice_nodes(0, 4, 13) == 4:4:13
+end
+
+@testset "a level's cells nest only on a grid whose origin is on a block" begin
+    grid = gridpoints((256, 256), 8; chip_size = 16, search_radius = 20)
+    wanted = trues(size(grid))
+    @test AutoRIFT._decimate_level(grid, wanted, 4).grid.origin == (0, 0)
+    nested = AutoRIFT.rebuild(grid; origin = (8, 16))
+    sub = AutoRIFT._decimate_level(nested, wanted, 4)
+    @test sub.grid.origin == (2, 4)
+    @test sub.rows == 1:4:size(grid, 1)
+    @test_throws "is not a multiple of the level stride 4" AutoRIFT._decimate_level(
+        AutoRIFT.rebuild(grid; origin = (6, 16)), wanted, 4)
+end
+
+@testset "a point set's origin follows crops and rebuilds" begin
+    pts = AutoRIFT.rebuild(gridpoints((256, 256), 8; chip_size = 16, search_radius = 20); origin = (32, 48))
+    @test AutoRIFT.rebuild(pts; radius_x = copy(pts.radius_x)).origin == (32, 48)
+    @test pts[3:5, 2:6].origin == (34, 49)
+    # Every second point from a lattice multiple of 2 is the lattice of every second index.
+    @test pts[1:2:7, 1:2:7].origin == (16, 24)
+    @test AutoRIFT.pointset([1.0, 2.0], [1.0, 2.0]).origin == (0, 0)
 end

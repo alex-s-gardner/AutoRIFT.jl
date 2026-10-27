@@ -1067,7 +1067,7 @@ function rungs_coarse_mask(k::Capture, p::Params, L::Int, chip::Int)
     # gives the totals it resolves to.
     want = size(_consumed_grid(k, "xGrid0", L))
     stride = AutoRIFT._sparse_stride(p)
-    expanded = AutoRIFT._expand_coarse_mask(grown, want, stride)
+    expanded = AutoRIFT._expand_coarse_mask(grown, want, stride, (0, 0))
     full_mc2 = _state_shaped(k, "MC2", L, want)
     if full_mc2 !== nothing
         ref = full_mc2 .!= 0
