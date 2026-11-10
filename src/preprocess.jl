@@ -900,13 +900,19 @@ textureless areas the division amplifies noise; `min_std` floors the divisor to 
     changes the band-reject decision of [`Destripe`](@ref). `dev/CORRECTNESS.md` item 4 records the
     plan to restore it, and `tools/golden/README.md` the measurement.
 """
-function wallis(img::AbstractMatrix, mask::AbstractMatrix{Bool}, width::Integer,
-                min_std::Real = 0.0)
+wallis(img::AbstractMatrix, mask::AbstractMatrix{Bool}, width::Integer, min_std::Real = 0.0) =
+    wallis!(Matrix{Float32}(undef, size(img)), img, mask, width, min_std)
+
+# `wallis` into `out`, which shares `img`'s axes. The local mean and standard deviation are still
+# allocated per call.
+function wallis!(out::AbstractMatrix{Float32}, img::AbstractMatrix, mask::AbstractMatrix{Bool},
+                 width::Integer, min_std::Real = 0.0)
+    axes(out) == axes(img) == axes(mask) || throw(DimensionMismatch(
+        "out, img and mask must share axes"))
     w = Int(width)
     mean = _masked_boxmean(img, mask, w)
     sd = _masked_boxstd(img, mask, mean, w)
     floor_sd = Float32(min_std)
-    out = Matrix{Float32}(undef, size(img))
     @inbounds for i in eachindex(out)
         if !mask[i] || !isfinite(mean[i]) || !isfinite(sd[i])
             out[i] = NaN32

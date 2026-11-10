@@ -1025,3 +1025,43 @@ end
                            "block $bs, filter tile $tile")
     end
 end
+
+@testset "a Wallis-filtered run is cached and pooled like a high-passed one" begin
+    m = Wallis(5, 0.0)
+    @test AutoRIFT._poolable(m)
+
+    # A cached Wallis tile against the whole-image filter: values and eroded mask, on a miss and a hit,
+    # over an image with a hole the erosion has to reach.
+    rng = MersenneTwister(4)
+    img = 100 .+ 20 .* rand(rng, Float32, 300, 260)
+    img[50:58, 60:68] .= NaN32
+    mask = isfinite.(img)
+    pair = ImagePair(img, img .+ 0.5f0; reference_valid = mask, secondary_valid = mask)
+    w = AutoRIFT.filter_width(m)
+    truth_f = AutoRIFT.wallis(pair.reference, pair.reference_valid, w, 0.0)
+    truth_v = similar(mask)
+    AutoRIFT._filtered!(truth_f, truth_v, pair.reference_valid, w)
+    c = AutoRIFT.FilterTileCache(size(img), w; tile = 64)
+    rows, cols = 30:200, 40:220
+    fr = Matrix{Float32}(undef, length(rows), length(cols)); fs = similar(fr)
+    rv = Matrix{Bool}(undef, size(fr)); sv = similar(rv)
+    for _ in 1:2
+        AutoRIFT._cached_filtered_window!(fr, rv, fs, sv, c, pair, m, rows, cols)
+        @test isequal(fr, truth_f[rows, cols])
+        @test rv == truth_v[rows, cols]
+    end
+    @test c.served[] > 0
+    close(c)
+
+    # A whole cached, blocked run equals the untiled one.
+    ref, sec = split_pair(1536)
+    p = params(; chip_size = 32, chip_size_max = 64, grid_spacing = 16, search_radius = 12, preprocess = m)
+    raw = ImagePair(ref, sec)
+    grid = AutoRIFT._build_grid(size(raw), p)
+    AutoRIFT._warm_grid_plans(grid, p)
+    untiled = AutoRIFT.correlate_multichip(AutoRIFT._prepare(raw, p), grid, p)
+    for tile in (nothing, 128)
+        assert_same_result(untiled, AutoRIFT.correlate_tiled(raw, grid, p, (320, 320), tile),
+                           "Wallis, filter tile $tile")
+    end
+end
