@@ -586,12 +586,12 @@ filter_width(::Destripe) = 0
     AutoRIFT._poolable(method::PreprocessMethod) -> Bool
 
 Whether `_prepare_block` pools its buffers for `method`, and so whether a [`FilterTileCache`](@ref) can
-cache its output — the two are the same question, since both exist for the one filter the production
-driver runs inside the correlator. Every other method still allocates per block (`_prepare_block`'s
-generic fallback) and is not covered.
+cache its output: true for [`Highpass`](@ref) and [`Wallis`](@ref), the two filters a production driver
+runs inside the correlator, which share an in-place form ([`AutoRIFT._filter_into!`](@ref)). Every other
+method allocates per block (`_prepare_block`'s generic fallback) and is not cached.
 """
 _poolable(::PreprocessMethod) = false
-_poolable(::Highpass) = true
+_poolable(::Union{Highpass,Wallis}) = true
 
 """
     AutoRIFT.filter_reach(method::PreprocessMethod) -> Int

@@ -942,8 +942,8 @@ end
 Each tile's filtered pixels and eroded validity mask, for both images of a pair, computed once and kept
 in a memory-mapped scratch file rather than recomputed on every pass that touches it.
 
-Only [`Highpass`](@ref) is cached this way, being the default filter and the only one the production
-driver runs inside the correlator. `width` is its width.
+The methods [`AutoRIFT._poolable`](@ref) covers are cached this way: [`Highpass`](@ref) and
+[`Wallis`](@ref). `width` is the filter's width.
 """
 struct FilterTileCache
     dims::Tuple{Int,Int}
@@ -1071,18 +1071,30 @@ _as_matrix_bool(m::Matrix{Bool}) = m
 _as_matrix_bool(m::AbstractMatrix{Bool}) = Matrix{Bool}(m)
 
 """
+    AutoRIFT._filter_into!(out, img, mask, method, scratch)
+
+`method`'s filtered values of `img` into `out`, for the methods [`AutoRIFT._poolable`](@ref) covers; the
+eroded mask is [`AutoRIFT._filtered!`](@ref)'s, applied afterwards. `scratch` is `highpass!`'s NaN-encoded
+copy, or `nothing`; `wallis!` allocates its own.
+"""
+function _filter_into! end
+_filter_into!(out, img, mask, m::Highpass, scratch) = highpass!(out, img, mask, filter_width(m); scratch)
+_filter_into!(out, img, mask, m::Wallis, _scratch) = wallis!(out, img, mask, m.width, m.min_std)
+
+"""
     _ensure_filter_tile!(c, pair, m, ti, tj)
 
 Make tile `(ti, tj)` present in `c`, deriving it from `pair` if it is not already.
 
 The interior kept is bit-identical to a block's own filtered read. The tile is derived with padding of
-`filter_reach(m)`, the neighborhood `highpass!` and `_filtered!` reach, so its pixels see the same real
+`filter_reach(m)`, the neighborhood the filter and `_filtered!` reach, so its pixels see the same real
 neighbors as in a block's read window.
 
 The check and derivation run under a per-tile lock, so two tasks wanting the same absent tile do not
 both derive it and a later reader sees a completed write.
 """
-function _ensure_filter_tile!(c::FilterTileCache, pair::ImagePair, m::Highpass, ti::Integer, tj::Integer)
+function _ensure_filter_tile!(c::FilterTileCache, pair::ImagePair, m::Union{Highpass,Wallis},
+                              ti::Integer, tj::Integer)
     k = (tj - 1) * c.ntiles[1] + ti
     @lock c.tiles[k] begin
         if c.present[k]
@@ -1106,8 +1118,8 @@ function _ensure_filter_tile!(c::FilterTileCache, pair::ImagePair, m::Highpass, 
         pfs = Matrix{Float32}(undef, size(psec))
         prv = Matrix{Bool}(undef, size(pref))
         psv = Matrix{Bool}(undef, size(psec))
-        highpass!(pfr, pref, prefv, w)
-        highpass!(pfs, psec, psecv, w)
+        _filter_into!(pfr, pref, prefv, m, nothing)
+        _filter_into!(pfs, psec, psecv, m, nothing)
         _filtered!(pfr, prv, prefv, w)
         _filtered!(pfs, psv, psecv, w)
 
@@ -1134,7 +1146,7 @@ over `rows`/`cols`, tile by tile, deriving each covering tile of `c` if absent a
 with the request.
 """
 function _cached_filtered_window!(dest_fr, dest_rv, dest_fs, dest_sv,
-                                  c::FilterTileCache, pair::ImagePair, m::Highpass,
+                                  c::FilterTileCache, pair::ImagePair, m::Union{Highpass,Wallis},
                                   rows::AbstractUnitRange, cols::AbstractUnitRange)
     for tj in _filter_tile_span(c, cols), ti in _filter_tile_span(c, rows)
         _ensure_filter_tile!(c, pair, m, ti, tj)
@@ -1222,7 +1234,7 @@ _reads_filter_cache(cache::Union{Nothing,FilterTileCache}, p::Params) =
 #
 # `cache` bypasses the read and the block-local filter entirely when it applies — a pair cached by
 # `FilterTileCache`, which `_poolable` gates the same way `_prepare_block` gates its own pooled
-# branch — and fills the same pooled buffers `_prepare_block`'s `Highpass` branch would have, tile by
+# branch — and fills the same pooled buffers `_prepare_block`'s pooled branch would have, tile by
 # tile, from the cache instead.
 function _prepared_block_pair(buf::BlockBuffers, pair::ImagePair, rows, cols, p::Params,
                               cache::Union{Nothing,FilterTileCache} = nothing)
@@ -1239,13 +1251,10 @@ function _prepared_block_pair(buf::BlockBuffers, pair::ImagePair, rows, cols, p:
     return _prepare_block(buf, raw, p, p.preprocess, length(rows), length(cols))
 end
 
-# Filtering a block into pooled storage, for the filters that have an in-place form.
-#
-# `Highpass` is the one that matters — the default, and the only filter the production driver runs
-# inside the correlator — so it is the one pooled. Anything else falls through to the allocating
-# path below: correct, and costing a filter output per block, which is worth having as the honest
-# fallback rather than blocking those filters from tiled runs.
-function _prepare_block(buf::BlockBuffers, raw::ImagePair, p::Params, m::Highpass,
+# Filtering a block into pooled storage, for the filters that have an in-place form: `Highpass` and
+# `Wallis`, the ones a production driver runs inside the correlator. Anything else falls through to the
+# allocating path below: correct, and costing a filter output per block.
+function _prepare_block(buf::BlockBuffers, raw::ImagePair, p::Params, m::Union{Highpass,Wallis},
                         nr::Int, nc::Int)
     w = filter_width(m)
     fr = @view buf.filtered_reference[1:nr, 1:nc]
@@ -1254,8 +1263,8 @@ function _prepare_block(buf::BlockBuffers, raw::ImagePair, p::Params, m::Highpas
     rv = @view buf.filtered_reference_valid[1:nr, 1:nc]
     sv = @view buf.filtered_secondary_valid[1:nr, 1:nc]
 
-    highpass!(fr, raw.reference, raw.reference_valid, w; scratch)
-    highpass!(fs, raw.secondary, raw.secondary_valid, w; scratch)
+    _filter_into!(fr, raw.reference, raw.reference_valid, m, scratch)
+    _filter_into!(fs, raw.secondary, raw.secondary_valid, m, scratch)
     # `_filtered!` does the mask bookkeeping every windowed filter needs: erode by the filter
     # width, and drop any pixel whose filtered value came out non-finite.
     _filtered!(fr, rv, raw.reference_valid, w)
