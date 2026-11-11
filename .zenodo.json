@@ -1,0 +1,11 @@
+{
+  "title": "AutoRIFT.jl: Autonomous Repeat Image Feature Tracking in Julia",
+  "upload_type": "software",
+  "creators": [
+    {"name": "Gardner, Alex S.", "affiliation": "NASA Jet Propulsion Laboratory, California Institute of Technology"},
+    {"name": "Kennedy, Joseph H.", "affiliation": "Alaska Satellite Facility, University of Alaska Fairbanks"},
+    {"name": "Player, Andrew", "affiliation": "Alaska Satellite Facility, University of Alaska Fairbanks"}
+  ],
+  "license": "MIT",
+  "keywords": ["computer vision", "feature tracking", "glacier velocity", "ITS_LIVE", "Julia"]
+}
