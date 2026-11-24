@@ -248,12 +248,14 @@ end
                (X = 32, Y = 32), (X = 128, Y = 128), (X = 32, Y = 32), (X = 25, Y = 25),
                6, 4, 8, 0.01, 0.0, 0.0, 3, UInt64(0), false)
     @test p.backend === AutoRIFT.CPU()
+    @test p.coarse_outliers === p.outliers
     # And the 20-argument form selects a device.
     q = AutoRIFT.Params((ZNCC(),), Highpass(), (PyramidRefine(),), GardnerFilter(),
                AutoRIFT.False(), AutoRIFT.NoRotationSearch(),
                (X = 32, Y = 32), (X = 128, Y = 128), (X = 32, Y = 32), (X = 25, Y = 25),
                6, 4, 8, 0.01, 0.0, 0.0, 3, UInt64(0), false, AutoRIFT.MetalGPU())
     @test q.backend === AutoRIFT.MetalGPU()
+    @test q.coarse_outliers === q.outliers
 
     # Selecting a backend whose package is absent must name the package. The whole point of
     # declaring the backends in the core rather than in their extensions is that this error is

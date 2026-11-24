@@ -689,6 +689,21 @@ end
     @test all(i -> abs(strict.dx[i] - loose.dx[i]) < 0.5, both)
 end
 
+@testset "the coarse filter decides where to search and the fine filter what to keep" begin
+    # One level, so a level the coarse pass skips leaves nothing for a coarser one to claim.
+    n = 512
+    pair = banded_pair(n, (6, -4), 200:290)
+    grid = gridpoints((n, n), 16; chip_size = 16, search_radius = 25)
+    run(; kw...) = correlate_multichip(pair, grid, params(; chip_size = 16, chip_size_max = 16, kw...))
+    # A filter no estimate passes: agreement over the whole window, at a vanishing tolerance.
+    nothing_passes = GardnerFilter(; agree_tolerance = 0.001, mad_scale = 0.01, min_agree_fraction = 1.0)
+    @test nmeasured(run()) > 0
+    # A coarse filter that rejects every coarse point skips the level, whatever the fine filter would keep.
+    @test nmeasured(run(; coarse_outliers = nothing_passes)) == 0
+    # A coarse filter that rejects nothing searches everywhere, and the fine filter still decides what is kept.
+    @test nmeasured(run(; outliers = nothing_passes, coarse_outliers = :none)) == 0
+end
+
 @testset "the coarse pass samples at the rate times the oversampling" begin
     # `coarse_stride` is a rate against one point per chip, not a step in grid points, so on a grid
     # posted finer than its chips the sparse pass steps by the rate times that ratio — the reference's

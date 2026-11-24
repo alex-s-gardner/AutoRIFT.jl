@@ -116,6 +116,20 @@ end
     @test @allocated(AutoRIFT.params()) <= @allocated(AutoRIFT.params(; mad_scale = 2.0))
 end
 
+@testset "the coarse pass's filter is selected on its own" begin
+    # Unset, the coarse pass uses the fine pass's filter, the loose keywords included.
+    @test AutoRIFT.params().coarse_outliers === AutoRIFT.params().outliers
+    @test AutoRIFT.params(; agree_tolerance = 0.15).coarse_outliers.agree_tolerance == 0.15
+    # Set, each is independent of the other.
+    loose = GardnerFilter(; agree_tolerance = 0.25)
+    p = AutoRIFT.params(; agree_tolerance = 0.15, coarse_outliers = loose)
+    @test p.outliers.agree_tolerance == 0.15 && p.coarse_outliers === loose
+    q = AutoRIFT.params(; coarse_outliers = :none)
+    @test q.coarse_outliers isa NoOutlierFilter && q.outliers isa GardnerFilter
+    @test_throws "`coarse_outliers` must be a Symbol or an `OutlierMethod`" AutoRIFT.params(; coarse_outliers = 0.25)
+    @test_throws "not recognised" AutoRIFT.params(; coarse_outliers = :westerweel)
+end
+
 @testset "a coherent field survives" begin
     # The first thing to get right: the filter must not reject good data. A smoothly
     # varying field is what real ice motion looks like, and if this fails the filter is
