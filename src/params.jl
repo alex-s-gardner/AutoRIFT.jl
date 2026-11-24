@@ -178,6 +178,9 @@ end
 
 _outliers(x, _kw) = _badtype(:outliers, x, "a Symbol or an `OutlierMethod`")
 
+_coarse_outliers(x::Union{Symbol,OutlierMethod}) = _outliers(x, (;))
+_coarse_outliers(x) = _badtype(:coarse_outliers, x, "a Symbol or an `OutlierMethod`")
+
 # `nothing`/`false` off, `true` the paper's default, a tuple the explicit angles. Accepting a `Bool`
 # because "should I search rotations" reads as a yes/no question at the call site even though the
 # answer carries parameters.
@@ -370,6 +373,11 @@ chip_size = (X = 16, Y = 32)   # taller than wide
   centering the angle window on a scene that is already rotated.
 - `outliers = :gardner`: `:gardner` (the filter of Gardner et al. (2018), [`GardnerFilter`](@ref)),
   `:none` (keep everything), or an [`OutlierMethod`](@ref) instance.
+- `coarse_outliers = outliers`: the filter each level's coarse (sparse) pass uses to decide where the
+  fine pass searches, as a Symbol or an [`OutlierMethod`](@ref) instance like `outliers`, adjusted for
+  the coarse grid with [`AutoRIFT.relax`](@ref) and [`AutoRIFT.rescale`](@ref). `outliers` still decides
+  which estimates are kept, so a looser coarse filter costs runtime, not accuracy. A coarse filter that
+  rejects nearly every coarse point skips the level (`min_coarse_valid_fraction`).
 - `outlier_window = 5`: neighborhood width for the filter, in grid points. Odd and at least 3.
 - `outlier_iterations = 3`: iterations of the filter's first stage.
 - `min_agree_fraction = 8/25`: fraction of the window area that must agree.
@@ -414,6 +422,7 @@ function params(;
     min_coarse_valid_fraction = 0.01,
     min_chip_valid_fraction = _DEFAULT_MIN_CHIP_VALID_FRACTION,
     outliers = :gardner,
+    coarse_outliers = nokw,
     rotation = nothing,
     outlier_window = nokw,
     outlier_iterations = nokw,
@@ -435,6 +444,9 @@ function params(;
     # `fill_window` and `filter_width`. Translated here, in the one file that owns keywords.
     out = _outliers(outliers, (; window = outlier_window, iterations = outlier_iterations,
                                min_agree_fraction, agree_tolerance, mad_scale))
+    # The loose `outlier_*` keywords configure `outliers` alone; a coarse filter that differs is given
+    # whole.
+    cout = isnokw(coarse_outliers) ? out : _coarse_outliers(coarse_outliers)
     rot = _rotation(rotation)
     back = _backend(backend)
     # Intra-pair threading and a GPU both parallelise the same loop, and on a device they would
@@ -467,6 +479,7 @@ function params(;
         UInt64(rng_seed),
         Bool(progress),
         back,
+        cout,
     )
 end
 

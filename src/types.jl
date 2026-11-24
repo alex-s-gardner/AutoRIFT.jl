@@ -901,7 +901,7 @@ window(::NoOutlierFilter) = 0
 A looser variant of `method` for a decimated grid.
 
 The coarse pass runs on a strided subset, so a point's neighbors lie further away and resemble it
-less. Holding them to the fine pass's standard would reject coherent motion. What loosening means is
+less. Holding them to a fine pass's standard would reject coherent motion. What loosening means is
 the method's own: [`GardnerFilter`](@ref) drops one iteration (minimum one), and
 [`NoOutlierFilter`](@ref) returns itself.
 """
@@ -968,12 +968,12 @@ denominator depends on chip size, so a level's displacement may be quantized to 
 chip size and to 1/32 or 1/64 above it. See [`chip_measures`](@ref) and `chip_subpixels`.
 
 The positional constructor is stable API; its arguments follow the field declaration order. Shorter
-forms omit `min_chip_valid_fraction` and `fill_min_hole` (defaults `0.65` and `5`) and, in the
-shortest, `backend` (default `CPU()`).
+forms omit `coarse_outliers` (default: the same filter as `outliers`), `min_chip_valid_fraction` and
+`fill_min_hole` (defaults `0.65` and `5`) and, in the shortest, `backend` (default `CPU()`).
 """
 struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:PreprocessMethod,
               R<:Tuple{SubpixelMethod,Vararg{SubpixelMethod}},O<:OutlierMethod,T<:BoolAsType,
-              W<:RotationMethod,B<:Backend}
+              W<:RotationMethod,B<:Backend,C<:OutlierMethod}
     similarity::S
     preprocess::P
     subpixel::R
@@ -1024,10 +1024,13 @@ struct Params{S<:Tuple{SimilarityMeasure,Vararg{SimilarityMeasure}},P<:Preproces
     rng_seed::UInt64
     progress::Bool
 
-    # Where the kernels run. Last, so the positional constructor every earlier caller wrote keeps
-    # working through the outer method below — see [`AutoRIFT.Backend`](@ref) for why this is a
-    # type parameter rather than a plain field.
+    # Where the kernels run. See [`AutoRIFT.Backend`](@ref) for why this is a type parameter rather
+    # than a plain field.
     backend::B
+
+    # The coarse (sparse) pass's filter, which decides where the fine pass searches; `outliers` decides
+    # what is kept. Last, so every shorter positional form below gets `outliers` here.
+    coarse_outliers::C
 end
 
 # Holes of one to four points are closed on size alone. The reference's `bwareaopen(..., 5)`
@@ -1050,6 +1053,16 @@ Params(similarity, preprocess, subpixel, outliers, threaded, rotation, chip_size
            chip_size_max, grid_spacing, search_radius, min_search_radius, coarse_stride,
            coarse_buffer, min_coarse_valid_fraction, _DEFAULT_MIN_CHIP_VALID_FRACTION,
            dx_prior, dy_prior, fill_window, _DEFAULT_FILL_MIN_HOLE, rng_seed, progress, CPU())
+
+# Without `coarse_outliers`: the coarse pass uses `outliers`.
+Params(similarity, preprocess, subpixel, outliers, threaded, rotation, chip_size_min,
+       chip_size_max, grid_spacing, search_radius, min_search_radius, coarse_stride,
+       coarse_buffer, min_coarse_valid_fraction, min_chip_valid_fraction, dx_prior, dy_prior,
+       fill_window, fill_min_hole, rng_seed, progress, backend) =
+    Params(similarity, preprocess, subpixel, outliers, threaded, rotation, chip_size_min,
+           chip_size_max, grid_spacing, search_radius, min_search_radius, coarse_stride,
+           coarse_buffer, min_coarse_valid_fraction, min_chip_valid_fraction, dx_prior, dy_prior,
+           fill_window, fill_min_hole, rng_seed, progress, backend, outliers)
 
 # The form without `fill_min_hole`, which the 18-argument one above also routes through. Kept so a
 # caller written against the field list before hole size was a criterion still compiles, and gets

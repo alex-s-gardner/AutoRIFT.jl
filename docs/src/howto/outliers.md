@@ -148,6 +148,22 @@ window is appropriate. `autorift` calls [`AutoRIFT.rescale`](@ref), which widens
 the agreement fraction to match. The ratio of `chip_size` to `grid_spacing` used is capped at 2. The
 settings you pass are those for one point per chip, and the rescaling is applied on top of them.
 
+## The coarse pass's filter
+
+Each chip-size level first runs a sparse coarse pass and filters it, and the fine pass searches only near
+the coarse points that survive. A level whose coarse pass keeps fewer than `min_coarse_valid_fraction` of
+its points is skipped. By default the coarse pass uses the same filter as the fine pass. A strict filter can
+then skip whole levels, and with them a pair's coverage at those chip sizes, even where the fine pass would
+have kept many points.
+
+`coarse_outliers` gives the coarse pass its own filter. The fine filter still decides which estimates are
+kept, so a looser coarse filter costs runtime, not accuracy:
+
+```julia
+p = AutoRIFT.params(; outliers = GardnerFilter(; agree_tolerance = 0.15),
+                      coarse_outliers = GardnerFilter(; agree_tolerance = 0.25))
+```
+
 ## Turning it off
 
 `outliers = :none` keeps every measured point. It is not suitable for production, since the table above

@@ -1067,14 +1067,15 @@ function _coarse_points(pts::PointSet{2}, p::Params, chip_size::Extent)
     nr, nc = size(pts)
     rows = _lattice_nodes(pts.origin[1], stride, nr)
     cols = _lattice_nodes(pts.origin[2], stride, nc)
-    # Two adjustments, both the reference's (`autoRIFT.py:484-496`). `relax` loosens for the
-    # decimation: a coarse point's neighbours span several times more ground and are genuinely
-    # less like it. `rescale` matches the neighbourhood to a grid finer than its chips.
+    # The coarse pass's own filter, `p.coarse_outliers`, with two adjustments, both the reference's
+    # (`autoRIFT.py:484-496`). `relax` loosens for the decimation: a coarse point's neighbours span
+    # several times more ground and are genuinely less like it. `rescale` matches the neighbourhood to a
+    # grid finer than its chips.
     #
     # `coarse_stride` and not `stride` here: the overlap term is the reference's
     # `1 - sparseSearchSampleRate / ratio`, which is written against the sampling *rate* rather than
     # against the grid step the rate produces. See `_sparse_stride`.
-    filt = rescale(relax(p.outliers), _oversample(p), p.coarse_stride)
+    filt = rescale(relax(p.coarse_outliers), _oversample(p), p.coarse_stride)
     w = window(filt)
     (length(rows) < w || length(cols) < w) && return nothing
 

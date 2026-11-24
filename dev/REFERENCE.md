@@ -159,6 +159,16 @@ the base level agrees exactly on half its points, while the coarser levels agree
 **none** of them, because the two sides are rounding to different grids. Supporting
 a per-level factor is the fix; `tools/golden/README.md` records the measurement.
 
+**The coarse pass's filter is the dense one's.** `DispFiltC` copies `FracValid`, `FracSearch`,
+`FiltWidth` and `MadScalar` from the dense filter's settings and only drops one iteration
+(`autoRIFT.py:484-496`), so tightening the dense filter tightens the coarse pass too. A coarse pass
+that keeps under `CoarseCorCutoff` of its points skips its level (`:706`), so a strict dense filter
+can skip a level whose dense search would have kept many points.
+
+*AutoRIFT.jl takes the coarse filter separately* (`coarse_outliers`). By default it is the dense filter,
+which is the reference's behaviour. A looser coarse filter decides only where the dense search runs; the
+dense filter still decides what is kept.
+
 ---
 
 ## What the production drivers change
